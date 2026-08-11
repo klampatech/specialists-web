@@ -44,7 +44,7 @@ Or use the short-form for a quick check-in:
 **Playtest**: <was it playable? what was tested?>
 ```
 
-> ⚠️ **The playtest status is mandatory.** Every session end must answer: *"What did Kyle actually run and experience?"* — not "what was implemented." If nothing was playable this session, say so. That's the signal to prioritize a playable build next session. See `SPEC.md` → Operating Principles.
+> ⚠️ **The playtest status is mandatory.** Every session end must answer: *"What did Kyle actually run and experience?"* — not "what was implemented." If nothing was playable this session, say so. That's the signal to prioritize a playable build next session. See `docs/SPEC.md` → Operating Principles.
 
 ---
 
@@ -99,6 +99,8 @@ Deviations from the original HANDOFF.md plan for this session:
 
 ### 2026-08-11 — Phase 0 kickoff
 
+> **Historical note (added later)**: the spec model established in this entry was superseded later the same day. Originally, the vault was the source of truth and the repo `SPEC.md` was a sync. The current model is the inverse — `docs/SPEC.md` in the repo is canonical, the vault is a one-way mirror (see the Phase 0 tooling baseline entry above for the flip, and `tools/sync-spec-to-vault.sh`). This kickoff entry is preserved as-is to record what we actually believed and did on day one; the convention block at the bottom of this file reflects the *current* model.
+
 **Status**: Phase 0 / pre-milestone-1 / project scaffolding done, client/ not yet scaffolded
 
 **Done this session**:
@@ -134,6 +136,7 @@ Deviations from the original HANDOFF.md plan for this session:
 
 - **One entry per session, dated ISO-style.** New entries go on top.
 - **Short, factual, action-oriented.** The point is so the next session can pick up without re-reading sessions.
-- **Decisions go in `SPEC.md` too.** Cross-link if needed.
-- **Blockers are surfaced, not buried.** Anything stuck >1 session = top of the vault doc's Open Questions section.
-- **Playtest status is mandatory at every session end.** See `SPEC.md` → Operating Principles. If nothing was playable, say so.
+- **Decisions go in `docs/SPEC.md` too.** Cross-link from the handoff entry if needed.
+- **Blockers are surfaced, not buried.** Anything stuck >1 session = top of the Open Questions section in `docs/SPEC.md`.
+- **Playtest status is mandatory at every session end.** See `docs/SPEC.md` → Operating Principles. If nothing was playable, say so.
+- **Don't rewrite history.** The kickoff entry below records the old vault-as-source-of-truth model. It was correct at the time; new model is `docs/SPEC.md` canonical + vault mirror (see the PM tooling-baseline session entry above for the flip).
