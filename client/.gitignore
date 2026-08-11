@@ -2,3 +2,6 @@ node_modules/
 dist/
 .vite/
 *.log
+# Output of the headless scene smoke test (CI uploads it as an artifact;
+# we don't want it in the repo).
+scene-smoke.png

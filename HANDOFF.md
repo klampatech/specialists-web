@@ -50,6 +50,63 @@ Or use the short-form for a quick check-in:
 
 ## Log
 
+### 2026-08-11 — PR 2 (scene baseline) shipped, handoff for PR 3
+
+**Status**: Phase 0 / milestone 1 / PR 2 (Babylon scene + Havok plugin + skydome + lit static mesh + static ground + Playwright headless smoke) shipped on branch `feat/phase0-scene-baseline`. PR 3 ready to start.
+
+**Done this session**:
+- Branched `feat/phase0-scene-baseline` off `main` (origin/main @ `05d960c` at handoff-time — fast-forwarded past PR 1 merge `8254347` and the handoff-log PR 2)
+- Installed `@babylonjs/core@9.20.0` + `@babylonjs/havok@1.3.14` + `playwright@1.62.1` (devDep)
+- `client/src/engine/scene.ts` — new file. Engine + Scene + ArcRotateCamera + HemisphericLight + DirectionalLight + skydome (infinite-distance inward sphere) + one static red sphere + 30x30 ground plane + Havok plugin + static rigid bodies for both ground + sphere + shadows. WebGL2 path (WebGPU deferred to PR 3).
+- `client/src/ui/App.tsx` — replaced the React banner with a Babylon canvas mounted via ref. Loading / error / ready overlays. Cleans up on unmount.
+- `client/vite.config.ts` — added `optimizeDeps.exclude: ["@babylonjs/havok"]`. Without it, Vite pre-bundling rewrites Havok's `import.meta.url` wasm lookup and the browser fetches the index.html fallback ("expected magic word 00 61 73 6d, found 3c 21 64 6f"). Documented inline with a link to the Babylon forum thread.
+- `.github/workflows/ci.yml` — new `client-scene-smoke` job. Boots `npm run dev`, runs `node ./tools/scene-smoke.mjs` (Playwright headless), uploads the screenshot as a build artifact, fails on any pageerror/requestfailed.
+- `client/tools/scene-smoke.mjs` — new file. Headless Chromium against the dev server, waits for the loading banner to clear, captures a 1280x720 screenshot to `client/scene-smoke.png` (gitignored; CI uploads it as an artifact), validates the canvas has WebGL and there are zero pageerrors.
+- `client/.gitignore` — added `scene-smoke.png`
+- `docs/pr2-screenshot.png` — the lit-scene screenshot (red sphere, ground, sky, shadow). 1280x720. Pulled in as the PR description's "show, don't tell" evidence.
+
+**Verification gates passed**:
+- ✓ `npm run typecheck` — exit 0
+- ✓ `npm run build` — built in 1m 50s, 6.99MB JS bundle (gzip 1.56MB). *Flag*: ahead of the spec's "<5MB initial" target. Code-splitting is a PR 3 deliverable, not a blocker. Recorded in PR 2 body.
+- ✓ `node ./tools/scene-smoke.mjs` — "OK — scene smoke passed". Canvas: 1280x720, WebGL2 context present, scene banner cleared, zero pageerrors, zero requestfaileds.
+- ✓ Manual smoke: opened dev URL, hovered/redrew, scene stable. Screenshot at `docs/pr2-screenshot.png`.
+- ✓ Spec-canonical CI job: existing checks unchanged, still pass.
+
+**Next session task** (PR 3):
+- Create branch `feat/phase0-character-controller` off `main` (after PR 2 merges)
+- Add character controller: WASD + Space + Shift (dive) + C (slide) + V (camera toggle)
+- Swap `ArcRotateCamera` for a chase camera that follows the player (with the toggle for first-person)
+- Havok `PhysicsCharacterController` (the by-the-book API for character movement)
+- Add a second static mesh so we can see the character collide with something (or drop a couple of crate-shaped boxes)
+- Wire mixamo → glTF for the character model (FBX → glTF via `npx fbx2gltf` per the spec)
+- Smoke: screenshot of character in scene at two positions (start + after WASD movement)
+- Milestone 1 rows 4-10 of the acceptance table
+
+**Blockers / open questions**:
+- None real. Bundle size is large but documented; we split it in PR 3.
+- WebGPU bootstrap is *not* started — deferred to PR 3 alongside the controller per the deviation note in PR 2.
+
+**Decisions made**:
+- 2026-08-11 — WebGL2 over WebGPU for PR 2. Spec says WebGPU but Vite's dev-server smoke + Playwright headless path is more reliable on WebGL2 today. Bootstrap path is `new Engine(canvas, true)` (WebGL2 default). WebGPU targeted for PR 3.
+- 2026-08-11 — Vite `optimizeDeps.exclude: ["@babylonjs/havok"]` to fix the wasm-load bug. Documented inline in `vite.config.ts`.
+- 2026-08-11 — Manual scene mounts via a React ref + an async `createScene()` that returns a `SceneHandle { dispose() }`. Explicit dispose hook so React StrictMode's double-mount unmount path doesn't leak a render loop. PR 3 follows the same pattern.
+- 2026-08-11 — CI uploads the smoke screenshot as an artifact (`actions/upload-artifact@v4`). Not auto-commented on the PR (that's a PR 3 polish — the PR body points at the artifact URL).
+
+**Playtest status** ⚠️
+- **Playable**: yes — Kyle opens `http://localhost:5173` after `npm run dev` and sees a lit 3D scene with a red sphere on a ground plane under a blue sky. Camera orbits on drag. **No interaction yet** — PR 3 adds the character controller.
+- **What was tested this session**: typecheck + build + headless browser smoke. Manual spot-check via screenshot. Zero console errors, zero pageerrors, scene paints in <2s after page load.
+- **Build artifact**: screenshot at `docs/pr2-screenshot.png` (in-repo); full screenshot at `client/scene-smoke.png` (artifact in CI).
+- **Next session's playtest target**: PR 3 ships a character that WASD-walks around the existing scene. Kyle opens the URL, sees the character, moves it, sees the camera follow.
+
+#### Long-form
+
+The session had one real detour: Havok's wasm load failed with the "expected magic word 00 61 73 6d, found 3c 21 64 6f" error. The `3c 21 64 6f` is `<!do` — Vite was serving the HTML fallback because the pre-bundling rewrote the wasm URL. Fix is `optimizeDeps.exclude: ["@babylonjs/havok"]` (known Vite issue, documented in the Babylon forum). Caught it in the first headless smoke run, not later.
+
+Deviations from the prior handoff's plan:
+- Originally planned to add Playwright *as the first thing* in PR 2. Ended up writing the scene first, smoke-testing manually, then adding the CI job. Felt cleaner — the smoke test asserts the scene boots, so the scene needs to exist first.
+- Originally planned to use `WebGPUEngine`. Took WebGL2 instead — Vite dev + Playwright Chromium path is faster on WebGL2 today, and the WebGPU bootstrap adds an adapter wait that complicates the headless capture. Flagged for PR 3.
+- Originally planned to use a Kenney asset for the static mesh. Used a procedural sphere instead — no asset pipeline yet, and the sphere is enough to verify the lit-scene acceptance. PR 3 imports the box meshes from the asset pipeline.
+
 ### 2026-08-11 — PR 1 merged, handoff for PR 2
 
 **Status**: Phase 0 / milestone 1 / PR 1 MERGED to main (merge commit 8254347). PR 2 ready to start.

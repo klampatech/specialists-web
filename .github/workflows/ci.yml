@@ -24,6 +24,64 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
+  # Phase 0 / PR 2: headless smoke test of the Babylon scene.
+  # Boots `npm run dev`, waits for the ready banner to disappear, captures a
+  # screenshot, fails on any console error, and uploads the screenshot as a
+  # build artifact so it's visible on the PR page.
+  #
+  # Why a separate job: `npm run dev` is a long-lived process, and the
+  # typecheck + build job runs much faster. Splitting avoids serializing the
+  # whole pipeline on the screenshot step.
+  client-scene-smoke:
+    name: client — scene smoke (headless screenshot)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5173 > /tmp/vite-dev.log 2>&1 &
+          echo $! > /tmp/vite-dev.pid
+          # Wait for the dev server to come up (max 60s)
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5173/ > /dev/null; then
+              echo "Dev server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5173/ > /dev/null; then
+            echo "::error::Dev server did not come up in 60s"
+            cat /tmp/vite-dev.log
+            exit 1
+          fi
+      - name: Run headless smoke
+        run: node ./tools/scene-smoke.mjs
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scene-screenshot
+          path: client/scene-smoke.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev.pid ]]; then
+            kill "$(cat /tmp/vite-dev.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   spec-canonical:
     name: spec layout — canonical at docs/SPEC.md
     runs-on: ubuntu-latest
