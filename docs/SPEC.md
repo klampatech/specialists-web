@@ -197,6 +197,13 @@ Six phases. Each is a shippable thing. Don't build N+1 until N is solid.
 | 1 | Repo scaffolded, Vite + Babylon + Havok running, single-player character controller in a static scene | Kyle can open a URL in a browser and walk a character around an empty map. Movement must feel right (run, jump, dive, slide, wallrun, third-person toggle). |
 | 2 | ggrs integrated, two tabs can roll back, single weapon + melee, bullet time, third-person toggle | Kyle can open two browser tabs, see the other player, dive/slide/wallrun, fire a gun, hit with melee, trigger bullet time with mid-air shots, and feel the rollback netcode is correct (no teleport, no desync). |
 
+#### Build & dev prerequisites (recover these BEFORE you start coding)
+
+- **`npm install` from `client/`** — pulls `@babylonjs/core`, `@babylonjs/havok`, `playwright` (devDep). No system packages required.
+- **`vite.config.ts` requires `optimizeDeps.exclude: ["@babylonjs/havok"]`** — without it, Vite's pre-bundling rewrites Havok's `import.meta.url` to a hashed path the wasm fetch can't follow, and the browser fetches the HTML fallback with a "expected magic word 00 61 73 6d, found 3c 21 64 6f" error. If you see this error, you forgot the exclude (or the `.vite` cache is stale). Fix: `rm -rf client/node_modules/.vite` and reload. Full diagnosis in the `babylonjs-vite-havok-wasm` skill.
+- **If you change the Vite config, clear the cache.** Same path as above.
+- **Headless smoke test:** `cd client && node ./tools/scene-smoke.mjs` requires the dev server already running on `:5173`. CI does this automatically.
+
 ### Phase 0 — architecture details
 
 #### ggrs ↔ Babylon ↔ Havok wiring (the hard part)
@@ -349,6 +356,14 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 - **Asset strategy**: Mixamo + Kenney CC0 for Phase 0
 - **Working title**: "Specialists Web" — final name TBD at public launch
 
+### 2026-08-11 — PR 2 implementation decisions
+- **WebGPU vs WebGL2**: PR 2 ships **WebGL2** via `new Engine(canvas, true)` (the default). Spec says WebGPU but the Vite dev server + Playwright headless Chromium path is more reliable on WebGL2 today, and the WebGPU bootstrap adds an adapter-wait that complicates the headless capture. WebGPU targeted for PR 3 alongside the character controller. Bootstrap path is a one-line swap to `WebGPUEngine` in PR 3.
+- **Vite `optimizeDeps.exclude: ["@babylonjs/havok"]`**: required for Havok to load in dev mode. Havok's ESM uses `import.meta.url` to locate its wasm at runtime; Vite's pre-bundling rewrites that URL to a hashed path the wasm fetch can't follow, causing the browser to fetch the HTML fallback. See the `babylonjs-vite-havok-wasm` skill for the full diagnosis.
+- **No static mesh from the asset pipeline**: PR 2 uses a procedural red sphere as the placeholder for the Mixamo character model. The asset pipeline is a PR 3 concern — building it now would be premature for a single-object acceptance test.
+- **Phase 0 split into 3 PRs**: tooling baseline (PR 1, done) → scene baseline (PR 2, this PR) → character controller (PR 3, next). Each PR ends at a playable beat: PR 1 = "build runs and shows a banner", PR 2 = "you can see a lit scene with one object", PR 3 = "you can walk a character around". Each PR is independently mergeable and reviewable.
+- **Headless smoke in CI**: PR 2 adds a third CI job (`client-scene-smoke`) that boots the dev server, runs Playwright headless against it, captures a screenshot, fails on any pageerror, and uploads the screenshot as a build artifact. Replaces the deferred "Playwright headless smoke test" item from PR 1.
+- **Bundle size flag**: Vite reports a 6.99 MB JS bundle (1.56 MB gzip) for PR 2. Spec's "<5MB initial" target is not met. Code-splitting is a PR 3 deliverable (the character controller will benefit from dynamic imports anyway). Not a blocker for PR 2.
+
 ### 2026-08-11 — Project location
 - **Vault**: `~/Obsidian/mem/projects/specialists-web.md` (this file)
 - **Repo**: `~/Development/specialists-web/`
@@ -371,6 +386,19 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 ---
 
 ## Session log
+
+### 2026-08-11 — PR 2 (scene baseline) shipped, spec drift caught and fixed
+- Branched `feat/phase0-scene-baseline` off `main` (origin/main @ `05d960c` at handoff-time)
+- Installed `@babylonjs/core@9.20.0` + `@babylonjs/havok@1.3.14` + `playwright@1.62.1` (devDep)
+- `client/src/engine/scene.ts` — first real Babylon scene (Engine + Scene + ArcRotateCamera + HemisphericLight + DirectionalLight + skydome + red sphere + 30x30 ground + Havok + static rigid bodies). PR 2 scope per Milestone 1 acceptance rows 1-3.
+- `client/src/ui/App.tsx` — replaced React banner with Babylon canvas mounted via ref. Loading / error / ready overlays.
+- `client/vite.config.ts` — added `optimizeDeps.exclude: ["@babylonjs/havok"]` to fix the dev-mode wasm load (Havok's `import.meta.url` was being rewritten by Vite's pre-bundling)
+- `.github/workflows/ci.yml` — new `client-scene-smoke` job (boots dev server, runs Playwright headless, fails on pageerror, uploads screenshot as artifact)
+- `client/tools/scene-smoke.mjs` — headless smoke test script
+- `docs/pr2-screenshot.png` — the lit-scene screenshot (in-repo evidence)
+- PR opened: https://github.com/klampatech/specialists-web/pull/3 — all 3 CI checks green (typecheck + build, scene smoke, spec-canonical)
+- **Spec drift caught by Kyle post-merge**: PR 2 didn't ship a spec update. Fixed here: pinned versions, recorded WebGL2-vs-WebGPU decision, recorded Vite gotcha, recorded CI evolution, realigned the Milestone 1 acceptance table with the actual PR split, recorded the 3-PR Phase 0 split. Spec also synced to vault via `tools/sync-spec-to-vault.sh` (next step).
+- **Lesson learned**: every PR must land with the spec updated. The spec is the load-bearing artifact for this project; PRs without spec updates rot the next session's understanding. Add this to the session-end checklist.
 
 ### 2026-08-11 — kickoff
 - Kyle: "I'd like to essentially bring this version of the specialists into the browser. It must be multiplayer and available to anyone on the web to play."
