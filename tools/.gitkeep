@@ -1,0 +1,6 @@
+# Build / asset pipeline scripts
+
+- Babylon scene authoring tools
+- Blender glTF export scripts
+- Asset compression (Draco, KTX2, meshopt)
+- CI helpers
