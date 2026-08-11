@@ -63,13 +63,13 @@ Or use the short-form for a quick check-in:
 - Smoke tested locally: npm install (68 pkgs, 4s), npm run typecheck (exit 0), npm run build (143kB JS bundle), npm run dev (HTTP 200 on /, /src/main.tsx, /src/ui/App.tsx), headless browser visit (React renders, zero console errors)
 - Opened PR #1: https://github.com/klampatech/specialists-web/pull/1
 - CI green on PR #1 (client — typecheck + build, 13s, SUCCESS)
-- Branch protection status: API reports `protected: false` on `main` — open branch-protection discrepancy from memory. TODO: ask Kyle to confirm whether protection is intentional or whether the rule was scoped elsewhere.
+- Branch protection: not yet set on this repo (it's brand new). Followed the universal "no direct-to-main" rule anyway — branch + PR + green CI + review + merge.
 
 **Next session task**:
 - Continue with PR 2: Babylon.js scene + Havok plugin + skydome + directional light + a single static mesh (Milestone 1 acceptance rows 1-3). Start with the simplest possible Havok-free Babylon scene; layer Havok in once the scene runs.
 
 **Blockers / open questions**:
-- Branch protection on `main` is reported as not set (`gh api` returns 404). Memory says it was set 2026-08-10. Either it was set on a different repo, lost, or scoped to a different branch. Treat as "no direct-to-main" rule regardless of GitHub setting; ask Kyle to confirm/reset.
+- (No real blocker. Branch protection isn't set on this fresh repo yet. I conflated phaseturn's protected main with this one — corrected after Kyle's flag. Universal "no direct-to-main" rule still applies regardless.)
 
 **Decisions made**:
 - 2026-08-11 — Transport: WebRTC for Phase 0 peer-to-peer (no signalling server), WebTransport for Phase 1+ client→server, WebSocket fallback deferred to Phase 1
@@ -86,7 +86,7 @@ Or use the short-form for a quick check-in:
 
 #### Long-form
 
-This session was a clean "tooling baseline" beat. Plan was: (1) lock the spec, (2) make the build pipeline work, (3) open a PR that's reviewable. Steps 1 and 2 were straightforward; step 3 hit a small friction — gitignore was missing `*.tsbuildinfo` so tsc artifacts tried to stage. Fixed in `.gitignore` before commit. The bigger finding was the branch-protection discrepancy: memory says `main` is protected, GitHub API says it isn't. I followed the rule anyway (branch + PR + green CI + review + merge — no direct-to-main) and surfaced the discrepancy for Kyle to clarify. The PR is in a state Kyle can review and merge whenever he's ready.
+This session was a clean "tooling baseline" beat. Plan was: (1) lock the spec, (2) make the build pipeline work, (3) open a PR that's reviewable. Steps 1 and 2 were straightforward; step 3 hit a small friction — gitignore was missing `*.tsbuildinfo` so tsc artifacts tried to stage. Fixed in `.gitignore` before commit. The friction I should have surfaced cleaner: I initially framed the missing branch protection as a "discrepancy" because my memory said it was set. Kyle corrected it — that memory was from phaseturn, not specialists-web. Rule still applies (no direct-to-main), but it applies as a universal discipline, not a repo-level guarantee. PR is in a state Kyle can review and merge whenever he's ready.
 
 The Phase 0 split into 3 PRs came out of the conversation at the start of this session. Driving principle: every PR ends at a playable beat. PR 1 ends at "the build runs and shows a banner." PR 2 ends at "you can see a lit scene with one object." PR 3 ends at "you can walk a character around." Each PR is independently mergeable and reviewable.
 
