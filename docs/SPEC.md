@@ -4,6 +4,13 @@
 
 **Editing rule**: branch + PR. No direct pushes to `main`. Decisions, operating principles, and acceptance criteria are all version-controlled here. The vault entry is a stub pointer that gets regenerated.
 
+> **Current status (2026-08-11):** Phase 0 / Milestone 1 in progress.
+> - **PR 1** (tooling baseline + CI + spec lock) — **MERGED** to main.
+> - **PR 2** (Babylon scene + Havok + skydome + static mesh + static ground + Playwright headless smoke) — **MERGED** at https://github.com/klampatech/specialists-web/pull/3 (squash commit `2a12a59`), all 3 CI checks green.
+> - **PR 3** (character controller + WASD + camera + jump) — next up.
+>
+> **Spec drift caught and fixed across PR 2:** pinned versions, WebGL2-vs-WebGPU decision, the 3-PR Phase 0 split, CI evolution, Vite `optimizeDeps.exclude` gotcha, and the milestone acceptance markings. See Decisions log + Session log.
+
 ## Operating Principles
 
 ### Playtest everything. Handing Kyle a broken game is unacceptable.
@@ -53,11 +60,12 @@ The reason people came back: **moments**. A slow-mo dual-pistol dive into a kung
 ## The stack (frozen for Phase 0)
 
 **Client** (in-browser)
-- **TypeScript** + **Vite** + **React** (UI shell)
-- **Babylon.js** on **WebGPU** (rendering)
-- **Havok** physics via wasm (character controller, world physics)
-- **ggrs** (Rust GGPO-style rollback netcode, talks to TS via wasm)
+- **TypeScript** + **Vite** + **React** (UI shell) — pinned in [client/package.json](client/package.json)
+- **Babylon.js** for rendering — **WebGL2 in Phase 0 PR 2**; WebGPU deferred to PR 3+ (see Decisions log). Pinned `@babylonjs/core@9.20.0`.
+- **Havok** physics via wasm (character controller, world physics) — pinned `@babylonjs/havok@1.3.14`
+- **ggrs** (Rust GGPO-style rollback netcode, talks to TS via wasm) — PR 3+ (netcode work)
 - **WebTransport** (UDP over HTTP/3) for game traffic; **WebSocket** fallback for restricted networks
+- **Playwright** (devDep) for headless smoke testing — pinned `playwright@1.62.1` as of PR 2
 
 **Server** (Rust)
 - **Tokio** + **Rapier** (deterministic mode) for the game server
@@ -187,15 +195,24 @@ Six phases. Each is a shippable thing. Don't build N+1 until N is solid.
 
 ### CI
 
-- GitHub Actions: typecheck, lint, build, Playwright headless smoke test
-- Deploy preview: Vercel or CloudFront (auto on PR)
+Three GitHub Actions jobs on every PR (`.github/workflows/ci.yml`):
+- **`client-typecheck`** — `npm run typecheck` + `npm run build` (production bundle). Catches type and bundling errors.
+- **`client-scene-smoke`** — boots `npm run dev`, runs Playwright headless Chromium against `http://localhost:5173`, captures a 1280x720 screenshot, fails on any pageerror. Uploads the screenshot as the `scene-screenshot` artifact on the PR. Lands in PR 2.
+- **`spec-canonical`** — positive-claim assertion that `docs/SPEC.md` exists, declares itself canonical, and that the repo-root `SPEC.md` is a stub pointer. Catches accidental dual-canonical drift.
+
+Deploy preview: Vercel or CloudFront (auto on PR) — not yet wired; deferred to Phase 1 when there's a real backend to deploy with.
 
 ### Phase 0 milestones
 
 | Week | Milestone | Playtest acceptance |
 |------|-----------|---------------------|
-| 1 | Repo scaffolded, Vite + Babylon + Havok running, single-player character controller in a static scene | Kyle can open a URL in a browser and walk a character around an empty map. Movement must feel right (run, jump, dive, slide, wallrun, third-person toggle). |
+| 1 | **Lit 3D scene + character controller + stunts + camera toggle** (split into 3 PRs — see Decisions log) | Kyle can open a URL in a browser and walk a character around an empty map. Movement must feel right (run, jump, dive, slide, wallrun, third-person toggle). |
 | 2 | ggrs integrated, two tabs can roll back, single weapon + melee, bullet time, third-person toggle | Kyle can open two browser tabs, see the other player, dive/slide/wallrun, fire a gun, hit with melee, trigger bullet time with mid-air shots, and feel the rollback netcode is correct (no teleport, no desync). |
+
+**Phase 0 PR split (3 PRs, in order):**
+- **PR 1 (DONE):** tooling baseline + CI + spec lock. No scene.
+- **PR 2 (DONE, merged to main at `2a12a59`):** Babylon scene + Havok plugin + skydome + lights + one static mesh + static ground + Playwright headless smoke. **Covers Milestone 1 acceptance rows 1-3** (boots, shows lit scene, shows one object).
+- **PR 3 (NEXT):** character controller + WASD + jump + dive + slide + camera toggle + Mixamo character model. **Covers Milestone 1 acceptance rows 4-10.**
 
 #### Build & dev prerequisites (recover these BEFORE you start coding)
 
@@ -294,9 +311,9 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 
 | Acceptance criterion | How Kyle verifies |
 |---|---|
-| `npm install && npm run dev` boots a browser at `http://localhost:5173` | Page returns 200; React renders; no console errors |
-| Babylon.js canvas is visible, scene has skydome + 1 directional light | Screenshot shows lit scene |
-| A character model (Mixamo) is standing in the scene at origin | Visible in viewport |
+| `npm install && npm run dev` boots a browser at `http://localhost:5173` | Page returns 200; React renders; no console errors | **LANDED PR 2** ✅ |
+| Babylon.js canvas is visible, scene has skydome + 1 directional light | Screenshot shows lit scene | **LANDED PR 2** ✅ (placeholder sphere instead of Mixamo character — see row 3) |
+| A character model (Mixamo) is standing in the scene at origin | Visible in viewport | **PARTIAL PR 2** — procedural red sphere as placeholder; Mixamo model lands in PR 3 |
 | WASD moves the character, with smooth acceleration/deceleration | Hold W for 1s → character moves forward; release → character decelerates over ~0.3s |
 | Space jumps (single, double-jump disabled in Phase 0) | Tap Space → character jumps, height ~1.5m |
 | Shift toggles dive (forward + dive for 0.8s anim) | Tap Shift while moving → character dives forward |
