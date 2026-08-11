@@ -5,7 +5,32 @@
 >
 > **Editing rule**: edit the vault doc first; sync to this file on commit. The vault is the source of truth for *why* we made decisions. This file is the source of truth for *what we are building right now*.
 
-Browser-native, multiplayer remake of *The Specialists* (2002 Half-Life mod).
+## Operating Principles
+
+### Playtest everything. Handing Kyle a broken game is unacceptable.
+
+This is the single highest-priority discipline for this project. Every milestone, every feature, every Friday — there must be a real, playable thing in Kyle's hands.
+
+**What this means in practice:**
+
+- **Every milestone ends with a playable build.** Not "the code compiles." Not "the tests pass." A person can run it and experience the thing.
+- **Every feature must be testable in isolation.** Don't bury a feature behind five other features. Build it, expose it, run it, see it.
+- **"Done" means tested by a human, not just compiles.** A feature that compiles but doesn't work is not done. A feature that works on the developer's machine but not Kyle's is not done.
+- **Broken/missing functionality = blocker, not "polish."** If something is broken in a build, it blocks the milestone. We don't push broken to "later."
+- **Show, don't tell.** Rather than say "the character controller works," record a video, write a test report, or share a URL Kyle can hit. A description is not evidence.
+- **Surface regressions explicitly.** If something that worked before stopped working, that's a regression. Surface it immediately, don't fast-path past it.
+- **If you can't playtest it, you can't ship it.** If a build is unbuildable, unrunnable, or unverifiable, stop and fix the build before continuing.
+
+**How this shows up in this spec:**
+- Phase milestones have a "Definition of done" — each must include a playable acceptance test.
+- HANDOFF.md sessions end with a "Playtest status" check-in.
+- Decisions in the decision log reference what was tested, not just what was decided.
+
+---
+
+# Specialists Web
+
+A browser-native, multiplayer-first remake of *The Specialists* (2002 Half-Life mod).
 The vibe: **John Woo × Matrix × Hong Kong Blood Opera** — a spectacle shooter where movement is the game, not a side feature.
 
 > **Working title: "Specialists Web"**. Final name TBD at public launch.
@@ -145,8 +170,7 @@ Six phases. Each is a shippable thing. Don't build N+1 until N is solid.
 ├── .github/
 │   └── workflows/           # CI
 ├── README.md
-├── SPEC.md                  # This file (vault doc synced)
-├── HANDOFF.md               # Session-to-session handoff
+├── LICENSE                  # TBD at public launch
 └── .gitignore
 ```
 
@@ -174,6 +198,126 @@ Six phases. Each is a shippable thing. Don't build N+1 until N is solid.
 | 1 | Repo scaffolded, Vite + Babylon + Havok running, single-player character controller in a static scene | Kyle can open a URL in a browser and walk a character around an empty map. Movement must feel right (run, jump, dive, slide, wallrun, third-person toggle). |
 | 2 | ggrs integrated, two tabs can roll back, single weapon + melee, bullet time, third-person toggle | Kyle can open two browser tabs, see the other player, dive/slide/wallrun, fire a gun, hit with melee, trigger bullet time with mid-air shots, and feel the rollback netcode is correct (no teleport, no desync). |
 
+### Phase 0 — architecture details
+
+#### ggrs ↔ Babylon ↔ Havok wiring (the hard part)
+
+The non-obvious thing: **Babylon and Havok both simulate physics.** We need one canonical physics authority per client, and that's Havok. Babylon reads Havok's transforms for mesh sync; it does **not** run its own physics for gameplay.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                          CLIENT                              │
+│                                                             │
+│  Input ──► ggrs.GGRSession (collects inputs, drives ticks)  │
+│                │                                            │
+│                ▼                                            │
+│         Game.tick(gs, inputs)                               │
+│            │       │                                        │
+│            │       └──► Havok.characterController.move()    │
+│            │             │                                  │
+│            │             ▼                                  │
+│            │       Havok.physicsWorld.step()                │
+│            │             │                                  │
+│            │             ▼                                  │
+│            └──► Mesh transforms = Havok transforms          │
+│                                                             │
+│  Babylon.scene.onBeforeRenderObservable ──► render meshes   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Tick loop** (every frame, ggrs advances and we render):
+1. ggrs reports which inputs we have for frame N (locally captured, remote via rollback).
+2. Game.applyInputs(gs, inputs) — converts inputs to intent (move, jump, fire, dive).
+3. Havok controller applies intent → physics step.
+4. Babylon meshes read rig.position / rotation from a thin "Player" object that wraps Havok's transform.
+5. Render.
+
+**Why this order**: physics is the source of truth, not Babylon. If we ever need a server (Phase 1), the server runs the same physics step with the same inputs — full determinism. Animation, FX, camera all **render only**. They never feed back into the sim.
+
+**Havok capsule behavior**: we use Babylon's `PhysicsCharacterController` (Havok-backed). Default settings: 0.5m radius, 1.8m height, slope 45°, step 0.3m. **Tune anything in `client/src/engine/characterConfig.ts`** — never hard-code in the controller.
+
+**Determinism rule**: every physics-affecting input is a frame-aligned integer (button bitmask + normalized analog). Never read `Date.now()` or `performance.now()` inside the tick.
+
+#### WebRTC peer bootstrap (Phase 0 signalling)
+
+Two browser tabs need to find each other. Phase 0 has no server, so the bootstrap is manual — share a link, paste the offer, paste the answer. This is intentional: we don't want to spend engineering time on a signalling server until we've proved the thing is fun.
+
+**Flow** (host = tab that opened the room; guest = tab that joined via URL):
+
+1. Host clicks "Create Room" → generates an SDP offer + ICE candidates.
+2. Host displays a copy-pasteable blob (base64 of the SDP+ICE) and a URL like `?join=<blob>`.
+3. Guest opens the URL → parse blob → generates an SDP answer → displays copy-pasteable blob back.
+4. Host pastes guest's answer blob → both sides now have full SDP+ICE on each other.
+5. WebRTC `RTCPeerConnection` opens a `RTCDataChannel` for game inputs (reliable ordered) and one for time-sensitive state (unreliable unordered).
+6. Both tabs connect to ggrs → ggrs drives the rollback loop.
+
+**Why no signalling server in Phase 0**: we want to prove the *feel* before investing in matchmaking infra. The copy-paste dance is annoying but it lets us land Phase 0 in 2 weeks instead of 4. Phase 1 replaces this with a Rust WebTransport server + a `/create` + `/join` REST endpoint.
+
+**Implementation sketch** (`client/src/net/peer.ts`):
+- One `WebRTCPeer` class wraps `RTCPeerConnection` + ICE handling.
+- One `ClipboardPayload` type for the offer/answer blob (`{ sdp: string, candidates: RTCIceCandidateInit[] }`).
+- Browser context menu exposes "Copy join link" / "Paste answer" — no React UI yet, raw `<button>`s on a debug overlay.
+
+**Pitfall to avoid**: don't try to use WebRTC's auto-signalling (it doesn't exist — WebRTC always needs an out-of-band channel). The copy-paste is that channel.
+
+#### Asset import pipeline
+
+Phase 0 doesn't need a real pipeline — we drop pre-baked assets in `client/public/` and vitedev-serve them. The build-time pipeline is a Phase 3 concern. Here's what's in place for Phase 0:
+
+**Source-of-truth files** (manual drops into `client/public/`):
+- `models/` — Mixamo FBX exports, decompressed (no FBX in browser — convert to glTF first via `npx fbx2gltf`)
+- `textures/` — Kenney CC0 PNGs, no compression (Phase 0 size budget is loose)
+- `maps/` — Blender `.glb` exports of the test map (corridor + rooftop)
+- `audio/` — freesound CC0 WAVs → convert to OGG with `ffmpeg` on import
+
+**Loading pattern** (`client/src/engine/loader.ts`):
+- `async loadCharacter(name: string): Promise<TransformNode>` — caches by URL, returns a Babylon `TransformNode` with the mesh + animation groups attached
+- `async loadMap(name: string): Promise<Scene>` — builds a Babylon `Scene` from the `.glb`, returns it ready to attach to the engine
+- `async loadAudio(name: string): Promise<Sound>` — Babylon sound handle
+
+**Phase 0 budget**: client's initial JS+wasm payload should be under 5MB; assets are loaded lazily. Verify with `vite build --mode production && du -sh client/dist/assets/`.
+
+**Phase 3 upgrade path** (placeholder, **don't build yet**): meshopt + KTX2 + Draco compression, CDN delivery, BatchedMesh for environment props. Architecture leaves room (the loader is a wrapper, not a Babylon singleton) but the optimization itself is out of scope.
+
+### Phase 0 — milestone acceptance criteria (expanded)
+
+The Phase 0 milestones table above is a one-liner. Below is the same info plus the *testable* acceptance criteria per milestone. Each item here is something Kyle can run and verify.
+
+#### Milestone 1 — single-player feel (week 1)
+
+| Acceptance criterion | How Kyle verifies |
+|---|---|
+| `npm install && npm run dev` boots a browser at `http://localhost:5173` | Page returns 200; React renders; no console errors |
+| Babylon.js canvas is visible, scene has skydome + 1 directional light | Screenshot shows lit scene |
+| A character model (Mixamo) is standing in the scene at origin | Visible in viewport |
+| WASD moves the character, with smooth acceleration/deceleration | Hold W for 1s → character moves forward; release → character decelerates over ~0.3s |
+| Space jumps (single, double-jump disabled in Phase 0) | Tap Space → character jumps, height ~1.5m |
+| Shift toggles dive (forward + dive for 0.8s anim) | Tap Shift while moving → character dives forward |
+| C toggles crouch/slide | Hold C + W → character slides |
+| Q triggers wallrun if airborne near a wall at angle | Side approach wall, jump toward it → wallrun along wall for ~1s |
+| V toggles third-person ↔ first-person camera | Press V → camera moves from over-shoulder to eye-level |
+| Havok physics is the source of truth (verify by toggling Babylon physics off in DevTools) | Physics off → character doesn't move when WASD pressed |
+
+**Done =** all 10 criteria pass in Kyle's browser.
+
+#### Milestone 2 — netcode + combat (week 2)
+
+| Acceptance criterion | How Kyle verifies |
+|---|---|
+| Two browser tabs can complete the WebRTC handshake (copy-paste dance) | Both tabs show "Connected" overlay |
+| Each tab sees the other player's character in the same scene | Tabs side-by-side, both show 2 characters |
+| Local input latency feels < 1 frame on remote view | Move in tab A → tab B sees motion within ~50ms |
+| Rollback correction is invisible under 100ms simulated lag | `chrome://network-conditions` → set 100ms throttle; move erratically; no visible teleport |
+| Firing the dual pistols (LMB) shoots a raycast that draws a tracer | Click LMB → tracer line from gun to hit point |
+| Melee attack (RMB) hits within 1.5m cone | Approach within 1.5m, RMB → hit indicator on target |
+| Holding T toggles bullet time (0.25x speed, full air control) | Hold T → time slows visibly, character can curve shots mid-air |
+| Bullet time is independent per player (offensive + defensive mode) | Both players in bullet time independently; presses feel right |
+| Health → 0 → respawn at spawn point | Take 100 damage → 1s respawn timer → back at spawn |
+| One full minute of two-tab play = no console errors, no desync, no rubberbanding | Both tabs stay in sync for 60s |
+
+**Done =** all 10 criteria pass with Kyle driving both tabs.
+
 ### Phase 0 risks
 
 - **Netcode for bullet-time is the make-or-break.** This is the highest-risk single component. If it doesn't feel right, nothing else matters.
@@ -182,37 +326,14 @@ Six phases. Each is a shippable thing. Don't build N+1 until N is solid.
 
 ---
 
-## Working with this spec
+## Working with this doc
 
-- **Edit the vault doc first** (`~/Obsidian/mem/projects/specialists-web.md`), then sync to this file on commit. The vault is the source of truth for *why* — this file is the source of truth for *what we are building right now*.
+- **Top of file**: status, dates, repo location, sync notes. Update when phase changes.
+- **This doc is the source of truth for *why*** (decisions, reasoning, rejected alternatives). The repo file `SPEC.md` is a synchronized copy — source of truth for *what we are building right now*. **Edit vault first, sync to repo on commit.**
 - **Phase sections**: append-only as we complete work. Don't rewrite history — mark superseded phases with `(superseded by Phase N)` so we can chase the reasoning later.
 - **Decisions**: log in the Decisions section below as we make them. Each decision = why + when + what we picked + what we rejected.
 - **Open questions**: log in the Open Questions section. Surface blockers for the next session.
-
-For session-to-session continuity, see `HANDOFF.md`.
-
----
-
-## Operating Principles
-
-### Playtest everything. Handing Kyle a broken game is unacceptable.
-
-This is the single highest-priority discipline for this project. Every milestone, every feature, every Friday — there must be a real, playable thing in Kyle's hands.
-
-**What this means in practice:**
-
-- **Every milestone ends with a playable build.** Not "the code compiles." Not "the tests pass." A person can run it and experience the thing.
-- **Every feature must be testable in isolation.** Don't bury a feature behind five other features. Build it, expose it, run it, see it.
-- **"Done" means tested by a human, not just compiles.** A feature that compiles but doesn't work is not done. A feature that works on the developer's machine but not Kyle's is not done.
-- **Broken/missing functionality = blocker, not "polish."** If something is broken in a build, it blocks the milestone. We don't push broken to "later."
-- **Show, don't tell.** Rather than say "the character controller works," record a video, write a test report, or share a URL Kyle can hit. A description is not evidence.
-- **Surface regressions explicitly.** If something that worked before stopped working, that's a regression. Surface it immediately, don't fast-path past it.
-- **If you can't playtest it, you can't ship it.** If a build is unbuildable, unrunnable, or unverifiable, stop and fix the build before continuing.
-
-**How this shows up in this spec:**
-- Phase milestones have a "Definition of done" — each must include a playable acceptance test.
-- HANDOFF.md sessions end with a "Playtest status" check-in.
-- Decisions in the decision log reference what was tested, not just what was decided.
+- **Session log**: see `HANDOFF.md` in the repo for session-to-session continuity.
 
 ---
 
@@ -221,14 +342,15 @@ This is the single highest-priority discipline for this project. Every milestone
 ### 2026-08-11 — Stack picks
 - **Client**: TS + Babylon.js on WebGPU + Havok + ggrs via wasm
 - **Server**: Rust + Tokio + Rapier (deterministic)
-- **Transport**: WebTransport (UDP), WebSocket fallback
+- **Transport decision (2026-08-11)**: Phase 0 uses **WebRTC peer-to-peer** between two browser tabs (no dedicated server). Phase 1+ uses **WebTransport** (UDP over HTTP/3) for client→server traffic, with **WebSocket** fallback when WebTransport is unavailable. WebRTC stays as the option for peer-to-peer data channels in Phase 5+ (spectator relays, custom net topologies). **Why split**: WebRTC is the only browser-to-browser transport — no signalling server needed for Phase 0 feel test. WebTransport is the right client→server transport once a server exists, but it's not browser-to-browser. Don't relitigate this in Phase 0.
+- **WebSocket fallback**: deferred to Phase 1 (only matters when there's a server)
 - **Hosting**: Hetzner (matches existing infrastructure)
 - **Auth (eventually)**: Discord OAuth (zero-friction)
 - **Asset strategy**: Mixamo + Kenney CC0 for Phase 0
 - **Working title**: "Specialists Web" — final name TBD at public launch
 
 ### 2026-08-11 — Project location
-- **Vault**: `~/Obsidian/mem/projects/specialists-web.md` (this file's source of truth)
+- **Vault**: `~/Obsidian/mem/projects/specialists-web.md` (this file)
 - **Repo**: `~/Development/specialists-web/`
 - **Remote**: `github.com/klampatech/specialists-web`
 
@@ -255,5 +377,7 @@ This is the single highest-priority discipline for this project. Every milestone
 - Pulled ModDB page, Fandom wiki, scouted WebGPU/netcode state of the art in 2026.
 - Evan ended on: "Document the *vision* and the *plan*, then start building."
 - Kyle: "I want a canonical living spec to grow alongside this project and track our work. So write the phased MVP plan and then we can fill in the details for phase 0."
-- Created vault doc + repo + remote. Next session: fill in Phase 0 details.
-- Spec also checked into repo as `SPEC.md` (this file). Added `HANDOFF.md` for session-to-session continuity.
+- Created this vault doc + repo + remote. Next session: fill in Phase 0 details.
+- Spec also checked into repo as `SPEC.md` (synced from vault). `HANDOFF.md` added for session-to-session continuity.
+- **Operating principle added**: "Playtest everything. Handing Kyle a broken game is unacceptable." Each milestone ends with a playable build. Each session-end handoff has a mandatory Playtest status block. Phase 0 milestones now have playtest acceptance criteria.
+- Kyle will start Phase 0 in the next session.
