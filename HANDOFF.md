@@ -2,6 +2,8 @@
 
 Drop a new entry at the top of the log on every session end. Keep entries short, factual, and **action-oriented** — what was done, what's next, what's blocking.
 
+**Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
+
 ---
 
 ## Handoff template
