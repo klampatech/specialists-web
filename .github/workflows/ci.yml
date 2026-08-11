@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  client-typecheck:
+    name: client — typecheck + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  spec-canonical:
+    name: spec layout — canonical at docs/SPEC.md
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that docs/SPEC.md exists
+        run: |
+          if [[ ! -f docs/SPEC.md ]]; then
+            echo "::error::docs/SPEC.md is missing — that is the canonical spec file."
+            exit 1
+          fi
+      - name: Check that SPEC.md at the repo root is a stub pointer
+        run: |
+          if ! grep -q "docs/SPEC.md" SPEC.md; then
+            echo "::error::SPEC.md (repo root) must be a stub pointer that references docs/SPEC.md."
+            exit 1
+          fi
+          if ! grep -qE "Canonical source of truth: this file|canonical spec lives at .docs/SPEC.md" docs/SPEC.md; then
+            echo "::error::docs/SPEC.md must declare itself as the canonical spec (e.g. 'Canonical source of truth: this file')."
+            exit 1
+          fi
+      - name: Show the doc tree
+        run: |
+          echo "Spec files in this PR:"
+          find . -name 'SPEC*' -type f -not -path './node_modules/*' -not -path './client/node_modules/*' | sort

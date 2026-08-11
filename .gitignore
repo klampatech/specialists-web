@@ -20,6 +20,7 @@ client/dist/
 server/target/
 *.wasm
 *.map
+*.tsbuildinfo
 
 # Env
 .env

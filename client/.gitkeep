@@ -1,8 +1,0 @@
-# Phase 0 lives here.
-
-This directory will be scaffolded in Phase 0 milestone 1:
-- TypeScript + Vite + React + Babylon.js + Havok + ggrs
-- Single-player character controller in a static scene
-- Then: ggrs integration, two tabs rolling back, weapons, bullet time, third-person toggle
-
-See `~/Obsidian/mem/projects/specialists-web.md` for the canonical spec.
