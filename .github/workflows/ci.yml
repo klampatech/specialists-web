@@ -41,8 +41,8 @@ jobs:
             echo "::error::SPEC.md (repo root) must be a stub pointer that references docs/SPEC.md."
             exit 1
           fi
-          if grep -q "synced from" docs/SPEC.md || grep -q "Obsidian vault" docs/SPEC.md; then
-            echo "::error::docs/SPEC.md must not claim to be a sync of the vault. It is the canonical source."
+          if ! grep -qE "Canonical source of truth: this file|canonical spec lives at .docs/SPEC.md" docs/SPEC.md; then
+            echo "::error::docs/SPEC.md must declare itself as the canonical spec (e.g. 'Canonical source of truth: this file')."
             exit 1
           fi
       - name: Show the doc tree
