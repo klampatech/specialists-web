@@ -71,7 +71,7 @@ Six phases. Each is a shippable thing. Don't build N+1 until N is solid.
 
 **Out of scope**: dedicated server, accounts, matchmaking, multiple game modes, asset pipeline polish.
 
-**Definition of done**: a person who plays it goes "this feels like The Specialists."
+**Definition of done**: a person who plays it goes "this feels like The Specialists." Demonstrated via a playable build Kyle can hit (URL or local run) within the 2-week window.
 
 ### **Phase 1 — The real server** (~3 weeks)
 - Dedicated Rust game server (Rapier deterministic)
@@ -169,10 +169,10 @@ Six phases. Each is a shippable thing. Don't build N+1 until N is solid.
 
 ### Phase 0 milestones
 
-| Week | Milestone |
-|------|-----------|
-| 1 | Repo scaffolded, Vite + Babylon + Havok running, single-player character controller in a static scene |
-| 2 | ggrs integrated, two tabs can roll back, single weapon + melee, bullet time, third-person toggle |
+| Week | Milestone | Playtest acceptance |
+|------|-----------|---------------------|
+| 1 | Repo scaffolded, Vite + Babylon + Havok running, single-player character controller in a static scene | Kyle can open a URL in a browser and walk a character around an empty map. Movement must feel right (run, jump, dive, slide, wallrun, third-person toggle). |
+| 2 | ggrs integrated, two tabs can roll back, single weapon + melee, bullet time, third-person toggle | Kyle can open two browser tabs, see the other player, dive/slide/wallrun, fire a gun, hit with melee, trigger bullet time with mid-air shots, and feel the rollback netcode is correct (no teleport, no desync). |
 
 ### Phase 0 risks
 
@@ -190,6 +190,29 @@ Six phases. Each is a shippable thing. Don't build N+1 until N is solid.
 - **Open questions**: log in the Open Questions section. Surface blockers for the next session.
 
 For session-to-session continuity, see `HANDOFF.md`.
+
+---
+
+## Operating Principles
+
+### Playtest everything. Handing Kyle a broken game is unacceptable.
+
+This is the single highest-priority discipline for this project. Every milestone, every feature, every Friday — there must be a real, playable thing in Kyle's hands.
+
+**What this means in practice:**
+
+- **Every milestone ends with a playable build.** Not "the code compiles." Not "the tests pass." A person can run it and experience the thing.
+- **Every feature must be testable in isolation.** Don't bury a feature behind five other features. Build it, expose it, run it, see it.
+- **"Done" means tested by a human, not just compiles.** A feature that compiles but doesn't work is not done. A feature that works on the developer's machine but not Kyle's is not done.
+- **Broken/missing functionality = blocker, not "polish."** If something is broken in a build, it blocks the milestone. We don't push broken to "later."
+- **Show, don't tell.** Rather than say "the character controller works," record a video, write a test report, or share a URL Kyle can hit. A description is not evidence.
+- **Surface regressions explicitly.** If something that worked before stopped working, that's a regression. Surface it immediately, don't fast-path past it.
+- **If you can't playtest it, you can't ship it.** If a build is unbuildable, unrunnable, or unverifiable, stop and fix the build before continuing.
+
+**How this shows up in this spec:**
+- Phase milestones have a "Definition of done" — each must include a playable acceptance test.
+- HANDOFF.md sessions end with a "Playtest status" check-in.
+- Decisions in the decision log reference what was tested, not just what was decided.
 
 ---
 

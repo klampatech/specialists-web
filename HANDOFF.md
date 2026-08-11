@@ -24,6 +24,12 @@ When starting a fresh session, copy this template to the top of the log and fill
 
 **Decisions made**:
 - <decision + why, or "none">
+
+**Playtest status** ⚠️
+- <What was playable and tested this session?>
+- <What was built but NOT playable yet — and why?>
+- <Anything broken, missing, or regressed?>
+- <URL / video / build artifact Kyle can hit to verify>
 ```
 
 Or use the short-form for a quick check-in:
@@ -33,7 +39,10 @@ Or use the short-form for a quick check-in:
 **Done**: <one bullet>
 **Next**: <one bullet>
 **Blockers**: <one bullet or "none">
+**Playtest**: <was it playable? what was tested?>
 ```
+
+> ⚠️ **The playtest status is mandatory.** Every session end must answer: *"What did Kyle actually run and experience?"* — not "what was implemented." If nothing was playable this session, say so. That's the signal to prioritize a playable build next session. See `SPEC.md` → Operating Principles.
 
 ---
 
@@ -64,6 +73,11 @@ Or use the short-form for a quick check-in:
 - 2026-08-11 — Asset strategy: Mixamo + Kenney CC0 for Phase 0
 - 2026-08-11 — Vault `SPEC.md` is THE canonical spec; repo `SPEC.md` is a synced copy; vault is source of truth for *why*, repo for *what*
 - 2026-08-11 — Phase 0 is "feel test" — two browser tabs, peer-to-peer, no dedicated server. Goal: prove movement + bullet time + rollback netcode feel right before investing in matchmaking infra
+- 2026-08-11 — Operating principle: **playtest everything, hand Kyle a broken game is unacceptable.** Every milestone ends with a playable build. Every session-end handoff has a mandatory Playtest status block.
+
+**Playtest status** ⚠️
+- **No playable build yet.** Phase 0 has not started — repo is scaffolded but the client/ directory is empty.
+- **Next session's playtest target**: Vite + Babylon + Havok running in a browser tab, with a single character controller visible in a static scene. Even that "walks around an empty room" is a playtest beat.
 
 ---
 
@@ -73,3 +87,4 @@ Or use the short-form for a quick check-in:
 - **Short, factual, action-oriented.** The point is so the next session can pick up without re-reading sessions.
 - **Decisions go in `SPEC.md` too.** Cross-link if needed.
 - **Blockers are surfaced, not buried.** Anything stuck >1 session = top of the vault doc's Open Questions section.
+- **Playtest status is mandatory at every session end.** See `SPEC.md` → Operating Principles. If nothing was playable, say so.
