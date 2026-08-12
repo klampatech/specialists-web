@@ -9,7 +9,7 @@
 > - **PR 2** (Babylon scene + Havok + skydome + static mesh + static ground + Playwright headless smoke) — **MERGED** at https://github.com/klampatech/specialists-web/pull/3 (squash commit `2a12a59`), all 3 CI checks green.
 > - **PR 3** (Havok character controller + WASD + stunts + chase camera + procedural character + WebGPU bootstrap) — **MERGED** at https://github.com/klampatech/specialists-web/pull/5 (squash commit `86feffa`), all 3 CI checks green.
 > - **PR 4** (spec drift fix — pinned `playwright@1.62.1`, explicit Vite Havok cache rule, Milestone 1 acceptance markers) — **MERGED** at https://github.com/klampatech/specialists-web/pull/4 (squash commit `1a0a5fd4`), all 3 CI checks green. No code surface change; spec alignment only.
-> - **PR 6** (WebRTC peer bootstrap + deterministic fixed-frame lockstep + 2-character scene + two-tab handshake smoke + new `client-two-tab-smoke` CI job + spec alignment for actual shipped signaling surface) — **READY for review**. Substrate for Milestone 2 rows 1-4 is in; combat semantics remain PR 7+.
+> - **PR 6** (WebRTC peer bootstrap + deterministic fixed-frame lockstep + 2-character scene + two-tab handshake smoke + new `client-two-tab-smoke` CI job + spec alignment for actual shipped signaling surface) — **READY for review**. Substrate for Milestone 2 rows 1-4 is in; combat semantics remain PR 7+. **Known follow-up**: PR 8 investigation into "jump makes you fly up forever" regression observed during the dev-box playtest. Mouse-look in first-person deferred to Phase 1 (carry-over from PR 3).
 >
 > **Spec drift caught and fixed across PR 2:** pinned versions, WebGL2-vs-WebGPU decision, the 3-PR Phase 0 split, CI evolution, Vite `optimizeDeps.exclude` gotcha, and the milestone acceptance markings. See Decisions log + Session log.
 
@@ -347,7 +347,7 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 | Babylon.js canvas is visible, scene has skydome + 1 directional light | Screenshot shows lit scene | **LANDED PR 2** ✅ (placeholder sphere instead of Mixamo character — see row 3) |
 | A character model is standing in the scene at origin | Visible in viewport | **LANDED PR 3** ✅ — procedural humanoid rig (capsule torso + sphere head + cylinder limbs); real Mixamo glTF deferred to Phase 1 once an asset pipeline exists (see Decisions) |
 | WASD moves the character, with smooth acceleration/deceleration | Hold W for 1s → character moves forward; release → character decelerates over ~0.3s | **LANDED PR 3** ✅ |
-| Space jumps (single, double-jump disabled in Phase 0) | Tap Space → character jumps, height ~1.5m | **LANDED PR 3** ✅ |
+| Space jumps (single, double-jump disabled in Phase 0) | Tap Space → character jumps, height ~1.5m | **LANDED PR 3** ✅ — **regression observed 2026-08-12**: holding Space makes the character fly up indefinitely instead of jumping once. PR 8 will investigate. Hypothesis: `state.supported` flag not flipping back to `true` after landing, OR `vy = MOVEMENT.jumpZ` is being applied continuously instead of one-shot. Track in `HANDOFF.md` "Known regressions" section. |
 | Shift toggles dive (forward + dive for 0.8s anim) | Tap Shift while moving → character dives forward | **LANDED PR 3** ✅ |
 | C toggles crouch/slide | Hold C + W → character slides | **LANDED PR 3** ✅ |
 | Q triggers wallrun if airborne near a wall at angle | Side approach wall, jump toward it → wallrun along wall for ~1s | **LANDED PR 3** ✅ (animation-state only; the stunt changes controller parameters + visual lean, it does not bend the collision shape) |

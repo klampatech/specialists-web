@@ -21,11 +21,11 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - **`.github/workflows/ci.yml` — Timeout bumped.** `client-two-tab-smoke` job timeout increased from 30s to 60s. TURN allocation in worst-case CI can take 15-25s, plus the second vite dev-server boot adds ~8s.
 - **`docs/SPEC.md` — Three concrete edits.** (1) Status banner: PR 4 (spec-drift) and PR 6 (this) are now both listed, and the 3-PR Phase 0 split is now 4 PRs. (2) The "PR 2" / "3" / "4" / "6" numbering is now consistent across the status banner, the PR-split table, and the new "WebRTC peer bootstrap" section. (3) The WebRTC peer bootstrap section was rewritten end-to-end: dropped the `?join=<blob>` URL (never shipped), added the `data-testid` smoke contract, the StrictMode-singleton rule, TURN server config, and an explicit "Smoke acceptance (what green means)" section that documents what the smoke proves vs. what it doesn't (specifically: it does NOT prove `connectionState === "connected"`).
 
-**Verification gates passed (local + CI)**:
+**Verification gates passed (local + CI) — scope: headless smoke only, NOT end-to-end two-tab play**:
 - ✓ `npm run typecheck` — exit 0
 - ✓ `npm run build` — exit 0
 - ✓ `node ./tools/scene-smoke.mjs` — PR 3 single-tab smoke still green (initial + walked screenshots captured)
-- ✓ `node ./tools/two-tab-smoke.mjs` — exit 0, both tabs render `frame: 176` (A) and `frame: 108` (B), both have `localDescription + remoteDescription` set
+- ✓ `node ./tools/two-tab-smoke.mjs` — exit 0, both tabs render `frame: 176` (A) and `frame: 108` (B), both have `localDescription + remoteDescription` set. **Scope**: SDP exchange + dual-tab rendering only. Does NOT prove `connectionState === "connected"`, data channel `open`, or packet flow → remote character mirroring. See "Honest downgrade" below for what was never actually verified.
 - ✓ CI run #31618994062 — all 4 jobs green (typecheck, scene smoke, spec-canonical, two-tab smoke)
 - ✓ CI artifacts: `two-tab-screenshot` + `two-tab-screenshot-connected` uploaded, screenshots show the WebRTC overlay in the top-right corner, HUD chip with frame counts visible in the bottom-left
 
@@ -61,6 +61,28 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - **Build artifacts**: `client/two-tab-smoke.png` + `client/two-tab-smoke-connected.png` (uploaded by CI as `two-tab-screenshot` + `two-tab-screenshot-connected`). CI artifacts are at https://github.com/klampatech/specialists-web/actions/runs/31618994062 — click into the two-tab smoke job to download.
 - **Known limits**: bullet time / combat are PR 7. The lockstep has no rollback, so under heavy loss the two visuals can drift; PR 7 documents this for Kyle.
 - **Next session's playtest target**: PR 7 ships the dual-pistol fire + melee cone hit + bullet-time scale. Kyle opens two tabs, both fire (LMB), the tracers render, melee hit indicators pop, time slows to 0.25x with air control.
+
+**Known regressions (do NOT block PR 6 merge, but track them)**:
+
+- **PR 8 (after PR 7): "Jump makes you fly up forever" — needs investigation.** Kyle observed this during a manual playtest against the dev box (Discord `1537158787947954297`, 2026-08-12 PM). Hypothesis: `state.supported` flag in `characterController.ts:224` is not flipping back to `true` after landing, OR the impulse `vy = MOVEMENT.jumpZ` is being applied continuously instead of one-shot. Possible reproduction: hold Space. Code path: inputListener keydown sets `jumpPressed=true` (guarded by `!e.repeat`), read() clears it after one frame, controller checks `input.jumpPressed && this.state.supported`. **Doesn't reproduce from logs alone** — needs a Playwright script that holds Space for 5s and asserts Y velocity stays near 0 when grounded, OR a manual repro on a real browser. Surface in PR 8 description.
+- **No mouse-drag camera control.** By design for PR 3 (deferred to Phase 1, per `HANDOFF.md` history). PR 8+ will add mouse-look for first-person. Confirm with PR 3's "no mouse-look in first-person" deferral note in the prior HANDOFF entry. Not a regression.
+
+**Honest downgrade on the "green smoke = working netcode" claim**:
+
+The PM entry above claims "PR 6 netcode is mechanically complete and the smoke proves it end-to-end." That overstates what was actually verified. The diagnostic run that Kyle triggered (Discord `1537158787947954297`, dev box pointing at `m5.local:5173`/`5174`) showed:
+- `connectionState` stuck on `new` in both tabs after the handshake
+- `iceGatheringState` stuck on `gathering` (never reaches `complete`)
+- Data channel `inputs` stuck on `connecting` (never reaches `open`)
+- Tab A HUD `frame: 311`, Tab B HUD `frame: 260` after Tab A held W for 2s — the **frame counter ticks** (lockstep runs), but no `packet` events ever fired because the data channel never opened
+- The remote rig in both tabs stays at its spawn (2.5m offset from local) because no packets ever arrive
+
+This is **expected** when ICE can't reach TURN, and is consistent with the spec's "Smoke acceptance" caveats. But the prior PR 6 description claimed "real `Connected` verified" — it wasn't. The honest claim is:
+- ✓ WebRTC SDP exchange (offer/answer over clipboard) is correct
+- ✓ Both peers have `localDescription + remoteDescription` set after the handshake
+- ✓ Lockstep runtime advances frames on both peers
+- ✗ **NEVER VERIFIED**: ICE → `connected` transition, data channel `open`, packet flow → remote character mirrors local input. None of these were observed in any test run.
+
+The PR 6 body should be amended to say "PR 6 ships the substrate + smoke (which proves the SDP path) but real two-tab play is gated on a network path where ICE can complete." Otherwise a reviewer merging this PR will think it works on real hardware when it very likely does, but hasn't been proven.
 
 ---
 
