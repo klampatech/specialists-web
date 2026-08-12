@@ -297,7 +297,9 @@ export async function createScene(
       // available for future per-frame UI updates.
     },
     onCameraToggle: () => chase.toggle(),
-  });
+  }, canvas);  // PR 7.3: bind mouse handlers directly to the canvas so clicks
+               // always reach the listener regardless of Babylon's attachControl
+               // pointer-capture behavior.
 
   // ---- Render loop ---------------------------------------------------------
   let lastTimestamp = performance.now();

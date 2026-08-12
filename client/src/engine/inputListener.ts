@@ -51,7 +51,7 @@ const KEY_SLIDE = new Set(["c", "C"]);
 const KEY_WALLRUN = new Set(["q", "Q"]);
 const KEY_CAMERA_TOGGLE = new Set(["v", "V"]);
 
-export function createInputListener(hooks: InputHooks): InputListener {
+export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElement): InputListener {
   const held: HeldState = {
     forward: 0,
     right: 0,
@@ -170,16 +170,49 @@ export function createInputListener(hooks: InputHooks): InputListener {
     if (e.button === 2) held.meleePressed = true;
   };
   const onMouseUp = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = false; if (e.button === 2) held.meleePressed = false; };
+  // PR 7.3 fix: also handle PointerEvents (pointerdown/pointerup) for browsers
+  // that don't fire mousedown (e.g., some Safari versions, or Playwright's
+  // synthetic clicks). PointerEvent.button works the same as MouseEvent.button
+  // for the LMB/RMB cases we care about.
+  const onPointerDown = (e: PointerEvent) => {
+    if (e.button === 0) held.fireHeld = true;
+    if (e.button === 2) held.meleePressed = true;
+  };
+  const onPointerUp = (e: PointerEvent) => {
+    if (e.button === 0) held.fireHeld = false;
+    if (e.button === 2) held.meleePressed = false;
+  };
   // PR 7: suppress the browser context menu so RMB melee + RMB-during-aim
   // work in headless smoke and real play. The default right-click menu
   // would otherwise steal the click on every press.
   const onContextMenu = (e: MouseEvent) => { e.preventDefault(); };
   if (typeof window !== "undefined") {
-    // PR 7.2 debug: also listen on document and the canvas directly so we
-    // can prove which element is intercepting (or if anything is).
-    document.addEventListener("mousedown", onMouseDown);
-    document.addEventListener("mouseup", onMouseUp);
-    document.addEventListener("contextmenu", onContextMenu);
+    // PR 7.3 fix: bind mousedown/mouseup/contextmenu DIRECTLY to the canvas
+    // element when provided, instead of just window/document. Babylon's
+    // UniversalCamera.attachControl() (called in chaseCamera.ts) registers
+    // pointer listeners on the canvas that may swallow or repath events
+    // before they reach window/document listeners in some browser/canvas-
+    // size combinations. Binding at the canvas level guarantees we fire
+    // whenever the user clicks anywhere on the canvas.
+    //
+    // Fall back to document/window listeners for backwards compatibility
+    // (e.g., unit tests that don't pass a canvas).
+    if (target) {
+      target.addEventListener("mousedown", onMouseDown);
+      target.addEventListener("mouseup", onMouseUp);
+      target.addEventListener("contextmenu", onContextMenu);
+      // PR 7.3 fix: also listen for pointerdown/pointerup to handle
+      // Playwright's synthetic clicks + browsers that only fire pointer
+      // events (some Safari versions).
+      target.addEventListener("pointerdown", onPointerDown);
+      target.addEventListener("pointerup", onPointerUp);
+    } else {
+      document.addEventListener("mousedown", onMouseDown);
+      document.addEventListener("mouseup", onMouseUp);
+      document.addEventListener("contextmenu", onContextMenu);
+      document.addEventListener("pointerdown", onPointerDown);
+      document.addEventListener("pointerup", onPointerUp);
+    }
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", onBlur);
@@ -215,9 +248,19 @@ export function createInputListener(hooks: InputHooks): InputListener {
     },
     dispose: () => {
       if (typeof window !== "undefined") {
-        document.removeEventListener("mousedown", onMouseDown);
-        document.removeEventListener("mouseup", onMouseUp);
-        document.removeEventListener("contextmenu", onContextMenu);
+        if (target) {
+          target.removeEventListener("mousedown", onMouseDown);
+          target.removeEventListener("mouseup", onMouseUp);
+          target.removeEventListener("contextmenu", onContextMenu);
+          target.removeEventListener("pointerdown", onPointerDown);
+          target.removeEventListener("pointerup", onPointerUp);
+        } else {
+          document.removeEventListener("mousedown", onMouseDown);
+          document.removeEventListener("mouseup", onMouseUp);
+          document.removeEventListener("contextmenu", onContextMenu);
+          document.removeEventListener("pointerdown", onPointerDown);
+          document.removeEventListener("pointerup", onPointerUp);
+        }
         window.removeEventListener("keydown", onKeyDown);
         window.removeEventListener("keyup", onKeyUp);
         window.removeEventListener("blur", onBlur);
