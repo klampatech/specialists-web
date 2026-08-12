@@ -16,6 +16,11 @@ interface BulletHudProps {
   hasRemote: boolean;
   /** Total combat events emitted by the GameSession so far. */
   hits: number;
+  /** PR 7.2 debug: live mouse-button state from the input listener. */
+  fireHeld: boolean;
+  meleePressed: boolean;
+  /** PR 7.2 debug: same as `bulletTime` but raw boolean. */
+  bulletTime: boolean;
 }
 
 function statusLabel(s: BulletHudProps["connectionStatus"]): string {
@@ -36,7 +41,7 @@ function statusLabel(s: BulletHudProps["connectionStatus"]): string {
  * file MUST keep `pointerEvents: "none"` (or `pointerEvents: "auto"` only on
  * the buttons it contains — but right now there are no buttons in the HUD).
  */
-export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits }: BulletHudProps) {
+export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, fireHeld, meleePressed, bulletTime }: BulletHudProps) {
   return (
     <div
       data-testid="bullet-hud"
@@ -47,27 +52,29 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
         padding: "6px 9px",
         background: "rgba(10, 10, 12, 0.72)",
         color: "#ddd",
-        font: "12px monospace",
+        font: "11px monospace",
         zIndex: 4,
         border: "1px solid rgba(230, 230, 230, 0.18)",
         borderRadius: 4,
-        lineHeight: 1.45,
-        // PR 7.1 fix: see header. The HUD chip is informational only.
+        lineHeight: 1.4,
         pointerEvents: "none",
       }}
     >
       <div>frame: {frame}</div>
-      <div>
-        confirmed: {frame - 1}
-      </div>
-      <div style={{ opacity: 0.7 }}>
-        repeated: {repeatedFrames}
-      </div>
+      <div>confirmed: {frame - 1}</div>
+      <div style={{ opacity: 0.7 }}>repeated: {repeatedFrames}</div>
       <div data-testid="bullet-hud-status" style={{ opacity: 0.85 }}>
         {statusLabel(connectionStatus)}{hasRemote ? "" : " (idle)"}
       </div>
-      <div data-testid="bullet-hud-hits" style={{ opacity: 0.95 }}>
-        hits: {hits}
+      <div data-testid="bullet-hud-hits" style={{ opacity: 0.95 }}>hits: {hits}</div>
+      {/* PR 7.2 DEBUG BLOCK: shows live input listener state so we can
+          confirm whether the mouse/keyboard handlers are firing at all.
+          If these stay "false" while LMB/T are pressed, the inputListener
+          is the bug. Remove once combat is confirmed working. */}
+      <div style={{ borderTop: "1px dashed #444", marginTop: 2, paddingTop: 2, opacity: 0.85 }}>
+        <div>LMB: <span data-testid="debug-fire">{fireHeld ? "TRUE" : "false"}</span></div>
+        <div>RMB: <span data-testid="debug-melee">{meleePressed ? "TRUE" : "false"}</span></div>
+        <div>T: <span data-testid="debug-bullet">{bulletTime ? "TRUE" : "false"}</span></div>
       </div>
     </div>
   );

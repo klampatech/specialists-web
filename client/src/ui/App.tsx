@@ -40,6 +40,9 @@ interface HudState {
   hits: number;
   /** PR 7: true while the local tab holds the T key (bullet time). */
   bulletTime: boolean;
+  /** PR 7.2 debug: live mouse-button state from the input listener. */
+  fireHeld: boolean;
+  meleePressed: boolean;
 }
 
 export function App() {
@@ -56,6 +59,8 @@ export function App() {
     hasRemote: false,
     hits: 0,
     bulletTime: false,
+    fireHeld: false,
+    meleePressed: false,
   });
 
   // Construct the WebRTC peer once per mount. The peer lives across scene
@@ -102,6 +107,28 @@ export function App() {
   }, [peer, reportConnection]);
 
   useEffect(() => {
+    // PR 7.2 debug: top-level window mousedown listener that's attached
+    // BEFORE createScene runs. If THIS one fires but createScene's doesn't,
+    // we know createScene's listener was never attached. If THIS one
+    // doesn't fire, we know something is preventing mousedown entirely.
+    const onDocMouseDown = (e: MouseEvent) => {
+      (window as unknown as Record<string, unknown>).__topLevelMouseDown = {
+        ts: performance.now(),
+        button: e.button,
+        target: e.target && (e.target as Element).tagName,
+        composedPath: e.composedPath?.().slice(0, 6).map((n) => (n as Element).tagName ?? typeof n),
+      };
+      console.log("[APP] document mousedown (top-level)", { button: e.button, target: (e.target as Element).tagName });
+    };
+    document.addEventListener("mousedown", onDocMouseDown, true); // CAPTURE PHASE
+    document.addEventListener("mouseup", onDocMouseDown, true);
+    return () => {
+      document.removeEventListener("mousedown", onDocMouseDown, true);
+      document.removeEventListener("mouseup", onDocMouseDown, true);
+    };
+  }, []);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -134,6 +161,8 @@ export function App() {
             hasRemote: session.runtime.hasRemote,
             hits: session.getCombatEvents().length,
             bulletTime: inputState?.bulletTimeHeld ?? false,
+            fireHeld: inputState?.fireHeld ?? false,
+            meleePressed: inputState?.meleePressed ?? false,
           }));
         }, 100);
         // Stash the timer on the scene ref so unmount can clear it.
@@ -199,6 +228,9 @@ export function App() {
             connectionStatus={hud.connectionStatus}
             hasRemote={hud.hasRemote}
             hits={hud.hits}
+            fireHeld={hud.fireHeld}
+            meleePressed={hud.meleePressed}
+            bulletTime={hud.bulletTime}
           />
           <OverlayBanner bottom={16} size="0.7rem" opacity={0.35}>
             Phase 0 PR 7 — combat (LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged

@@ -116,7 +116,14 @@ export function createInputListener(hooks: InputHooks): InputListener {
       return;
     }
     if (KEY_CAMERA_TOGGLE.has(key)) {
-      if (!e.repeat) held.cameraTogglePressed = true;
+      if (!e.repeat) {
+        held.cameraTogglePressed = true;
+        // PR 7.2 fix: actually call the camera-toggle hook. Without this
+        // the press flag was being set but the camera never flipped. Toggle
+        // hook fires synchronously here (it just sets a boolean on the
+        // ChaseCameraHandle).
+        hooks.onCameraToggle();
+      }
       e.preventDefault();
       return;
     }
@@ -148,17 +155,38 @@ export function createInputListener(hooks: InputHooks): InputListener {
     held.slideHeld = false; held.fireHeld = false; held.bulletTimeHeld = false;
   };
 
-  const onMouseDown = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = true; if (e.button === 2) held.meleePressed = true; };
+  const onMouseDown = (e: MouseEvent) => {
+    // PR 7.2 debug: visible HUD indicator proves whether THIS specific
+    // handler fired. If this stays false while the user is clearly
+    // mousedown'ing, something upstream ate the event before window.
+    (window as unknown as Record<string, unknown>).__lastMouseDown = {
+      ts: performance.now(),
+      button: e.button,
+      target: e.target && (e.target as Element).tagName,
+      composedPath: e.composedPath ? e.composedPath().slice(0, 5).map((n) => (n as Element).tagName || typeof n) : [],
+    };
+    console.log("[input] mousedown", { button: e.button, target: (e.target as Element).tagName });
+    if (e.button === 0) held.fireHeld = true;
+    if (e.button === 2) held.meleePressed = true;
+  };
   const onMouseUp = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = false; if (e.button === 2) held.meleePressed = false; };
   // PR 7: suppress the browser context menu so RMB melee + RMB-during-aim
   // work in headless smoke and real play. The default right-click menu
   // would otherwise steal the click on every press.
   const onContextMenu = (e: MouseEvent) => { e.preventDefault(); };
   if (typeof window !== "undefined") {
+    // PR 7.2 debug: also listen on document and the canvas directly so we
+    // can prove which element is intercepting (or if anything is).
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("mouseup", onMouseUp);
+    document.addEventListener("contextmenu", onContextMenu);
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", onBlur); window.addEventListener("mousedown", onMouseDown); window.addEventListener("mouseup", onMouseUp);
-    window.addEventListener("contextmenu", onContextMenu);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("mousedown", (e) => {
+      console.log("[input] window mousedown (capture path)", { button: e.button, target: (e.target as Element).tagName });
+    }, true);
   }
 
   return {
@@ -187,10 +215,13 @@ export function createInputListener(hooks: InputHooks): InputListener {
     },
     dispose: () => {
       if (typeof window !== "undefined") {
+        document.removeEventListener("mousedown", onMouseDown);
+        document.removeEventListener("mouseup", onMouseUp);
+        document.removeEventListener("contextmenu", onContextMenu);
         window.removeEventListener("keydown", onKeyDown);
         window.removeEventListener("keyup", onKeyUp);
-        window.removeEventListener("blur", onBlur); window.removeEventListener("mousedown", onMouseDown); window.removeEventListener("mouseup", onMouseUp);
-        window.removeEventListener("contextmenu", onContextMenu);
+        window.removeEventListener("blur", onBlur);
+        window.removeEventListener("mouseup", onMouseUp);
       }
     },
   };
