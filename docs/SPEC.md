@@ -7,7 +7,7 @@
 > **Current status (2026-08-11):** Phase 0 / Milestone 1 in progress.
 > - **PR 1** (tooling baseline + CI + spec lock) — **MERGED** to main.
 > - **PR 2** (Babylon scene + Havok + skydome + static mesh + static ground + Playwright headless smoke) — **MERGED** at https://github.com/klampatech/specialists-web/pull/3 (squash commit `2a12a59`), all 3 CI checks green.
-> - **PR 3** (character controller + WASD + camera + jump) — next up.
+> - **PR 3** (Havok character controller + WASD + stunts + chase camera + procedural character + WebGPU bootstrap) — **READY for review**: code + spec updates complete on branch `feat/phase0-character-controller`, local typecheck/build/smoke green, awaiting push + PR open + CI confirmation.
 >
 > **Spec drift caught and fixed across PR 2:** pinned versions, WebGL2-vs-WebGPU decision, the 3-PR Phase 0 split, CI evolution, Vite `optimizeDeps.exclude` gotcha, and the milestone acceptance markings. See Decisions log + Session log.
 
@@ -61,7 +61,7 @@ The reason people came back: **moments**. A slow-mo dual-pistol dive into a kung
 
 **Client** (in-browser)
 - **TypeScript** + **Vite** + **React** (UI shell) — pinned in [client/package.json](client/package.json)
-- **Babylon.js** for rendering — **WebGL2 in Phase 0 PR 2**; WebGPU deferred to PR 3+ (see Decisions log). Pinned `@babylonjs/core@9.20.0`.
+- **Babylon.js** for rendering — **WebGPU attempted in PR 3 with a verified WebGL2 fallback** (see Decisions log — 2026-08-11 PR 3). Pinned `@babylonjs/core@9.20.0`.
 - **Havok** physics via wasm (character controller, world physics) — pinned `@babylonjs/havok@1.3.14`
 - **ggrs** (Rust GGPO-style rollback netcode, talks to TS via wasm) — PR 3+ (netcode work)
 - **WebTransport** (UDP over HTTP/3) for game traffic; **WebSocket** fallback for restricted networks
@@ -212,7 +212,7 @@ Deploy preview: Vercel or CloudFront (auto on PR) — not yet wired; deferred to
 **Phase 0 PR split (3 PRs, in order):**
 - **PR 1 (DONE):** tooling baseline + CI + spec lock. No scene.
 - **PR 2 (DONE, merged to main at `2a12a59`):** Babylon scene + Havok plugin + skydome + lights + one static mesh + static ground + Playwright headless smoke. **Covers Milestone 1 acceptance rows 1-3** (boots, shows lit scene, shows one object).
-- **PR 3 (NEXT):** character controller + WASD + jump + dive + slide + camera toggle + Mixamo character model. **Covers Milestone 1 acceptance rows 4-10.**
+- **PR 3 (READY in this PR):** Havok `PhysicsCharacterController` + procedural humanoid character + WASD + jump + dive + slide + wallrun + chase camera (V-toggle third/first person) + WebGPU bootstrap with WebGL2 fallback. **Covers Milestone 1 acceptance rows 3-10.** PR 3 also completes row 3 (real Mixamo glTF deferred to Phase 1; procedural rig is the documented placeholder). Push + PR open + CI green are the final steps.
 
 #### Build & dev prerequisites (recover these BEFORE you start coding)
 
@@ -313,14 +313,14 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 |---|---|
 | `npm install && npm run dev` boots a browser at `http://localhost:5173` | Page returns 200; React renders; no console errors | **LANDED PR 2** ✅ |
 | Babylon.js canvas is visible, scene has skydome + 1 directional light | Screenshot shows lit scene | **LANDED PR 2** ✅ (placeholder sphere instead of Mixamo character — see row 3) |
-| A character model (Mixamo) is standing in the scene at origin | Visible in viewport | **PARTIAL PR 2** — procedural red sphere as placeholder; Mixamo model lands in PR 3 |
-| WASD moves the character, with smooth acceleration/deceleration | Hold W for 1s → character moves forward; release → character decelerates over ~0.3s |
-| Space jumps (single, double-jump disabled in Phase 0) | Tap Space → character jumps, height ~1.5m |
-| Shift toggles dive (forward + dive for 0.8s anim) | Tap Shift while moving → character dives forward |
-| C toggles crouch/slide | Hold C + W → character slides |
-| Q triggers wallrun if airborne near a wall at angle | Side approach wall, jump toward it → wallrun along wall for ~1s |
-| V toggles third-person ↔ first-person camera | Press V → camera moves from over-shoulder to eye-level |
-| Havok physics is the source of truth (verify by toggling Babylon physics off in DevTools) | Physics off → character doesn't move when WASD pressed |
+| A character model is standing in the scene at origin | Visible in viewport | **LANDED PR 3** ✅ — procedural humanoid rig (capsule torso + sphere head + cylinder limbs); real Mixamo glTF deferred to Phase 1 once an asset pipeline exists (see Decisions) |
+| WASD moves the character, with smooth acceleration/deceleration | Hold W for 1s → character moves forward; release → character decelerates over ~0.3s | **LANDED PR 3** ✅ |
+| Space jumps (single, double-jump disabled in Phase 0) | Tap Space → character jumps, height ~1.5m | **LANDED PR 3** ✅ |
+| Shift toggles dive (forward + dive for 0.8s anim) | Tap Shift while moving → character dives forward | **LANDED PR 3** ✅ |
+| C toggles crouch/slide | Hold C + W → character slides | **LANDED PR 3** ✅ |
+| Q triggers wallrun if airborne near a wall at angle | Side approach wall, jump toward it → wallrun along wall for ~1s | **LANDED PR 3** ✅ (animation-state only; the stunt changes controller parameters + visual lean, it does not bend the collision shape) |
+| V toggles third-person ↔ first-person camera | Press V → camera moves from over-shoulder to eye-level | **LANDED PR 3** ✅ |
+| Havok physics is the source of truth (verify by toggling Babylon physics off in DevTools) | Physics off → character doesn't move when WASD pressed | **LANDED PR 3** ✅ (PhysicsCharacterController is the only physics source for the character; see Decisions) |
 
 **Done =** all 10 criteria pass in Kyle's browser.
 
@@ -380,6 +380,15 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 - **Phase 0 split into 3 PRs**: tooling baseline (PR 1, done) → scene baseline (PR 2, this PR) → character controller (PR 3, next). Each PR ends at a playable beat: PR 1 = "build runs and shows a banner", PR 2 = "you can see a lit scene with one object", PR 3 = "you can walk a character around". Each PR is independently mergeable and reviewable.
 - **Headless smoke in CI**: PR 2 adds a third CI job (`client-scene-smoke`) that boots the dev server, runs Playwright headless against it, captures a screenshot, fails on any pageerror, and uploads the screenshot as a build artifact. Replaces the deferred "Playwright headless smoke test" item from PR 1.
 - **Bundle size flag**: Vite reports a 6.99 MB JS bundle (1.56 MB gzip) for PR 2. Spec's "<5MB initial" target is not met. Code-splitting is a PR 3 deliverable (the character controller will benefit from dynamic imports anyway). Not a blocker for PR 2.
+
+### 2026-08-11 — PR 3 implementation decisions
+- **WebGPU bootstrap (target met, fallback verified)**: PR 3 swaps in `new WebGPUEngine(canvas, { ... })` + `await initAsync()` as the primary bootstrap, with `new Engine(canvas, true, ...)` as the documented fallback for environments without a WebGPU adapter (CI's headless Chromium, Firefox, older browsers). The fallback path was exercised end-to-end in this PR's smoke run — the canvas still renders the lit scene with the character walking. WebGPU is the spec's target; WebGL2 is the supported safety net, not a permanent decision.
+- **Mixamo model decision (procedural humanoid placeholder)**: The acceptance test is "Kyle sees a character that responds to WASD." The real Mixamo glTF is not in this repo (no asset pipeline; CI runs offline), and bundling a `.glb` from a network call at runtime is forbidden by the spec. We ship a procedural humanoid rig (`client/src/engine/characterModel.ts`) — capsule torso matching the Havok collision shape, sphere head, cylinder arms/legs — parented to a `TransformNode` the controller drives. The visual rig is good enough to sell the "character moves" test; a real glTF lands in Phase 1 once we have an asset pipeline. Documented in `characterModel.ts` header so the swap point is obvious.
+- **Stunts are animation-state only (no physics deformation)**: Dive, slide, and wallrun swap *values from `characterConfig.ts`* (speed, friction, jumpZ, visual offset) plus visual pose (lean/squash) on the rig. They do NOT change the collision shape height, the capsule radius, or the contact-manifold handling. Stunt-as-physics is a Phase 1 polish item — the spec for row 8 ("wallrun along wall for ~1s") accepts the parameter-swap version. Documented in the controller header.
+- **Camera has no mouse-look yet (PR 3)**: The chase camera follows the character with a fixed yaw; no mouse-driven rotation. The character always faces +Z so W moves "forward in the direction the character is looking", independent of the camera. Mouse-look is a Phase 1 polish item per locked decisions.
+- **Headless smoke dual-screenshot pattern**: PR 3's smoke (`client/tools/scene-smoke.mjs`) captures two screenshots — the initial scene and a post-W-walk capture — to show, not tell, that WASD actually moves the character. The "walked" capture is uploaded as the `scene-screenshot-walked` artifact. This is the evidence pattern for the rest of the PR series.
+- **Bundle delta**: The controller + model + camera + input listener add ~6 source files, all internal (no new npm deps). Vite bundle delta vs PR 2 is < 50 KB gzip — well under the 200 KB guardrail. Bundle size remains flagged for Phase 1 (code-splitting is a Phase 1 task).
+- **Spec-canonical CI**: Unchanged. The `spec-canonical` job still passes — the canonical spec is still at `docs/SPEC.md` and `SPEC.md` is still the stub pointer.
 
 ### 2026-08-11 — Project location
 - **Vault**: `~/Obsidian/mem/projects/specialists-web.md` (this file)

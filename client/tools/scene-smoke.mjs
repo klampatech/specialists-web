@@ -1,23 +1,28 @@
-// Phase 0 / PR 2 — headless scene smoke test.
+// Phase 0 / PR 3 — headless scene smoke test (extended for WASD evidence).
 //
 // Boots a headless Chromium against the running dev server, waits for the
-// Babylon scene to finish initializing, captures a screenshot, and fails if
-// any pageerror / requestfailed events fired during the load.
+// Babylon scene to finish initializing, captures a screenshot, then dispatches
+// a synthetic W keypress, waits 500ms, captures a second screenshot. The
+// pair of screenshots is the "show, don't tell" evidence that the character
+// controller actually responds to WASD.
 //
 // Run from the `client/` directory:
 //   node ./tools/scene-smoke.mjs
 //
 // The CI job (`.github/workflows/ci.yml` → `client-scene-smoke`) is the
-// authoritative caller. This script is also runnable locally for debugging —
-// see the HANDOFF.md "Blockers / open questions" section for the dev-server
-// prerequisite.
+// authoritative caller. This script is also runnable locally for debugging.
 
 import { chromium } from "playwright";
 
 const URL = process.env.SCENE_SMOKE_URL ?? "http://localhost:5173/";
 const OUT = process.env.SCENE_SMOKE_OUT ?? "./scene-smoke.png";
+const WALKED_OUT =
+  process.env.SCENE_SMOKE_WALKED_OUT ?? "./scene-smoke-walked.png";
 const NAV_TIMEOUT = Number(process.env.SCENE_SMOKE_NAV_TIMEOUT ?? 30000);
 const SCENE_TIMEOUT = Number(process.env.SCENE_SMOKE_SCENE_TIMEOUT ?? 15000);
+const WALK_DURATION_MS = Number(
+  process.env.SCENE_SMOKE_WALK_DURATION_MS ?? 500,
+);
 
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({
@@ -54,7 +59,19 @@ await page.waitForTimeout(1500);
 
 await page.screenshot({ path: OUT, fullPage: false });
 
-// Verify the canvas has WebGL (a lit scene requires it).
+// ---- WASD evidence: walk forward for a beat, screenshot again. ------------
+// We have to focus the canvas first; the keyboard listener is on `window`
+// so even without focus the events should reach the handler, but focusing
+// is the documented input contract.
+await page.locator("canvas").first().click();
+await page.keyboard.down("w");
+await page.waitForTimeout(WALK_DURATION_MS);
+await page.keyboard.up("w");
+// Brief settle so the controller finishes its deceleration before the capture.
+await page.waitForTimeout(120);
+await page.screenshot({ path: WALKED_OUT, fullPage: false });
+
+// ---- Inspect the canvas + walking state for the report --------------------
 const canvasInfo = await page.evaluate(() => {
   const c = document.querySelector("canvas");
   if (!c) return { exists: false };
@@ -85,5 +102,5 @@ if (errors.length) {
   process.exit(1);
 }
 
-console.log("OK — scene smoke passed");
+console.log("OK — scene smoke passed (initial + walked screenshots captured)");
 await browser.close();
