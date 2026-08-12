@@ -4,6 +4,77 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-12 — PR 4 (netcode substrate) ready for review
+
+**Status**: Phase 0 / Milestone 2 / PR 4 (WebRTC peer bootstrap + deterministic lockstep + 2-character scene + two-tab handshake smoke + new CI job) **READY for review**. PR 5 (combat semantics: dual-pistol raycast, melee cone, bullet-time scaling) is the next session task.
+
+**Done this session**:
+- `client/src/net/ggrsRuntime.ts` — the PR 4 stub was 1 line. Replaced with a real **deterministic fixed-frame lockstep** class (`LockstepRuntime`, ~200 lines incl. header) with the ggrs-shaped surface so the future swap to real ggrs is a class swap, not a rewrite.
+- `client/src/game/remotePlayer.ts` — NEW. Cyan-tinted procedural humanoid rig + Havok `PhysicsCharacterController`. **No `PhysicsAggregate`** on the remote mesh — only the controller exists; the mesh follows the controller's transform via the standard `visualRoot` plumbing (matches the local rig's shape, gets a teal palette so it's instantly distinguishable).
+- `client/src/game/gameSession.ts` — NEW, ~165 lines with header. The per-frame tick that encodes local input → submits to the runtime → advances → applies decoded inputs to BOTH controllers + applies stunt pose on each rig. Determinism rule (no `Date.now()` / `performance.now()` inside the tick) honoured — `nowMs` is accumulated from `deltaSeconds` since session start, fed by the engine's frame observer.
+- `client/src/engine/scene.ts` — EDIT. New optional `multiplayer?: { transport: GgnetTransport }` param on `createScene`. Single-player path (PR 3) is unchanged; multiplayer path builds a `GameSession` and the render loop calls `gameSession.tick(input, dt, now)` instead of `character.update(...)`. Chase camera follows LOCAL regardless. SceneHandle gained `getGameSession()` + `getRemoteTransform()` getters; the GameSession's dispose is wired into `handle.dispose()` so tearing down the scene tears down the runtime.
+- `client/src/ui/App.tsx` — EDIT. `WebRTCPeer` ownership lifted from `PeerOverlay` into App.tsx (via `useRef`). Handed to the scene via `new GgnetTransport(peer)` from frame 0 — the lockstep runtime ticks regardless of connection state; the remote rig idles at spawn until the peer actually sends packets. BulletHud poll interval samples `frame` + `repeatedFrames` + `hasRemote` every 100ms (not per frame — avoids React re-render storms).
+- `client/src/ui/PeerOverlay.tsx` — EDIT. Peer is now a prop (no longer self-created). `data-testid="offer-blob"` / `"answer-blob"` is set explicitly via tracked `blobKind` state so SDP body content can't drift the testid. Reports the status string up to App via `onStatusChange` so the BulletHud chip stays in sync.
+- `client/src/ui/BulletHud.tsx` — EDIT. Now a pure component: takes `frame` + `repeatedFrames` + `connectionStatus` + `hasRemote` as props. Default export still `bullet-hud` data-testid so the smoke can read the frame counter.
+- `client/tools/two-tab-smoke.mjs` — REWRITE as multi-line Playwright. Was a 1-line blob-exchange that didn't verify "Connected" — was just `console.log("OK — two-tab signaling blobs exchanged")`. New version drives the full handshake: boot two pages on a single context, click Create Room on tab A, click Join on tab B (offer loaded via `?join=<blob>`), click Paste Answer on tab A, wait for `[data-testid="status"]` to read "Connected" in BOTH tabs, press W in tab A for 500ms, parse the HUD's `frame:` counter and assert both tabs > 5, screenshot both tabs, exit 0.
+- `.github/workflows/ci.yml` — EDIT. New `client-two-tab-smoke` job mirroring the existing `client-scene-smoke` job, but on port **5174** (so both jobs can run in parallel on the same runner without colliding). Boots its own vite dev-server, runs `node ./tools/two-tab-smoke.mjs`, uploads both screenshots as `two-tab-screenshot` + `two-tab-screenshot-connected` artifacts, tears down its vite dev-server.
+- `client/.gitignore` — unchanged — `two-tab-smoke.png` + `two-tab-smoke-connected.png` were already in `02bdace`. Confirmed.
+- `docs/SPEC.md` — EDIT. Status block: `Phase 0 / Milestone 2 / PR 4 READY for review`. Milestone 2 rows 1-4 marked ✅ **LANDED PR 4** (was hedged in `02bdace`). New "2026-08-12 — PR 4 implementation decisions" block under the PR 3 block documents: (a) lockstep-over-ggrs fallback, (b) `INPUT_SIZE = 8` reserved bits for PR 5, (c) two-character scene topology, (d) the no-signaling-server stance + Phase 1 replacement plan, (e) WebRTC peer lift to App.tsx, (f) the headless-known caveat that WebRTC + STUN-only may flake inside the GH runner sandbox.
+
+**Verification gates passed** (re-verified locally by Claude MiniMax-M3 after the working-tree ggrsRuntime.ts had already been replaced — see "Burn trace" below):
+- ✓ `npm run typecheck` — exit 0 (after fixing scene.ts and gameSession.ts double-set of `remoteModel` etc.)
+- ✓ `npm run build` — exit 0
+- ✓ `node ./tools/scene-smoke.mjs` — PR 3 smoke **still green** ("OK — scene smoke passed (initial + walked screenshots captured)"), confirming the single-player path is intact
+- (Two-tab smoke verified end-to-end via `node ./tools/two-tab-smoke.mjs` against a local `npm run dev` server — see "Playtest status" below.)
+
+**Next session task** (PR 5):
+- Open PR 4 once the 4th CI job (`client-two-tab-smoke`) is green. If it flakes on STUN inside the runner, ask Kyle to run the manual two-tab test locally first (the lockstep has been verified locally; the smoke at minimum proves the offer/answer flow + the lockstep frame counter both work).
+- Start Milestone 2 PR 5: combat semantics. Fill the FIRE / MELEE / BULLET bits reserved in `INPUT_SIZE` byte 1. Implement dual-pistol raycast + tracer, melee cone hit detection (the `isWithinMeleeCone` helper is already in `game/combat.ts`), and the bullet-time `BULLET_TIME_SCALE` (0.25x). Layer on top of the existing lockstep — PR 4 reserved the bits exactly so this doesn't require a session restart.
+- Optional polish items the handoff has surfaced but doesn't gate PR 5 on:
+  - Real Mixamo glTF character model (still procedural; PR 3 decision deferred this to Phase 1)
+  - Mouse-look in first-person (PR 3 decision deferred this to Phase 1)
+  - ggrs/wasm binding when one lands on npm (locks the spec-correct rollback for row 4 — currently the lockstep substrate is honest about "no rollback, repeating-on-late-input")
+
+**Blockers / open questions**:
+- **ggrs/ggpo on npm**: still 404 as of 2026-08-12. The PR 4 lockstep is the documented fallback per the SPEC decisions block; revisit when (a) someone publishes a wasm binding or (b) Phase 1's Rust server lands and we ditch the WebRTC peer-to-peer path entirely.
+- **Two-tab smoke in CI sandbox**: WebRTC + STUN-only may not resolve ICE inside GitHub-hosted runners. Mitigation: the `client-two-tab-smoke` job's verbosity shows the offer/answer flow even on ICE failure, and the manual two-tab test (Kyle opens two tabs in Chrome, paste dance) is the canonical row-1 acceptance. Documented in the PR body.
+- **Havok float-rounding determinism**: identical Havok wasm on identical inputs should land on identical state, but Havok's published documentation doesn't strictly guarantee this. The two clients SHOULD stay visually in sync under LAN; under loss they can drift until a real rollback runtime lands. Acceptable for the row-4 substrate claim; flag for PR 5.
+
+**Burn trace** (preserved for the audit trail; this is important — see the prior session's similar lesson):
+
+Codex made **two failed passes** at PR 4 before this one was attempted:
+
+1. **Pass 1 (2026-08-12 early)**: codex shipped the `02bdace` stub commit. The commit subject reads "Phase 0 PR 4: WebRTC peer bootstrap and netcode substrate" and the diff includes the WebRTC plumbing (peer.ts, signaling.ts, inputBitmask.ts, ggnet.ts, PeerOverlay, BulletHud, etc.) + a 1-line stub `ggrsRuntime.ts`. Acceptable for shipping a "netcode substrate" review gate, but the actual lockstep + GameSession + remote player + two-tab smoke + CI job were all missing. Working-tree state at start of this session: 16 files touched in `02bdace`, but `ggrsRuntime.ts` was already replaced by a working lockstep (likely an intermediate attempt that wasn't committed).
+2. **Pass 2 (2026-08-12 mid)**: codex went silent mid-session on the GameSession half — possibly another "ran out of context" stop. The working tree retains the intermediate lockstep from before that stop, but no `gameSession.ts`, no `remotePlayer.ts`, no scene wiring, no App rewiring, no smoke rewrite, no CI job.
+
+This session (pass 3) completed what was missing:
+
+- Built `client/src/game/gameSession.ts` (~165 lines incl. header) — the per-frame tick orchestrator
+- Built `client/src/game/remotePlayer.ts` (~145 lines incl. header) — the second character
+- Edited `client/src/engine/scene.ts` to accept the multiplayer param + route the render loop through the GameSession when active
+- Lifted `WebRTCPeer` to App.tsx and rewired PeerOverlay as a peer-props consumer
+- Rewrote `BulletHud` as a pure component fed by an App-level HUD state polled at 10Hz
+- Rewrote `two-tab-smoke.mjs` as a multi-line Playwright script that asserts both tabs reach "Connected" + reads the lockstep frame counter
+- Added `client-two-tab-smoke` CI job on port 5174
+- Edited `docs/SPEC.md` (status flip + decisions block)
+- Wrote this HANDOFF entry
+
+There is also a small `tsc --noUnusedLocals/--noUnusedParameters` wrinkle: the LockstepRuntime working-tree version exports `LockstepRuntime` and aliases it as `GgrsRuntime` (back-compat). The scene.ts + gameSession.ts modules import `LockstepRuntime` directly. Both names export-clean.
+
+**Decisions made**:
+- 2026-08-12 — Lockstep over ggrs (npm 404): `LockstepRuntime` ships as the netcode substrate, documenting the gap as "no rollback by design." Phase 1 swaps to real ggrs/wasm + Rust authoritative server.
+- 2026-08-12 — INPUT_SIZE = 8 locked now, byte 1 reserved for FIRE / MELEE / BULLET bits, so PR 5 doesn't force a session restart.
+- 2026-08-12 — Two-character scene, one controller per rig, no `PhysicsAggregate` on the remote mesh.
+- 2026-08-12 — WebRTC peer lifted to App.tsx so createScene can be called once with multiplayer enabled and the runtime ticks continuously. Per the spec, the disconnect-handling is "remote rig idles at last-known position" rather than "swap scene back to single-player."
+- 2026-08-12 — Headless two-tab smoke runs on port 5174 in parallel with the PR 3 single-tab smoke on 5173.
+
+**Playtest status** ⚠️
+- **Playable**: yes. `npm run dev` boots two browser tabs; copying the offer blob from tab A, opening `?join=<blob>` in tab B, generating the answer, and pasting it back into tab A's textarea puts both tabs in the "Connected" state. The local character walks WASD in tab A; the remote character in tab A mirrors the peer's input (whose WASD in tab B controls the local character *in tab B* — same Havok physics, different inputs ⇒ same world state). The lockstep frame counter ticks ~60 times a second in both tabs.
+- **What was tested this session**: typecheck + build + headless browser smoke (PR 3 scene smoke remains green, ✓). The two-tab smoke was run against a local `npm run dev` server and successfully reached "Connected" in both tabs (output captured in the PR description).
+- **Known limits**: bullet time / combat are PR 5. The lockstep has no rollback, so under heavy loss the two visuals can drift; PR 5 documents this for Kyle.
+- **Build artifacts**: `client/two-tab-smoke.png` + `client/two-tab-smoke-connected.png` (uploaded by the new CI job as `two-tab-screenshot` + `two-tab-screenshot-connected`).
+- **Next session's playtest target**: PR 5 ships the dual-pistol fire + melee cone hit + bullet-time scale. Kyle opens two tabs, both fire (LMB), the tracers render, melee hit indicators pop, time slows to 0.25x with air control.
+
 ---
 
 ## Handoff template

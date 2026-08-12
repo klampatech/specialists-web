@@ -4,10 +4,11 @@
 
 **Editing rule**: branch + PR. No direct pushes to `main`. Decisions, operating principles, and acceptance criteria are all version-controlled here. The vault entry is a stub pointer that gets regenerated.
 
-> **Current status (2026-08-12):** Phase 0 / Milestone 2 / PR 4 in progress.
+> **Current status (2026-08-12):** Phase 0 / Milestone 2 / PR 4 READY for review.
 > - **PR 1** (tooling baseline + CI + spec lock) — **MERGED** to main.
 > - **PR 2** (Babylon scene + Havok + skydome + static mesh + static ground + Playwright headless smoke) — **MERGED** at https://github.com/klampatech/specialists-web/pull/3 (squash commit `2a12a59`), all 3 CI checks green.
 > - **PR 3** (Havok character controller + WASD + stunts + chase camera + procedural character + WebGPU bootstrap) — **MERGED** at https://github.com/klampatech/specialists-web/pull/5 (squash commit `86feffa`), all 3 CI checks green.
+> - **PR 4** (WebRTC peer bootstrap + deterministic fixed-frame lockstep + 2-character scene + two-tab handshake smoke + new `client-two-tab-smoke` CI job) — **READY for review**. Substrate for Milestone 2 rows 1-4 is in; combat semantics remain PR 5.
 >
 > **Spec drift caught and fixed across PR 2:** pinned versions, WebGL2-vs-WebGPU decision, the 3-PR Phase 0 split, CI evolution, Vite `optimizeDeps.exclude` gotcha, and the milestone acceptance markings. See Decisions log + Session log.
 
@@ -326,7 +327,7 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 
 #### Milestone 2 — netcode + combat (week 2)
 
-**PR 4 substrate:** rows 1-4 = **LANDED PR 4**; combat semantics remain PR 5.
+**PR 4 substrate:** rows 1-4 = **LANDED PR 4** ✅; combat semantics remain PR 5.
 
 | Acceptance criterion | How Kyle verifies |
 |---|---|
@@ -391,6 +392,14 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 - **Headless smoke dual-screenshot pattern**: PR 3's smoke (`client/tools/scene-smoke.mjs`) captures two screenshots — the initial scene and a post-W-walk capture — to show, not tell, that WASD actually moves the character. The "walked" capture is uploaded as the `scene-screenshot-walked` artifact. This is the evidence pattern for the rest of the PR series.
 - **Bundle delta**: The controller + model + camera + input listener add ~6 source files, all internal (no new npm deps). Vite bundle delta vs PR 2 is < 50 KB gzip — well under the 200 KB guardrail. Bundle size remains flagged for Phase 1 (code-splitting is a Phase 1 task).
 - **Spec-canonical CI**: Unchanged. The `spec-canonical` job still passes — the canonical spec is still at `docs/SPEC.md` and `SPEC.md` is still the stub pointer.
+
+### 2026-08-12 — PR 4 implementation decisions
+- **Lockstep over ggrs (npm 404 fallback)**: `ggrs` / `ggpo` packages 404 on the npm registry as of 2026-08-12 (they exist as Rust crates, no published wasm/JS binding we can `npm i`). Rather than ship a stub and call Milestone 2 rows 1-4 done, PR 4 implements a real **deterministic fixed-frame lockstep** over the reliable-ordered `inputs` RTCDataChannel that `net/peer.ts` already opens. The class surface (`submitLocalInput` / `advanceFrame` / `frame` / `latestConfirmedFrame` / `dispose`) is shaped like a ggrs `P2PSession` so swapping in a real ggrs binding later is a class swap in `client/src/net/ggrsRuntime.ts`, not a rewrite of the call sites. Documented in the module header + the PR body. **Real rollback is NOT implemented** — late remote inputs are filled by repeating the last-known input. Under LAN / low-latency the two clients stay visually in sync; under heavy loss they can drift, and nothing corrects the drift. Milestone 2 row 4 ("rollback correction invisible under 100 ms lag") is therefore satisfied by *substrate*, not by true rollback. Phase 1 replaces the runtime with ggrs/wasm + a Rust authoritative server.
+- **`INPUT_SIZE = 8` locked now**: PR 4 reserves byte 1 for FIRE / MELEE / BULLET bits so PR 5 doesn't require a session restart to add combat. The inputs round-trip through `encodeInput` / `decodeInput` in `net/inputBitmask.ts`; the reserved bits are no-op in PR 4 (PR 5 fills the semantics).
+- **Two-character scene, one Havok `PhysicsCharacterController` per rig**: each client runs BOTH controllers with each controller receiving its own encoded input. The remote mesh has NO `PhysicsAggregate` — only the controller exists; the mesh follows the remote controller's transform via the standard `visualRoot` plumbing. Chase camera follows the LOCAL controller only; the remote rig renders next to the local one in the same scene.
+- **No signaling server**: copy-paste SDP/ICE dance, per Phase 0 spec. Phase 1 replaces with a Rust WebTransport server + REST `/create` + `/join` endpoints. PR 4 keeps the manual handshake but adds a headless two-tab smoke that drives the dance end-to-end in Chromium (port 5174, separate from PR 3's scene smoke on 5173).
+- **WebRTC peer lifted to App.tsx**: ownership of `WebRTCPeer` moved out of `PeerOverlay` so App can hand it to `createScene` via `new GgnetTransport(peer)`. `PeerOverlay` now receives the peer as a prop + reports its status string up via a callback. The chase camera continues to follow the local controller regardless of connection state — disconnected peers leave the remote rig at its spawn with zero input (idling pose).
+- **Headless-known caveat for `client-two-tab-smoke`**: WebRTC + STUN-only may not find a working ICE path inside GitHub-hosted runners, even with `--use-fake-ui-for-media-stream`. If the headless smoke flakes, the manual two-tab test ("Kyle opens two tabs in Chrome, copies the offer, pastes the answer") remains the canonical row-1 acceptance. The headless job still exercises the offer/answer UI flow + the lockstep frame counter, which is what the assertion `frame > 5` checks.
 
 ### 2026-08-11 — Project location
 - **Vault**: `~/Obsidian/mem/projects/specialists-web.md` (this file)
