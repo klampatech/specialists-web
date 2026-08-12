@@ -155,11 +155,19 @@ console.log("Both peers have SDP set — WebRTC handshake verified.");
 
 // ── PR 7: Fire dual-pistol (LMB) in Tab A, assert hits counter ticks ─────────
 // After the WebRTC handshake is verified, drive the new combat semantics:
-// click and hold LMB on Tab A for 200ms, release, wait, and verify both tabs'
-// HUD chip has a `hits:` line with count >= 1 in at least one tab. The
-// tracer path runs in scene.ts's onBeforeRenderObservable so the render
-// loop has to actually advance to register a hit event.
-await tabA.locator("canvas").first().focus();
+// click and hold LMB on Tab A's canvas for 200ms, release, wait, and verify
+// both tabs' HUD chip has a `hits:` line with count >= 1 in at least one tab.
+// The render loop has to actually advance to register a hit event.
+//
+// IMPORTANT: Playwright's mouse.down() with no coordinates reuses the LAST
+// clicked element, which would be the WebRTC Create button from the
+// handshake. To actually click the canvas we have to explicitly move the
+// mouse to a canvas-relative coordinate first.
+const canvasBoxA = await tabA.locator("canvas").first().boundingBox();
+if (!canvasBoxA) throw new Error("Tab A canvas not found");
+const canvasCenterX = canvasBoxA.x + canvasBoxA.width / 2;
+const canvasCenterY = canvasBoxA.y + canvasBoxA.height / 2;
+await tabA.mouse.move(canvasCenterX, canvasCenterY);
 await new Promise((r) => setTimeout(r, 50));
 await tabA.mouse.down({ button: "left" });
 await new Promise((r) => setTimeout(r, 200));
