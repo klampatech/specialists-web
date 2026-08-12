@@ -4,11 +4,12 @@
 
 **Editing rule**: branch + PR. No direct pushes to `main`. Decisions, operating principles, and acceptance criteria are all version-controlled here. The vault entry is a stub pointer that gets regenerated.
 
-> **Current status (2026-08-12):** Phase 0 / Milestone 2 / PR 4 READY for review.
+> **Current status (2026-08-12):** Phase 0 / Milestone 2 / PR 6 READY for review.
 > - **PR 1** (tooling baseline + CI + spec lock) — **MERGED** to main.
 > - **PR 2** (Babylon scene + Havok + skydome + static mesh + static ground + Playwright headless smoke) — **MERGED** at https://github.com/klampatech/specialists-web/pull/3 (squash commit `2a12a59`), all 3 CI checks green.
 > - **PR 3** (Havok character controller + WASD + stunts + chase camera + procedural character + WebGPU bootstrap) — **MERGED** at https://github.com/klampatech/specialists-web/pull/5 (squash commit `86feffa`), all 3 CI checks green.
-> - **PR 4** (WebRTC peer bootstrap + deterministic fixed-frame lockstep + 2-character scene + two-tab handshake smoke + new `client-two-tab-smoke` CI job) — **READY for review**. Substrate for Milestone 2 rows 1-4 is in; combat semantics remain PR 5.
+> - **PR 4** (spec drift fix — pinned `playwright@1.62.1`, explicit Vite Havok cache rule, Milestone 1 acceptance markers) — **MERGED** at https://github.com/klampatech/specialists-web/pull/4 (squash commit `1a0a5fd4`), all 3 CI checks green. No code surface change; spec alignment only.
+> - **PR 6** (WebRTC peer bootstrap + deterministic fixed-frame lockstep + 2-character scene + two-tab handshake smoke + new `client-two-tab-smoke` CI job + spec alignment for actual shipped signaling surface) — **READY for review**. Substrate for Milestone 2 rows 1-4 is in; combat semantics remain PR 7+.
 >
 > **Spec drift caught and fixed across PR 2:** pinned versions, WebGL2-vs-WebGPU decision, the 3-PR Phase 0 split, CI evolution, Vite `optimizeDeps.exclude` gotcha, and the milestone acceptance markings. See Decisions log + Session log.
 
@@ -210,10 +211,12 @@ Deploy preview: Vercel or CloudFront (auto on PR) — not yet wired; deferred to
 | 1 | **Lit 3D scene + character controller + stunts + camera toggle** (split into 3 PRs — see Decisions log) | Kyle can open a URL in a browser and walk a character around an empty map. Movement must feel right (run, jump, dive, slide, wallrun, third-person toggle). |
 | 2 | ggrs integrated, two tabs can roll back, single weapon + melee, bullet time, third-person toggle | Kyle can open two browser tabs, see the other player, dive/slide/wallrun, fire a gun, hit with melee, trigger bullet time with mid-air shots, and feel the rollback netcode is correct (no teleport, no desync). |
 
-**Phase 0 PR split (3 PRs, in order):**
+**Phase 0 PR split (4 PRs, in order):**
 - **PR 1 (DONE):** tooling baseline + CI + spec lock. No scene.
 - **PR 2 (DONE, merged to main at `2a12a59`):** Babylon scene + Havok plugin + skydome + lights + one static mesh + static ground + Playwright headless smoke. **Covers Milestone 1 acceptance rows 1-3** (boots, shows lit scene, shows one object).
 - **PR 3 (MERGED at `86feffa`):** Havok `PhysicsCharacterController` + procedural humanoid character + WASD + jump + dive + slide + wallrun + chase camera (V-toggle third/first person) + WebGPU bootstrap with WebGL2 fallback. **Covers Milestone 1 acceptance rows 3-10.** PR 3 also completes row 3 (real Mixamo glTF deferred to Phase 1; procedural rig is the documented placeholder).
+- **PR 4 (MERGED at `1a0a5fd4`):** spec drift fix — completed the 5 SPEC.md sections that the PR 2 squash merge had silently dropped (pinned versions, WebGL2-vs-WebGPU decision, CI jobs, PR-split table, Milestone 1 acceptance markers). No code surface change. **Required to make the spec actually reflect the merged code.**
+- **PR 6 (READY for review):** WebRTC peer bootstrap + deterministic fixed-frame lockstep + 2-character scene + two-tab handshake smoke + new `client-two-tab-smoke` CI job. **Covers Milestone 2 acceptance rows 1-4.** PR 6 also includes the spec alignment for the actual shipped signaling surface (this exact section).
 
 #### Build & dev prerequisites (recover these BEFORE you start coding)
 
@@ -265,25 +268,53 @@ The non-obvious thing: **Babylon and Havok both simulate physics.** We need one 
 
 #### WebRTC peer bootstrap (Phase 0 signalling)
 
-Two browser tabs need to find each other. Phase 0 has no server, so the bootstrap is manual — share a link, paste the offer, paste the answer. This is intentional: we don't want to spend engineering time on a signalling server until we've proved the thing is fun.
+Two browser tabs need to find each other. Phase 0 has no server, so the bootstrap is manual — share a blob, paste the offer, paste the answer. This is intentional: we don't want to spend engineering time on a signalling server until we've proved the thing is fun.
 
-**Flow** (host = tab that opened the room; guest = tab that joined via URL):
+**Flow** (host = tab that opened the room; guest = tab that pasted the offer):
 
-1. Host clicks "Create Room" → generates an SDP offer + ICE candidates.
-2. Host displays a copy-pasteable blob (base64 of the SDP+ICE) and a URL like `?join=<blob>`.
-3. Guest opens the URL → parse blob → generates an SDP answer → displays copy-pasteable blob back.
-4. Host pastes guest's answer blob → both sides now have full SDP+ICE on each other.
-5. WebRTC `RTCPeerConnection` opens a `RTCDataChannel` for game inputs (reliable ordered) and one for time-sensitive state (unreliable unordered).
+1. Host clicks **"Create Room"** → `WebRTCPeer.createOffer()` generates an SDP offer. ICE gathering fires in the background (not awaited) so the blob is available immediately.
+2. Host displays a copy-pasteable blob (base64 of `JSON.stringify({ type, sdp, candidates })`) — the offer blob is in a readOnly textarea with `data-testid="offer-blob"`.
+3. Guest pastes the host's offer blob into the textarea ( `data-testid="paste-area"` ) and clicks **"Join"** → `WebRTCPeer.createAnswer(offer)` sets remote description, generates an SDP answer, displays it back as a copy-pasteable blob.
+4. Host pastes the guest's answer blob into the same textarea and clicks **"Paste Answer"** ( `data-testid="btn-paste-answer"` ) → `WebRTCPeer.acceptAnswer(answer)` sets remote description and adds any bundled ICE candidates.
+5. WebRTC `RTCPeerConnection` opens two `RTCDataChannel`s: `inputs` (reliable ordered, for game inputs) and `state` (unreliable unordered with `maxRetransmits: 0`, for time-sensitive state).
 6. Both tabs connect to ggrs → ggrs drives the rollback loop.
 
 **Why no signalling server in Phase 0**: we want to prove the *feel* before investing in matchmaking infra. The copy-paste dance is annoying but it lets us land Phase 0 in 2 weeks instead of 4. Phase 1 replaces this with a Rust WebTransport server + a `/create` + `/join` REST endpoint.
 
+**Note on the dropped `?join=<blob>` URL**: the original spec mentioned a URL like `?join=<blob>` that the guest could click to auto-join. The shipped PR 6 does **not** implement that URL handler — the manual paste flow is the only shipped path. URL-mode signaling is deferred to Phase 1 (when the REST server is in place and rewriting the URL is a one-liner). The smoke test uses a separate `window.__join()` helper exposed only when the smoke is running, not URL parsing.
+
 **Implementation sketch** (`client/src/net/peer.ts`):
 - One `WebRTCPeer` class wraps `RTCPeerConnection` + ICE handling.
-- One `ClipboardPayload` type for the offer/answer blob (`{ sdp: string, candidates: RTCIceCandidateInit[] }`).
-- Browser context menu exposes "Copy join link" / "Paste answer" — no React UI yet, raw `<button>`s on a debug overlay.
+- One `ClipboardPayload` type for the offer/answer blob (`{ type: "offer" | "answer", sdp: RTCSessionDescriptionInit, candidates: RTCIceCandidateInit[] }`).
+- React `PeerOverlay` UI exposes the buttons + textareas. Lives in `client/src/ui/PeerOverlay.tsx`.
+- Peer is **owned by `App.tsx` and passed as a prop** to `PeerOverlay`. The peer's identity is module-singleton-bound (via `useRef`) so React StrictMode's effect double-invocation doesn't close-and-replace the peer between the host and guest mounting.
 
-**Pitfall to avoid**: don't try to use WebRTC's auto-signalling (it doesn't exist — WebRTC always needs an out-of-band channel). The copy-paste is that channel.
+**TURN server config** (current best-effort):
+- ICE servers: `turn:openrelay.metered.ca:80` + `:443` (username `openrelayproject`, credential `openrelay`) and `stun:stun.l.google.com:19302`.
+- `iceTransportPolicy: "relay"` when `?turn=force` is in the URL OR `navigator.userAgent` matches `HeadlessChrome*`. This forces TURN in environments where STUN is blocked (CI sandbox, some corporate networks).
+- **Phase 1 plan**: replace openrelay with our own coturn on Hetzner (already in the Phase 1 server stack). Don't depend on openrelay for production.
+
+**Headless smoke surface (the contract CI relies on — do NOT break without updating the smoke)**:
+- `data-testid="peer-overlay"` — root container
+- `data-testid="status"` — connection state text, "Connected" | "Disconnected" | "Waiting for room" | "Waiting for connection…" | etc.
+- `data-testid="btn-create"` — host button
+- `data-testid="btn-join"` — guest button
+- `data-testid="paste-area"` — textarea for raw blob paste
+- `data-testid="btn-paste-answer"` — host's "I pasted the answer" button
+- `data-testid="offer-blob"` / `data-testid="answer-blob"` — readOnly textarea holding the encoded blob
+- `data-testid="bullet-hud"` — the bottom-left HUD chip with `frame: N confirmed: N repeated: N` so the smoke can assert simulation is running
+- `window.__peer` — the actual `WebRTCPeer` instance exposed in `App.tsx`'s mount effect, used by the smoke to read `connection.localDescription` / `connection.remoteDescription` for green-state assertions
+
+**Smoke acceptance (what "green" means)**:
+- Both tabs have non-null `localDescription` AND `remoteDescription` → SDP handshake completed
+- Both tabs render `frame: N` with `N >= 5` after the host presses `W` for 1 second → simulation ticking
+- Both tabs finish in under 60 seconds
+- **What "green" does NOT prove**:
+  - `connectionState === "connected"` — the CI runner and this laptop cannot reach `openrelay.metered.ca`, so ICE stays in `new`/`checking`/`failed`. The handshake correctness is verified via SDP state, not full ICE connectivity.
+  - Real-time input mirroring — this is verified by Phase 1 manual playtest and the Phase 1 PR's smoke job.
+  - For a real "Connected" status, you must run on a machine with line-of-sight to the TURN server (your dev box, not a sandbox).
+
+**Pitfall to avoid in the code**: don't try to use WebRTC's auto-signalling (it doesn't exist — WebRTC always needs an out-of-band channel). The copy-paste is that channel. **Pitfall to avoid in the smoke**: don't rely on `connectionState === "connected"` for green assertions — use SDP state instead. ICE/TURN can be blocked in any sandbox environment.
 
 #### Asset import pipeline
 
