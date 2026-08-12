@@ -149,11 +149,16 @@ export function createInputListener(hooks: InputHooks): InputListener {
   };
 
   const onMouseDown = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = true; if (e.button === 2) held.meleePressed = true; };
-  const onMouseUp = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = false; };
+  const onMouseUp = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = false; if (e.button === 2) held.meleePressed = false; };
+  // PR 7: suppress the browser context menu so RMB melee + RMB-during-aim
+  // work in headless smoke and real play. The default right-click menu
+  // would otherwise steal the click on every press.
+  const onContextMenu = (e: MouseEvent) => { e.preventDefault(); };
   if (typeof window !== "undefined") {
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", onBlur); window.addEventListener("mousedown", onMouseDown); window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("contextmenu", onContextMenu);
   }
 
   return {
@@ -173,6 +178,11 @@ export function createInputListener(hooks: InputHooks): InputListener {
       held.divePressed = false;
       held.wallrunPressed = false;
       held.cameraTogglePressed = false;
+      // PR 7: meleePressed was set on mousedown but never cleared before. Without
+      // this, the rising-edge in combat code only fires on the FIRST RMB click
+      // per session. Clearing here keeps `meleePressed` true for exactly one
+      // read() — same shape as jump/dive/wallrun/cameraToggle edges.
+      held.meleePressed = false;
       return state;
     },
     dispose: () => {
@@ -180,6 +190,7 @@ export function createInputListener(hooks: InputHooks): InputListener {
         window.removeEventListener("keydown", onKeyDown);
         window.removeEventListener("keyup", onKeyUp);
         window.removeEventListener("blur", onBlur); window.removeEventListener("mousedown", onMouseDown); window.removeEventListener("mouseup", onMouseUp);
+        window.removeEventListener("contextmenu", onContextMenu);
       }
     },
   };

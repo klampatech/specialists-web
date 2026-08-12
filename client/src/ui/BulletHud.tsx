@@ -1,15 +1,21 @@
-// Phase 0 / PR 4 — bottom-left HUD chip.
+// Phase 0 / PR 4+7 — bottom-left HUD chip.
 //
-// Shows the live lockstep frame number, how many frames the runtime had to
-// fill by repeating the last-known remote input (a tell-tale of packet loss
-// or peer lag), and the high-level WebRTC connection state. Updated ~10Hz
-// from App.tsx; the chip itself is a pure render.
+// PR 4 shows the live lockstep frame number, how many frames the runtime had
+// to fill by repeating the last-known remote input (a tell-tale of packet
+// loss or peer lag), and the high-level WebRTC connection state.
+//
+// PR 7 adds a `hits:` line driven by `gameSession.getCombatEvents().length`.
+// "Hits" here counts every tracer render (fire_hit + fire_miss + melee_hit)
+// — the test that proves the rising-edge combat code fired at least once in
+// the smoke. Updated ~10Hz from App.tsx; the chip itself is a pure render.
 
 interface BulletHudProps {
   frame: number;
   repeatedFrames: number;
   connectionStatus: "offline" | "waiting-ice" | "connected" | "disconnected";
   hasRemote: boolean;
+  /** Total combat events emitted by the GameSession so far. */
+  hits: number;
 }
 
 function statusLabel(s: BulletHudProps["connectionStatus"]): string {
@@ -21,7 +27,7 @@ function statusLabel(s: BulletHudProps["connectionStatus"]): string {
   }
 }
 
-export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote }: BulletHudProps) {
+export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits }: BulletHudProps) {
   return (
     <div
       data-testid="bullet-hud"
@@ -48,6 +54,9 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote }
       </div>
       <div data-testid="bullet-hud-status" style={{ opacity: 0.85 }}>
         {statusLabel(connectionStatus)}{hasRemote ? "" : " (idle)"}
+      </div>
+      <div data-testid="bullet-hud-hits" style={{ opacity: 0.95 }}>
+        hits: {hits}
       </div>
     </div>
   );

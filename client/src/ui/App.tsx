@@ -1,4 +1,4 @@
-// Phase 0 / PR 3+4 — React shell with Babylon canvas + HUD + WebRTC overlay.
+// Phase 0 / PR 3+4+7 — React shell with Babylon canvas + HUD + WebRTC overlay.
 //
 // The canvas is mounted via a ref so the Babylon Engine can attach to it
 // directly. The scene is built asynchronously (Havok wasm + WebGPU adapter
@@ -11,6 +11,11 @@
 // GameSession ticks every frame regardless of connection state — the remote
 // rig stays at its spawn with zero input until the peer actually sends
 // packets. BulletHud shows the live frame number + connection state.
+//
+// PR 7: HUD grows a `hits:` counter (combat events emitted by the session)
+// and a top-center "BULLET TIME" chip that lights red when the local tab
+// holds T. KeybindHud adds the combat bindings. All polled at ~10Hz from
+// the existing HUD interval — no per-frame React re-renders.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createScene, type SceneHandle } from "../engine/scene";
@@ -31,6 +36,10 @@ interface HudState {
   repeatedFrames: number;
   /** True once the runtime has received at least one packet from the peer. */
   hasRemote: boolean;
+  /** PR 7: total combat events emitted by the local session so far. */
+  hits: number;
+  /** PR 7: true while the local tab holds the T key (bullet time). */
+  bulletTime: boolean;
 }
 
 export function App() {
@@ -45,6 +54,8 @@ export function App() {
     frame: 0,
     repeatedFrames: 0,
     hasRemote: false,
+    hits: 0,
+    bulletTime: false,
   });
 
   // Construct the WebRTC peer once per mount. The peer lives across scene
@@ -114,11 +125,15 @@ export function App() {
         const hudTimer = window.setInterval(() => {
           const session = handle.getGameSession?.();
           if (!session) return;
+          // PR 7: pull the live InputState snapshot for the bullet-time chip.
+          const inputState = handle.getInputState?.();
           setHud((h) => ({
             ...h,
             frame: session.frame,
             repeatedFrames: session.repeatedFrameCount,
             hasRemote: session.runtime.hasRemote,
+            hits: session.getCombatEvents().length,
+            bulletTime: inputState?.bulletTimeHeld ?? false,
           }));
         }, 100);
         // Stash the timer on the scene ref so unmount can clear it.
@@ -176,18 +191,50 @@ export function App() {
       {phase === "ready" && (
         <>
           <KeybindHud engineLabel={engineLabel} />
+          <BulletTimeChip active={hud.bulletTime} />
           <PeerOverlay peer={peer} onStatusChange={reportConnection} />
           <BulletHud
             frame={hud.frame}
             repeatedFrames={hud.repeatedFrames}
             connectionStatus={hud.connectionStatus}
             hasRemote={hud.hasRemote}
+            hits={hud.hits}
           />
           <OverlayBanner bottom={16} size="0.7rem" opacity={0.35}>
             Phase 0 — character controller · click canvas to focus · WASD to move
           </OverlayBanner>
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * PR 7: top-center chip that lights red while the local tab holds T.
+ * Tiny chip — it's a status indicator, not a feature surface.
+ */
+function BulletTimeChip({ active }: { active: boolean }) {
+  if (!active) return null;
+  return (
+    <div
+      data-testid="bullet-time-chip"
+      style={{
+        position: "fixed",
+        top: 16,
+        left: "50%",
+        transform: "translateX(-50%)",
+        padding: "0.4rem 0.9rem",
+        background: "rgba(154, 30, 30, 0.85)",
+        color: "#fff",
+        font: "bold 0.85rem ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+        border: "1px solid rgba(255, 120, 120, 0.6)",
+        borderRadius: "0.4rem",
+        zIndex: 5,
+        pointerEvents: "none",
+        letterSpacing: "0.12em",
+      }}
+    >
+      BULLET TIME
     </div>
   );
 }
@@ -212,7 +259,7 @@ function KeybindHud({ engineLabel }: { engineLabel: "webgpu" | "webgl2" | null }
       }}
     >
       <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>
-        Specialists Web — PR 4 controls (PR 3 keymap unchanged)
+        Specialists Web — PR 7 controls (PR 6 keymap unchanged)
       </div>
       <div><Key>W A S D</Key> walk</div>
       <div><Key>Space</Key> jump</div>
@@ -220,6 +267,7 @@ function KeybindHud({ engineLabel }: { engineLabel: "webgpu" | "webgl2" | null }
       <div><Key>C</Key> slide (hold + move)</div>
       <div><Key>Q</Key> wallrun (tap mid-air)</div>
       <div><Key>V</Key> camera · third-person ↔ first-person</div>
+      <div><Key>LMB</Key> fire dual pistols · <Key>RMB</Key> melee (1.5m cone) · <Key>T</Key> bullet time (0.25x, per-client)</div>
       {engineLabel && (
         <div style={{ marginTop: "0.4rem", opacity: 0.7 }}>
           renderer: {engineLabel}
