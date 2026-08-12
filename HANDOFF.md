@@ -1,6 +1,6 @@
 ## 2026-08-12 (evening) — PR 7 READY for review. Next: PR 8 (jump regression)
 
-**Status**: Phase 0 / Milestone 2 / PR 7 (combat semantics: dual-pistol raycast + tracer render, melee cone hit detection, per-client bullet-time scaling at 0.25x with air control) **READY for review**. Branch `feat/phase0-combat-semantics`, HEAD <see `git rev-parse HEAD`> on this commit. All 4 verification gates green (typecheck + build + scene-smoke + two-tab-smoke). Real two-tab playtest still gated on the same TURN reachability caveat documented in the prior PR 6 entry — see "Playtest status" below.
+**Status**: Phase 0 / Milestone 2 / PR 7 (combat semantics: dual-pistol raycast + tracer render, melee cone hit detection, per-client bullet-time scaling at 0.25x with air control) **READY for review**. Branch `feat/phase0-combat-semantics`, HEAD `bf3c802`. All 4 verification gates green (typecheck + build + scene-smoke + two-tab-smoke). Real two-tab playtest still gated on the same TURN reachability caveat documented in the prior PR 6 entry — see "Playtest status" below.
 
 **Done this session** (since the prior PM "PR 6 MERGED" entry):
 
