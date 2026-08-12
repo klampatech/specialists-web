@@ -16,7 +16,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createScene, type SceneHandle } from "../engine/scene";
 import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
-import { WebRTCPeer } from "../net/peer";
+import { WebRTCPeer, smokeSignalPut, smokeSignalGet } from "../net/peer";
 import { GgnetTransport } from "../net/ggnet";
 
 /** Snapshot the HUD reads each frame. We sample a handful of fields rather
@@ -52,6 +52,26 @@ export function App() {
   // transport wraps it for the GameSession.
   if (!peerRef.current) peerRef.current = new WebRTCPeer();
   const peer = peerRef.current;
+
+  // Expose smoke-test API on window — the smoke script calls window.__join()
+  // explicitly after mount, so this works regardless of StrictMode timing.
+  useEffect(() => {
+    (window as unknown as Record<string, unknown>).__peer = peer;
+    (window as unknown as Record<string, unknown>).__smokeSignal = {
+      put: smokeSignalPut,
+      get: smokeSignalGet,
+    };
+    // Called by the smoke script after mount — triggers the signaling flow
+    // without relying on URL param reading timing inside a React effect.
+    (window as unknown as Record<string, unknown>).__join = (offerB64: string) => {
+      const offer = JSON.parse(atob(offerB64));
+      peer.createAnswer(offer).then((answer) => {
+        smokeSignalPut("sw_answer", JSON.stringify(answer));
+      }).catch((err) => {
+        console.error("[__join] createAnswer failed:", err);
+      });
+    };
+  }, [peer]);
 
   // Stable callback so PeerOverlay's useEffect doesn't re-fire every render.
   const reportConnection = useCallback((s: HudState["connectionStatus"]) => {
