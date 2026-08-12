@@ -1,3 +1,37 @@
+# Handoff — Session-to-Session Continuity
+
+Drop a new entry at the top of the log on every session end. Keep entries short, factual, and **action-oriented** — what was done, what's next, what's blocking.
+
+**Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
+
+## 2026-08-12 (late, post-playtest) — PR 7.1 HOTFIX: HUD overlay was eating LMB/RMB. Phase 0 banner copy stale.
+
+**Status**: PR 7 was shipped with all 4 local gates green + Claude's cross-vendor review passing without blocking findings, but **failed real dev-box playtest**. Root cause: bottom-left `BulletHud` chip was missing `pointerEvents: "none"` and was silently eating LMB/RMB clicks that landed in its ~80x100px box. Bottom-banner subtitle also still said the stale PR 3 copy. Both fixed in this hotfix.
+
+**Done this hotfix session**:
+
+- **`client/src/ui/BulletHud.tsx` — REAL BUG FIX.** Added `pointerEvents: "none"` to the chip's root style. The HUD chip was sitting at `position: fixed; bottom: 16; left: 16` and rendering 5 lines of text. Every click landing inside that box was being absorbed by the HUD div instead of bubbling to `window`. The input listener (added in PR 7) uses `window.addEventListener("mousedown", ...)`, so an event that never reaches `window` means `fireHeld`/`meleePressed` never set → combat never fires. **Lesson learned**: every overlaid HUD chip in this app must keep `pointerEvents: "none"`. PeerOverlay + KeybindHud + OverlayBanner + BulletTimeChip all already had it; only BulletHud slipped through PR 7's review.
+
+- **`client/src/ui/App.tsx` — BANNER COPY.** Changed the bottom-of-screen subtitle from the stale PR 3 copy `"Phase 0 — character controller · click canvas to focus · WASD to move"` to `"Phase 0 PR 7 — combat (LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged"`. The original line was supposed to be updated in PR 7 but a patch above the `<OverlayBanner>` reference missed the banner content itself.
+
+**What was NOT changed in this hotfix**: the underlying combat code, the byte-1 inputBitmask fix, the tracer rendering, the HUD chip's `hits:` counter, the `BulletTimeChip` — all of those are working as PR 7 intended once clicks reach `window`. The hotfix is purely about letting clicks get to the input layer.
+
+**Re-verification gates**:
+- `npm run typecheck` — exit 0 (HUD style addition is typeclean, no new errors)
+- Vite HMR picks up the change in both running dev servers (5173 + 5174); no rebuild needed; just refresh your browser tab.
+- Manual: re-run your dev-box playtest. LMB should now fire (you should see the cyan-amber tracer line and the `hits:` counter advance). RMB within 1.5m of the cyan remote should register a melee_hit (HUD `hits` line will tick). T held → top-center red `BULLET TIME` chip should appear.
+
+**Playtest status** ⚠️
+
+- **PREVIOUSLY BROKEN**: PR 7 was shipped with the HUD eating clicks + a stale banner copy. Both the byte-1 inputBitmask fix + the rising-edge combat code were correct in code, but the input never reached the inputListener for most clicks. Kyle's first dev-box playtest caught this immediately: *"LMB and RMB didn't seem to have any effect."* This hotfix closes that loop.
+- **Awaiting**: Kyle's re-test of LMB fire, RMB melee, T bullet-time on the dev box. (Jump-forever is NOT in scope here — PR 8 backlog.)
+
+**Known regressions (carry-forward, do NOT fix in this hotfix)**:
+
+- **"Jump makes you fly up forever" — PR 8 backlog.** Same as the prior entry. Hypothesis: `state.supported` flag not flipping back to `true` after landing, OR `vy = MOVEMENT.jumpZ` is being applied continuously instead of one-shot. Per the locked HANDOFF rule "Don't conflate them" — surface here, fix in PR 8.
+
+---
+
 ## 2026-08-12 (evening) — PR 7 READY for review. Next: PR 8 (jump regression)
 
 **Status**: Phase 0 / Milestone 2 / PR 7 (combat semantics: dual-pistol raycast + tracer render, melee cone hit detection, per-client bullet-time scaling at 0.25x with air control) **READY for review**. Branch `feat/phase0-combat-semantics`, HEAD `bf3c802`. All 4 verification gates green (typecheck + build + scene-smoke + two-tab-smoke). Real two-tab playtest still gated on the same TURN reachability caveat documented in the prior PR 6 entry — see "Playtest status" below.

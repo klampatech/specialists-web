@@ -201,7 +201,7 @@ export function App() {
             hits={hud.hits}
           />
           <OverlayBanner bottom={16} size="0.7rem" opacity={0.35}>
-            Phase 0 — character controller · click canvas to focus · WASD to move
+            Phase 0 PR 7 — combat (LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged
           </OverlayBanner>
         </>
       )}

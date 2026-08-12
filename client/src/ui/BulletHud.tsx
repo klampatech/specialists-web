@@ -27,6 +27,15 @@ function statusLabel(s: BulletHudProps["connectionStatus"]): string {
   }
 }
 
+/**
+ * PR 7.1 fix (post-Kyle playtest): the HUD chip was missing `pointerEvents: none`,
+ * which meant clicks landing inside the bottom-left ~80x100px HUD box never
+ * reached `window` — `BulletHud` was eating the LMB/RMB events that should
+ * have been triggering combat. The chip is purely informational; nothing
+ * inside it should ever intercept a click. Every overlaid HUD chip in this
+ * file MUST keep `pointerEvents: "none"` (or `pointerEvents: "auto"` only on
+ * the buttons it contains — but right now there are no buttons in the HUD).
+ */
 export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits }: BulletHudProps) {
   return (
     <div
@@ -43,6 +52,8 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
         border: "1px solid rgba(230, 230, 230, 0.18)",
         borderRadius: 4,
         lineHeight: 1.45,
+        // PR 7.1 fix: see header. The HUD chip is informational only.
+        pointerEvents: "none",
       }}
     >
       <div>frame: {frame}</div>
