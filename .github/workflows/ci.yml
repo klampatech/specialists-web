@@ -74,6 +74,13 @@ jobs:
           name: scene-screenshot
           path: client/scene-smoke.png
           if-no-files-found: warn
+      - name: Upload walked screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scene-screenshot-walked
+          path: client/scene-smoke-walked.png
+          if-no-files-found: warn
       - name: Tear down dev server
         if: always()
         run: |

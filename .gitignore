@@ -32,3 +32,9 @@ coverage/
 playwright-report/
 test-results/
 .caches/
+
+# Codex delegation scratch (briefs + last-message files live here transiently,
+# alongside the AGENTS.md/handoff docs which are real artifacts).
+.codex-prompt-*.md
+.codex-last-message*.txt
+.codex-last*.txt
