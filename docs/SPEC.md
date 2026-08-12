@@ -7,7 +7,7 @@
 > **Current status (2026-08-11):** Phase 0 / Milestone 1 in progress.
 > - **PR 1** (tooling baseline + CI + spec lock) — **MERGED** to main.
 > - **PR 2** (Babylon scene + Havok + skydome + static mesh + static ground + Playwright headless smoke) — **MERGED** at https://github.com/klampatech/specialists-web/pull/3 (squash commit `2a12a59`), all 3 CI checks green.
-> - **PR 3** (Havok character controller + WASD + stunts + chase camera + procedural character + WebGPU bootstrap) — **READY for review**: code + spec updates complete on branch `feat/phase0-character-controller`, local typecheck/build/smoke green, awaiting push + PR open + CI confirmation.
+> - **PR 3** (Havok character controller + WASD + stunts + chase camera + procedural character + WebGPU bootstrap) — **MERGED** at https://github.com/klampatech/specialists-web/pull/5 (squash commit `86feffa`), all 3 CI checks green.
 >
 > **Spec drift caught and fixed across PR 2:** pinned versions, WebGL2-vs-WebGPU decision, the 3-PR Phase 0 split, CI evolution, Vite `optimizeDeps.exclude` gotcha, and the milestone acceptance markings. See Decisions log + Session log.
 
@@ -212,7 +212,7 @@ Deploy preview: Vercel or CloudFront (auto on PR) — not yet wired; deferred to
 **Phase 0 PR split (3 PRs, in order):**
 - **PR 1 (DONE):** tooling baseline + CI + spec lock. No scene.
 - **PR 2 (DONE, merged to main at `2a12a59`):** Babylon scene + Havok plugin + skydome + lights + one static mesh + static ground + Playwright headless smoke. **Covers Milestone 1 acceptance rows 1-3** (boots, shows lit scene, shows one object).
-- **PR 3 (READY in this PR):** Havok `PhysicsCharacterController` + procedural humanoid character + WASD + jump + dive + slide + wallrun + chase camera (V-toggle third/first person) + WebGPU bootstrap with WebGL2 fallback. **Covers Milestone 1 acceptance rows 3-10.** PR 3 also completes row 3 (real Mixamo glTF deferred to Phase 1; procedural rig is the documented placeholder). Push + PR open + CI green are the final steps.
+- **PR 3 (MERGED at `86feffa`):** Havok `PhysicsCharacterController` + procedural humanoid character + WASD + jump + dive + slide + wallrun + chase camera (V-toggle third/first person) + WebGPU bootstrap with WebGL2 fallback. **Covers Milestone 1 acceptance rows 3-10.** PR 3 also completes row 3 (real Mixamo glTF deferred to Phase 1; procedural rig is the documented placeholder).
 
 #### Build & dev prerequisites (recover these BEFORE you start coding)
 

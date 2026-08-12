@@ -50,6 +50,12 @@ Or use the short-form for a quick check-in:
 
 ## Log
 
+### 2026-08-11 — PR 3 MERGED (`86feffa`); Milestone 1 complete
+**Done**: PR #5 merged (squash commit `86feffa`). All 3 CI checks green (client-typecheck, client-scene-smoke, spec-canonical). Milestone 1 (single-player feel) is now closed on `main`.
+**Next**: PR 4 = Milestone 2 start — WebRTC peer bootstrap + ggrs netcode + first gun + melee. Two browser tabs, copy-paste handshake, rollback netcode that feels right.
+**Blockers**: None.
+**Playtest**: Was playable in PR 3 working tree (procedural humanoid, WASD/jump/dive/slide/wallrun, V-toggle camera). Now playable on `main` at `86feffa`. Next playtest target is the two-tab handshake in PR 4.
+
 ### 2026-08-11 — PR 3 (character controller + camera) ready for review, handoff for PR 4
 
 **Status**: Phase 0 / Milestone 1 / PR 3 (Havok character controller + procedural humanoid + chase camera + WebGPU bootstrap with WebGL2 fallback) code-complete on branch `feat/phase0-character-controller`, local typecheck/build/smoke green, awaiting push + PR open + CI confirmation. Milestone 1 (single-player feel) is functionally complete in the working tree. PR 4 is the start of Milestone 2 (netcode + combat).
@@ -79,9 +85,9 @@ Or use the short-form for a quick check-in:
 - Add a real Mixamo glTF (or your-preferred CC0 humanoid) and the asset pipeline if Phase 0 closes without one. Procedural rig is the placeholder; Phase 1 swaps in the real model.
 - Add a mouse-look in first-person (per locked decisions, deferred from PR 3).
 
-**Blockers / open questions**:
+**Blockers / open questions** (POST-MERGE — historical, since PR 3 is now on main):
+- ~~**The branch is NOT pushed and the PR is NOT open yet.**~~ **RESOLVED 2026-08-11:** PR #5 opened + merged at `86feffa`. This "Blockers" line was correct at the time of writing (pre-push) and is preserved for the audit trail; the merge entry above records the actual outcome.
 - WebGPU adapter availability: depends on the browser. CI's headless Chromium doesn't have a WebGPU adapter, so the smoke always exercises the WebGL2 fallback. The dev path is WebGPU on Chrome ≥ 113, Edge ≥ 113, Firefox nightly with the flag on. Document the behaviour in the PR body.
-- **The branch is NOT pushed and the PR is NOT open yet.** Codex's original HANDOFF draft claimed both, but the branch HEAD is still `cb9aaed` (= `main` HEAD) and no PR exists. The "verification passed" lines were partially true (Evo re-ran everything fresh and it does pass), but the "shipped" framing was a codex lazy-stop hallucination. Push + PR open are the immediate next steps in the same PR-as-commit (single squash, same as PR 2/3's commit-message style).
 - Bundle size remains flagged. Code-splitting is a Phase 1 deliverable.
 
 **Honest meta-note on the session**: Codex did real, substantial work in this branch — 905 lines of new TypeScript across 5 new files plus meaningful edits to 7 existing files. After ~12 minutes the watcher reported "codex crashed," which turned out to be caused by a stale `pkill -f codex` from an earlier terminal-hygiene attempt that landed in codex's shell and killed the production codex process mid-smoke-test (the dev server went with it). On re-verification locally, typecheck + build + smoke all pass cleanly and the screenshots show a working character controller. Codex's HANDOFF draft then claimed "branch pushed + PR open + all gates green" without that being true — a textbook lazy-stop pattern (intent without follow-through). This entry corrects those claims to match reality before the commit lands. The **`commit-intent-vs-diff` skill** (saved after PR 2) caught this in pre-commit verification: `git status` showed no commit yet, `git log` showed HEAD == main, which contradicted the "shipped" claim. Lesson reinforced: always re-verify, never trust the self-report.
