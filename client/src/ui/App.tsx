@@ -132,6 +132,35 @@ export function App() {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    // PR 7.2 debug: attach mousedown directly to the canvas element so
+    // we can confirm whether the canvas itself is receiving events.
+    // If even THIS handler doesn't fire, the canvas is not where the
+    // user expects it to be OR it has a CSS issue.
+    const onCanvasDown = (e: MouseEvent) => {
+      (window as unknown as Record<string, unknown>).__canvasDown = {
+        ts: performance.now(),
+        button: e.button,
+        canvasRect: canvas.getBoundingClientRect(),
+        clientXY: { x: e.clientX, y: e.clientY },
+        canvasStyle: {
+          width: canvas.style.width,
+          height: canvas.style.height,
+          cssWidth: getComputedStyle(canvas).width,
+          cssHeight: getComputedStyle(canvas).height,
+          attrWidth: canvas.getAttribute("width"),
+          attrHeight: canvas.getAttribute("height"),
+          display: getComputedStyle(canvas).display,
+          pointerEvents: getComputedStyle(canvas).pointerEvents,
+        },
+      };
+      console.log("[input] CANVAS mousedown", {
+        button: e.button,
+        rect: canvas.getBoundingClientRect(),
+        canvasAttrWH: `${canvas.width}x${canvas.height}`,
+      });
+    };
+    canvas.addEventListener("mousedown", onCanvasDown);
+
     let disposed = false;
     const transport = new GgnetTransport(peer);
     createScene(
@@ -175,6 +204,9 @@ export function App() {
       });
 
     return () => {
+      // canvas-direct listener cleanup — handles the case where the
+      // createScene promise never resolves before unmount.
+      canvas.removeEventListener("mousedown", onCanvasDown);
       disposed = true;
       const handle = sceneRef.current;
       if (handle) {
