@@ -1,4 +1,4 @@
-// Phase 0 / PR 3 — first playable scene.
+// Phase 0 / PR 3+4 — first playable scene (with optional multiplayer).
 //
 // PR 3 scope (per docs/SPEC.md Milestone 1, rows 3-10):
 //   - Havok `PhysicsCharacterController` driving the player (WASD + stunts)
@@ -9,12 +9,20 @@
 //       "WebGPU targeted for PR 3 alongside the character controller. Bootstrap
 //        path is a one-line swap to `WebGPUEngine` in PR 3."
 //
-// What PR 3 *deliberately* doesn't do (deferred to Phase 1):
-//   - ggrs netcode (Milestone 2)
-//   - bullet time (Milestone 2)
-//   - mouse-look in first-person (polish)
-//   - stunt-as-physics (the dive/slide/wallrun change controller parameters +
-//     visual pose; they don't bend the collision shape)
+// PR 4 additions (Milestone 2, rows 1-4 substrate):
+//   - Optional `multiplayer` parameter on `createScene` — if present, builds
+//     a SECOND character (cyan rig from `game/remotePlayer.ts`) and a
+//     `GameSession` from `game/gameSession.ts` that drives BOTH controllers
+//     in lockstep from the `LockstepRuntime` over the supplied transport.
+//   - The chase camera continues to follow the LOCAL controller only — the
+//     remote rig renders next to the local one in the same scene.
+//
+// What this PR *deliberately* doesn't do (deferred to PR 5):
+//   - combat semantics (fire / melee / bullet-time behavior)
+//   - state-channel usage (the "state" data channel is opened by the peer
+//     but the lockstep runs entirely on the reliable ordered "inputs" channel)
+//   - any rollback / spec-correct prediction (the lockstep has no rollback by
+//     design — see the module header in `net/ggrsRuntime.ts`)
 //
 // **Havok contract reminder**: PhysicsCharacterController is the source of
 // truth for the character transform. Babylon meshes read Havok's transform
@@ -50,14 +58,27 @@ import {
 } from "./characterController";
 import { CAPSULE, WORLD_GRAVITY } from "./characterConfig";
 import { createInputListener, type InputListener } from "./inputListener";
+import { createGameSession, type GameSession } from "../game/gameSession";
+import type { GgnetTransport } from "../net/ggnet";
+
+/** Optional multiplayer kick — when present, createScene also runs a second
+ *  controller and a lockstep session across the supplied transport. */
+export interface MultiplayerOptions {
+  transport: GgnetTransport;
+}
 
 export interface SceneHandle {
   engine: AbstractEngine;
   scene: Scene;
   /** Disposes the engine, scene, render loop, and any listeners. */
   dispose: () => void;
-  /** Snapshot of the live character transform — used by tests / HUD. */
+  /** Snapshot of the live LOCAL character transform — used by tests / HUD.
+   *  If multiplayer is on, this is the local rig; the remote rig has its
+   *  own controller accessible via `getGameSession()`. */
   getCharacterTransform: () => { position: Vector3; rotation: Quaternion };
+  /** Snapshot of the live REMOTE character transform — only present when
+   *  multiplayer was enabled. Returns null in single-player mode. */
+  getRemoteTransform?: () => { position: Vector3; rotation: Quaternion } | null;
   /** True once the WebGPU/WebGL2 bootstrap finished successfully. */
   isWebGPU: () => boolean;
   /** True if the camera is currently in first-person mode. */
@@ -66,6 +87,8 @@ export interface SceneHandle {
   toggleCamera: () => void;
   /** Programmatic controller reset — used by tests. */
   resetCharacter: () => void;
+  /** The GameSession, if multiplayer was enabled. */
+  getGameSession?: () => GameSession | null;
 }
 
 /** Try WebGPU first; fall back to WebGL2 if anything throws during init. */
@@ -100,13 +123,35 @@ async function createEngine(
 }
 
 /**
- * Build the PR 3 scene into a pre-mounted canvas element.
+ * Add the meshes of a procedural humanoid rig to the shadow caster list.
+ * Pulled out so the single-player path and the multiplayer path share the
+ * exact same shadow setup (matches the rig returned by characterModel.ts
+ * and by game/remotePlayer.ts).
+ */
+function castRigShadows(
+  shadowGen: ShadowGenerator,
+  rig: { torso: import("@babylonjs/core").Mesh; head: import("@babylonjs/core").Mesh; leftArm: import("@babylonjs/core").Mesh; rightArm: import("@babylonjs/core").Mesh; leftLeg: import("@babylonjs/core").Mesh; rightLeg: import("@babylonjs/core").Mesh },
+): void {
+  shadowGen.addShadowCaster(rig.torso, true);
+  shadowGen.addShadowCaster(rig.head, true);
+  shadowGen.addShadowCaster(rig.leftArm, true);
+  shadowGen.addShadowCaster(rig.rightArm, true);
+  shadowGen.addShadowCaster(rig.leftLeg, true);
+  shadowGen.addShadowCaster(rig.rightLeg, true);
+}
+
+/**
+ * Build the PR 3 scene into a pre-mounted canvas element, optionally with a
+ * multiplayer GameSession driving a second character.
  *
  * Returns the engine + scene so the caller can drive the render loop. Babylon
  * starts one automatically when the engine is constructed, but we expose the
  * handles for the Playwright headless smoke + future PR 4+ work.
  */
-export async function createScene(canvas: HTMLCanvasElement): Promise<SceneHandle> {
+export async function createScene(
+  canvas: HTMLCanvasElement,
+  multiplayer?: MultiplayerOptions,
+): Promise<SceneHandle> {
   const { engine, webgpu } = await createEngine(canvas);
 
   const scene = new Scene(engine);
@@ -208,22 +253,35 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SceneHandl
     );
   }
 
-  // ---- Character visual + controller ---------------------------------------
-  const characterModel = createCharacterModel(scene);
-  const character: CharacterController = createCharacterController(scene, {
-    startPosition: new Vector3(0, CAPSULE.height / 2, 0),
-    visualRoot: characterModel.root,
-  });
-  shadowGen.addShadowCaster(characterModel.torso, true);
-  shadowGen.addShadowCaster(characterModel.head, true);
-  // Arms + legs are stubs in PR 3 but they still cast shadows for parity.
-  shadowGen.addShadowCaster(characterModel.leftArm, true);
-  shadowGen.addShadowCaster(characterModel.rightArm, true);
-  shadowGen.addShadowCaster(characterModel.leftLeg, true);
-  shadowGen.addShadowCaster(characterModel.rightLeg, true);
-  const applyPose = attachPoseUpdater(characterModel, character);
+  // ---- GameSession (multiplayer) or single character ----------------------
+  // Single-player path: build the local rig + controller directly (PR 3).
+  // Multiplayer path: the GameSession owns BOTH rigs + both controllers +
+  // the LockstepRuntime; the render loop just calls `gameSession.tick()`.
+  const gameSession = multiplayer ? createGameSession(scene, multiplayer.transport) : null;
+
+  let character: CharacterController;
+  let applyPose: () => void = () => {};
+
+  if (gameSession) {
+    // Multiplayer branch: GameSession owns the rigs. Use the local rig for
+    // shadow casting and as the chase-camera target (camera follows LOCAL
+    // player, remote renders alongside).
+    character = gameSession.localController;
+    castRigShadows(shadowGen, gameSession.localModel);
+    castRigShadows(shadowGen, gameSession.remoteModel);
+  } else {
+    // Single-player branch (unchanged from PR 3).
+    const characterModel = createCharacterModel(scene);
+    character = createCharacterController(scene, {
+      startPosition: new Vector3(0, CAPSULE.height / 2, 0),
+      visualRoot: characterModel.root,
+    });
+    castRigShadows(shadowGen, characterModel);
+    applyPose = attachPoseUpdater(characterModel, character);
+  }
 
   // ---- Chase camera --------------------------------------------------------
+  // Follows the LOCAL controller regardless of mode.
   const chase: ChaseCameraHandle = createChaseCamera(scene, character, canvas);
 
   // ---- Input listener ------------------------------------------------------
@@ -242,8 +300,15 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SceneHandl
     const deltaSeconds = Math.max(0.0001, Math.min(0.1, (now - lastTimestamp) / 1000));
     lastTimestamp = now;
     const state: InputState = input.read();
-    character.update(state, deltaSeconds, now);
-    applyPose();
+    if (gameSession) {
+      // Multiplayer path: the session drives both controllers, applies the
+      // stunt pose, and pushes the visual transforms into each rig's root.
+      gameSession.tick(state, deltaSeconds, now);
+    } else {
+      // Single-player path (PR 3 behaviour).
+      character.update(state, deltaSeconds, now);
+      applyPose();
+    }
     chase.update();
   });
 
@@ -251,14 +316,14 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SceneHandl
   const onResize = () => engine.resize();
   window.addEventListener("resize", onResize);
 
-  return {
+  const handle: SceneHandle = {
     engine,
     scene,
     dispose: () => {
       window.removeEventListener("resize", onResize);
       input.dispose();
       chase.dispose();
-      characterModel.dispose();
+      gameSession?.dispose();
       scene.dispose();
       engine.dispose();
     },
@@ -271,4 +336,17 @@ export async function createScene(canvas: HTMLCanvasElement): Promise<SceneHandl
     toggleCamera: () => chase.toggle(),
     resetCharacter: () => character.reset(),
   };
+
+  if (gameSession) {
+    handle.getGameSession = () => gameSession;
+    handle.getRemoteTransform = () => {
+      const ctrl = gameSession.remoteController;
+      return {
+        position: ctrl.state.position.clone(),
+        rotation: ctrl.state.rotation.clone(),
+      };
+    };
+  }
+
+  return handle;
 }

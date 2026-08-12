@@ -1,4 +1,4 @@
-// Phase 0 / PR 3 — React shell with Babylon canvas + a keybind HUD.
+// Phase 0 / PR 3+4 — React shell with Babylon canvas + HUD + WebRTC overlay.
 //
 // The canvas is mounted via a ref so the Babylon Engine can attach to it
 // directly. The scene is built asynchronously (Havok wasm + WebGPU adapter
@@ -6,25 +6,100 @@
 // scene is ready. The `dispose()` handle lets us clean up on unmount so
 // React StrictMode's double-mount doesn't leak a render loop.
 //
-// The keybind HUD on top of the canvas lists the PR 3 controls (WASD /
-// Space / Shift / C / Q / V) so Kyle doesn't have to guess.
+// PR 4: the WebRTC `WebRTCPeer` is owned here (not inside PeerOverlay) so
+// that App can hand it to `createScene` via a `GgnetTransport` wrapper. The
+// GameSession ticks every frame regardless of connection state — the remote
+// rig stays at its spawn with zero input until the peer actually sends
+// packets. BulletHud shows the live frame number + connection state.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createScene, type SceneHandle } from "../engine/scene";
+import { PeerOverlay } from "./PeerOverlay";
+import { BulletHud } from "./BulletHud";
+import { WebRTCPeer, smokeSignalPut, smokeSignalGet } from "../net/peer";
+import { GgnetTransport } from "../net/ggnet";
+
+/** Snapshot the HUD reads each frame. We sample a handful of fields rather
+ *  than the whole transport so React doesn't re-render on every input. */
+interface HudState {
+  /** "offline" / "waiting-ice" / "connected" / "disconnected" — displays as
+   *  a single readable string in the overlay. */
+  connectionStatus: "offline" | "waiting-ice" | "connected" | "disconnected";
+  /** Latest lockstep frame the runtime has advanced. 0 before the first tick. */
+  frame: number;
+  /** Frames the runtime had to fill by repeating the last-known remote input. */
+  repeatedFrames: number;
+  /** True once the runtime has received at least one packet from the peer. */
+  hasRemote: boolean;
+}
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sceneRef = useRef<SceneHandle | null>(null);
+  const peerRef = useRef<WebRTCPeer | null>(null);
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
   const [engineLabel, setEngineLabel] = useState<"webgpu" | "webgl2" | null>(null);
+  const [hud, setHud] = useState<HudState>({
+    connectionStatus: "offline",
+    frame: 0,
+    repeatedFrames: 0,
+    hasRemote: false,
+  });
+
+  // Construct the WebRTC peer once per mount. The peer lives across scene
+  // rebuilds (so "disconnect → reconnect" doesn't drop ICE state). The
+  // transport wraps it for the GameSession.
+  if (!peerRef.current) peerRef.current = new WebRTCPeer();
+  const peer = peerRef.current;
+
+  // Expose smoke-test API on window — the smoke script calls window.__join()
+  // explicitly after mount, so this works regardless of StrictMode timing.
+  useEffect(() => {
+    (window as unknown as Record<string, unknown>).__peer = peer;
+    (window as unknown as Record<string, unknown>).__smokeSignal = {
+      put: smokeSignalPut,
+      get: smokeSignalGet,
+    };
+    // Called by the smoke script after mount — triggers the signaling flow
+    // without relying on URL param reading timing inside a React effect.
+    (window as unknown as Record<string, unknown>).__join = (offerB64: string) => {
+      const offer = JSON.parse(atob(offerB64));
+      peer.createAnswer(offer).then((answer) => {
+        smokeSignalPut("sw_answer", JSON.stringify(answer));
+      }).catch((err) => {
+        console.error("[__join] createAnswer failed:", err);
+      });
+    };
+  }, [peer]);
+
+  // Stable callback so PeerOverlay's useEffect doesn't re-fire every render.
+  const reportConnection = useCallback((s: HudState["connectionStatus"]) => {
+    setHud((h) => (h.connectionStatus === s ? h : { ...h, connectionStatus: s }));
+  }, []);
+
+  // Wire peer lifecycle to the HUD.
+  useEffect(() => {
+    const onOpen = () => reportConnection("connected");
+    const onDisconnect = () => reportConnection("disconnected");
+    peer.on("open", onOpen);
+    peer.on("disconnect", onDisconnect);
+    return () => {
+      // PeerOverlay's cleanup closes the connection on unmount — don't
+      // double-close here.
+    };
+  }, [peer, reportConnection]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     let disposed = false;
-    createScene(canvas)
+    const transport = new GgnetTransport(peer);
+    createScene(
+      canvas,
+      { transport }, // multiplayer-on from frame 0; the runtime idles until peer connects
+    )
       .then((handle) => {
         if (disposed) {
           handle.dispose();
@@ -33,6 +108,21 @@ export function App() {
         sceneRef.current = handle;
         setEngineLabel(handle.isWebGPU() ? "webgpu" : "webgl2");
         setPhase("ready");
+
+        // Poll the runtime at ~10Hz for HUD display (avoids per-render React
+        // re-renders from per-frame state updates).
+        const hudTimer = window.setInterval(() => {
+          const session = handle.getGameSession?.();
+          if (!session) return;
+          setHud((h) => ({
+            ...h,
+            frame: session.frame,
+            repeatedFrames: session.repeatedFrameCount,
+            hasRemote: session.runtime.hasRemote,
+          }));
+        }, 100);
+        // Stash the timer on the scene ref so unmount can clear it.
+        (handle as unknown as { __hudTimer: number }).__hudTimer = hudTimer;
       })
       .catch((err: unknown) => {
         if (disposed) return;
@@ -42,10 +132,15 @@ export function App() {
 
     return () => {
       disposed = true;
-      sceneRef.current?.dispose();
+      const handle = sceneRef.current;
+      if (handle) {
+        const t = (handle as unknown as { __hudTimer?: number }).__hudTimer;
+        if (t !== undefined) window.clearInterval(t);
+        handle.dispose();
+      }
       sceneRef.current = null;
     };
-  }, []);
+  }, [peer]);
 
   return (
     <div
@@ -81,6 +176,13 @@ export function App() {
       {phase === "ready" && (
         <>
           <KeybindHud engineLabel={engineLabel} />
+          <PeerOverlay peer={peer} onStatusChange={reportConnection} />
+          <BulletHud
+            frame={hud.frame}
+            repeatedFrames={hud.repeatedFrames}
+            connectionStatus={hud.connectionStatus}
+            hasRemote={hud.hasRemote}
+          />
           <OverlayBanner bottom={16} size="0.7rem" opacity={0.35}>
             Phase 0 — character controller · click canvas to focus · WASD to move
           </OverlayBanner>
@@ -110,7 +212,7 @@ function KeybindHud({ engineLabel }: { engineLabel: "webgpu" | "webgl2" | null }
       }}
     >
       <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>
-        Specialists Web — PR 3 controls
+        Specialists Web — PR 4 controls (PR 3 keymap unchanged)
       </div>
       <div><Key>W A S D</Key> walk</div>
       <div><Key>Space</Key> jump</div>

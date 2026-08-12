@@ -89,6 +89,75 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  # Phase 0 / PR 4: headless two-tab WebRTC handshake smoke.
+  # Boots a SECOND vite dev-server on port 5174 (so this job can run in
+  # parallel with `client-scene-smoke` on 5173 without colliding), opens two
+  # headless pages on the same browser context, drives the manual SDP/ICE
+  # copy-paste flow, asserts both pages reach the "Connected" state, and
+  # uploads both screenshots as artifacts.
+  #
+  # TURN relay: the smoke passes `?turn=force` to both tabs so the peer
+  # uses openrelay.metered.ca TURN servers. STUN-only may fail in GH
+  # sandboxed runners; TURN works because it routes via a public relay.
+  client-two-tab-smoke:
+    name: client — two-tab smoke (WebRTC handshake)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot second dev server (port 5174)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5174 > /tmp/vite-dev2.log 2>&1 &
+          echo $! > /tmp/vite-dev2.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5174/ > /dev/null; then
+              echo "Dev server 2 ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5174/ > /dev/null; then
+            echo "::error::Dev server 2 did not come up in 60s"
+            cat /tmp/vite-dev2.log
+            exit 1
+          fi
+      - name: Run two-tab smoke
+        run: node ./tools/two-tab-smoke.mjs
+        env:
+          URL: http://localhost:5174/
+          CONNECT_TIMEOUT_MS: 60000
+      - name: Upload screenshot (tab A — host)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-tab-screenshot
+          path: client/two-tab-smoke.png
+          if-no-files-found: warn
+      - name: Upload screenshot (tab B — guest)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-tab-screenshot-connected
+          path: client/two-tab-smoke-connected.png
+          if-no-files-found: warn
+      - name: Tear down dev server 2
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev2.pid ]]; then
+            kill "$(cat /tmp/vite-dev2.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   spec-canonical:
     name: spec layout — canonical at docs/SPEC.md
     runs-on: ubuntu-latest

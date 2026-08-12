@@ -1,0 +1,1 @@
+import {WebRTCPeer} from "./peer";export class GgnetTransport{constructor(private peer:WebRTCPeer){}send(p:Uint8Array){this.peer.send("inputs",p)}onPacket(f:(p:Uint8Array)=>void){this.peer.on("packet",f)}}
