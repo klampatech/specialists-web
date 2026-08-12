@@ -198,14 +198,18 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
     // Fall back to document/window listeners for backwards compatibility
     // (e.g., unit tests that don't pass a canvas).
     if (target) {
+      // PR 7.3: bind at BOTH the canvas (for canvas-area clicks) AND
+      // document (for clicks on HUD/overlay elements that bubble up).
+      // The smoke harness clicks the WebRTC overlay's Create button
+      // which is OUTSIDE the canvas — without the document listener,
+      // those clicks never reach us.
       target.addEventListener("mousedown", onMouseDown);
       target.addEventListener("mouseup", onMouseUp);
       target.addEventListener("contextmenu", onContextMenu);
-      // PR 7.3 fix: also listen for pointerdown/pointerup to handle
-      // Playwright's synthetic clicks + browsers that only fire pointer
-      // events (some Safari versions).
       target.addEventListener("pointerdown", onPointerDown);
       target.addEventListener("pointerup", onPointerUp);
+      document.addEventListener("mousedown", onMouseDown);
+      document.addEventListener("pointerdown", onPointerDown);
     } else {
       document.addEventListener("mousedown", onMouseDown);
       document.addEventListener("mouseup", onMouseUp);
@@ -254,6 +258,8 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
           target.removeEventListener("contextmenu", onContextMenu);
           target.removeEventListener("pointerdown", onPointerDown);
           target.removeEventListener("pointerup", onPointerUp);
+          document.removeEventListener("mousedown", onMouseDown);
+          document.removeEventListener("pointerdown", onPointerDown);
         } else {
           document.removeEventListener("mousedown", onMouseDown);
           document.removeEventListener("mouseup", onMouseUp);
