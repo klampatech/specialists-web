@@ -36,6 +36,9 @@ interface HeldState {
   slideHeld: boolean;
   wallrunPressed: boolean;
   cameraTogglePressed: boolean;
+  fireHeld: boolean;
+  meleePressed: boolean;
+  bulletTimeHeld: boolean;
 }
 
 const KEY_FORWARD = new Set(["w", "W", "ArrowUp"]);
@@ -56,7 +59,7 @@ export function createInputListener(hooks: InputHooks): InputListener {
     divePressed: false,
     slideHeld: false,
     wallrunPressed: false,
-    cameraTogglePressed: false,
+    cameraTogglePressed: false, fireHeld: false, meleePressed: false, bulletTimeHeld: false,
   };
 
   const isEditableTarget = (target: EventTarget | null): boolean => {
@@ -71,6 +74,7 @@ export function createInputListener(hooks: InputHooks): InputListener {
     // have a chat box; PR 3 doesn't, but this guard future-proofs it.
     if (isEditableTarget(e.target)) return;
     const key = e.key;
+    if (key === "t") { held.bulletTimeHeld = true; return; }
     if (KEY_FORWARD.has(key)) {
       held.forward = 1;
       e.preventDefault();
@@ -129,6 +133,7 @@ export function createInputListener(hooks: InputHooks): InputListener {
       held.right = 0;
       return;
     }
+    if (key === "t") { held.bulletTimeHeld = false; return; }
     if (KEY_SLIDE.has(key)) {
       held.slideHeld = false;
       return;
@@ -140,13 +145,15 @@ export function createInputListener(hooks: InputHooks): InputListener {
   const onBlur = (): void => {
     held.forward = 0;
     held.right = 0;
-    held.slideHeld = false;
+    held.slideHeld = false; held.fireHeld = false; held.bulletTimeHeld = false;
   };
 
+  const onMouseDown = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = true; if (e.button === 2) held.meleePressed = true; };
+  const onMouseUp = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = false; };
   if (typeof window !== "undefined") {
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", onBlur);
+    window.addEventListener("blur", onBlur); window.addEventListener("mousedown", onMouseDown); window.addEventListener("mouseup", onMouseUp);
   }
 
   return {
@@ -158,7 +165,7 @@ export function createInputListener(hooks: InputHooks): InputListener {
         divePressed: held.divePressed,
         slideHeld: held.slideHeld,
         wallrunPressed: held.wallrunPressed,
-        cameraTogglePressed: held.cameraTogglePressed,
+        cameraTogglePressed: held.cameraTogglePressed, fireHeld: held.fireHeld, meleePressed: held.meleePressed, bulletTimeHeld: held.bulletTimeHeld,
       };
       hooks.onFrame(state);
       // Clear one-shot flags. Held flags stay until the matching keyup.
@@ -172,7 +179,7 @@ export function createInputListener(hooks: InputHooks): InputListener {
       if (typeof window !== "undefined") {
         window.removeEventListener("keydown", onKeyDown);
         window.removeEventListener("keyup", onKeyUp);
-        window.removeEventListener("blur", onBlur);
+        window.removeEventListener("blur", onBlur); window.removeEventListener("mousedown", onMouseDown); window.removeEventListener("mouseup", onMouseUp);
       }
     },
   };

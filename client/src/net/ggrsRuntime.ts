@@ -1,0 +1,1 @@
+export class GgrsRuntime {private frame=0;addLocalInput(_p:number,_i:Uint8Array){}addRemoteInput(_p:number,_i:Uint8Array){}advanceFrame(){return {latestConfirmedFrame:++this.frame,checksum:0};}dispose(){}}

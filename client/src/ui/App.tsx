@@ -11,6 +11,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createScene, type SceneHandle } from "../engine/scene";
+import { PeerOverlay } from "./PeerOverlay";
+import { BulletHud } from "./BulletHud";
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -81,6 +83,8 @@ export function App() {
       {phase === "ready" && (
         <>
           <KeybindHud engineLabel={engineLabel} />
+          <PeerOverlay />
+          <BulletHud />
           <OverlayBanner bottom={16} size="0.7rem" opacity={0.35}>
             Phase 0 — character controller · click canvas to focus · WASD to move
           </OverlayBanner>

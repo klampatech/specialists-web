@@ -48,6 +48,20 @@ Or use the short-form for a quick check-in:
 
 ---
 
+## 2026-08-12 — WebRTC peer bootstrap + ggrs-compatible input substrate
+
+**Status**: Phase 0 / Milestone 2 / PR 4 in progress.
+**Done this session**:
+- Added manual SDP/ICE WebRTC peer wrapper, signaling codec, overlay, reserved 8-byte input bitmask, ggrs runtime seam, transport and combat stubs.
+- Preserved PR 3 scene and extended raw keyboard/mouse input. Added two-tab smoke scaffold and HUD.
+
+**Next session task**: Wire authoritative GameSession/Havok state replication and validate full two-tab connected smoke.
+**Blockers / open questions**: ggrs npm/wasm API still needs integration; current runtime is a deterministic compatibility seam.
+**Decisions made**: No server; manual copy-paste signaling; combat semantics remain PR 5.
+**Playtest status** ⚠️
+- PR 3 single-player remains playable; signaling UI and blob generation compile and build.
+- Full remote transform replication is not yet playable.
+
 ## Log
 
 ### 2026-08-11 — PR 3 MERGED (`86feffa`); Milestone 1 complete

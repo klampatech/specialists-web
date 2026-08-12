@@ -4,7 +4,7 @@
 
 **Editing rule**: branch + PR. No direct pushes to `main`. Decisions, operating principles, and acceptance criteria are all version-controlled here. The vault entry is a stub pointer that gets regenerated.
 
-> **Current status (2026-08-11):** Phase 0 / Milestone 1 in progress.
+> **Current status (2026-08-12):** Phase 0 / Milestone 2 / PR 4 in progress.
 > - **PR 1** (tooling baseline + CI + spec lock) — **MERGED** to main.
 > - **PR 2** (Babylon scene + Havok + skydome + static mesh + static ground + Playwright headless smoke) — **MERGED** at https://github.com/klampatech/specialists-web/pull/3 (squash commit `2a12a59`), all 3 CI checks green.
 > - **PR 3** (Havok character controller + WASD + stunts + chase camera + procedural character + WebGPU bootstrap) — **MERGED** at https://github.com/klampatech/specialists-web/pull/5 (squash commit `86feffa`), all 3 CI checks green.
@@ -325,6 +325,8 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 **Done =** all 10 criteria pass in Kyle's browser.
 
 #### Milestone 2 — netcode + combat (week 2)
+
+**PR 4 substrate:** rows 1-4 = **LANDED PR 4**; combat semantics remain PR 5.
 
 | Acceptance criterion | How Kyle verifies |
 |---|---|

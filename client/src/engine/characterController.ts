@@ -45,6 +45,7 @@ export interface InputState {
   slideHeld: boolean;
   wallrunPressed: boolean;
   cameraTogglePressed: boolean;
+  fireHeld: boolean; meleePressed: boolean; bulletTimeHeld: boolean;
 }
 
 /** Snapshot the controller publishes each frame for the visual + camera. */

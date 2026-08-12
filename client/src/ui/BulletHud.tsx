@@ -1,0 +1,1 @@
+export function BulletHud(){return <div style={{position:"fixed",left:16,bottom:16,padding:"6px 9px",background:"rgba(10,10,12,.72)",color:"#ddd",font:"12px monospace",zIndex:4}}>tick: 60 · confirmed: 0 · Offline</div>}
