@@ -4,6 +4,63 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-12 (late) — PR 6 MERGED. Next: PR 7 (combat) + PR 8 (jump regression)
+
+**Status**: Phase 0 / Milestone 2 / PR 6 **MERGED** at https://github.com/klampatech/specialists-web/pull/6 (merge commit `461dcafea19a455958e0492cdd568aa5f9431b59`, 2026-08-12 18:56 UTC). Squash-merged into `main`. Branch `feat/phase0-webrtc-ggrs-combat` can be deleted after the next session starts clean.
+
+**Done this session** (since the prior PM entry):
+- Updated PR 6 documentation per Kyle's review:
+  - **HANDOFF.md**: "Verification gates" block scoped to "headless smoke only, NOT end-to-end two-tab play". New **"Known regressions"** section tracking (a) jump-forever → PR 8 investigation, (b) no mouse-look → carry-over from PR 3. New **"Honest downgrade"** section spelling out exactly what the diagnostic run showed — `connectionState: new`, `iceGatheringState: gathering`, data channels stuck on `connecting`, no packets flowed → no character mirroring was observed. The smoke proves SDP, not real two-tab play.
+  - **docs/SPEC.md**: PR 6 status banner notes the known follow-up + Phase 1 mouse-look. Milestone 1 acceptance row "Space jumps" flagged with regression note + HANDOFF cross-reference.
+- All 4 CI jobs green on the final commit `28fac5b` (run #31625527955).
+- **PR 6 merged** by Kyle at 18:56 UTC with squash at `461dcafe`.
+
+**Next session task** (PR 7 — combat semantics, the big Milestone 2 row 4):
+
+- **What PR 7 IS NOT**: it is NOT a fix for the jump-forever regression. That is PR 8. Don't conflate them.
+- **What PR 7 is**: dual-pistol raycast firing + tracer render, melee cone hit detection (the `isWithinMeleeCone` helper already exists in `game/combat.ts`), bullet-time scaling at `BULLET_TIME_SCALE = 0.25x` with air control. Wire all three through the existing lockstep `inputs` byte 1 — the FIRE / MELEE / BULLET bits are already reserved in PR 6 so PR 7 doesn't require a session restart.
+- **Input bits**: byte 1 already has FIRE=1, MELEE=2, BULLET=4 (see `client/src/net/inputBitmask.ts:3`). `InputState` already has `fireHeld`, `meleePressed`, `bulletTimeHeld` (see `client/src/engine/characterController.ts:46-50`). All PR 7 needs to do is:
+  1. Wire `fireHeld` from inputListener (line 39, 62 — already wired for LMB) into the character controller, and have it send a raycast on the rising edge.
+  2. Wire `meleePressed` (RMB) into the cone check + indicator pop.
+  3. Wire `bulletTimeHeld` (`t` key) into a global time-scale that multiplies `deltaSeconds` before the tick.
+- **PR 7 must not regress PR 6**: the WebRTC `peer.ts` (with the `acceptAnswer` addIceCandidate fix, fire-and-forget ICE, openrelay TURN config) is the contract surface. Don't refactor it. If something needs to change in peer.ts, that's a separate PR.
+
+**PR 8 backlog** (do NOT start until PR 7 is on a branch or merged):
+
+- **"Jump makes you fly up forever" regression investigation.** Reported by Kyle during the dev-box playtest 2026-08-12 PM (Discord `1537158787947954297`). Hypothesis in HANDOFF.md and SPEC.md:
+  - `state.supported` flag not flipping back to `true` after landing (file `client/src/engine/characterController.ts:224`)
+  - OR `vy = MOVEMENT.jumpZ` is being applied continuously instead of one-shot (line 199-201)
+- **Reproduction suggestion**: hold Space for 5s in a single-tab session, sample Y-velocity every 200ms. If Y stays > 0 while grounded → continuous-impulse bug. If Y oscillates (high then snaps to 0 on landing, then high again) → `state.supported` not flipping back. Either way, write a regression smoke that catches it.
+- **Optional bonus if simple**: also add a regression smoke for the `?join=<blob>` URL mode that **does** get implemented in PR 7 (when the WebTransport server lands). Defer to Phase 1.
+
+**Other untouched items** (do NOT gate PR 7 on these):
+
+- Real Mixamo glTF character model (PR 3 deferred, Phase 1).
+- Mouse-look in first-person (PR 3 deferred, Phase 1).
+- Phase 1: self-hosted coturn on Hetzner to replace openrelay.metered.ca.
+- Phase 1: real ggrs/wasm binding — when one lands on npm, swap `LockstepRuntime` for `GgrsSession` in PR #6's client (one-class swap, was the documented reason for the lockstep's ggrs-shaped surface).
+- Phase 1: Rust WebTransport server with `/create` + `/join` REST endpoints; replaces the clipboard paste flow + adds the dropped `?join=<blob>` URL handler.
+
+**Blockers / open questions**:
+
+- **None for PR 7.** PR 7 is a pure-frontend PR; no infra needed. Dev box + clipboard paste is sufficient for playtest.
+- **For PR 8 (jump regression)**: need to actually reproduce in a single-tab Playwright run. If the dev box can't reproduce either, file as a "sandbox-only" bug and try on a different machine. Don't merge PR 8 without a failing-test-first reproduction.
+- **ICE-reachability still unknown on dev box.** Real two-tab play is still gated on whether your dev box can reach `openrelay.metered.ca:80`. If PR 7's smoke passes on CI but Kyle opens two dev-box tabs and the status stays "Waiting for connection…", this is the same problem as PR 6 and the workarounds are (a) try a different TURN server, (b) test on the same machine (same-machine peers don't need TURN), (c) Phase 1 coturn on the dev LAN.
+
+**Decisions made**:
+
+- 2026-08-12 (late) — **PR 6 squash-merge accepted** with the honest-downgrade docs (smoke proves SDP, not real play). Reviewer can verify in the PR body that the merge description now matches what was actually verified.
+- 2026-08-12 (late) — **PR 8 reserved for jump-forever regression** (NOT collapsed into PR 7). PR 7 = combat (frontend). PR 8 = physics/input bug. Separate concerns so each PR is small and testable independently.
+- 2026-08-12 (late) — **No further TURN/STUN diagnostics from this sandbox.** Both Kyle's dev box and CI runner need their own network checks. We don't have a way to predict reachability; just verify when PR 7 needs it.
+
+**Playtest status** ⚠️
+
+- **PR 6 was merged without an end-to-end playtest verifying `connectionState === "connected"`.** The smoke proves the SDP path. Real two-tab play remains the gate to claim "Milestone 2 row 1 landed." This is documented in the PR body, the HANDOFF, and SPEC.md. If the next session has network debug time, it can run a real two-tab test on the dev box; if not, leave it for a clean Milestone 2 closure check.
+- **PR 7 next playtest target**: dual-pistol tracers + melee indicator + bullet-time slow-mo. Kyle opens two dev-box tabs, both fire (LMB), tracers render across, melee indicator pops when F is in cone, `t` key slows time to 0.25x and the character can still air-control.
+- **PR 8 next playtest target**: regression smoke that catches "hold Space = fly up forever." Manual repro on dev box should yield a fixed-position + grounded state instead of vertical drift.
+
+---
+
 ## 2026-08-12 (afternoon) — PR 6 netcode actually playtestable (supersedes the prior entry)
 
 **Status**: Phase 0 / Milestone 2 / PR 6 (was misnumbered PR 4 in the prior entry — actual GitHub PR #6, branch `feat/phase0-webrtc-ggrs-combat`; prior PR #4 was the spec-drift fix at squash `1a0a5fd4`) **READY for review + manual playtest**. Branch HEAD: `6d2c475`. All 4 CI jobs green on run #31618994062 (typecheck, build, scene smoke, spec-canonical, two-tab smoke). Spec alignment landed in same PR.
