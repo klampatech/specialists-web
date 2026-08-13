@@ -43,6 +43,15 @@ interface HudState {
   /** PR 7.2 debug: live mouse-button state from the input listener. */
   fireHeld: boolean;
   meleePressed: boolean;
+  /** PR 10: live HP for the LOCAL controller (drives the HUD chip). */
+  localHp: number;
+  /** PR 10: live HP for the REMOTE controller. */
+  remoteHp: number;
+  /** PR 10: timestamp (ms) at which the LOCAL controller's respawn fires.
+   *  0 when not respawning. */
+  localRespawningMs: number;
+  /** PR 10: same for the REMOTE controller. */
+  remoteRespawningMs: number;
 }
 
 export function App() {
@@ -61,6 +70,10 @@ export function App() {
     bulletTime: false,
     fireHeld: false,
     meleePressed: false,
+    localHp: 100,
+    remoteHp: 100,
+    localRespawningMs: 0,
+    remoteRespawningMs: 0,
   });
 
   // Construct the WebRTC peer once per mount. The peer lives across scene
@@ -183,6 +196,9 @@ export function App() {
           if (!session) return;
           // PR 7: pull the live InputState snapshot for the bullet-time chip.
           const inputState = handle.getInputState?.();
+          // PR 10: pull the health snapshot so the HUD chip can render HP
+          // + respawn countdown. Cheap read — just two field accesses.
+          const health = session.getHealthSnapshot();
           setHud((h) => ({
             ...h,
             frame: session.frame,
@@ -192,6 +208,10 @@ export function App() {
             bulletTime: inputState?.bulletTimeHeld ?? false,
             fireHeld: inputState?.fireHeld ?? false,
             meleePressed: inputState?.meleePressed ?? false,
+            localHp: health.local.hp,
+            remoteHp: health.remote.hp,
+            localRespawningMs: health.local.respawningMs,
+            remoteRespawningMs: health.remote.respawningMs,
           }));
         }, 100);
         // Stash the timer on the scene ref so unmount can clear it.
@@ -263,9 +283,13 @@ export function App() {
             fireHeld={hud.fireHeld}
             meleePressed={hud.meleePressed}
             bulletTime={hud.bulletTime}
+            localHp={hud.localHp}
+            remoteHp={hud.remoteHp}
+            localRespawningMs={hud.localRespawningMs}
+            remoteRespawningMs={hud.remoteRespawningMs}
           />
           <OverlayBanner bottom={16} size="0.7rem" opacity={0.35}>
-            Phase 0 PR 7 — combat (LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged
+            Phase 0 PR 10 — health & respawn (LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged
           </OverlayBanner>
         </>
       )}
@@ -323,7 +347,7 @@ function KeybindHud({ engineLabel }: { engineLabel: "webgpu" | "webgl2" | null }
       }}
     >
       <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>
-        Specialists Web — PR 7 controls (PR 6 keymap unchanged)
+        Specialists Web — PR 10 controls (PR 6+7 keymap unchanged)
       </div>
       <div><Key>W A S D</Key> walk</div>
       <div><Key>Space</Key> jump</div>

@@ -21,6 +21,15 @@ interface BulletHudProps {
   meleePressed: boolean;
   /** PR 7.2 debug: same as `bulletTime` but raw boolean. */
   bulletTime: boolean;
+  /** PR 10: live HP for the LOCAL controller (clamped 0..HEALTH.maxHp). */
+  localHp: number;
+  /** PR 10: live HP for the REMOTE controller (clamped 0..HEALTH.maxHp). */
+  remoteHp: number;
+  /** PR 10: timestamp (ms) at which the LOCAL controller's respawn fires.
+   *  0 when not respawning. Rendered as a countdown when > 0. */
+  localRespawningMs: number;
+  /** PR 10: same for the REMOTE controller. */
+  remoteRespawningMs: number;
 }
 
 function statusLabel(s: BulletHudProps["connectionStatus"]): string {
@@ -41,7 +50,7 @@ function statusLabel(s: BulletHudProps["connectionStatus"]): string {
  * file MUST keep `pointerEvents: "none"` (or `pointerEvents: "auto"` only on
  * the buttons it contains — but right now there are no buttons in the HUD).
  */
-export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, fireHeld, meleePressed, bulletTime }: BulletHudProps) {
+export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, fireHeld, meleePressed, bulletTime, localHp, remoteHp, localRespawningMs, remoteRespawningMs }: BulletHudProps) {
   return (
     <div
       data-testid="bullet-hud"
@@ -67,6 +76,16 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
         {statusLabel(connectionStatus)}{hasRemote ? "" : " (idle)"}
       </div>
       <div data-testid="bullet-hud-hits" style={{ opacity: 0.95 }}>hits: {hits}</div>
+      {/* PR 10: health pools + optional respawn countdown. The countdown
+          shows the remaining ms on the respawning-until timestamp. When
+          the timer is 0 (idle) we render `idle` so the line still occupies
+          a stable row in the chip (no layout jitter on respawn). */}
+      <div data-testid="bullet-hud-hp-local" style={{ opacity: 0.95 }}>
+        HP me: {localHp}{localRespawningMs > 0 ? ` (respawn ${localRespawningMs}ms)` : ""}
+      </div>
+      <div data-testid="bullet-hud-hp-remote" style={{ opacity: 0.95 }}>
+        HP them: {remoteHp}{remoteRespawningMs > 0 ? ` (respawn ${remoteRespawningMs}ms)` : ""}
+      </div>
       {/* PR 7.2 DEBUG BLOCK: shows live input listener state so we can
           confirm whether the mouse/keyboard handlers are firing at all.
           If these stay "false" while LMB/T are pressed, the inputListener

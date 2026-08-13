@@ -31,6 +31,7 @@ import {
 
 import {
   CAPSULE,
+  HEALTH,
   MOVEMENT,
   SLOPE_AND_STEP,
   STUNTS,
@@ -55,6 +56,13 @@ export interface CharacterState {
   supported: boolean;
   sliding: boolean;
   stunt: "none" | "dive" | "slide" | "wallrun";
+  /** PR 10: current health points. Decremented by `applyDamage` from
+   *  `game/health.ts`; reset to `HEALTH.maxHp` on respawn / `reset()`. */
+  hp: number;
+  /** PR 10: timestamp (ms) at which the respawn teleport should fire.
+   *  Set to `nowMs + HEALTH.respawnDelayMs` when HP drops to 0; cleared
+   *  when the teleport fires. 0 means "not currently respawning". */
+  respawningUntilMs: number;
 }
 
 /** Options accepted by `createCharacterController`. */
@@ -113,7 +121,8 @@ export class CharacterController {
   readonly havok: PhysicsCharacterController;
   readonly state: CharacterState;
   private readonly visualRoot: TransformNode | undefined;
-  private readonly startPosition: Vector3;
+  /** PR 10: spawn point the controller teleports back to on respawn. */
+  public readonly startPosition: Vector3;
   private readonly up: Vector3 = new Vector3(0, 1, 0);
   private readonly baseDynamicFriction: number = BASE_DYNAMIC_FRICTION;
   private yawRadians: number = 0;
@@ -148,6 +157,8 @@ export class CharacterController {
       supported: true,
       sliding: false,
       stunt: "none",
+      hp: HEALTH.maxHp,
+      respawningUntilMs: 0,
     };
   }
 
@@ -170,6 +181,39 @@ export class CharacterController {
     // PR 8.1: clear the wallrun rising-edge tracker + cooldown too.
     this.wasWallrunPressedLast = false;
     this.lastWallrunEndedAtMs = 0;
+    // PR 10: reset health pool + any in-flight respawn timer.
+    this.state.hp = HEALTH.maxHp;
+    this.state.respawningUntilMs = 0;
+  }
+
+  /**
+   * PR 10: teleport the controller back to its spawn point and restore
+   * a clean state. Called from `tickRespawn` in `game/health.ts` once
+   * the respawn timer expires. Encapsulates the reset path so callers
+   * don't need to know the underlying `havok.setPosition` /
+   * `havok.setVelocity` sequence.
+   *
+   * Resets position, velocity, health, respawn timer, stunts, and the
+   * wallrun cooldown. Does NOT mutate the input-driven state machine
+   * (the next `update()` call will re-derive stunt state from input).
+   */
+  public respawn(_nowMs: number): void {
+    this.havok.setPosition(this.startPosition.clone());
+    this.havok.setVelocity(Vector3.Zero());
+    this.state.position.copyFrom(this.startPosition);
+    this.state.hp = HEALTH.maxHp;
+    this.state.respawningUntilMs = 0;
+    this.stunt = "none";
+    this.stuntEndsAtMs = 0;
+    this.stuntJustEntered = false;
+    this.state.stunt = "none";
+    this.wasWallrunPressedLast = false;
+    this.lastWallrunEndedAtMs = 0;
+    this.yawRadians = 0;
+    this.state.rotation.copyFromFloats(0, 0, 0, 1);
+    this.havok.dynamicFriction = this.baseDynamicFriction;
+    this.havok.staticFriction = 0;
+    this.lastPlanarSpeed = 0;
   }
 
   /** Set the yaw the character should face (radians, 0 = +Z forward). */
