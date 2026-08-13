@@ -196,7 +196,32 @@ export class CharacterController {
     const currentVel = this.havok.getVelocity();
     let vy = currentVel.y;
 
-    if (input.jumpPressed && this.state.supported) {
+    // PR 8: Havok's PhysicsCharacterController is kinematic (ANIMATED body)
+    // and only applies the `gravity` parameter inside `_resolveContacts`,
+    // which only fires when there's a contact in the manifold. Mid-air the
+    // velocity we hand to `setVelocity` is preserved verbatim — there is no
+    // gravity accumulation. The previous code relied on Havok applying
+    // gravity for us; it didn't, so holding Space made the character fly up
+    // forever (jump impulse 5.2 m/s applied on the rising edge → vy stays
+    // 5.2 forever → capsule ascends at 5.2 m/s indefinitely).
+    //
+    // Fix: accumulate gravity ourselves whenever the controller is not
+    // SUPPORTED. This matches the standard kinematic character-controller
+    // pattern (gravity = a * dt, applied to vy before setVelocity).
+    if (!this.state.supported) {
+      vy += MOVEMENT.gravity.y * deltaSeconds;
+    }
+
+    // PR 8: tighten the jump condition. Previously we accepted ANY rising
+    // edge while `state.supported` was true. That had two failure modes:
+    //   (a) `state.supported` was true for one frame while the capsule was
+    //       still moving up from the previous jump's residual velocity,
+    //       letting a second Space press add another impulse on top.
+    //   (b) the contact manifold flipped supported=true in between frames
+    //       during the descent, firing a "second" jump impulse.
+    // We now require vy ≤ 0 (no upward residual) so the jump can only fire
+    // from a true grounded state.
+    if (input.jumpPressed && this.state.supported && vy <= 0) {
       vy = MOVEMENT.jumpZ;
     }
 
@@ -223,7 +248,11 @@ export class CharacterController {
     const surfaceInfo = this.havok.checkSupport(deltaSeconds, GRAVITY_DIRECTION);
     this.state.supported = surfaceInfo.supportedState === CharacterSupportedState.SUPPORTED;
     this.state.sliding = surfaceInfo.supportedState === CharacterSupportedState.SLIDING;
-    this.havok.integrate(deltaSeconds, surfaceInfo, MOVEMENT.gravity);
+    // PR 8: pass Zero for gravity — we now accumulate it ourselves above.
+    // Passing a non-zero gravity here would double-apply it on frames where
+    // the contact manifold has a ground entry (Havok resolves it via
+    // `_resolveContacts` which adds gravity into the contact impulse).
+    this.havok.integrate(deltaSeconds, surfaceInfo, Vector3.ZeroReadOnly);
 
     // 6. Publish world-space transform.
     const pos = this.havok.getPosition();

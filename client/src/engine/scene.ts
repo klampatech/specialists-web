@@ -335,6 +335,18 @@ export async function createScene(
   const onResize = () => engine.resize();
   window.addEventListener("resize", onResize);
 
+  // PR 8: expose a jump-regression probe so the headless smoke can sample
+  // the local controller's Y position every frame. This is purely an
+  // instrumentation hook — no behavioural effect on the game. The
+  // `jump-regression-smoke.mjs` script reads `window.__jumpProbe()` once
+  // per poll to assert that holding Space does not fly the character up
+  // indefinitely. Kept gated behind `import.meta.env.DEV` (Vite-only,
+  // stripped in production) so the production bundle is unchanged.
+  if (import.meta.env.DEV && typeof window !== "undefined") {
+    (window as unknown as { __jumpProbe?: () => number }).__jumpProbe = () =>
+      character.state.position.y;
+  }
+
   const handle: SceneHandle = {
     engine,
     scene,

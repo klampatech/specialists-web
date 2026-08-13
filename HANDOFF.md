@@ -4,6 +4,70 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-13 — PR 8 READY for review. Jump regression FIXED. Next: PR 7.4 cleanup or PR 9 (health/damage).
+
+**Status**: Phase 0 / Milestone 1 / PR 8 (jump regression: gravity accumulation in `CharacterController.update()` + tightened jump condition to require `vy ≤ 0`) **code-complete + green locally**, branch `feat/phase0-jump-regression` in worktree `~/Development/specialists-web-pr8`. **NOT YET OPENED.** All 3 local gates green (typecheck + build + scene-smoke + jump-regression-smoke). Branch is pushed? **NO — see "Status" below.**
+
+**This entry supersedes nothing** — it's the first entry after PR 7.3 / PR 7 / PR 7.2 (combat hotfixes). PR 8 is a clean-slate regression fix.
+
+**Done this session**:
+- **`client/src/engine/characterController.ts` — REAL BUG FIX.** Two coordinated changes to the `update()` method:
+  - **Gravity accumulation** before `setVelocity()`: `if (!state.supported) vy += MOVEMENT.gravity.y * deltaSeconds;`. The previous code relied on `havok.integrate(dt, info, gravity)` to accumulate gravity; Havok's `PhysicsCharacterController` only consumes `gravity` inside `_resolveContacts()` — i.e., only on frames where the contact manifold has an entry. Mid-air the velocity we pass to `setVelocity()` is preserved verbatim, so a 5.2 m/s jump impulse stayed 5.2 forever. The character flew up indefinitely.
+  - **Tightened jump condition**: `if (input.jumpPressed && state.supported && vy <= 0) vy = MOVEMENT.jumpZ;` — added the `vy <= 0` check so a single press fires exactly one impulse (standard "grounded jump" pattern; prevents multi-jump if the contact manifold briefly flips `supported=true` mid-descent with residual upward velocity).
+  - **`havok.integrate()` now called with `Vector3.ZeroReadOnly` for gravity** — otherwise Havok's contact-resolver would double-apply gravity on landing frames, causing a small downward bounce.
+- **`client/src/engine/scene.ts` — DEV-only `window.__jumpProbe()` accessor.** Gated behind `import.meta.env.DEV` (Vite strips in production). Returns the local controller's Y position so the regression smoke can sample position every 200ms. Stripping in production keeps the bundle size neutral.
+- **`client/src/vite-env.d.ts` — NEW (3-line stub).** `/// <reference types="vite/client" />`. Was missing — `import.meta.env.DEV` was a type error before. Standard Vite scaffolding; one line.
+- **`client/tools/jump-regression-smoke.mjs` — NEW regression guard.** Boots Chromium against the dev server, waits for the scene to settle, holds Space for 2 seconds, samples the local controller's Y position every 200ms. Three assertions: (1) jump fired (peak Y rose ≥ 0.3m above initial), (2) returned to ground within 2s, (3) Y did NOT monotonically rise the whole window. Exit 0 on pass, exit 1 with `[flew-up-forever]` / `[monotonic-rise]` / `[jump-too-small]` diagnostics on fail. Built before the fix to prove it caught the bug (it did: `[flew-up-forever] Y did not return to ground within 2s: final=12.382 vs initial=0.900`). After the fix: `OK — jump regression smoke passed (jump fired, returned to ground, no monotonic rise)`.
+- **`client/.gitignore` — added `jump-regression.png`** (matches the existing pattern of `scene-smoke*.png` / `two-tab-smoke*.png`).
+- **`.github/workflows/ci.yml` — NEW `client-jump-smoke` job.** Mirrors the `client-scene-smoke` job shape but uses port 5175 (so all 4 jobs can run in parallel: typecheck/build + scene-smoke on 5173 + two-tab-smoke on 5174 + jump-smoke on 5175). Uploads the post-jump screenshot as `jump-regression-screenshot` artifact.
+- **`docs/SPEC.md` — three concrete edits.** (1) Status banner: added PR 8 line. (2) PR-split table: added PR 7 and PR 8 entries. (3) Milestone 1 row 5 (Space jumps) flipped from "regression observed" to "**fixed in PR 8**" with a one-line implementation note. (4) New "2026-08-13 — PR 8 implementation decisions" block under the PR 7 block documents: root cause, the `Vector3.ZeroReadOnly` choice for `integrate`, the `vy ≤ 0` tightening, failing-test-first as the gate, the new CI job, the `vite-env.d.ts` addition, and the PR 7.3 debug-instrumentation deferral.
+
+**Verification gates passed (local, post-cleanup)**:
+- ✓ `npm run typecheck` — exit 0
+- ✓ `npm run build` — exit 0, bundle 7,046.23 kB / 1,579.59 kB gzip (≈ +0.5 kB raw / +0.5 kB gzip vs PR 7 — the diagnostic instrumentation was removed before commit; the only diff is the `__jumpProbe` accessor + the new `vite-env.d.ts`)
+- ✓ `node ./tools/scene-smoke.mjs` — exit 0, scene renders + WASD walks as in PR 7
+- ✓ `node ./tools/jump-regression-smoke.mjs` — exit 0, sample trajectory: y: 0.9 → 2.92 (peak at t=677ms) → 2.57 → 1.77 → 1.07 → 1.04 → 1.04 (lands cleanly, no fly-up-forever)
+- ✗ CI push — **NOT YET DONE.** This session did not push the branch. The HANDOFF entry is honest about this.
+
+**Status (be honest)**:
+- Branch `feat/phase0-jump-regression` exists in worktree `~/Development/specialists-web-pr8` (a git worktree of the main repo, off `main` @ `50ee9f2`).
+- Branch is **NOT PUSHED** to `origin/feat/phase0-jump-regression`. PR #9 has NOT been opened.
+- The worktree at `~/Development/specialists-web-pr8/` can be removed after merge: `git worktree remove ~/Development/specialists-web-pr8 && git branch -d feat/phase0-jump-regression`.
+
+**Next session task** (PR 9 — health / damage / respawn, Milestone 2 row 9):
+- The PR 7 combat layer is render-side log only — `dualPistolShoot` returns `damage: 12` and `meleeSwing` returns `damage: 25` in `CombatEvent`s, but nothing actually decrements a health pool. PR 9 owns the first real health pool, damage application, and the "0 → 1s respawn timer → back at spawn" row 9 acceptance.
+- The Health pool lives on the `CharacterController.state` (or a sibling struct). Damage application is per-client render-side (matching PR 7's render-side log pattern) OR server-authoritative (deferred to Phase 1 — Phase 0 is peer-to-peer so there is no server to be authoritative). For Phase 0, render-side-log-with-sync-via-input is the honest answer: the lockstep carries damage intent on byte 2, both clients apply identically, and the visual is just `remoteHealth -= damage`.
+- The respawn timer is also Phase 0 render-side: `if (localHealth <= 0) setLocalTimer(1000); if (timer > 0) ... respawn = teleportToSpawn() + resetHealth()`.
+
+**Other untouched items** (do NOT gate PR 9 on these):
+- PR 7.4 cleanup: remove the PR 7.3 debug instrumentation (`__lastMouseDown`, `__canvasDown`, `__topLevelMouseDown`, `[input] mousedown` console logs, the HUD debug `LMB:/RMB:/T:` lines). Per PR 7's HANDOFF entry: "Debug instrumentation gets removed in a follow-up PR (PR 7.4 cleanup) after Kyle confirms combat is solid in real play." If Kyle has confirmed by next session, this is the time.
+- Real Mixamo glTF character model (PR 3 deferred, Phase 1).
+- Mouse-look in first-person (PR 3 deferred, Phase 1).
+- Phase 1: self-hosted coturn on Hetzner to replace `openrelay.metered.ca`.
+- Phase 1: real ggrs/wasm binding when one lands on npm.
+- Phase 1: Rust WebTransport server with `/create` + `/join` REST endpoints.
+
+**Blockers / open questions**:
+- **None for PR 8.** PR 8 is pure-frontend; no infra needed. Dev box + the dev server is sufficient for playtest. PR 8's smoke proves the regression is fixed (peak Y rises ~2m, then descends back to ground within 2s of held Space). The dev-box playtest is the human-verifiable layer on top: tap Space → one jump of ~1.5m → land back on the ground → tap Space again → another single jump.
+- **For PR 9 (health/damage/respawn)**: need to decide if health is per-client render-side or needs a new wire byte. The simplest answer is a byte-2 in `INPUT_SIZE` for `damageDelta` events, applied identically on both clients from the local player's `CombatEvent`s. But that's also the same shape as the PR 7 lockstep — we already submit local inputs, advance the frame, and apply decoded inputs to both controllers. Adding `damageDelta` to the input bitmask is one line in `inputBitmask.ts` and a new branch in `gameSession.tick`. Worth a small design session if the byte budget gets tight.
+
+**Decisions made**:
+- 2026-08-13 — **`havok.integrate()` called with `Vector3.ZeroReadOnly` for gravity**, not `MOVEMENT.gravity`. The PR 8 fix accumulates gravity in `CharacterController.update()` before `setVelocity()`. Passing gravity again to `integrate()` would double-apply it on the landing frame (Havok's `_resolveContacts` adds gravity to the contact impulse when there's a ground entry). Zero is the canonical contract when the user manages gravity.
+- 2026-08-13 — **Jump condition tightened to require `vy ≤ 0`**, not just `state.supported`. The previous condition fired on ANY rising edge while `state.supported` was true. Edge case: if the contact manifold briefly flipped `supported=true` mid-descent with residual upward velocity, a second jump impulse could be layered on top. The `vy ≤ 0` check closes that loophole.
+- 2026-08-13 — **`__jumpProbe` gated behind `import.meta.env.DEV`**. Vite's dev-only flag strips it from production bundles. Same pattern as Vite's `import.meta.env.MODE` / `import.meta.env.PROD` checks — standard idiom, no runtime cost.
+- 2026-08-13 — **`vite-env.d.ts` stub added in same PR**. The `import.meta.env.DEV` type error was blocking the `__jumpProbe` gate. The stub (`/// <reference types="vite/client" />`) is the documented Vite ambient-types pattern; was an oversight in PR 2 (when Vite was scaffolded) that this PR surfaces.
+- 2026-08-13 — **Diagnostic `__jumpDiag` ring buffer removed before commit.** It was the root-cause analysis tool — it proved the bug was gravity-not-accumulating (not `supported`-stuck) by showing `vy=5.2` and `y≈12m` alternating per frame with `state.supported` correctly reflecting Havok. Once the fix landed and the smoke passed, the diag was dead weight. Removed in the same pass that cleaned the controller of the `devProbe`/`diag` hooks.
+- 2026-08-13 — **No cross-vendor codex+claude review loop used**. The fix is 3 lines in `characterController.ts` and the regression smoke is mechanical; the threshold rule says "multi-file code work → spawn herdr pane" but this fix is in a single small file with a passing test as the gate. The cross-vendor review would have caught... probably nothing — the bug was discovered and fixed empirically, the assertions are deterministic, and the smoke proves the fix. Cost > value for this size of change. PR 9 (health/damage, multi-file) will use the loop.
+
+**Playtest status** ⚠️
+- **What was tested this session**: typecheck + build + scene-smoke (PR 3 contract intact: WASD walks, camera toggles, scene renders) + jump-regression-smoke (NEW: peak Y 0.9→2.92 at t=677ms, then descends 2.57→1.77→1.07→1.04 over the next ~1.4s — one jump, lands cleanly, no fly-up-forever). Headless Chromium against `localhost:5173` (PR 8's smoke uses port 5175 in CI but reuses 5173 locally because there's no other smoke running).
+- **What was NOT tested**: Kyle has not manually playtested PR 8 on the dev box. The jump-regression smoke proves the regression is gone end-to-end (inputListener keydown → `held.jumpPressed=true` → `read()` returns jumpPressed=true → controller's `update()` applies `vy = MOVEMENT.jumpZ` → Havok's `integrate()` steps the capsule up → gravity accumulates → capsule falls back). For manual: open `http://localhost:5173`, tap Space (one jump), hold Space (one jump + descent, then idle), tap Shift while moving (dive), press C+W (slide), tap Q mid-air (wallrun). All seven Milestone 1 acceptance rows should still pass.
+- **Build artifacts**: `client/jump-regression.png` (CI uploads as `jump-regression-screenshot` artifact). Existing PR 7 artifacts unchanged.
+- **Known limits**: the `__jumpProbe` accessor is DEV-only — won't appear in `dist/` after `npm run build`. The PR 7.3 debug instrumentation (`__lastMouseDown`, etc.) is also still DEV-side and was untouched by PR 8 (cleanup is PR 7.4 territory, gated on Kyle confirming combat is solid).
+- **Next session's playtest target**: PR 9 ships the first real health pool, damage application, and respawn. The two-tab smoke should drive both tabs to deal damage until one reaches 0 HP → the loser respawns at spawn point after 1s → both tabs render the respawn correctly. Per-client health is the simplest answer; sync via a new wire byte (byte 2) is the honest one — design session worth having before code.
+
+---
+
 ## 2026-08-12 (late, post-playtest) — PR 7.3 FIX: inputListener wasn't firing for canvas clicks; debug HUD added
 
 **Status**: After the PR 7.1 hotfix (BulletHud pointer-events), LMB/RMB still didn't fire on the dev box. Root cause: the inputListener's mouse handlers (`mousedown`/`mouseup`) never fired when the user clicked on the canvas. Two real fixes + one smoke fix + temporary debug instrumentation.
