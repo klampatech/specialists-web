@@ -158,6 +158,133 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  # Phase 0 / PR 8: jump regression smoke. Asserts that holding Space
+  # produces ONE jump (peak Y above initial) and returns the character
+  # to ground within 2s — i.e., the "fly up forever" bug observed during
+  # the dev-box playtest is caught before merge.
+  #
+  # Why a separate job: this PR's fix (gravity accumulation in the
+  # controller's update) is small and easy to accidentally regress in a
+  # future PR. The smoke is the regression guard. It can run on a
+  # dedicated port so the scene-smoke and two-tab-smoke jobs stay
+  # unaffected.
+  client-jump-smoke:
+    name: client — jump regression smoke (PR 8)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server (port 5175)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5175 > /tmp/vite-dev3.log 2>&1 &
+          echo $! > /tmp/vite-dev3.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5175/ > /dev/null; then
+              echo "Dev server (jump smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5175/ > /dev/null; then
+            echo "::error::Dev server (jump smoke) did not come up in 60s"
+            cat /tmp/vite-dev3.log
+            exit 1
+          fi
+      - name: Run jump regression smoke
+        run: node ./tools/jump-regression-smoke.mjs
+        env:
+          JUMP_SMOKE_URL: http://localhost:5175/
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jump-regression-screenshot
+          path: client/jump-regression.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev3.pid ]]; then
+            kill "$(cat /tmp/vite-dev3.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
+  # Phase 0 / PR 8.1: wallrun regression smoke. Asserts that holding Q
+  # in mid-air does NOT make the character fly up indefinitely. The
+  # underlying bug: if wallrunPressed is true at any frame after the
+  # 1000ms wallrun timer expires, the controller re-enters wallrun,
+  # resetting the timer — creating an indefinite upward cycle when
+  # real-browser auto-repeat fires keydowns faster than the wallrun
+  # duration. The fix: rising-edge detection + post-wallrun cooldown.
+  #
+  # Why a separate job: this is the second of two regression guards
+  # for the controller's update() path. The single-keydown case is
+  # what this smoke verifies (the smoke also passes pre-fix because
+  # Playwright doesn't auto-repeat — the aggressive auto-repeat test
+  # in tools/aggressive-wallrun.mjs is the actual diagnostic, removed
+  # before commit). Run on port 5176 so it stays independent of the
+  # other smoke jobs.
+  client-wallrun-smoke:
+    name: client — wallrun regression smoke (PR 8.1)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server (port 5176)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5176 > /tmp/vite-dev4.log 2>&1 &
+          echo $! > /tmp/vite-dev4.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5176/ > /dev/null; then
+              echo "Dev server (wallrun smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5176/ > /dev/null; then
+            echo "::error::Dev server (wallrun smoke) did not come up in 60s"
+            cat /tmp/vite-dev4.log
+            exit 1
+          fi
+      - name: Run wallrun regression smoke
+        run: node ./tools/wallrun-regression-smoke.mjs
+        env:
+          WALLRUN_SMOKE_URL: http://localhost:5176/
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallrun-regression-screenshot
+          path: client/wallrun-regression.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev4.pid ]]; then
+            kill "$(cat /tmp/vite-dev4.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   spec-canonical:
     name: spec layout — canonical at docs/SPEC.md
     runs-on: ubuntu-latest

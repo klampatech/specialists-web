@@ -121,6 +121,14 @@ export class CharacterController {
   private stuntEndsAtMs: number = 0;
   /** True for the single update tick after a new stunt becomes active. */
   private stuntJustEntered: boolean = false;
+  // PR 8.1: previous-frame snapshot of `input.wallrunPressed`. Used to
+  // detect the rising edge so wallrun doesn't re-enter every time the
+  // 1000ms timer expires while Q is still being held or auto-repeating.
+  private wasWallrunPressedLast: boolean = false;
+  // PR 8.1: timestamp of the last wallrun exit. Combined with the
+  // wallrun duration, defines the cooldown window during which a new
+  // wallrun entry is ignored (closes the auto-repeat re-entry loophole).
+  private lastWallrunEndedAtMs: number = 0;
   private lastPlanarSpeed: number = 0;
   // Scratch vectors to avoid per-frame allocations in the hot path.
   private readonly tmpDesired: Vector3 = new Vector3();
@@ -159,6 +167,9 @@ export class CharacterController {
     this.state.stunt = "none";
     this.havok.dynamicFriction = this.baseDynamicFriction;
     this.havok.staticFriction = 0;
+    // PR 8.1: clear the wallrun rising-edge tracker + cooldown too.
+    this.wasWallrunPressedLast = false;
+    this.lastWallrunEndedAtMs = 0;
   }
 
   /** Set the yaw the character should face (radians, 0 = +Z forward). */
@@ -196,7 +207,32 @@ export class CharacterController {
     const currentVel = this.havok.getVelocity();
     let vy = currentVel.y;
 
-    if (input.jumpPressed && this.state.supported) {
+    // PR 8: Havok's PhysicsCharacterController is kinematic (ANIMATED body)
+    // and only applies the `gravity` parameter inside `_resolveContacts`,
+    // which only fires when there's a contact in the manifold. Mid-air the
+    // velocity we hand to `setVelocity` is preserved verbatim — there is no
+    // gravity accumulation. The previous code relied on Havok applying
+    // gravity for us; it didn't, so holding Space made the character fly up
+    // forever (jump impulse 5.2 m/s applied on the rising edge → vy stays
+    // 5.2 forever → capsule ascends at 5.2 m/s indefinitely).
+    //
+    // Fix: accumulate gravity ourselves whenever the controller is not
+    // SUPPORTED. This matches the standard kinematic character-controller
+    // pattern (gravity = a * dt, applied to vy before setVelocity).
+    if (!this.state.supported) {
+      vy += MOVEMENT.gravity.y * deltaSeconds;
+    }
+
+    // PR 8: tighten the jump condition. Previously we accepted ANY rising
+    // edge while `state.supported` was true. That had two failure modes:
+    //   (a) `state.supported` was true for one frame while the capsule was
+    //       still moving up from the previous jump's residual velocity,
+    //       letting a second Space press add another impulse on top.
+    //   (b) the contact manifold flipped supported=true in between frames
+    //       during the descent, firing a "second" jump impulse.
+    // We now require vy ≤ 0 (no upward residual) so the jump can only fire
+    // from a true grounded state.
+    if (input.jumpPressed && this.state.supported && vy <= 0) {
       vy = MOVEMENT.jumpZ;
     }
 
@@ -223,7 +259,11 @@ export class CharacterController {
     const surfaceInfo = this.havok.checkSupport(deltaSeconds, GRAVITY_DIRECTION);
     this.state.supported = surfaceInfo.supportedState === CharacterSupportedState.SUPPORTED;
     this.state.sliding = surfaceInfo.supportedState === CharacterSupportedState.SLIDING;
-    this.havok.integrate(deltaSeconds, surfaceInfo, MOVEMENT.gravity);
+    // PR 8: pass Zero for gravity — we now accumulate it ourselves above.
+    // Passing a non-zero gravity here would double-apply it on frames where
+    // the contact manifold has a ground entry (Havok resolves it via
+    // `_resolveContacts` which adds gravity into the contact impulse).
+    this.havok.integrate(deltaSeconds, surfaceInfo, Vector3.ZeroReadOnly);
 
     // 6. Publish world-space transform.
     const pos = this.havok.getPosition();
@@ -242,9 +282,30 @@ export class CharacterController {
 
   /** Recompute which stunt is active based on input + timers. */
   private refreshStuntState(input: InputState, nowMs: number): void {
-    // Wallrun: tap Q mid-air to attach for 1s. Takes priority over dive.
-    if (input.wallrunPressed && !this.state.supported) {
+    // PR 8.1: gate wallrun entry on a cooldown after the previous
+    // wallrun exited. Without this, an input source that fires
+    // `wallrunPressed=true` more frequently than the 1000ms wallrun
+    // duration (real-browser auto-repeat, synthetic keydown loops, or
+    // a stuck input bit) re-enters wallrun the moment the timer
+    // expires — creating an indefinite upward cycle.
+    //
+    // Cooldown = STUNTS.wallrun.durationMs + 200ms grace. During the
+    // cooldown, rising-edge signals are ignored. Wallrun can only
+    // re-enter after the cooldown AND wallrunPressed has been false
+    // for at least one frame (rising edge of next press).
+    const wallrunOnCooldown = this.stunt === "none" &&
+      this.lastWallrunEndedAtMs > 0 &&
+      nowMs < this.lastWallrunEndedAtMs + STUNTS.wallrun.durationMs + 200;
+
+    // Wallrun: rising edge of Q while mid-air to attach for 1s. Takes
+    // priority over dive. Gated by cooldown to prevent auto-repeat
+    // re-entry (Kyle dev-box playtest, Discord 1537454310470717492).
+    const wallrunRisingEdge = input.wallrunPressed && !this.wasWallrunPressedLast;
+    this.wasWallrunPressedLast = input.wallrunPressed;
+
+    if (wallrunRisingEdge && !this.state.supported && !wallrunOnCooldown) {
       this.enterStunt("wallrun", nowMs + STUNTS.wallrun.durationMs);
+      this.lastWallrunEndedAtMs = 0; // clear on entry
       return;
     }
     // Dive: tap Shift while moving forward.
@@ -264,7 +325,13 @@ export class CharacterController {
     }
     // Time-based exits for non-held stunts.
     if (this.stunt !== "none" && this.stunt !== "slide" && nowMs >= this.stuntEndsAtMs) {
+      // PR 8.1: record the exit time so the wallrun cooldown can gate
+      // the next entry. Without this the auto-repeat loophole lets a
+      // continuous wallrunPressed re-enter wallrun the moment the timer
+      // expires.
+      const exitingStunt = this.stunt;
       this.exitStunt();
+      if (exitingStunt === "wallrun") this.lastWallrunEndedAtMs = nowMs;
     }
     // Released slide exits immediately.
     if (this.stunt === "slide" && !input.slideHeld) {
