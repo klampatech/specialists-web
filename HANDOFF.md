@@ -4,6 +4,46 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-13 (post-merge) — PR 9 MERGED. Both regressions fixed. Next: PR 10 (health/damage/respawn) or Phase 1 polish (wall-detection, Mixamo, mouse-look).
+
+**Status**: PR 9 (squash merge of PR 8 jump-regression + PR 8.1 wallrun-auto-repeat + the row-6 scope-clarification) MERGED to main at commit `2ed55a8`. All 6 CI jobs green on main. Worktree `~/Development/specialists-web-pr8/` no longer needed — safe to remove.
+
+**What this PR fixed**:
+1. **Jump regression** (PR 8): holding Space no longer flies the character up forever. Fixed by accumulating gravity in `CharacterController.update()` when `!state.supported`, tightening the jump condition to require `vy ≤ 0`, and passing `Vector3.ZeroReadOnly` to `havok.integrate()` so Havok doesn't double-apply gravity on landing frames.
+2. **Wallrun auto-repeat loophole** (PR 8.1): holding Q mid-air no longer flies the character up indefinitely. Fixed with rising-edge detection (`wasWallrunPressedLast` field) + post-wallrun cooldown (`lastWallrunEndedAtMs + durationMs + 200ms` grace).
+3. **Milestone 1 row 6 spec clarification** (commit `21132f7`): the row-6 acceptance phrasing "if airborne near a wall at angle" was aspirational — PR 3 actually shipped Q-mid-air as an animation-state-only thrust stunt with no wall collision check. The row is now reworded to match what shipped; real wall-detection is the Phase 1 follow-up.
+
+**Next session task** (PR 10 — health / damage / respawn, Milestone 2 row 9):
+- The PR 7 combat layer is still render-side log only — `dualPistolShoot` returns `damage: 12` and `meleeSwing` returns `damage: 25` in `CombatEvent`s, but nothing actually decrements a health pool. PR 10 owns the first real health pool, damage application, and the "0 → 1s respawn timer → back at spawn" row 9 acceptance.
+- The Health pool lives on the `CharacterController.state` (or a sibling struct). Damage application is per-client render-side (matching PR 7's render-side log pattern) — Phase 0 is peer-to-peer, no server to be authoritative. The lockstep carries damage intent on byte 2, both clients apply identically, and the visual is `remoteHealth -= damage`.
+- Respawn timer is also Phase 0 render-side: `if (localHealth <= 0) setLocalTimer(1000); if (timer > 0) ... respawn = teleportToSpawn() + resetHealth()`.
+
+**Other items in scope (pick any to work on next)**:
+- **Phase 1 polish items** (anytime, no PR-gate): real wall-detection for the Q-stunt via `PhysicsRaycast` (so the stunt only engages when near a wall), real Mixamo glTF character model (replaces procedural rig), first-person mouse-look. PR 3's HANDOFF documented all three as Phase 1 polish. Wall-detection is the most user-visible of the three and was the latest "not-intended?" surprise from Kyle's playtest — it's a small ~20-line change in `characterController.ts` + a new regression smoke.
+- **PR 7.4 cleanup**: remove the PR 7.3 debug instrumentation (`__lastMouseDown`, `__canvasDown`, `__topLevelMouseDown`, `[input] mousedown` console logs, the HUD debug `LMB:/RMB:/T:` lines). Per PR 7's HANDOFF entry: "Debug instrumentation gets removed in a follow-up PR (PR 7.4 cleanup) after Kyle confirms combat is solid in real play." Kyle has confirmed combat works post-merge — this is the time.
+
+**Out of scope** (don't pick up unless Kyle asks):
+- Phase 1: self-hosted coturn on Hetzner to replace `openrelay.metered.ca`.
+- Phase 1: real ggrs/wasm binding when one lands on npm.
+- Phase 1: Rust WebTransport server with `/create` + `/join` REST endpoints.
+
+**Blockers / open questions**:
+- **None for the merged work.** PR 9 is on main, all 6 CI jobs are green, both Kyle-confirmed regressions are fixed.
+- **For PR 10**: design decision on damage sync — the simplest answer is a new byte-2 wire format (damageDelta events applied identically on both clients from local `CombatEvent`s). Worth a small design session if the byte budget gets tight.
+- **For the wall-detection Phase 1 polish**: design decision on whether the wall-detect replaces the air-thrust entirely or coexists (e.g., wall-detect for `wallrun` stunt + a separate `boost` stunt for the air-thrust). Default = wall-detect replaces it (cleaner).
+
+**Playtest status** ✅
+- All gates green. Jump + wallrun + WASD + scene + combat + two-tab smoke all pass on main.
+- Dev box manual playtest confirmed by Kyle (Discord `1537452617633103903` + `1537454310470717492` + `1537468521523585073` + `1537481181828751411` + `1537496547443605577`): PR 8 jump fix ✅, PR 8.1 wallrun fix ✅, row-6 spec clarification accepted (wall-detection deferred to Phase 1).
+
+**About the first dev-box observation ("tapping and holding space produce the same jump behavior — no idle")**:
+
+This was **expected behavior**, not a regression. PR 8 fixed the jump to be a single clean impulse (tap or hold both fire exactly one jump). There's no hangtime at apex because vy = 5.2 → 0 → -5.2 over the arc — vy only momentarily hits 0 at peak, doesn't visibly float. Standard kinematic character-controller physics (Quake/Source/Unreal behave the same way).
+
+If a "hold to jump higher" or "jump-and-hang" mechanic is wanted later, that's a Phase 1 game-feel addition (jumpHoldBoost config + holding vy > 0 each frame until release). Noted for the next session in case it becomes a Phase 1 design conversation.
+
+---
+
 ## 2026-08-13 (post-playtest) — PR 8.1 follow-up: wallrun auto-repeat loophole fixed. Both regressions reported by Kyle addressed.
 
 **Status**: Phase 0 / Milestone 1 / PR 8.1 (wallrun rising-edge + post-wallrun cooldown guard) **code-complete + green locally + CI pending re-run**. Branch `feat/phase0-jump-regression` on commit `003ff4b` is the PR 8 base; this PR 8.1 work is added as a follow-up commit and will be force-pushed (or pushed as a fixup) once the local gates pass. All 3 local smokes green: typecheck + build + scene-smoke + jump-regression-smoke + **wallrun-regression-smoke** (NEW). The dev server at `http://100.95.111.112:5173/` is running so Kyle can playtest.
