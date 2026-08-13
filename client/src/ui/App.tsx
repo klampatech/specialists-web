@@ -52,12 +52,6 @@ interface HudState {
   localRespawningMs: number;
   /** PR 10: same for the REMOTE controller. */
   remoteRespawningMs: number;
-  /** PR 10.2 diagnostic: rig world positions + respawn count, sourced
-   *  from `scene.getCharacterTransform()` / `scene.getRemoteTransform()`
-   *  / `window.__respawnCount`. Empty strings when N/A. */
-  localPos: { x: string; z: string };
-  remotePos: { x: string; z: string };
-  respawnCount: number;
 }
 
 export function App() {
@@ -80,9 +74,6 @@ export function App() {
     remoteHp: 100,
     localRespawningMs: 0,
     remoteRespawningMs: 0,
-    localPos: { x: "0.00", z: "0.00" },
-    remotePos: { x: "0.00", z: "0.00" },
-    respawnCount: 0,
   });
 
   // Construct the WebRTC peer once per mount. The peer lives across scene
@@ -208,15 +199,6 @@ export function App() {
           // PR 10: pull the health snapshot so the HUD chip can render HP
           // + respawn countdown. Cheap read — just two field accesses.
           const health = session.getHealthSnapshot();
-          // PR 10.2 diagnostic: pull rig world positions from the scene
-          // so the HUD chip can confirm the respawn teleport actually moves
-          // the visual mesh to spawn. Cheap — just position.clone() reads.
-          const localT = handle.getCharacterTransform();
-          const remoteT = handle.getRemoteTransform?.();
-          // PR 10.2 diagnostic: window.__respawnCount is incremented inside
-          // CharacterController.respawn() (DEV-only). Falls back to current
-          // HUD value if window is unavailable.
-          const w = window as unknown as { __respawnCount?: number };
           setHud((h) => ({
             ...h,
             frame: session.frame,
@@ -230,11 +212,6 @@ export function App() {
             remoteHp: health.remote.hp,
             localRespawningMs: health.local.respawningMs,
             remoteRespawningMs: health.remote.respawningMs,
-            localPos: { x: localT.position.x.toFixed(2), z: localT.position.z.toFixed(2) },
-            remotePos: remoteT
-              ? { x: remoteT.position.x.toFixed(2), z: remoteT.position.z.toFixed(2) }
-              : h.remotePos,
-            respawnCount: w.__respawnCount ?? h.respawnCount,
           }));
         }, 100);
         // Stash the timer on the scene ref so unmount can clear it.
@@ -310,9 +287,6 @@ export function App() {
             remoteHp={hud.remoteHp}
             localRespawningMs={hud.localRespawningMs}
             remoteRespawningMs={hud.remoteRespawningMs}
-            localPos={hud.localPos}
-            remotePos={hud.remotePos}
-            respawnCount={hud.respawnCount}
           />
           <OverlayBanner bottom={16} size="0.7rem" opacity={0.35}>
             Phase 0 PR 10 — health & respawn (LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged

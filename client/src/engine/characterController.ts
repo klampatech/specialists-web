@@ -217,17 +217,6 @@ export class CharacterController {
    * (the next `update()` call will re-derive stunt state from input).
    */
   public respawn(_nowMs: number): void {
-    // PR 10.2 diagnostic (dev box playtest 2026-08-13): log position before
-    // teleport so we can verify the visual rig is actually moving to spawn
-    // and not being held in place by camera angle / Havok lag. Will be
-    // removed once Kyle confirms the teleport is visible in two-tab mode.
-    if (import.meta.env.DEV && typeof console !== "undefined") {
-      console.log("[respawn] before:", {
-        pos: { x: this.state.position.x.toFixed(2), y: this.state.position.y.toFixed(2), z: this.state.position.z.toFixed(2) },
-        target: { x: this.respawnPosition.x.toFixed(2), y: this.respawnPosition.y.toFixed(2), z: this.respawnPosition.z.toFixed(2) },
-        hp: this.state.hp,
-      });
-    }
     // PR 10.2: teleport to `respawnPosition`, not `startPosition`. The
     // remote (cyan) rig has a different `startPosition` (offset for initial
     // visual clarity) than `respawnPosition` (same as local rig, so the
@@ -248,24 +237,6 @@ export class CharacterController {
     this.havok.dynamicFriction = this.baseDynamicFriction;
     this.havok.staticFriction = 0;
     this.lastPlanarSpeed = 0;
-    // PR 10.2 diagnostic: also publish to window so we can verify the
-    // visual mesh root is in the right place. window.__respawnCount gives
-    // a quick count; window.__lastRespawn gives the last (controller-label,
-    // time, target-pos) tuple.
-    if (import.meta.env.DEV && typeof window !== "undefined") {
-      const w = window as unknown as { __respawnCount?: number; __lastRespawn?: { label: string; t: number; target: { x: number; y: number; z: number } } };
-      w.__respawnCount = (w.__respawnCount ?? 0) + 1;
-      // Try to figure out if we're local or remote by checking the visualRoot's name.
-      const label = this.visualRoot?.name?.startsWith("remote") ? "remote" : "local";
-      w.__lastRespawn = { label, t: performance.now(), target: { x: this.respawnPosition.x, y: this.respawnPosition.y, z: this.respawnPosition.z } };
-      console.log("[respawn] after:", {
-        pos: { x: this.state.position.x.toFixed(2), y: this.state.position.y.toFixed(2), z: this.state.position.z.toFixed(2) },
-        havokPos: { x: this.havok.getPosition().x.toFixed(2), y: this.havok.getPosition().y.toFixed(2), z: this.havok.getPosition().z.toFixed(2) },
-        visualRootPos: this.visualRoot ? { x: this.visualRoot.position.x.toFixed(2), y: this.visualRoot.position.y.toFixed(2), z: this.visualRoot.position.z.toFixed(2) } : null,
-        label,
-        count: w.__respawnCount,
-      });
-    }
   }
 
   /** Set the yaw the character should face (radians, 0 = +Z forward). */

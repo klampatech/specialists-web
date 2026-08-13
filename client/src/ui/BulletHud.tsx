@@ -30,13 +30,6 @@ interface BulletHudProps {
   localRespawningMs: number;
   /** PR 10: same for the REMOTE controller. */
   remoteRespawningMs: number;
-  /** PR 10.2 diagnostic: remote rig's world position (x, z) so we can
-   *  confirm the visual mesh actually teleports to spawn on respawn. */
-  remotePos: { x: string; z: string };
-  /** PR 10.2 diagnostic: local rig's world position (x, z) for context. */
-  localPos: { x: string; z: string };
-  /** PR 10.2 diagnostic: respawn count (window.__respawnCount). 0 if N/A. */
-  respawnCount: number;
 }
 
 function statusLabel(s: BulletHudProps["connectionStatus"]): string {
@@ -57,7 +50,7 @@ function statusLabel(s: BulletHudProps["connectionStatus"]): string {
  * file MUST keep `pointerEvents: "none"` (or `pointerEvents: "auto"` only on
  * the buttons it contains — but right now there are no buttons in the HUD).
  */
-export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, fireHeld, meleePressed, bulletTime, localHp, remoteHp, localRespawningMs, remoteRespawningMs, remotePos, localPos, respawnCount }: BulletHudProps) {
+export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, fireHeld, meleePressed, bulletTime, localHp, remoteHp, localRespawningMs, remoteRespawningMs }: BulletHudProps) {
   return (
     <div
       data-testid="bullet-hud"
@@ -92,20 +85,6 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
       </div>
       <div data-testid="bullet-hud-hp-remote" style={{ opacity: 0.95 }}>
         HP them: {remoteHp}{remoteRespawningMs > 0 ? ` (respawn ${remoteRespawningMs}ms)` : ""}
-      </div>
-      {/* PR 10.2 diagnostic: rig world positions so we can visually
-          confirm the respawn teleport actually moves the cyan rig back
-          to (2.5, 0, 0). localPos is the red rig (chase-cam target),
-          remotePos is the cyan rig. respawnCount is the lifetime count
-          of `controller.respawn()` calls (local + remote combined). */}
-      <div data-testid="bullet-hud-pos-local" style={{ opacity: 0.7 }}>
-        me pos: ({localPos.x}, {localPos.z})
-      </div>
-      <div data-testid="bullet-hud-pos-remote" style={{ opacity: 0.7 }}>
-        them pos: ({remotePos.x}, {remotePos.z})
-      </div>
-      <div data-testid="bullet-hud-respawn-count" style={{ opacity: 0.7 }}>
-        respawns: {respawnCount}
       </div>
       {/* PR 7.2 DEBUG BLOCK: shows live input listener state so we can
           confirm whether the mouse/keyboard handlers are firing at all.
