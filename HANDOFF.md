@@ -6,7 +6,7 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ## 2026-08-13 — PR 8 READY for review. Jump regression FIXED. Next: PR 7.4 cleanup or PR 9 (health/damage).
 
-**Status**: Phase 0 / Milestone 1 / PR 8 (jump regression: gravity accumulation in `CharacterController.update()` + tightened jump condition to require `vy ≤ 0`) **READY for review**, branch `feat/phase0-jump-regression` pushed, PR opened at https://github.com/klampatech/specialists-web/pull/9. All 3 local gates green (typecheck + build + scene-smoke + jump-regression-smoke). **CI status unknown until the first run completes.**
+**Status**: Phase 0 / Milestone 1 / PR 8 (jump regression: gravity accumulation in `CharacterController.update()` + tightened jump condition to require `vy ≤ 0`) **READY for review — ALL 5 CI JOBS GREEN**, branch `feat/phase0-jump-regression` pushed, PR opened at https://github.com/klampatech/specialists-web/pull/9. Local gates green (typecheck + build + scene-smoke + jump-regression-smoke). CI run: https://github.com/klampatech/specialists-web/actions/runs/31703813029 (5/5 SUCCESS).
 
 **This entry supersedes nothing** — it's the first entry after PR 7.3 / PR 7 / PR 7.2 (combat hotfixes). PR 8 is a clean-slate regression fix.
 
@@ -27,7 +27,7 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - ✓ `npm run build` — exit 0, bundle 7,046.23 kB / 1,579.59 kB gzip (≈ +0.5 kB raw / +0.5 kB gzip vs PR 7 — the diagnostic instrumentation was removed before commit; the only diff is the `__jumpProbe` accessor + the new `vite-env.d.ts`)
 - ✓ `node ./tools/scene-smoke.mjs` — exit 0, scene renders + WASD walks as in PR 7
 - ✓ `node ./tools/jump-regression-smoke.mjs` — exit 0, sample trajectory: y: 0.9 → 2.92 (peak at t=677ms) → 2.57 → 1.77 → 1.07 → 1.04 → 1.04 (lands cleanly, no fly-up-forever)
-- ✗ CI status — **NOT YET VERIFIED.** Branch is pushed and PR is opened; CI status is fetched on first poll. The local gates match the expected CI gates (the jump-smoke job mirrors the local `node ./tools/jump-regression-smoke.mjs` invocation one-for-one with the same vite dev-server boot pattern, so a green local run is the best predictor).
+- ✓ CI run https://github.com/klampatech/specialists-web/actions/runs/31703813029 — 5/5 SUCCESS (typecheck+build, scene-smoke, two-tab-smoke, **jump-regression-smoke (NEW)**, spec-canonical). PR is ready for Kyle's review + merge.
 
 **Status (be honest)**:
 - Branch `feat/phase0-jump-regression` exists in worktree `~/Development/specialists-web-pr8/` (a git worktree of the main repo, off `main` @ `50ee9f2`). Commit `4e86778`.
