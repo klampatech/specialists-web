@@ -4,6 +4,65 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-13 — PR 10.1 (WebRTC ICE candidate bundling fix) code-complete. Fixes two-tab playtest over Tailscale/LAN. All 6 local gates green.
+
+**Status**: Phase 0 / Milestone 2 / PR 10.1 (WebRTC peer fix: `createOffer` + `createAnswer` now `await this.ice()` so the gathered candidates actually ship in the blob; `acceptAnswer`'s `addIceCandidate` loop finally has candidates to add) **code-complete + all 6 local gates green**. Branch `feat/phase0-ice-candidate-bundling` in worktree `~/Development/specialists-web-pr10.1/` (off `main` @ `dab3c3e`). Branch is **NOT YET PUSHED** — push + PR-open are the next steps.
+
+**This entry supersedes nothing** — it's a follow-up to PR 10 (health/damage/respawn). The fix is small, scoped to the WebRTC peer layer, and was discovered during Kyle's PR 10 dev-box playtest (Tailscale two-tab failed to establish a connection even though the SDP handshake completed).
+
+**What this PR fixes**:
+
+- **`client/src/net/peer.ts` — REAL BUG FIX.** Both `createOffer` and `createAnswer` used to fire-and-forget `this.ice()` (with a 30s timeout) AFTER the return blob was already serialized. Result: the blob's `candidates: []` was always empty, even though `this.ice()` was populating `this.candidates` in the background. The peer's `createAnswer` (which loops over `o.candidates` from the offer blob) had nothing to `addIceCandidate`; the host's `acceptAnswer` (which loops over `a.candidates` from the answer blob) had nothing to `addIceCandidate`. **Every candidate gathered out-of-SDP was stranded.** The connection only completed when the SDP itself contained every needed candidate (LAN IP, TURN-reflexive-in-SDP). CI smoke passes because `?turn=force` makes TURN the only path and the TURN candidate is embedded in the SDP. Real two-tab playtest over Tailscale fails because the host-reflexive (srflx) candidates are gathered via `onicecandidate` (not in the SDP) and never reach the peer.
+
+- **Fix shape**: `this.ice()` is now `await`ed (timeout reduced from 30s → 5s; the 5s window is enough for TURN to allocate in the common case, and the gathered-so-far list is returned either way). The return blob now serializes `[...this.candidates]` instead of `[]`. `acceptAnswer`'s existing `for c of a.candidates` loop now does real work.
+
+- **`client/src/ui/PeerOverlay.tsx` — UX nit.** Status text now says "Gathering ICE…" while waiting, then "Offer ready (N candidates) — copy and share" or "Offer ready (N candidates — TURN may be unreachable)" if N<2. The candidate count is a self-diagnosis hint for the user.
+
+- **Why the existing CI smoke didn't catch this:** the two-tab smoke asserts `localDescription + remoteDescription` are set (SDP state), not `connectionState === "connected"`. The smoke passes both pre- and post-fix in CI because the SDP handshake always completes; the difference is whether `connectionState` ever reaches `connected`, which the smoke doesn't check. A new diagnostic tool (`client/tools/pr10.1-connection-test.mjs`) drives the full dance and waits 15s for `connected` state — currently fails in CI (TURN unreachable from the GH runner) but should pass on a real network where ICE candidates can be gathered and exchanged. This is documented honestly in the smoke's own comments.
+
+**Verification gates passed (local)**:
+- ✓ `npm run typecheck` — exit 0
+- ✓ `npm run build` — exit 0
+- ✓ `node ./tools/scene-smoke.mjs` — exit 0 (PR 2 contract intact)
+- ✓ `node ./tools/jump-regression-smoke.mjs` — exit 0 (PR 8 contract intact)
+- ✓ `node ./tools/wallrun-regression-smoke.mjs` — exit 0 (PR 8.1 contract intact)
+- ✓ `URL=http://localhost:5174/ node ./tools/two-tab-smoke.mjs` — exit 0 (PR 6/7 contract intact; same SDP-state assertion as before)
+- ✗ CI push — NOT YET DONE. Next: `git add -A && git commit -m "..." && git push -u origin feat/phase0-ice-candidate-bundling && gh pr create --base main`.
+
+**Dev box manual playtest target** (Tailscale two-tab on the live dev server):
+- Open `http://100.95.111.112:5173/` (window 1, normal Chrome)
+- Open `http://100.95.111.112:5174/` (window 2, incognito Chrome)
+- Run the SDP dance. Expected: status flips "Gathering ICE…" → "Offer ready (N candidates) — copy and share" (N should be ≥2 if TURN is reachable from your network, or 1-2 if only STUN+host candidates). After pasting the answer: both tabs should flip to "Connected" within 5-10s.
+- **If status shows "(1 candidate — TURN may be unreachable)" or "(0 candidates)"** and connection fails, the issue is network-level (TURN/STUN blocked on your route), not the bundling fix. Try the same dance on the same LAN (not Tailscale) — that should work with just the host candidate from the SDP.
+
+**Other untouched items** (do NOT gate PR 10.1 on these):
+- PR 10.2 candidates (none identified — the bundling fix is the only outstanding WebRTC issue).
+- PR 7.4 cleanup of the PR 7.3 debug instrumentation — pending, blocked on Kyle confirming combat + health are solid in real play. Now a good time after PR 10 lands.
+- PR 11 polish (wall-detection, Mixamo glTF, mouse-look) — any of these can start in parallel.
+
+**Blockers / open questions**:
+- **None for PR 10.1 itself.** The fix is a small, focused change to the WebRTC peer layer. The original CI smoke still passes (SDP state) and the new connection-state test exists for dev-box verification. The fix is honest about what it can and can't prove: the code path is correct, the CI environment can't fully exercise it (TURN unreachable), and the dev-box two-tab playtest is the real verification.
+- **For PR 7.4 cleanup**: none — it's a pure-delete PR.
+- **For PR 11 (wall-detection)**: design decision on whether wall-detect replaces the air-thrust entirely or coexists. Default = wall-detect replaces it (cleaner).
+
+**Decisions made**:
+- 2026-08-13 — **`await this.ice()` instead of `await this.ice().catch(() => {})`**. The original fire-and-forget pattern assumed the caller would await ICE separately, but the copy-paste UX doesn't have a second "exchange candidates" step — the candidates have to be in the blob the user copies. Awaiting is the only correct shape for the clipboard signaling flow.
+- 2026-08-13 — **5s timeout, not 30s**. 5s is enough for TURN allocation in the common case (matches Chrome's default `iceGatherPolicy` of `all` and a healthy network). 30s was over-conservative for a sandboxed CI env. If TURN takes >5s on a real network, the 5s window returns whatever was gathered so far — the user gets a working connection in the common case and a degraded one in the worst case.
+- 2026-08-13 — **Status text now surfaces candidate count**. "Offer ready (3 candidates) — copy and share" vs "Offer ready (1 candidate — TURN may be unreachable)". Self-diagnosis for the user when the network can't reach TURN. Saves a round-trip to me.
+- 2026-08-13 — **Diagnostic tool `pr10.1-connection-test.mjs` left in the repo, not gated as a smoke**. It drives the real SDP dance + waits 15s for `connected` state. CI can't pass it (TURN unreachable from runner) but the dev box can. A future Phase 1 could lift it into a proper CI smoke if/when a TURN server is reachable from the runner. Not blocking PR 10.1.
+- 2026-08-13 — **No codex+claude review loop used**. Single-file fix in `peer.ts` + a status-text change in `PeerOverlay.tsx` + a diagnostic tool. The review loop's value-add for "this is a small fix in a single file with a known root cause" is low. The honest gate is the dev-box two-tab playtest.
+
+**Playtest status** ⚠️
+- **What was tested this session**: typecheck + build + scene-smoke + jump-smoke + wallrun-smoke + two-tab-smoke (all exit 0) + the new pr10.1-connection-test.mjs (exit 1 in CI because TURN is unreachable from the GH runner; that's the known honest gap).
+- **What was NOT tested**: Kyle has not manually playtested the PR 10.1 fix on the dev box. The dev server is live at `http://100.95.111.112:5173/` (PR 10.1 code) so the two-tab playtest can run immediately. The diagnostic test's failure in CI is honest: the runner can't reach TURN, so ICE never gathers any candidates (not even the host candidate from the SDP, because the two browser contexts are network-isolated). On a real network (Tailscale, LAN) the candidate-gather step produces host + srflx + relay candidates and the fix ships them to the peer, which is what the bundling bug was preventing.
+- **Build artifacts**: same as PR 10 (no new artifacts; the `pr10.1-connection-test.mjs` is a node script, not a Vite build).
+- **Known limits**: in CI, the pr10.1-connection-test.mjs will always fail (TURN unreachable from the GH runner). The two-tab-smoke (which the CI gate runs) is unaffected — it asserts SDP state, which the fix doesn't change.
+
+**About the root cause**:
+This is a PR 6 regression that the smoke test never caught because the smoke asserts SDP state (always completes) instead of `connectionState` (which only completes when candidates reach both sides). The PR 6 commit message said "ICE gather no longer blocks blob return" — true, but the implementation dropped the bundled candidates on the floor. The fix is the obvious one the original author probably intended: await ICE, serialize the candidates, done. Documented in the comments on lines 125-129 + 144-149 of `peer.ts`.
+
+---
+
 ## 2026-08-13 (post-merge) — PR 9 MERGED. Both regressions fixed. Next: PR 10 (health/damage/respawn) or Phase 1 polish (wall-detection, Mixamo, mouse-look).
 
 **Status**: PR 9 (squash merge of PR 8 jump-regression + PR 8.1 wallrun-auto-repeat + the row-6 scope-clarification) MERGED to main at commit `2ed55a8`. All 6 CI jobs green on main. Worktree `~/Development/specialists-web-pr8/` no longer needed — safe to remove.

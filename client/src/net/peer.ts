@@ -91,16 +91,30 @@ export class WebRTCPeer {
     this.attach(this.connection.createDataChannel("state", { ordered: false, maxRetransmits: 0 }));
   }
 
-  private async ice(): Promise<void> {
-    if (this.connection.iceGatheringState === "complete") return;
-    // TURN relay allocation can take up to ~15s in some sandboxed environments.
-    // Increase timeout from 5s to 30s to account for TURN server response time.
-    await new Promise<void>((r) => {
-      const t = window.setTimeout(r, 30000);
+  /**
+   * Wait for ICE gathering to settle (or until `timeoutMs` elapses, whichever
+   * comes first). Pushes every gathered candidate into `this.candidates` via
+   * the `onicecandidate` handler, so callers can serialize the array into
+   * the next offer/answer blob. Returns the number of candidates gathered
+   * — callers can use this for telemetry / status messages.
+   *
+   * **Why the timeout matters**: TURN allocation can take 5-15s in some
+   * networks; we want the caller's `await` to return even if gathering
+   * is still in progress, so they get the candidates gathered so far and
+   * can proceed with the copy-paste dance. Candidates that arrive AFTER
+   * the timeout are dropped (the user would have to do a second paste
+   * — see PeerOverlay's "Gathering ICE…" status).
+   */
+  private async ice(timeoutMs = 5000): Promise<number> {
+    if (this.connection.iceGatheringState === "complete") return this.candidates.length;
+    return new Promise<number>((resolve) => {
+      const t = window.setTimeout(() => {
+        resolve(this.candidates.length);
+      }, timeoutMs);
       this.connection.onicegatheringstatechange = () => {
         if (this.connection.iceGatheringState === "complete") {
-          clearTimeout(t);
-          r();
+          window.clearTimeout(t);
+          resolve(this.candidates.length);
         }
       };
     });
@@ -111,11 +125,16 @@ export class WebRTCPeer {
     this.channelsForHost();
     await this.connection.setLocalDescription(await this.connection.createOffer());
     console.log("[peer] setLocalDescription done, state=", this.connection.connectionState);
-    // Fire-and-forget ICE gather. The blob is returned immediately so the
-    // clipboard signaling can begin; the caller can await ice() separately
-    // if they need candidates bundled (not needed for clipboard flow).
-    this.ice().catch(() => {});
-    return { type: "offer", sdp: this.connection.localDescription!, candidates: [] };
+    // PR 10.1: await ICE gathering (up to 5s) so the bundled candidates get
+    // serialized into the offer blob. Without this, the peer's
+    // `createAnswer` has no candidates to addIceCandidate — the host's
+    // host-reflexive (srflx) candidates get stranded in `this.candidates`
+    // and the connection only completes when the SDP itself contains
+    // every needed candidate (LAN, TURN-reflexive-in-SDP). Real two-tab
+    // playtest over Tailscale or non-TURN-reachable networks fails.
+    const gathered = await this.ice();
+    console.log("[peer] createOffer: gathered", gathered, "candidates");
+    return { type: "offer", sdp: this.connection.localDescription!, candidates: [...this.candidates] };
   }
 
   async createAnswer(o: ClipboardPayload): Promise<ClipboardPayload> {
@@ -125,9 +144,12 @@ export class WebRTCPeer {
     for (const c of o.candidates) await this.connection.addIceCandidate(c);
     await this.connection.setLocalDescription(await this.connection.createAnswer());
     console.log("[peer] setLocalDescription done (answer), state=", this.connection.connectionState);
-    // Fire-and-forget ICE gather — blob returned immediately.
-    this.ice().catch(() => {});
-    return { type: "answer", sdp: this.connection.localDescription!, candidates: [] };
+    // PR 10.1: same fix as createOffer — await ICE gathering so the
+    // bundled candidates ship in the answer blob. `acceptAnswer` on the
+    // host reads them and addIceCandidate's them on the host's connection.
+    const gathered = await this.ice();
+    console.log("[peer] createAnswer: gathered", gathered, "candidates");
+    return { type: "answer", sdp: this.connection.localDescription!, candidates: [...this.candidates] };
   }
 
   async acceptAnswer(a: ClipboardPayload): Promise<void> {
