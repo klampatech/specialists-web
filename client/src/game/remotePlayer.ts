@@ -59,11 +59,18 @@ export interface RemotePlayer {
  * side in the scene. The capsule is teal instead of red so the player can tell
  * the two apart. No `PhysicsAggregate` is created — the controller alone is
  * the collision body; the mesh follows.
+ *
+ * PR 10.2: `spawnPosition` is the initial placement (offset for visual
+ * clarity). `respawnPosition` defaults to `spawnPosition` when omitted.
+ * The game session passes `respawnPosition = localSpawn` so the cyan rig
+ * respawns to the same point as the red rig (i.e. where the actual remote
+ * player's red rig will be, not where the cyan rig started).
  */
 export function createRemotePlayer(
   scene: Scene,
   name: string,
   spawnPosition: Vector3,
+  respawnPosition?: Vector3,
 ): RemotePlayer {
   const root = new TransformNode(`${name}_root`, scene);
 
@@ -145,6 +152,9 @@ export function createRemotePlayer(
 
   const controller: CharacterController = createCharacterController(scene, {
     startPosition: spawnPosition.clone(),
+    // PR 10.2: pass the optional respawnPosition through to the controller.
+    // Defaults to startPosition when omitted (preserves existing behavior).
+    respawnPosition: respawnPosition?.clone(),
     visualRoot: root,
   });
 

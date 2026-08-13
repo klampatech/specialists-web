@@ -165,7 +165,10 @@ export function createGameSession(
   const applyLocalPose = attachPoseUpdater(localModel, localController);
 
   // ---- Remote rig + controller ------------------------------------------------
-  const remote = createRemotePlayer(scene, "remote", remoteSpawn);
+  // PR 10.2: the remote rig spawns at an offset (visual clarity when no peer
+  // is connected yet), but respawns to `localSpawn` (so the cyan rig mirrors
+  // the actual remote player's red rig, not the offset initial position).
+  const remote = createRemotePlayer(scene, "remote", remoteSpawn, localSpawn);
   const remoteController = remote.controller;
   const applyRemotePose = attachPoseUpdater(remote.model, remoteController);
 

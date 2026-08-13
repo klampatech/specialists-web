@@ -70,6 +70,15 @@ export interface CharacterControllerOptions {
   startPosition?: Vector3;
   /** Visual root the controller drives — receives the same transform each frame. */
   visualRoot?: TransformNode;
+  /**
+   * PR 10.2: where the controller teleports back to on `respawn()`.
+   * Defaults to `startPosition` when omitted. The remote (cyan) rig
+   * wants to start at an offset position for visual clarity but respawn
+   * to the SAME point as the local rig (so the cyan rig mirrors where
+   * the actual remote player's red rig is, not where the cyan rig
+   * happened to be when the local tab loaded).
+   */
+  respawnPosition?: Vector3;
 }
 
 /** Default gravity direction used by `checkSupport` (must match world gravity). */
@@ -113,7 +122,7 @@ export function createCharacterController(
   havok.dynamicFriction = BASE_DYNAMIC_FRICTION;
   havok.up = new Vector3(0, 1, 0);
 
-  return new CharacterController(havok, options.visualRoot, startPosition);
+  return new CharacterController(havok, options.visualRoot, startPosition, options.respawnPosition);
 }
 
 /** Public wrapper — owns the Havok controller + stunt state machine. */
@@ -121,8 +130,14 @@ export class CharacterController {
   readonly havok: PhysicsCharacterController;
   readonly state: CharacterState;
   private readonly visualRoot: TransformNode | undefined;
-  /** PR 10: spawn point the controller teleports back to on respawn. */
+  /** PR 10: spawn point the controller starts at. */
   public readonly startPosition: Vector3;
+  /** PR 10.2: where the controller teleports to on `respawn()`.
+   *  Defaults to `startPosition` if not provided at construction.
+   *  Set separately so the remote (cyan) rig can start at an offset
+   *  for visual clarity but respawn to the same point as the local
+   *  rig (so the cyan rig mirrors the actual remote player's position). */
+  public readonly respawnPosition: Vector3;
   private readonly up: Vector3 = new Vector3(0, 1, 0);
   private readonly baseDynamicFriction: number = BASE_DYNAMIC_FRICTION;
   private yawRadians: number = 0;
@@ -147,10 +162,14 @@ export class CharacterController {
     havok: PhysicsCharacterController,
     visualRoot: TransformNode | undefined,
     startPosition: Vector3,
+    respawnPosition?: Vector3,
   ) {
     this.havok = havok;
     this.visualRoot = visualRoot;
     this.startPosition = startPosition.clone();
+    // PR 10.2: respawnPosition defaults to startPosition when omitted
+    // (preserves PR 10's existing behavior for callers that don't care).
+    this.respawnPosition = (respawnPosition ?? startPosition).clone();
     this.state = {
       position: startPosition.clone(),
       rotation: Quaternion.Identity(),
@@ -205,13 +224,17 @@ export class CharacterController {
     if (import.meta.env.DEV && typeof console !== "undefined") {
       console.log("[respawn] before:", {
         pos: { x: this.state.position.x.toFixed(2), y: this.state.position.y.toFixed(2), z: this.state.position.z.toFixed(2) },
-        target: { x: this.startPosition.x.toFixed(2), y: this.startPosition.y.toFixed(2), z: this.startPosition.z.toFixed(2) },
+        target: { x: this.respawnPosition.x.toFixed(2), y: this.respawnPosition.y.toFixed(2), z: this.respawnPosition.z.toFixed(2) },
         hp: this.state.hp,
       });
     }
-    this.havok.setPosition(this.startPosition.clone());
+    // PR 10.2: teleport to `respawnPosition`, not `startPosition`. The
+    // remote (cyan) rig has a different `startPosition` (offset for initial
+    // visual clarity) than `respawnPosition` (same as local rig, so the
+    // cyan rig mirrors the actual remote player's spawn point).
+    this.havok.setPosition(this.respawnPosition.clone());
     this.havok.setVelocity(Vector3.Zero());
-    this.state.position.copyFrom(this.startPosition);
+    this.state.position.copyFrom(this.respawnPosition);
     this.state.hp = HEALTH.maxHp;
     this.state.respawningUntilMs = 0;
     this.stunt = "none";
@@ -234,7 +257,7 @@ export class CharacterController {
       w.__respawnCount = (w.__respawnCount ?? 0) + 1;
       // Try to figure out if we're local or remote by checking the visualRoot's name.
       const label = this.visualRoot?.name?.startsWith("remote") ? "remote" : "local";
-      w.__lastRespawn = { label, t: performance.now(), target: { x: this.startPosition.x, y: this.startPosition.y, z: this.startPosition.z } };
+      w.__lastRespawn = { label, t: performance.now(), target: { x: this.respawnPosition.x, y: this.respawnPosition.y, z: this.respawnPosition.z } };
       console.log("[respawn] after:", {
         pos: { x: this.state.position.x.toFixed(2), y: this.state.position.y.toFixed(2), z: this.state.position.z.toFixed(2) },
         havokPos: { x: this.havok.getPosition().x.toFixed(2), y: this.havok.getPosition().y.toFixed(2), z: this.havok.getPosition().z.toFixed(2) },
