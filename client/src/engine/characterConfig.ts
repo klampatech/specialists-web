@@ -87,7 +87,7 @@ export const SPAWN_POSITION = new Vector3(0, CAPSULE.height / 2, 0);
 
 /** World gravity (m/s²) — also exposed for the Havok plugin. */
 export const WORLD_GRAVITY = MOVEMENT.gravity.clone();
-
-/** PR 4 reserved combat/session constants; semantics land in PR 5. */
-export const COMBAT = { fireCooldownMs: 120, meleeRangeMeters: 1.5, bulletTimeScale: 0.25 } as const;
-export const BULLET_TIME = { scale: 0.25, energyMax: 100, energyDrainPerSec: 33, energyRechargePerSec: 20 } as const;
+// PR 7: combat tunables now live in `client/src/game/combat.ts` as the single
+// structured source. The flat `COMBAT` / `BULLET_TIME` placeholders that
+// landed in PR 4 are removed — nothing read them, and they shadowed the
+// structured tunables in combat.ts.

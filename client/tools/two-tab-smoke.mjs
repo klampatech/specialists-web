@@ -153,6 +153,40 @@ if (!bInfo.hasLocalDesc) {
 }
 console.log("Both peers have SDP set — WebRTC handshake verified.");
 
+// ── PR 7: Fire dual-pistol (LMB) in Tab A, assert hits counter ticks ─────────
+// After the WebRTC handshake is verified, drive the new combat semantics:
+// click and hold LMB on Tab A's canvas for 200ms, release, wait, and verify
+// both tabs' HUD chip has a `hits:` line with count >= 1 in at least one tab.
+// The render loop has to actually advance to register a hit event.
+//
+// IMPORTANT: Playwright's mouse.down() with no coordinates reuses the LAST
+// clicked element, which would be the WebRTC Create button from the
+// handshake. To actually click the canvas we have to explicitly move the
+// mouse to a canvas-relative coordinate first.
+const canvasBoxA = await tabA.locator("canvas").first().boundingBox();
+if (!canvasBoxA) throw new Error("Tab A canvas not found");
+const canvasCenterX = canvasBoxA.x + canvasBoxA.width / 2;
+const canvasCenterY = canvasBoxA.y + canvasBoxA.height / 2;
+await tabA.mouse.move(canvasCenterX, canvasCenterY);
+await new Promise((r) => setTimeout(r, 50));
+await tabA.mouse.down({ button: "left" });
+await new Promise((r) => setTimeout(r, 200));
+await tabA.mouse.up({ button: "left" });
+await new Promise((r) => setTimeout(r, 500));
+
+const aHudAfterFire = (await tabA.locator('[data-testid="bullet-hud"]').textContent() ?? "").replace(/\s+/g, " ").trim();
+const bHudAfterFire = (await tabB.locator('[data-testid="bullet-hud"]').textContent() ?? "").replace(/\s+/g, " ").trim();
+console.log(`Tab A HUD after fire: ${aHudAfterFire}`);
+console.log(`Tab B HUD after fire: ${bHudAfterFire}`);
+
+const aHits = parseInt(/hits:\s*(\d+)/.exec(aHudAfterFire)?.[1] ?? "0", 10);
+const bHits = parseInt(/hits:\s*(\d+)/.exec(bHudAfterFire)?.[1] ?? "0", 10);
+if (aHits < 1 && bHits < 1) {
+  console.log(`[FAIL] PR 7 hits counter not advancing: A=${aHits} B=${bHits}`);
+  await browserA.close(); await browserB.close(); process.exit(1);
+}
+console.log(`PR 7 hits counter advanced: A=${aHits} B=${bHits}`);
+
 // ── Drive character in Tab A; assert frame counter ticks in both ─────────────
 await tabA.locator("canvas").first().focus();
 await tabA.keyboard.down("w");
@@ -181,7 +215,7 @@ console.log("Screenshots: two-tab-smoke.png, two-tab-smoke-connected.png");
 if (aFrame < 5) { console.log(`[FAIL] Tab A frame too low: ${aFrame}`); await browserA.close(); await browserB.close(); process.exit(1); }
 if (bFrame < 5) { console.log(`[FAIL] Tab B frame too low: ${bFrame}`); await browserA.close(); await browserB.close(); process.exit(1); }
 
-console.log(`OK — smoke PASSED (A frame=${aFrame} B frame=${bFrame})`);
+console.log(`OK — smoke PASSED (A frame=${aFrame} B frame=${bFrame}, A hits=${aHits} B hits=${bHits})`);
 await browserA.close();
 await browserB.close();
 process.exit(0);

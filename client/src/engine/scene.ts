@@ -59,6 +59,7 @@ import {
 import { CAPSULE, WORLD_GRAVITY } from "./characterConfig";
 import { createInputListener, type InputListener } from "./inputListener";
 import { createGameSession, type GameSession } from "../game/gameSession";
+import { renderTracer } from "../game/combat";
 import type { GgnetTransport } from "../net/ggnet";
 
 /** Optional multiplayer kick — when present, createScene also runs a second
@@ -89,6 +90,8 @@ export interface SceneHandle {
   resetCharacter: () => void;
   /** The GameSession, if multiplayer was enabled. */
   getGameSession?: () => GameSession | null;
+  /** Snapshot of the most recent LOCAL InputState — used by the HUD bullet-time chip. */
+  getInputState?: () => InputState | null;
 }
 
 /** Try WebGPU first; fall back to WebGL2 if anything throws during init. */
@@ -285,13 +288,18 @@ export async function createScene(
   const chase: ChaseCameraHandle = createChaseCamera(scene, character, canvas);
 
   // ---- Input listener ------------------------------------------------------
+  // PR 7: keep a closure ref to the most recent InputState so the HUD's
+  // bullet-time chip can poll `input.bulletTimeHeld` via the SceneHandle.
+  let latestInput: InputState | null = null;
   const input: InputListener = createInputListener({
     onFrame: (_state) => {
       // The character controller reads input via `read()`; this hook is
       // available for future per-frame UI updates.
     },
     onCameraToggle: () => chase.toggle(),
-  });
+  }, canvas);  // PR 7.3: bind mouse handlers directly to the canvas so clicks
+               // always reach the listener regardless of Babylon's attachControl
+               // pointer-capture behavior.
 
   // ---- Render loop ---------------------------------------------------------
   let lastTimestamp = performance.now();
@@ -300,10 +308,21 @@ export async function createScene(
     const deltaSeconds = Math.max(0.0001, Math.min(0.1, (now - lastTimestamp) / 1000));
     lastTimestamp = now;
     const state: InputState = input.read();
+    latestInput = state;
     if (gameSession) {
       // Multiplayer path: the session drives both controllers, applies the
       // stunt pose, and pushes the visual transforms into each rig's root.
       gameSession.tick(state, deltaSeconds, now);
+      // PR 7: render tracers for any fire_hit / fire_miss events that were
+      // generated since the last frame. consumeUnrenderedCombatEvents()
+      // advances the internal cursor so we never draw a tracer twice.
+      const newCombatEvents = gameSession.consumeUnrenderedCombatEvents();
+      for (const ev of newCombatEvents) {
+        if (ev.kind === "fire_hit" || ev.kind === "fire_miss") {
+          renderTracer(scene, ev.tracerFrom, ev.tracerTo);
+        }
+        // melee_hit is a HUD-only event for PR 7; no tracer, no mesh.
+      }
     } else {
       // Single-player path (PR 3 behaviour).
       character.update(state, deltaSeconds, now);
@@ -346,6 +365,9 @@ export async function createScene(
         rotation: ctrl.state.rotation.clone(),
       };
     };
+    handle.getInputState = () => latestInput;
+  } else {
+    handle.getInputState = () => latestInput;
   }
 
   return handle;

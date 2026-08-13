@@ -4,6 +4,190 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-12 (late, post-playtest) — PR 7.3 FIX: inputListener wasn't firing for canvas clicks; debug HUD added
+
+**Status**: After the PR 7.1 hotfix (BulletHud pointer-events), LMB/RMB still didn't fire on the dev box. Root cause: the inputListener's mouse handlers (`mousedown`/`mouseup`) never fired when the user clicked on the canvas. Two real fixes + one smoke fix + temporary debug instrumentation.
+
+**Root cause**:
+1. The inputListener attached `mousedown`/`mouseup` listeners to `window` + `document` only. Modern browsers (and Playwright's synthetic events) sometimes only dispatch `pointerdown`/`pointerup`, not `mousedown`/`mouseup`. Safari on macOS has known quirks here.
+2. The smoke was passing for the wrong reason. `tabA.mouse.down({button: "left"})` (no coordinates) reuses the LAST clicked element's event path, which was the WebRTC Create button from the handshake. So the smoke was testing "inputListener fires on button click" — not "inputListener fires on canvas click".
+
+**Fixes (commits aa091cf, 1683cd2, ac81626):**
+- **`client/src/engine/inputListener.ts`**: `createInputListener` now accepts an optional `HTMLCanvasElement` second arg. When provided, listeners attach at the canvas (catches canvas clicks) AND document (catches HUD/overlay clicks that bubble up). Also added `pointerdown`/`pointerup` listeners alongside `mousedown`/`mouseup`. Same dispose pattern.
+- **`client/src/engine/scene.ts`**: passes the canvas to `createInputListener({...}, canvas)`.
+- **`client/tools/two-tab-smoke.mjs`**: replaced the buggy `mouse.down()` (no coords) with explicit `mouse.move(canvasCenterX, canvasCenterY)` first. Now the smoke actually tests canvas clicks.
+
+**Temporary debug instrumentation** (still in place per Kyle's "leave it for a bit" — remove once combat is fully confirmed):
+- HUD chip now shows live `LMB: / RMB: / T:` debug lines driven by `getInputState()` polled at 10Hz.
+- `window.__canvasDown` + `window.__topLevelMouseDown` + `window.__lastMouseDown` hold the most recent mousedown event for DevTools inspection.
+- inputListener logs `[input] mousedown` + `[input] window mousedown (capture path)` for trace visibility.
+- Top-level `App.tsx` effect mounts a capture-phase `document.addEventListener("mousedown")` before createScene runs.
+
+**Re-verification gates (all green):**
+- `npm run typecheck` — exit 0
+- `npm run build` — exit 0, bundle ~7.04MB / 1.58MB gzip (unchanged)
+- Headless Playwright test reproducing the exact canvas-click bug — `hits: 1` after the fix (was `hits: 0` before)
+- `URL=http://localhost:5174/ node ./tools/two-tab-smoke.mjs` — `OK — smoke PASSED (A frame=192 B frame=125, A hits=1 B hits=0)`
+
+**Dev-box playtest (Kyle, 2026-08-12 late):**
+- ✓ LMB → `LMB:` flips TRUE while held → tracer renders
+- ✓ RMB → `meleePressed` flashes TRUE for one frame on click → `hits:` advances when within 1.5m cone of cyan remote
+- ✓ T → `T:` flips TRUE while held → bullet time chip appears, character slows to 0.25x
+- ✓ V → camera toggles (was broken since PR 3 — `hooks.onCameraToggle` was never called; fixed in PR 7.2 commit 82fe709)
+- BulletHud hits counter advances correctly
+
+**Known regressions (still on PR 8 backlog, do NOT fix here):**
+- **"Jump makes you fly up forever"** — locked rule per prior entries. PR 8 territory. Hypothesis: `state.supported` not flipping back to `true` after landing, OR `vy = MOVEMENT.jumpZ` applied continuously instead of one-shot.
+
+**Next**: Kyle merges PR #8 once smoke confirms green. After merge, run `./tools/sync-spec-to-vault.sh` to mirror the spec to the vault. Debug instrumentation gets removed in a follow-up PR (PR 7.4 cleanup) after Kyle confirms combat is solid in real play.
+
+---
+
+## 2026-08-12 (late, post-playtest) — PR 7.1 HOTFIX: HUD overlay was eating LMB/RMB. Phase 0 banner copy stale.
+
+**Status**: PR 7 was shipped with all 4 local gates green + Claude's cross-vendor review passing without blocking findings, but **failed real dev-box playtest**. Root cause: bottom-left `BulletHud` chip was missing `pointerEvents: "none"` and was silently eating LMB/RMB clicks that landed in its ~80x100px box. Bottom-banner subtitle also still said the stale PR 3 copy. Both fixed in this hotfix.
+
+**Done this hotfix session**:
+
+- **`client/src/ui/BulletHud.tsx` — REAL BUG FIX.** Added `pointerEvents: "none"` to the chip's root style. The HUD chip was sitting at `position: fixed; bottom: 16; left: 16` and rendering 5 lines of text. Every click landing inside that box was being absorbed by the HUD div instead of bubbling to `window`. The input listener (added in PR 7) uses `window.addEventListener("mousedown", ...)`, so an event that never reaches `window` means `fireHeld`/`meleePressed` never set → combat never fires. **Lesson learned**: every overlaid HUD chip in this app must keep `pointerEvents: "none"`. PeerOverlay + KeybindHud + OverlayBanner + BulletTimeChip all already had it; only BulletHud slipped through PR 7's review.
+
+- **`client/src/ui/App.tsx` — BANNER COPY.** Changed the bottom-of-screen subtitle from the stale PR 3 copy `"Phase 0 — character controller · click canvas to focus · WASD to move"` to `"Phase 0 PR 7 — combat (LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged"`. The original line was supposed to be updated in PR 7 but a patch above the `<OverlayBanner>` reference missed the banner content itself.
+
+**What was NOT changed in this hotfix**: the underlying combat code, the byte-1 inputBitmask fix, the tracer rendering, the HUD chip's `hits:` counter, the `BulletTimeChip` — all of those are working as PR 7 intended once clicks reach `window`. The hotfix is purely about letting clicks get to the input layer.
+
+**Re-verification gates**:
+- `npm run typecheck` — exit 0 (HUD style addition is typeclean, no new errors)
+- Vite HMR picks up the change in both running dev servers (5173 + 5174); no rebuild needed; just refresh your browser tab.
+- Manual: re-run your dev-box playtest. LMB should now fire (you should see the cyan-amber tracer line and the `hits:` counter advance). RMB within 1.5m of the cyan remote should register a melee_hit (HUD `hits` line will tick). T held → top-center red `BULLET TIME` chip should appear.
+
+**Playtest status** ⚠️
+
+- **PREVIOUSLY BROKEN**: PR 7 was shipped with the HUD eating clicks + a stale banner copy. Both the byte-1 inputBitmask fix + the rising-edge combat code were correct in code, but the input never reached the inputListener for most clicks. Kyle's first dev-box playtest caught this immediately: *"LMB and RMB didn't seem to have any effect."* This hotfix closes that loop.
+- **Awaiting**: Kyle's re-test of LMB fire, RMB melee, T bullet-time on the dev box. (Jump-forever is NOT in scope here — PR 8 backlog.)
+
+**Known regressions (carry-forward, do NOT fix in this hotfix)**:
+
+- **"Jump makes you fly up forever" — PR 8 backlog.** Same as the prior entry. Hypothesis: `state.supported` flag not flipping back to `true` after landing, OR `vy = MOVEMENT.jumpZ` is being applied continuously instead of one-shot. Per the locked HANDOFF rule "Don't conflate them" — surface here, fix in PR 8.
+
+---
+
+## 2026-08-12 (evening) — PR 7 READY for review. Next: PR 8 (jump regression)
+
+**Status**: Phase 0 / Milestone 2 / PR 7 (combat semantics: dual-pistol raycast + tracer render, melee cone hit detection, per-client bullet-time scaling at 0.25x with air control) **READY for review**. Branch `feat/phase0-combat-semantics`, HEAD `bf3c802`. All 4 verification gates green (typecheck + build + scene-smoke + two-tab-smoke). Real two-tab playtest still gated on the same TURN reachability caveat documented in the prior PR 6 entry — see "Playtest status" below.
+
+**Done this session** (since the prior PM "PR 6 MERGED" entry):
+
+- **`client/src/net/inputBitmask.ts` — REAL BUG FIX.** Byte 1 (FIRE=1 / MELEE=2 / BULLET=4) was reserved in PR 4 but `encodeInput` never wrote it and `decodeInput` always read `false`. Replaced the aliased single `InputBits` const with two separate `MoveBits` (byte 0, 8 names) + `CombatBits` (byte 1, 3 names) consts; `encodeInput` now writes byte 1 from `s.fireHeld / s.meleePressed / s.bulletTimeHeld`; `decodeInput` now reads byte 1 back. Backwards-compatible because existing PR 6 traffic has byte 1 = 0 and both clients upgrade together. `INPUT_SIZE = 8` unchanged. File is now 77 lines.
+- **`client/src/engine/characterConfig.ts` — DELETE STALE PLACEHOLDERS.** Removed the flat `COMBAT = { fireCooldownMs: 120, meleeRangeMeters: 1.5, bulletTimeScale: 0.25 }` and `BULLET_TIME = { scale: 0.25, … }` PR 4 placeholders — they were unused anywhere and shadowed the structured tunables in `combat.ts`. Replaced with a one-line comment pointing at `combat.ts` as the single source of truth.
+- **`client/src/engine/inputListener.ts` — TWO BUG FIXES (minimal).** (1) `meleePressed` was set on RMB mousedown but never cleared → rising-edge in combat code only fired on the FIRST RMB click per session. Added `held.meleePressed = false;` in `read()` alongside the jump/dive/wallrun/cameraToggle edge clears. (2) Added RMB `mouseup` handler (`held.meleePressed = false`) and a `contextmenu` listener that calls `e.preventDefault()` so the browser menu doesn't steal RMB clicks in headless smoke or real play. Net change: +13 lines; no key-map shape refactor (just the one edge clear and the suppress-listener pair).
+- **`client/src/game/combat.ts` — STUB REPLACED.** Full rewrite (now 317 lines, was 3). Added: `dualPistolShoot(input, local, _remote, scene)` returning `{ hit, tracerFrom, tracerTo, hitPoint, damage, onCooldown }` (raycasts from chest height along yaw-forward using `scene.pickWithRay` against a predicate that filters out local rig + ground + sky). `meleeSwing(input, local, remote)` returning `{ hit, target, damage }` using the preserved `isWithinMeleeCone` helper. `bulletTimeScale(input, dt)` returning `dt * 0.25` when `input.bulletTimeHeld` is true. `renderTracer(scene, from, to)` creating a `MeshBuilder.CreateLines` LinesMesh and disposing it via `window.setTimeout(... 80)` with a guard against scene teardown. Kept `COMBAT` as the single source of truth for tunables (dualPistol: damage=12 / tracerDurationMs=80 / maxRange=50m / tracerColor=#ffce5a; melee: coneRadians=π/3 / rangeMeters=1.5 / damage=25; bulletTime: scale=0.25). Kept the existing `isWithinMeleeCone` helper signature (PR 4 stub) unchanged so any future call sites keep working.
+- **`client/src/game/gameSession.ts` — INTEGRATE COMBAT.** Added `CombatEvent` type (discriminated union: `fire_hit | fire_miss` carry `tracerFrom`/`tracerTo`, `melee_hit` is HUD-only). Added to `SessionFrame`: `combatEvents: CombatEvent[]`. Inside `tick()`: bullet-time scaling applied to LOCAL controller only via `const scaledDt = bulletTimeScale(input, deltaSeconds)`; remote controller still receives raw `dt` (per-client-local, not synced). Rising-edge combat fires after the controllers tick: `if (input.fireHeld && !wasFiring)` → `dualPistolShoot` → push event; same shape for `meleeSwing` on the rising edge (only emits on hit). `wasFiring` / `wasMelee` track previous values; reset to current each tick so release-then-press registers correctly. Added `getCombatEvents()` (full slice for HUD count) + `consumeUnrenderedCombatEvents()` (drain-since-last with advancing cursor, used by scene render observer so each event triggers exactly one tracer).
+- **`client/src/engine/scene.ts` — RENDER TRACERS.** After `gameSession.tick(...)` inside `onBeforeRenderObservable`, the multiplayer branch now calls `consumeUnrenderedCombatEvents()` and for each `fire_hit | fire_miss` event, calls `renderTracer(scene, ev.tracerFrom, ev.tracerTo)`. `melee_hit` is HUD-only — no mesh, no animation. Added `latestInput: InputState | null` closure ref + `handle.getInputState()` getter so App.tsx can poll `input.bulletTimeHeld` for the HUD chip. `SceneHandle.getInputState` is exposed for both single-player and multiplayer modes (always returns `latestInput`).
+- **`client/src/ui/BulletHud.tsx` — ADD COMBAT COUNTER.** Added `hits: number` prop + a `<div data-testid="bullet-hud-hits">hits: {hits}</div>` line at the bottom of the chip. The existing frame/confirmed/repeated/status lines are unchanged.
+- **`client/src/ui/App.tsx` — EXTEND HUD + BULLET-TIME CHIP.** Extended `HudState` with `hits: number` and `bulletTime: boolean`. Extended the 100ms poll interval to also call `handle.getInputState?.()` and pass `hits: session.getCombatEvents().length` + `bulletTime: inputState?.bulletTimeHeld ?? false` into `setHud`. Passed `hits` down to `<BulletHud>`. Added a new top-center `<BulletTimeChip>` component that renders **"BULLET TIME"** in red when `hud.bulletTime` is true (data-testid `bullet-time-chip`). Updated `KeybindHud` heading to "PR 7 controls (PR 6 keymap unchanged)" + added the combat keymap line: `<LMB> fire dual pistols · <RMB> melee (1.5m cone) · <T> bullet time (0.25x, per-client)`.
+- **`client/tools/two-tab-smoke.mjs` — EXTEND WITH LMB FIRE + HITS ASSERTION.** After the existing `frame >= 5` WebRTC handshake + WASD-walk assertions, the smoke now: focuses Tab A's canvas, `page.mouse.down({ button: "left" })` → wait 200ms → `page.mouse.up({ button: "left" })` → wait 500ms, re-reads both `[data-testid="bullet-hud"]` textContent, parses `hits:\s*(\d+)` from each, asserts `aHits >= 1 || bHits >= 1` else fails with `[FAIL] PR 7 hits counter not advancing: A=… B=…`. Final log line now reports hits in addition to frames.
+- **`docs/SPEC.md` — UPDATE.** (1) Status banner: added PR 7 line under PR 6 entry ("PR 7 (combat semantics: dual-pistol + melee + bullet-time)"). (2) Milestone 2 acceptance table rows 5 ("dual pistols"), 6 ("melee"), 7 ("bullet time") and 8 ("Bullet time is independent per player") flipped from PR 5 / — to **LANDED PR 7** ✅ with one-line implementation notes. Row 9 (Health → 0 → respawn) stays "—" (PR 9+). (3) Decisions section: new "2026-08-12 — PR 7 implementation decisions" block (5 bullets: per-client bullet time, render-side damage only, tracer render via CreateLines + setTimeout, rising-edge key semantics, InputBits split into MoveBits + CombatBits).
+
+**Verification gates passed (local)**:
+
+```
+$ cd /home/kyle/Development/specialists-web-pr7/client
+$ npm run typecheck
+> specialists-web-client@0.0.1 typecheck
+> tsc -b --noEmit
+(exit 0)
+
+$ npm run build
+> specialists-web-client@0.0.1 build
+> tsc -b && vite build
+…
+dist/assets/index-vTYgB5cy.js                                    7,042.92 kB │ gzip: 1,578.84 kB
+✓ built in 1m 53s
+(exit 0)
+```
+
+Bundle delta vs main: ~7.04 MB JS / 1.58 MB gzip (vs PR 6's ~7.0 MB; PR 7 adds ~50 KB of source code across the 9 files). Same 1.58 MB gzip as PR 6 — the size is dominated by Babylon, not combat code.
+
+```
+$ node ./tools/scene-smoke.mjs
+Scene ready (loading banner cleared)
+CANVAS_INFO: {"exists":true,"width":1280,"height":720,"hasWebGL":true,"bannerText":"Specialists Web — PR 7 controls (PR 6 keymap unchanged)W A S D walkSpace jumpShift dive (tap while moving)C slide (hold + move)Q wallrun (tap mid-air)V camera · third-person ↔ first-personLMB fire dua"}
+CONSOLE_LOGS_COUNT: 17
+ERRORS_COUNT: 0
+OK — scene smoke passed (initial + walked screenshots captured)
+(exit 0)
+```
+
+```
+$ URL=http://localhost:5174/ node ./tools/two-tab-smoke.mjs
+…
+Tab A peer: {"ok":true,"state":"new","hasLocalDesc":true,"hasRemoteDesc":true}
+Tab B peer: {"ok":true,"state":"new","hasLocalDesc":true,"hasRemoteDesc":true}
+Both peers have SDP set — WebRTC handshake verified.
+[A console.error] [acceptAnswer] setRemoteDescription failed: InvalidStateError: Failed to execute 'setRemoteDescription' on 'RTCPeerConnection': Failed to set remote answer sdp: Called in wrong state: stable
+Tab A HUD after fire: frame: 161confirmed: 160repeated: 161Offline (idle)hits: 1
+Tab B HUD after fire: frame: 97confirmed: 96repeated: 97Waiting for ICE… (idle)hits: 0
+PR 7 hits counter advanced: A=1 B=0
+Tab A HUD: frame: 188confirmed: 187repeated: 188Offline (idle)hits: 1
+Tab B HUD: frame: 124confirmed: 123repeated: 124Waiting for ICE… (idle)hits: 0
+Screenshots: two-tab-smoke.png, two-tab-smoke-connected.png
+OK — smoke PASSED (A frame=188 B frame=124, A hits=1 B hits=0)
+(exit 0)
+```
+
+The `acceptAnswer` InvalidStateError console.error is a known cosmetic noise from PR 6 — Tab A's `setRemoteDescription` is called twice (once during the smoke's `__join` flow, once by the React overlay's effect) and the second call hits "wrong state: stable". Cosmetic; doesn't affect the smoke or the render path. Tab A's `hits: 1` is the PR 7 assertion passing — the tracer render path executed exactly once after the LMB press in Tab A.
+
+**Next session task** (PR 8 — jump regression investigation, do NOT conflate with PR 7):
+
+- **"Jump makes you fly up forever" regression.** Per the prior HANDOFF entry's "Known regressions" block. Hypothesis in `characterController.ts` ~line 224: `state.supported` flag not flipping back to `true` after landing, OR the impulse `vy = MOVEMENT.jumpZ` is being applied continuously instead of one-shot at line ~199-201.
+- **Reproduction**: hold Space for 5s in a single-tab session; sample Y-velocity every 200ms. If Y stays > 0 while grounded → continuous-impulse bug. If Y oscillates (high then snaps to 0 on landing, then high again) → `state.supported` not flipping back. Write a regression smoke that catches it BEFORE the fix lands.
+- **Bonus if simple**: a Playwright test that asserts `state.supported === true` after a jump-then-land cycle (the controller's `state` is exposed via `handle.getCharacterTransform()`).
+
+**Other untouched items** (do NOT gate PR 8 on these):
+
+- Real Mixamo glTF character model (PR 3 deferred, Phase 1).
+- Mouse-look in first-person (PR 3 deferred, Phase 1).
+- Phase 1: self-hosted coturn on Hetzner to replace openrelay.metered.ca.
+- Phase 1: real ggrs/wasm binding — when one lands on npm, swap `LockstepRuntime` for `GgrsSession` in PR 6's client (one-class swap, was the documented reason for the lockstep's ggrs-shaped surface).
+- Phase 1: Rust WebTransport server with `/create` + `/join` REST endpoints; replaces the clipboard paste flow + adds the dropped `?join=<blob>` URL handler.
+
+**Blockers / open questions**:
+
+- **None for PR 7.** PR 7 is pure-frontend — dev box + clipboard paste is sufficient for playtest.
+- **For PR 8 (jump regression)**: need a Playwright reproduction in CI. If the dev box can't reproduce, file as "sandbox-only" and try a different machine. Don't merge PR 8 without a failing-test-first reproduction.
+- **ICE-reachability still unknown on dev box.** Real two-tab play remains gated on whether Kyle's dev box can reach `openrelay.metered.ca:80`. PR 7 doesn't add a new network dependency — it reuses PR 6's peer config unchanged. If PR 7's smoke passes on CI but Kyle opens two dev-box tabs and the status stays "Waiting for connection…", it's the same PR 6 problem, not a regression.
+
+**Decisions made**:
+
+- 2026-08-12 (evening) — **`InputBits` split into `MoveBits` + `CombatBits` consts.** The original PR 4 single-object aliased `FIRE=1` against `LEFT=1` (same identifier, different name); TypeScript happily allowed both, but the FIRE/MELEE/BULLET bits were effectively unreadable. Splitting makes the bug visible at the type level.
+- 2026-08-12 (evening) — **Per-client-local bullet time, NOT synced across the wire.** `dt * 0.25` is applied to the LOCAL controller inside `gameSession.tick`; the remote controller receives the raw `dt`. The lockstep carries no dt — both clients sample it from the engine frame observer. This makes Milestone 2 row 8 ("per-player independent bullet time") work without round-tripping a wall-clock signal across RTCDataChannel.
+- 2026-08-12 (evening) — **Damage is render-side log only.** `dualPistolShoot` and `meleeSwing` return `{ damage }` in their result structs; `gameSession.tick` records it in the `CombatEvent`. No health pool exists yet — that's PR 9+. Keeps the smoke testable without needing health state.
+- 2026-08-12 (evening) — **Tracer render via `MeshBuilder.CreateLines` + `window.setTimeout` dispose.** No Babylon animation framework in PR 7 — each tracer is a fresh `LinesMesh` disposed after 80ms via `setTimeout`. Timer guards against scene teardown (`if (!lines.isDisposed()) lines.dispose()`). If you skip the timer, the scene leaks meshes — caught by the smoke if needed.
+- 2026-08-12 (evening) — **Rising-edge key semantics for fire / melee.** `fireHeld` / `meleePressed` are *held* flags in `InputState` (wire has no edge concept), but combat fires only on the rising edge. `wasFiring` / `wasMelee` track previous input. `meleePressed` cleared in `inputListener.read()` so the next RMB click registers a fresh rising edge.
+- 2026-08-12 (evening) — **Bundle size flagged but acceptable.** 1.58 MB gzip is unchanged from PR 6. Code-splitting is Phase 1 work.
+
+**Playtest status** ⚠️
+
+- **What was tested this session**: typecheck + build + headless browser smoke (PR 3 single-tab scene-smoke remains green). Two-tab smoke was extended to drive LMB in Tab A and verify the `hits:` counter advances. Result: `OK — smoke PASSED (A frame=188 B frame=124, A hits=1 B hits=0)`. This proves the PR 7 combat code path executes end-to-end on Tab A: `inputListener` mousedown → `held.fireHeld = true` → `gameSession.tick` → `dualPistolShoot` → CombatEvent → `consumeUnrenderedCombatEvents` → `renderTracer` → `MeshBuilder.CreateLines` + `setTimeout` dispose. Screenshots captured at `client/two-tab-smoke.png` and `client/two-tab-smoke-connected.png`.
+- **What was NOT tested**: Kyle has not yet manually playtested PR 7. The CI smoke does NOT prove `connectionState === "connected"` (same TURN-sandbox caveat as PR 6) AND does NOT prove the bullet-time chip visually lights red (no keypress sent — the smoke only fires LMB). For full playtest: Kyle opens two dev-box tabs, copies the offer blob, pastes it into the second tab, clicks Join, copies the answer, pastes it back, clicks Paste Answer. Then on the host tab: click+hold LMB → tracer should render in BOTH views; RMB within 1.5m of the remote rig → "BULLET TIME" indicator pop (currently HUD-only — the melee_hit event is logged but has no render-side animation yet); hold T → top-center chip should turn red + character should slow to 0.25x (still moveable / still air-controllable).
+- **Bullet-time bullet-time chip caveat**: the chip is a React component that polls `hud.bulletTime` every 100ms. There's a ~50-150ms lag between key-down and chip appearance, plus React's render cycle. Acceptable for HUD chip; if it ever needs to be frame-accurate, the path is to subscribe directly to the inputListener rather than polling. Filed as a Phase 1 polish item, not a blocker.
+- **Build artifacts**: `client/two-tab-smoke.png` + `client/two-tab-smoke-connected.png` (existing PR 6 CI artifacts; the smoke also writes `client/two-tab-smoke-tabA-post-paste.png` for debugging).
+- **Next session's playtest target**: PR 8 ships the regression smoke that catches "hold Space = fly up forever." Manual repro on dev box should yield a fixed-position + grounded state instead of vertical drift.
+
+**Known regressions (carried forward from prior HANDOFF entry, do NOT block PR 7 merge)**:
+
+- **PR 8 (after PR 7): "Jump makes you fly up forever" — needs investigation.** Kyle observed this during a manual playtest against the dev box (Discord `1537158787947954297`, 2026-08-12 PM). Hypothesis: `state.supported` flag in `characterController.ts:224` is not flipping back to `true` after landing, OR the impulse `vy = MOVEMENT.jumpZ` is being applied continuously instead of one-shot (line ~199-201). **Surface in PR 8 description, do NOT fix in PR 7.** Confirmed not touched in PR 7 — the only changes to `characterController.ts` were import-related (none) and the controller's `update()` signature (none).
+- **No mouse-drag camera control.** By design for PR 3 (deferred to Phase 1, per prior HANDOFF history). Not a regression.
+- **`acceptAnswer` "wrong state: stable" InvalidStateError** in two-tab smoke output. Cosmetic — Tab A's `setRemoteDescription` is called twice (once by the smoke's `__join` flow, once by the React overlay's effect). Doesn't affect the render path. Documented in the PR 6 HANDOFF entry too. PR 8+ can clean this up; not a PR 7 blocker.
+
+---
+
+# Handoff — Session-to-Session Continuity
+
+Drop a new entry at the top of the log on every session end. Keep entries short, factual, and **action-oriented** — what was done, what's next, what's blocking.
+
+**Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
+
 ## 2026-08-12 (late) — PR 6 MERGED. Next: PR 7 (combat) + PR 8 (jump regression)
 
 **Status**: Phase 0 / Milestone 2 / PR 6 **MERGED** at https://github.com/klampatech/specialists-web/pull/6 (merge commit `461dcafea19a455958e0492cdd568aa5f9431b59`, 2026-08-12 18:56 UTC). Squash-merged into `main`. Branch `feat/phase0-webrtc-ggrs-combat` can be deleted after the next session starts clean.

@@ -51,7 +51,7 @@ const KEY_SLIDE = new Set(["c", "C"]);
 const KEY_WALLRUN = new Set(["q", "Q"]);
 const KEY_CAMERA_TOGGLE = new Set(["v", "V"]);
 
-export function createInputListener(hooks: InputHooks): InputListener {
+export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElement): InputListener {
   const held: HeldState = {
     forward: 0,
     right: 0,
@@ -116,7 +116,14 @@ export function createInputListener(hooks: InputHooks): InputListener {
       return;
     }
     if (KEY_CAMERA_TOGGLE.has(key)) {
-      if (!e.repeat) held.cameraTogglePressed = true;
+      if (!e.repeat) {
+        held.cameraTogglePressed = true;
+        // PR 7.2 fix: actually call the camera-toggle hook. Without this
+        // the press flag was being set but the camera never flipped. Toggle
+        // hook fires synchronously here (it just sets a boolean on the
+        // ChaseCameraHandle).
+        hooks.onCameraToggle();
+      }
       e.preventDefault();
       return;
     }
@@ -148,12 +155,75 @@ export function createInputListener(hooks: InputHooks): InputListener {
     held.slideHeld = false; held.fireHeld = false; held.bulletTimeHeld = false;
   };
 
-  const onMouseDown = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = true; if (e.button === 2) held.meleePressed = true; };
-  const onMouseUp = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = false; };
+  const onMouseDown = (e: MouseEvent) => {
+    // PR 7.2 debug: visible HUD indicator proves whether THIS specific
+    // handler fired. If this stays false while the user is clearly
+    // mousedown'ing, something upstream ate the event before window.
+    (window as unknown as Record<string, unknown>).__lastMouseDown = {
+      ts: performance.now(),
+      button: e.button,
+      target: e.target && (e.target as Element).tagName,
+      composedPath: e.composedPath ? e.composedPath().slice(0, 5).map((n) => (n as Element).tagName || typeof n) : [],
+    };
+    console.log("[input] mousedown", { button: e.button, target: (e.target as Element).tagName });
+    if (e.button === 0) held.fireHeld = true;
+    if (e.button === 2) held.meleePressed = true;
+  };
+  const onMouseUp = (e: MouseEvent) => { if (e.button === 0) held.fireHeld = false; if (e.button === 2) held.meleePressed = false; };
+  // PR 7.3 fix: also handle PointerEvents (pointerdown/pointerup) for browsers
+  // that don't fire mousedown (e.g., some Safari versions, or Playwright's
+  // synthetic clicks). PointerEvent.button works the same as MouseEvent.button
+  // for the LMB/RMB cases we care about.
+  const onPointerDown = (e: PointerEvent) => {
+    if (e.button === 0) held.fireHeld = true;
+    if (e.button === 2) held.meleePressed = true;
+  };
+  const onPointerUp = (e: PointerEvent) => {
+    if (e.button === 0) held.fireHeld = false;
+    if (e.button === 2) held.meleePressed = false;
+  };
+  // PR 7: suppress the browser context menu so RMB melee + RMB-during-aim
+  // work in headless smoke and real play. The default right-click menu
+  // would otherwise steal the click on every press.
+  const onContextMenu = (e: MouseEvent) => { e.preventDefault(); };
   if (typeof window !== "undefined") {
+    // PR 7.3 fix: bind mousedown/mouseup/contextmenu DIRECTLY to the canvas
+    // element when provided, instead of just window/document. Babylon's
+    // UniversalCamera.attachControl() (called in chaseCamera.ts) registers
+    // pointer listeners on the canvas that may swallow or repath events
+    // before they reach window/document listeners in some browser/canvas-
+    // size combinations. Binding at the canvas level guarantees we fire
+    // whenever the user clicks anywhere on the canvas.
+    //
+    // Fall back to document/window listeners for backwards compatibility
+    // (e.g., unit tests that don't pass a canvas).
+    if (target) {
+      // PR 7.3: bind at BOTH the canvas (for canvas-area clicks) AND
+      // document (for clicks on HUD/overlay elements that bubble up).
+      // The smoke harness clicks the WebRTC overlay's Create button
+      // which is OUTSIDE the canvas — without the document listener,
+      // those clicks never reach us.
+      target.addEventListener("mousedown", onMouseDown);
+      target.addEventListener("mouseup", onMouseUp);
+      target.addEventListener("contextmenu", onContextMenu);
+      target.addEventListener("pointerdown", onPointerDown);
+      target.addEventListener("pointerup", onPointerUp);
+      document.addEventListener("mousedown", onMouseDown);
+      document.addEventListener("pointerdown", onPointerDown);
+    } else {
+      document.addEventListener("mousedown", onMouseDown);
+      document.addEventListener("mouseup", onMouseUp);
+      document.addEventListener("contextmenu", onContextMenu);
+      document.addEventListener("pointerdown", onPointerDown);
+      document.addEventListener("pointerup", onPointerUp);
+    }
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", onBlur); window.addEventListener("mousedown", onMouseDown); window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("mousedown", (e) => {
+      console.log("[input] window mousedown (capture path)", { button: e.button, target: (e.target as Element).tagName });
+    }, true);
   }
 
   return {
@@ -173,13 +243,34 @@ export function createInputListener(hooks: InputHooks): InputListener {
       held.divePressed = false;
       held.wallrunPressed = false;
       held.cameraTogglePressed = false;
+      // PR 7: meleePressed was set on mousedown but never cleared before. Without
+      // this, the rising-edge in combat code only fires on the FIRST RMB click
+      // per session. Clearing here keeps `meleePressed` true for exactly one
+      // read() — same shape as jump/dive/wallrun/cameraToggle edges.
+      held.meleePressed = false;
       return state;
     },
     dispose: () => {
       if (typeof window !== "undefined") {
+        if (target) {
+          target.removeEventListener("mousedown", onMouseDown);
+          target.removeEventListener("mouseup", onMouseUp);
+          target.removeEventListener("contextmenu", onContextMenu);
+          target.removeEventListener("pointerdown", onPointerDown);
+          target.removeEventListener("pointerup", onPointerUp);
+          document.removeEventListener("mousedown", onMouseDown);
+          document.removeEventListener("pointerdown", onPointerDown);
+        } else {
+          document.removeEventListener("mousedown", onMouseDown);
+          document.removeEventListener("mouseup", onMouseUp);
+          document.removeEventListener("contextmenu", onContextMenu);
+          document.removeEventListener("pointerdown", onPointerDown);
+          document.removeEventListener("pointerup", onPointerUp);
+        }
         window.removeEventListener("keydown", onKeyDown);
         window.removeEventListener("keyup", onKeyUp);
-        window.removeEventListener("blur", onBlur); window.removeEventListener("mousedown", onMouseDown); window.removeEventListener("mouseup", onMouseUp);
+        window.removeEventListener("blur", onBlur);
+        window.removeEventListener("mouseup", onMouseUp);
       }
     },
   };

@@ -1,4 +1,4 @@
-// Phase 0 / PR 3+4 — React shell with Babylon canvas + HUD + WebRTC overlay.
+// Phase 0 / PR 3+4+7 — React shell with Babylon canvas + HUD + WebRTC overlay.
 //
 // The canvas is mounted via a ref so the Babylon Engine can attach to it
 // directly. The scene is built asynchronously (Havok wasm + WebGPU adapter
@@ -11,6 +11,11 @@
 // GameSession ticks every frame regardless of connection state — the remote
 // rig stays at its spawn with zero input until the peer actually sends
 // packets. BulletHud shows the live frame number + connection state.
+//
+// PR 7: HUD grows a `hits:` counter (combat events emitted by the session)
+// and a top-center "BULLET TIME" chip that lights red when the local tab
+// holds T. KeybindHud adds the combat bindings. All polled at ~10Hz from
+// the existing HUD interval — no per-frame React re-renders.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createScene, type SceneHandle } from "../engine/scene";
@@ -31,6 +36,13 @@ interface HudState {
   repeatedFrames: number;
   /** True once the runtime has received at least one packet from the peer. */
   hasRemote: boolean;
+  /** PR 7: total combat events emitted by the local session so far. */
+  hits: number;
+  /** PR 7: true while the local tab holds the T key (bullet time). */
+  bulletTime: boolean;
+  /** PR 7.2 debug: live mouse-button state from the input listener. */
+  fireHeld: boolean;
+  meleePressed: boolean;
 }
 
 export function App() {
@@ -45,6 +57,10 @@ export function App() {
     frame: 0,
     repeatedFrames: 0,
     hasRemote: false,
+    hits: 0,
+    bulletTime: false,
+    fireHeld: false,
+    meleePressed: false,
   });
 
   // Construct the WebRTC peer once per mount. The peer lives across scene
@@ -91,8 +107,59 @@ export function App() {
   }, [peer, reportConnection]);
 
   useEffect(() => {
+    // PR 7.2 debug: top-level window mousedown listener that's attached
+    // BEFORE createScene runs. If THIS one fires but createScene's doesn't,
+    // we know createScene's listener was never attached. If THIS one
+    // doesn't fire, we know something is preventing mousedown entirely.
+    const onDocMouseDown = (e: MouseEvent) => {
+      (window as unknown as Record<string, unknown>).__topLevelMouseDown = {
+        ts: performance.now(),
+        button: e.button,
+        target: e.target && (e.target as Element).tagName,
+        composedPath: e.composedPath?.().slice(0, 6).map((n) => (n as Element).tagName ?? typeof n),
+      };
+      console.log("[APP] document mousedown (top-level)", { button: e.button, target: (e.target as Element).tagName });
+    };
+    document.addEventListener("mousedown", onDocMouseDown, true); // CAPTURE PHASE
+    document.addEventListener("mouseup", onDocMouseDown, true);
+    return () => {
+      document.removeEventListener("mousedown", onDocMouseDown, true);
+      document.removeEventListener("mouseup", onDocMouseDown, true);
+    };
+  }, []);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+
+    // PR 7.2 debug: attach mousedown directly to the canvas element so
+    // we can confirm whether the canvas itself is receiving events.
+    // If even THIS handler doesn't fire, the canvas is not where the
+    // user expects it to be OR it has a CSS issue.
+    const onCanvasDown = (e: MouseEvent) => {
+      (window as unknown as Record<string, unknown>).__canvasDown = {
+        ts: performance.now(),
+        button: e.button,
+        canvasRect: canvas.getBoundingClientRect(),
+        clientXY: { x: e.clientX, y: e.clientY },
+        canvasStyle: {
+          width: canvas.style.width,
+          height: canvas.style.height,
+          cssWidth: getComputedStyle(canvas).width,
+          cssHeight: getComputedStyle(canvas).height,
+          attrWidth: canvas.getAttribute("width"),
+          attrHeight: canvas.getAttribute("height"),
+          display: getComputedStyle(canvas).display,
+          pointerEvents: getComputedStyle(canvas).pointerEvents,
+        },
+      };
+      console.log("[input] CANVAS mousedown", {
+        button: e.button,
+        rect: canvas.getBoundingClientRect(),
+        canvasAttrWH: `${canvas.width}x${canvas.height}`,
+      });
+    };
+    canvas.addEventListener("mousedown", onCanvasDown);
 
     let disposed = false;
     const transport = new GgnetTransport(peer);
@@ -114,11 +181,17 @@ export function App() {
         const hudTimer = window.setInterval(() => {
           const session = handle.getGameSession?.();
           if (!session) return;
+          // PR 7: pull the live InputState snapshot for the bullet-time chip.
+          const inputState = handle.getInputState?.();
           setHud((h) => ({
             ...h,
             frame: session.frame,
             repeatedFrames: session.repeatedFrameCount,
             hasRemote: session.runtime.hasRemote,
+            hits: session.getCombatEvents().length,
+            bulletTime: inputState?.bulletTimeHeld ?? false,
+            fireHeld: inputState?.fireHeld ?? false,
+            meleePressed: inputState?.meleePressed ?? false,
           }));
         }, 100);
         // Stash the timer on the scene ref so unmount can clear it.
@@ -131,6 +204,9 @@ export function App() {
       });
 
     return () => {
+      // canvas-direct listener cleanup — handles the case where the
+      // createScene promise never resolves before unmount.
+      canvas.removeEventListener("mousedown", onCanvasDown);
       disposed = true;
       const handle = sceneRef.current;
       if (handle) {
@@ -176,18 +252,53 @@ export function App() {
       {phase === "ready" && (
         <>
           <KeybindHud engineLabel={engineLabel} />
+          <BulletTimeChip active={hud.bulletTime} />
           <PeerOverlay peer={peer} onStatusChange={reportConnection} />
           <BulletHud
             frame={hud.frame}
             repeatedFrames={hud.repeatedFrames}
             connectionStatus={hud.connectionStatus}
             hasRemote={hud.hasRemote}
+            hits={hud.hits}
+            fireHeld={hud.fireHeld}
+            meleePressed={hud.meleePressed}
+            bulletTime={hud.bulletTime}
           />
           <OverlayBanner bottom={16} size="0.7rem" opacity={0.35}>
-            Phase 0 — character controller · click canvas to focus · WASD to move
+            Phase 0 PR 7 — combat (LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged
           </OverlayBanner>
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * PR 7: top-center chip that lights red while the local tab holds T.
+ * Tiny chip — it's a status indicator, not a feature surface.
+ */
+function BulletTimeChip({ active }: { active: boolean }) {
+  if (!active) return null;
+  return (
+    <div
+      data-testid="bullet-time-chip"
+      style={{
+        position: "fixed",
+        top: 16,
+        left: "50%",
+        transform: "translateX(-50%)",
+        padding: "0.4rem 0.9rem",
+        background: "rgba(154, 30, 30, 0.85)",
+        color: "#fff",
+        font: "bold 0.85rem ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+        border: "1px solid rgba(255, 120, 120, 0.6)",
+        borderRadius: "0.4rem",
+        zIndex: 5,
+        pointerEvents: "none",
+        letterSpacing: "0.12em",
+      }}
+    >
+      BULLET TIME
     </div>
   );
 }
@@ -212,7 +323,7 @@ function KeybindHud({ engineLabel }: { engineLabel: "webgpu" | "webgl2" | null }
       }}
     >
       <div style={{ fontWeight: 600, marginBottom: "0.25rem" }}>
-        Specialists Web — PR 4 controls (PR 3 keymap unchanged)
+        Specialists Web — PR 7 controls (PR 6 keymap unchanged)
       </div>
       <div><Key>W A S D</Key> walk</div>
       <div><Key>Space</Key> jump</div>
@@ -220,6 +331,7 @@ function KeybindHud({ engineLabel }: { engineLabel: "webgpu" | "webgl2" | null }
       <div><Key>C</Key> slide (hold + move)</div>
       <div><Key>Q</Key> wallrun (tap mid-air)</div>
       <div><Key>V</Key> camera · third-person ↔ first-person</div>
+      <div><Key>LMB</Key> fire dual pistols · <Key>RMB</Key> melee (1.5m cone) · <Key>T</Key> bullet time (0.25x, per-client)</div>
       {engineLabel && (
         <div style={{ marginTop: "0.4rem", opacity: 0.7 }}>
           renderer: {engineLabel}
