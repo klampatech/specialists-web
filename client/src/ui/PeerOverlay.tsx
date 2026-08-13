@@ -60,12 +60,21 @@ export function PeerOverlay({ peer, onStatusChange }: PeerOverlayProps) {
   }, [status, onStatusChange]);
 
   const create = async (): Promise<void> => {
-    setStatus("Waiting for ICE…");
+    setStatus("Gathering ICE…");
     try {
       const payload = await peer.createOffer();
       setBlob(encodePayload(payload));
       setBlobKind("offer");
-      setStatus("ICE complete — copy offer blob");
+      // PR 10.1: surface how many candidates got bundled so the user
+      // can self-diagnose a slow TURN / no-TURN network. <2 candidates
+      // means connection may not establish — copy the offer and continue
+      // anyway, but warn the user.
+      const candidateCount = payload.candidates.length;
+      setStatus(
+        candidateCount < 2
+          ? `Offer ready (${candidateCount} candidate${candidateCount === 1 ? "" : "s"} — TURN may be unreachable)`
+          : `Offer ready (${candidateCount} candidates) — copy and share`,
+      );
     } catch (e) {
       setStatus(e instanceof Error ? e.message : "Could not create offer");
     }
@@ -78,7 +87,13 @@ export function PeerOverlay({ peer, onStatusChange }: PeerOverlayProps) {
       const payload = await peer.createAnswer(decodePayload(initial));
       setBlob(encodePayload(payload));
       setBlobKind("answer");
-      setStatus("ICE complete — copy answer blob");
+      // PR 10.1: same candidate-count warning as `create`.
+      const candidateCount = payload.candidates.length;
+      setStatus(
+        candidateCount < 2
+          ? `Answer ready (${candidateCount} candidate${candidateCount === 1 ? "" : "s"} — TURN may be unreachable)`
+          : `Answer ready (${candidateCount} candidates) — copy and share`,
+      );
     } catch (e) {
       setStatus(e instanceof Error ? e.message : "Could not parse blob");
     }
