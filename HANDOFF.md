@@ -4,6 +4,45 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-12 (late, post-playtest) — PR 7.3 FIX: inputListener wasn't firing for canvas clicks; debug HUD added
+
+**Status**: After the PR 7.1 hotfix (BulletHud pointer-events), LMB/RMB still didn't fire on the dev box. Root cause: the inputListener's mouse handlers (`mousedown`/`mouseup`) never fired when the user clicked on the canvas. Two real fixes + one smoke fix + temporary debug instrumentation.
+
+**Root cause**:
+1. The inputListener attached `mousedown`/`mouseup` listeners to `window` + `document` only. Modern browsers (and Playwright's synthetic events) sometimes only dispatch `pointerdown`/`pointerup`, not `mousedown`/`mouseup`. Safari on macOS has known quirks here.
+2. The smoke was passing for the wrong reason. `tabA.mouse.down({button: "left"})` (no coordinates) reuses the LAST clicked element's event path, which was the WebRTC Create button from the handshake. So the smoke was testing "inputListener fires on button click" — not "inputListener fires on canvas click".
+
+**Fixes (commits aa091cf, 1683cd2, ac81626):**
+- **`client/src/engine/inputListener.ts`**: `createInputListener` now accepts an optional `HTMLCanvasElement` second arg. When provided, listeners attach at the canvas (catches canvas clicks) AND document (catches HUD/overlay clicks that bubble up). Also added `pointerdown`/`pointerup` listeners alongside `mousedown`/`mouseup`. Same dispose pattern.
+- **`client/src/engine/scene.ts`**: passes the canvas to `createInputListener({...}, canvas)`.
+- **`client/tools/two-tab-smoke.mjs`**: replaced the buggy `mouse.down()` (no coords) with explicit `mouse.move(canvasCenterX, canvasCenterY)` first. Now the smoke actually tests canvas clicks.
+
+**Temporary debug instrumentation** (still in place per Kyle's "leave it for a bit" — remove once combat is fully confirmed):
+- HUD chip now shows live `LMB: / RMB: / T:` debug lines driven by `getInputState()` polled at 10Hz.
+- `window.__canvasDown` + `window.__topLevelMouseDown` + `window.__lastMouseDown` hold the most recent mousedown event for DevTools inspection.
+- inputListener logs `[input] mousedown` + `[input] window mousedown (capture path)` for trace visibility.
+- Top-level `App.tsx` effect mounts a capture-phase `document.addEventListener("mousedown")` before createScene runs.
+
+**Re-verification gates (all green):**
+- `npm run typecheck` — exit 0
+- `npm run build` — exit 0, bundle ~7.04MB / 1.58MB gzip (unchanged)
+- Headless Playwright test reproducing the exact canvas-click bug — `hits: 1` after the fix (was `hits: 0` before)
+- `URL=http://localhost:5174/ node ./tools/two-tab-smoke.mjs` — `OK — smoke PASSED (A frame=192 B frame=125, A hits=1 B hits=0)`
+
+**Dev-box playtest (Kyle, 2026-08-12 late):**
+- ✓ LMB → `LMB:` flips TRUE while held → tracer renders
+- ✓ RMB → `meleePressed` flashes TRUE for one frame on click → `hits:` advances when within 1.5m cone of cyan remote
+- ✓ T → `T:` flips TRUE while held → bullet time chip appears, character slows to 0.25x
+- ✓ V → camera toggles (was broken since PR 3 — `hooks.onCameraToggle` was never called; fixed in PR 7.2 commit 82fe709)
+- BulletHud hits counter advances correctly
+
+**Known regressions (still on PR 8 backlog, do NOT fix here):**
+- **"Jump makes you fly up forever"** — locked rule per prior entries. PR 8 territory. Hypothesis: `state.supported` not flipping back to `true` after landing, OR `vy = MOVEMENT.jumpZ` applied continuously instead of one-shot.
+
+**Next**: Kyle merges PR #8 once smoke confirms green. After merge, run `./tools/sync-spec-to-vault.sh` to mirror the spec to the vault. Debug instrumentation gets removed in a follow-up PR (PR 7.4 cleanup) after Kyle confirms combat is solid in real play.
+
+---
+
 ## 2026-08-12 (late, post-playtest) — PR 7.1 HOTFIX: HUD overlay was eating LMB/RMB. Phase 0 banner copy stale.
 
 **Status**: PR 7 was shipped with all 4 local gates green + Claude's cross-vendor review passing without blocking findings, but **failed real dev-box playtest**. Root cause: bottom-left `BulletHud` chip was missing `pointerEvents: "none"` and was silently eating LMB/RMB clicks that landed in its ~80x100px box. Bottom-banner subtitle also still said the stale PR 3 copy. Both fixed in this hotfix.
