@@ -19,8 +19,14 @@
 //    PeerOverlay's job, kept separate.
 // 4. **No animation** — `null` vs rendered. PR 11.2 is functional, not
 //    visual polish. Fade-in is a 5-line follow-up if Kyle wants it.
-
-import { useEffect } from "react";
+//
+// PR 11.2.1 fix (Kyle playtest 2026-08-14): The pause menu does NOT
+// own a keydown listener for ESC. Two listeners firing on the same
+// keydown (inputListener.ts + PauseMenu's useEffect) caused a race where
+// the browser fired a follow-up `pointerlockchange(false)` immediately
+// after our `requestPointerLock()` succeeded, causing the menu to flash
+// and reappear. The single source of truth is `inputListener.ts`'s
+// `onEscapePressed` hook, which fires once per keydown.
 
 interface PauseMenuProps {
   /** True when the menu should be visible. */
@@ -36,24 +42,11 @@ interface PauseMenuProps {
 }
 
 export function PauseMenu({ visible, onResume, onDisconnect, viewMode }: PauseMenuProps) {
-  // PR 11.2: ESC-equals-resume. The input listener already calls
-  // `chase.setPointerLock(true)` on ESC when unlocked; this effect just
-  // makes the React side aware of that for the document-level handler.
-  // (We re-bind here as a belt-and-suspenders fallback — the smoke drives
-  // the pause menu via `__pointerLockToggle` and could click Resume even
-  // if the input listener's onEscapePressed hook hasn't fired yet.)
-  useEffect(() => {
-    if (!visible) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !e.repeat) {
-        e.preventDefault();
-        onResume();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [visible, onResume]);
-
+  // PR 11.2.1 fix: ESC-equals-resume is owned by inputListener.ts's
+  // onEscapePressed hook (single source of truth). The previous
+  // duplicate keydown listener here caused a race where the browser
+  // fired a follow-up pointerlockchange(false) immediately after our
+  // requestPointerLock() succeeded, making the menu flash + reappear.
   if (!visible) return null;
 
   const cameraLabel =
