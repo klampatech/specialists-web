@@ -340,6 +340,11 @@ export async function createScene(
     // before our handler re-locks it.
     onEscapePressed: () => {
       if (chase.isPointerLocked()) return;
+      try {
+        canvas.focus();
+      } catch {
+        // focus() can throw if the canvas was removed from the DOM; ignore.
+      }
       // Will be picked up by onPointerLockChange(true) → chase.setPointerLock(true).
       canvas.requestPointerLock();
     },
