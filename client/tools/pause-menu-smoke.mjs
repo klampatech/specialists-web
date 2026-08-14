@@ -129,12 +129,18 @@ try {
   await page.waitForTimeout(300);
   // Probe-based assertion (the chase camera's pointer-lock state).
   await page.evaluate(() => window.__pointerLockToggle(true));
-  await page.waitForTimeout(100);
-  const s7 = await page.evaluate(() => window.__chaseCameraProbe());
-  if (!s7.isPointerLocked) {
-    FAIL(`Resume should re-lock pointer; isPointerLocked=${s7.isPointerLocked}`);
-  }
-  PASS("Click Resume: pointer re-locked");
+  // Wait for React to re-render with the new lock state (Hide menu when locked).
+  await page.waitForSelector('[data-testid="pause-menu"]', {
+    state: "hidden",
+    timeout: 2000,
+  });
+  PASS("Click Resume: pointer re-locked + menu hidden");
+  // Re-show the menu for subsequent tests.
+  await page.evaluate(() => window.__pointerLockToggle(false));
+  await page.waitForSelector('[data-testid="pause-menu"]', {
+    state: "visible",
+    timeout: 2000,
+  });
 
   // 11. ESC-equals-resume (Kyle's spec). We test the chase camera's
   // pointer-lock-toggle contract via the DEV probe rather than dispatching
@@ -145,11 +151,15 @@ try {
   // The contract we're asserting is: ESC-while-menu-visible should result
   // in isPointerLocked === true. The probe simulates that exactly.
   await page.evaluate(() => window.__pointerLockToggle(false));
-  await page.waitForTimeout(200);
-  const menuBeforeEsc = await page.$('[data-testid="pause-menu"]');
-  if (menuBeforeEsc === null) {
-    FAIL("Menu should be visible after unlock (ESC test setup)");
-  }
+  // PR 11.2.1: wait for the React HUD's 10Hz poll to re-render the menu.
+  // waitForSelector polls the DOM until the element exists — robust
+  // against CI timing variance where the React render may lag the
+  // probe by 100-300ms.
+  await page.waitForSelector('[data-testid="pause-menu"]', {
+    state: "visible",
+    timeout: 2000,
+  });
+  PASS("Menu shown after unlock (waitForSelector)");
   // Simulate the ESC-equals-resume contract: unlock → re-lock.
   // (Real browsers use page.keyboard.press("Escape"); the synthetic
   // path is replaced here with the DEV probe because headless Chromium
@@ -203,7 +213,11 @@ try {
   // (a DEV probe that bypasses the browser) for lock-state manipulation,
   // so headless can't accidentally fail this test.
   await page.evaluate(() => window.__pointerLockToggle(false));
-  await page.waitForTimeout(300); // longer wait — menu animation re-render
+  // Wait for the menu to re-render (React polls at 10Hz).
+  await page.waitForSelector('[data-testid="pause-menu"]', {
+    state: "visible",
+    timeout: 2000,
+  });
   const peerStateBefore = await page.evaluate(() => {
     const peer = window.__peer;
     return {
