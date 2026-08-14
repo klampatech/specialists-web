@@ -166,17 +166,59 @@ export function createChaseCamera(
 
   const update = (): void => {
     const cp = character.state.position;
-    // PR 11.1.2: pointer-locked path (modes 0 and 1). Snap camera to
-    // character + offset; render at the character's exact yaw (no lerp —
-    // the locked view IS the character's view, not a follow-camera).
-    if (pointerLocked) {
-      const offset = offsetForMode(viewMode);
+    if (pointerLocked && viewMode === 0) {
+      // PR 11.1.2: 1st-person-locked. Snap camera to character + eye
+      // offset; render at the character's exact yaw. No lerp — the
+      // locked view IS the character's view.
+      const offset = offsetForMode(0);
       camera.position.set(cp.x + offset.x, cp.y + offset.y, cp.z + offset.z);
       const q = character.state.rotation;
       const sinY = 2 * (q.w * q.y + q.z * q.x);
       const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
       const eulerY = Math.atan2(sinY, cosY);
       camera.rotation.set(0, eulerY, 0);
+      return;
+    }
+    if (pointerLocked && viewMode === 1) {
+      // PR 11.1.3: over-shoulder-locked. Camera position is the
+      // over-shoulder offset rotated by the CHARACTER's yaw so the
+      // camera stays behind the character relative to facing direction.
+      // Camera ROTATION is NOT set to character yaw — instead the
+      // camera looks at the character's chest height (a fixed world
+      // point). This way, when the mouse rotates the character, the
+      // model visually rotates IN PLACE in front of the camera (you
+      // see the character's back turn left/right as you mouse around).
+      // Matches Kyle's spec: "moves the model just like first person,
+      // just the view is over the shoulder."
+      const q = character.state.rotation;
+      const sinY = 2 * (q.w * q.y + q.z * q.x);
+      const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
+      const charYaw = Math.atan2(sinY, cosY);
+      // Rotate the over-shoulder offset (character-local space) into
+      // world space. With offset = (0, 1.7, -1.6) at yaw=0, the camera
+      // sits at character + (-(-1.6)*sin(yaw), 1.7, (-1.6)*cos(yaw))
+      // = character + (1.6*sin(yaw), 1.7, -1.6*cos(yaw)) — wait let me
+      // re-derive. A point (0, 0, -1.6) rotated by yaw around the Y
+      // axis is (-(-1.6)*sin(yaw), 0, (-1.6)*cos(yaw)) — actually
+      // the Y-rotation matrix is:
+      //   [ cos  0  sin ]
+      //   [  0   1   0  ]
+      //   [-sin  0  cos ]
+      // so (0, y, -1.6) -> (sin(yaw)*-1.6, y, cos(yaw)*-1.6)
+      //                  = (-1.6*sin(yaw), y, -1.6*cos(yaw))
+      const off = CAMERA.overShoulderOffset; // character-local
+      const worldOffX = -off.z * Math.sin(charYaw);
+      const worldOffZ = -off.z * Math.cos(charYaw);
+      camera.position.set(cp.x + worldOffX, cp.y + off.y, cp.z + worldOffZ);
+      // Camera looks at the character's chest height (world-space target,
+      // independent of yaw). This is the key difference from 1st-person:
+      // the camera's forward vector is NOT the character's yaw, so the
+      // model rotates in the camera's view.
+      camera.setTarget(new Vector3(
+        cp.x + CAMERA.lookAtOffset.x,
+        cp.y + CAMERA.lookAtOffset.y,
+        cp.z + CAMERA.lookAtOffset.z,
+      ));
       return;
     }
 

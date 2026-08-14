@@ -33,6 +33,7 @@ const URL = process.env.POINTER_LOCK_CAMERA_SMOKE_URL ?? "http://localhost:5181/
 const SCREENSHOT = process.env.POINTER_LOCK_CAMERA_SMOKE_PNG ?? "pointer-lock-camera.png";
 const FIRST_PERSON_OFFSET = { x: 0, y: 1.6, z: 0 }; // CAMERA.firstPersonOffset from characterConfig.ts
 const OVER_SHOULDER_OFFSET = { x: 0, y: 1.7, z: -1.6 }; // CAMERA.overShoulderOffset
+const CAMERA_LOOK_AT = { x: 0, y: 0.9, z: 0 }; // CAMERA.lookAtOffset
 const MENU_ORBIT = { radius: 4.5, height: 1.8, angularSpeed: 0.3 }; // CAMERA.menuOrbit
 const POSITION_TOLERANCE = 0.05; // 5cm slack for float drift
 const YAW_TOLERANCE = 0.05; // 0.05 rad slack
@@ -163,9 +164,9 @@ try {
   // changes, the camera rotation will follow.
   //
   // We can simulate character yaw change via a direct call. Add a
-  // __setCharacterYaw probe. (Documented inline.)
-  await page.evaluate((r) => window.__setCharacterYaw(r), 0.7);
-  await page.waitForTimeout(200);
+  // __applyYawDelta probe. (Documented inline.)
+  await page.evaluate(() => window.__applyYawDelta(0.7));
+  await page.waitForTimeout(300); // wait for the wire round-trip + setYaw
 
   const s3 = await page.evaluate(() => window.__chaseCameraProbe());
   console.log(
@@ -182,14 +183,18 @@ try {
   }
   console.log(`LOCKED_YAW_UPDATE_OK: |camRotY-charYaw|=${afterYawDrift.toFixed(4)} ≤ ${YAW_TOLERANCE}`);
 
-  // (d) PR 11.1.2: V cycles mode 0 → 1 (still locked). Camera should
-  // snap to character.position + overShoulderOffset.
+  // (d) PR 11.1.3: V cycles mode 0 → 1 (over-shoulder-locked).
+  // Camera should be at character + overShoulderOffset rotated by
+  // character yaw (so it stays behind the character relative to facing).
+  // Camera ROTATION is NOT the character yaw — it looks at the character's
+  // chest height (so the model rotates in view, not glued to the screen).
   await page.evaluate(() => window.__chaseCameraToggle());
   await page.waitForTimeout(200);
 
   const sMode1 = await page.evaluate(() => window.__chaseCameraProbe());
   console.log(
     `V→MODE1: isLocked=${sMode1.isPointerLocked} viewMode=${sMode1.viewMode} ` +
+    `charYaw=${sMode1.characterYaw.toFixed(4)} ` +
     `cameraPos=(${sMode1.cameraPosition.x.toFixed(3)},${sMode1.cameraPosition.y.toFixed(3)},${sMode1.cameraPosition.z.toFixed(3)})`,
   );
   if (sMode1.viewMode !== 1) {
@@ -198,10 +203,16 @@ try {
   if (!sMode1.isPointerLocked) {
     throw new Error(`[V-unlocked] V while locked shouldn't release lock; isLocked=${sMode1.isPointerLocked}`);
   }
+  // Compute expected camera position: character + offset rotated by yaw.
+  // With offset = (0, 1.7, -1.6) and yaw rotated around Y:
+  //   worldOffsetX = -(-1.6) * sin(yaw) = 1.6 * sin(yaw)
+  //   worldOffsetY = 1.7
+  //   worldOffsetZ = -1.6 * cos(yaw)
+  const yaw1 = sMode1.characterYaw;
   const expectedMode1 = {
-    x: sMode1.characterPosition.x + OVER_SHOULDER_OFFSET.x,
+    x: sMode1.characterPosition.x + (-OVER_SHOULDER_OFFSET.z) * Math.sin(yaw1),
     y: sMode1.characterPosition.y + OVER_SHOULDER_OFFSET.y,
-    z: sMode1.characterPosition.z + OVER_SHOULDER_OFFSET.z,
+    z: sMode1.characterPosition.z + (-OVER_SHOULDER_OFFSET.z) * Math.cos(yaw1),
   };
   const mode1Drift = Math.sqrt(
     Math.pow(sMode1.cameraPosition.x - expectedMode1.x, 2) +
@@ -214,15 +225,73 @@ try {
       `got=${JSON.stringify(sMode1.cameraPosition)}`,
     );
   }
-  // Yaw should still match (mode 1 is locked, mouse still rotates).
-  const mode1YawDrift = Math.abs(sMode1.cameraRotationY - sMode1.characterYaw);
-  if (mode1YawDrift > YAW_TOLERANCE) {
+  // PR 11.1.3: in over-shoulder mode, camera.rotation.y should NOT equal
+  // character yaw (that's the whole point — the camera looks at the
+  // character's chest, not in the character's facing direction). The
+  // camera's forward vector points toward the character's chest.
+  // We can verify this by computing the expected camera.rotation.y from
+  // the camera position → chest position vector. If the camera were
+  // glued to character yaw, camera.rotation.y would equal character yaw.
+  const dx = (sMode1.characterPosition.x + CAMERA_LOOK_AT.x) - sMode1.cameraPosition.x;
+  const dz = (sMode1.characterPosition.z + CAMERA_LOOK_AT.z) - sMode1.cameraPosition.z;
+  const expectedCameraYaw = Math.atan2(dx, dz); // Babylon: camera.rotation.y = atan2(forwardX, forwardZ)
+  const yawGlueDrift = Math.abs(sMode1.cameraRotationY - yaw1);
+  if (yawGlueDrift < 0.1 && Math.abs(yaw1) > 0.1) {
+    // Camera is glued to character yaw — that's the OLD buggy behavior.
     throw new Error(
-      `[V-mode1-yaw] camera.rotation.y=${sMode1.cameraRotationY.toFixed(4)} should match ` +
-      `character yaw=${sMode1.characterYaw.toFixed(4)} (drift=${mode1YawDrift.toFixed(4)})`,
+      `[V-mode1-yaw-glued] camera.rotation.y=${sMode1.cameraRotationY.toFixed(4)} matches ` +
+      `character yaw=${yaw1.toFixed(4)} (drift=${yawGlueDrift.toFixed(4)}). PR 11.1.3 expects ` +
+      `camera to look at character chest, NOT match character yaw.`,
     );
   }
-  console.log(`V_MODE1_OK: viewMode=1, locked, drift=${mode1Drift.toFixed(4)}m, yaw matches`);
+  // Camera should look toward character chest.
+  const cameraLookAtDrift = Math.abs(sMode1.cameraRotationY - expectedCameraYaw);
+  if (cameraLookAtDrift > 0.1) {
+    throw new Error(
+      `[V-mode1-lookat] camera.rotation.y=${sMode1.cameraRotationY.toFixed(4)} should point ` +
+      `toward character chest (expected=${expectedCameraYaw.toFixed(4)}, drift=${cameraLookAtDrift.toFixed(4)})`,
+    );
+  }
+  console.log(`V_MODE1_OK: viewMode=1, drift=${mode1Drift.toFixed(4)}m, camera looks at chest (rotation=${sMode1.cameraRotationY.toFixed(4)} != charYaw=${yaw1.toFixed(4)})`);
+
+  // PR 11.1.3: simulate a mouse-rotation in over-shoulder mode by
+  // pushing a delta through the chase camera's yaw accumulator (the
+  // proper source of truth — the wire packet is populated from
+  // `chase.getYaw()` in scene.ts, NOT from the character's rotation).
+  // After 1 frame the controller's setYaw is called from the decoded
+  // input, which makes the model visually rotate.
+  await page.evaluate(() => window.__applyYawDelta(0.5));
+  await page.waitForTimeout(300); // wait for the wire round-trip + setYaw
+  const sMode1Rotated = await page.evaluate(() => window.__chaseCameraProbe());
+  console.log(
+    `MODE1+0.5rad: charYaw=${sMode1Rotated.characterYaw.toFixed(4)} ` +
+    `camRotY=${sMode1Rotated.cameraRotationY.toFixed(4)} ` +
+    `cameraPos=(${sMode1Rotated.cameraPosition.x.toFixed(3)},${sMode1Rotated.cameraPosition.y.toFixed(3)},${sMode1Rotated.cameraPosition.z.toFixed(3)})`,
+  );
+  // Camera position should be at character + rotated offset.
+  const yaw1b = sMode1Rotated.characterYaw;
+  const expectedMode1Rotated = {
+    x: sMode1Rotated.characterPosition.x + (-OVER_SHOULDER_OFFSET.z) * Math.sin(yaw1b),
+    y: sMode1Rotated.characterPosition.y + OVER_SHOULDER_OFFSET.y,
+    z: sMode1Rotated.characterPosition.z + (-OVER_SHOULDER_OFFSET.z) * Math.cos(yaw1b),
+  };
+  const mode1RotatedDrift = Math.sqrt(
+    Math.pow(sMode1Rotated.cameraPosition.x - expectedMode1Rotated.x, 2) +
+    Math.pow(sMode1Rotated.cameraPosition.y - expectedMode1Rotated.y, 2) +
+    Math.pow(sMode1Rotated.cameraPosition.z - expectedMode1Rotated.z, 2),
+  );
+  if (mode1RotatedDrift > POSITION_TOLERANCE) {
+    throw new Error(
+      `[V-mode1-rotation] drift ${mode1RotatedDrift.toFixed(4)}m after char yaw=0.5`,
+    );
+  }
+  // Camera rotation should have changed (not stuck glued to old value).
+  if (Math.abs(sMode1Rotated.cameraRotationY - sMode1.cameraRotationY) < 0.05) {
+    throw new Error(
+      `[V-mode1-rot-stuck] camera.rotation.y didn't change after char yaw changed (was ${sMode1.cameraRotationY.toFixed(4)}, now ${sMode1Rotated.cameraRotationY.toFixed(4)})`,
+    );
+  }
+  console.log(`V_MODE1_ROT_OK: camera repositioned to track character, rotation updated`);
 
   // (e) PR 11.1.2: V again → mode 0 (wrap). Camera back at firstPersonOffset.
   await page.evaluate(() => window.__chaseCameraToggle());
