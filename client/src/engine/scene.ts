@@ -345,6 +345,16 @@ export async function createScene(
   if (import.meta.env.DEV && typeof window !== "undefined") {
     (window as unknown as { __jumpProbe?: () => number }).__jumpProbe = () =>
       character.state.position.y;
+    // PR 10: smoke-only accessor for the health-regression test. Teleports
+    // the REMOTE rig onto a known position so every shot in the smoke
+    // is a guaranteed hit. Gated behind `import.meta.env.DEV` (same as
+    // `__jumpProbe`); stripped from production bundles by Vite.
+    if (gameSession) {
+      (window as unknown as { __teleportRemote?: (x: number, z: number) => void }).__teleportRemote =
+        (x: number, z: number) => {
+          gameSession.remoteController.havok.setPosition(new Vector3(x, 1, z));
+        };
+    }
   }
 
   const handle: SceneHandle = {

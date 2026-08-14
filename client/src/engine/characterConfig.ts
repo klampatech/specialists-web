@@ -87,7 +87,23 @@ export const SPAWN_POSITION = new Vector3(0, CAPSULE.height / 2, 0);
 
 /** World gravity (m/s²) — also exposed for the Havok plugin. */
 export const WORLD_GRAVITY = MOVEMENT.gravity.clone();
+
+/**
+ * PR 10: health-pool tunables. The HP pool lives on the
+ * `CharacterController.state` (see `characterController.ts`) and the
+ * damage values are reused from `client/src/game/combat.ts`
+ * (`COMBAT.dualPistol.damage = 12`, `COMBAT.melee.damage = 25`). This
+ * block owns the *pool size* and the *respawn delay* — the damage
+ * application itself lives in `client/src/game/health.ts`.
+ */
+export const HEALTH = {
+  maxHp: 100,
+  respawnDelayMs: 1000,
+} as const;
+
 // PR 7: combat tunables now live in `client/src/game/combat.ts` as the single
 // structured source. The flat `COMBAT` / `BULLET_TIME` placeholders that
 // landed in PR 4 are removed — nothing read them, and they shadowed the
 // structured tunables in combat.ts.
+// PR 10: health tunables now live above (`HEALTH`); combat damage
+// constants stay in `combat.ts` so PR 7's `COMBAT` is unchanged.

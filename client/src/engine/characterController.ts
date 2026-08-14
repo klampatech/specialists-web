@@ -31,6 +31,7 @@ import {
 
 import {
   CAPSULE,
+  HEALTH,
   MOVEMENT,
   SLOPE_AND_STEP,
   STUNTS,
@@ -55,6 +56,13 @@ export interface CharacterState {
   supported: boolean;
   sliding: boolean;
   stunt: "none" | "dive" | "slide" | "wallrun";
+  /** PR 10: current health points. Decremented by `applyDamage` from
+   *  `game/health.ts`; reset to `HEALTH.maxHp` on respawn / `reset()`. */
+  hp: number;
+  /** PR 10: timestamp (ms) at which the respawn teleport should fire.
+   *  Set to `nowMs + HEALTH.respawnDelayMs` when HP drops to 0; cleared
+   *  when the teleport fires. 0 means "not currently respawning". */
+  respawningUntilMs: number;
 }
 
 /** Options accepted by `createCharacterController`. */
@@ -62,6 +70,15 @@ export interface CharacterControllerOptions {
   startPosition?: Vector3;
   /** Visual root the controller drives — receives the same transform each frame. */
   visualRoot?: TransformNode;
+  /**
+   * PR 10.2: where the controller teleports back to on `respawn()`.
+   * Defaults to `startPosition` when omitted. The remote (cyan) rig
+   * wants to start at an offset position for visual clarity but respawn
+   * to the SAME point as the local rig (so the cyan rig mirrors where
+   * the actual remote player's red rig is, not where the cyan rig
+   * happened to be when the local tab loaded).
+   */
+  respawnPosition?: Vector3;
 }
 
 /** Default gravity direction used by `checkSupport` (must match world gravity). */
@@ -105,7 +122,7 @@ export function createCharacterController(
   havok.dynamicFriction = BASE_DYNAMIC_FRICTION;
   havok.up = new Vector3(0, 1, 0);
 
-  return new CharacterController(havok, options.visualRoot, startPosition);
+  return new CharacterController(havok, options.visualRoot, startPosition, options.respawnPosition);
 }
 
 /** Public wrapper — owns the Havok controller + stunt state machine. */
@@ -113,7 +130,14 @@ export class CharacterController {
   readonly havok: PhysicsCharacterController;
   readonly state: CharacterState;
   private readonly visualRoot: TransformNode | undefined;
-  private readonly startPosition: Vector3;
+  /** PR 10: spawn point the controller starts at. */
+  public readonly startPosition: Vector3;
+  /** PR 10.2: where the controller teleports to on `respawn()`.
+   *  Defaults to `startPosition` if not provided at construction.
+   *  Set separately so the remote (cyan) rig can start at an offset
+   *  for visual clarity but respawn to the same point as the local
+   *  rig (so the cyan rig mirrors the actual remote player's position). */
+  public readonly respawnPosition: Vector3;
   private readonly up: Vector3 = new Vector3(0, 1, 0);
   private readonly baseDynamicFriction: number = BASE_DYNAMIC_FRICTION;
   private yawRadians: number = 0;
@@ -138,16 +162,22 @@ export class CharacterController {
     havok: PhysicsCharacterController,
     visualRoot: TransformNode | undefined,
     startPosition: Vector3,
+    respawnPosition?: Vector3,
   ) {
     this.havok = havok;
     this.visualRoot = visualRoot;
     this.startPosition = startPosition.clone();
+    // PR 10.2: respawnPosition defaults to startPosition when omitted
+    // (preserves PR 10's existing behavior for callers that don't care).
+    this.respawnPosition = (respawnPosition ?? startPosition).clone();
     this.state = {
       position: startPosition.clone(),
       rotation: Quaternion.Identity(),
       supported: true,
       sliding: false,
       stunt: "none",
+      hp: HEALTH.maxHp,
+      respawningUntilMs: 0,
     };
   }
 
@@ -170,6 +200,43 @@ export class CharacterController {
     // PR 8.1: clear the wallrun rising-edge tracker + cooldown too.
     this.wasWallrunPressedLast = false;
     this.lastWallrunEndedAtMs = 0;
+    // PR 10: reset health pool + any in-flight respawn timer.
+    this.state.hp = HEALTH.maxHp;
+    this.state.respawningUntilMs = 0;
+  }
+
+  /**
+   * PR 10: teleport the controller back to its spawn point and restore
+   * a clean state. Called from `tickRespawn` in `game/health.ts` once
+   * the respawn timer expires. Encapsulates the reset path so callers
+   * don't need to know the underlying `havok.setPosition` /
+   * `havok.setVelocity` sequence.
+   *
+   * Resets position, velocity, health, respawn timer, stunts, and the
+   * wallrun cooldown. Does NOT mutate the input-driven state machine
+   * (the next `update()` call will re-derive stunt state from input).
+   */
+  public respawn(_nowMs: number): void {
+    // PR 10.2: teleport to `respawnPosition`, not `startPosition`. The
+    // remote (cyan) rig has a different `startPosition` (offset for initial
+    // visual clarity) than `respawnPosition` (same as local rig, so the
+    // cyan rig mirrors the actual remote player's spawn point).
+    this.havok.setPosition(this.respawnPosition.clone());
+    this.havok.setVelocity(Vector3.Zero());
+    this.state.position.copyFrom(this.respawnPosition);
+    this.state.hp = HEALTH.maxHp;
+    this.state.respawningUntilMs = 0;
+    this.stunt = "none";
+    this.stuntEndsAtMs = 0;
+    this.stuntJustEntered = false;
+    this.state.stunt = "none";
+    this.wasWallrunPressedLast = false;
+    this.lastWallrunEndedAtMs = 0;
+    this.yawRadians = 0;
+    this.state.rotation.copyFromFloats(0, 0, 0, 1);
+    this.havok.dynamicFriction = this.baseDynamicFriction;
+    this.havok.staticFriction = 0;
+    this.lastPlanarSpeed = 0;
   }
 
   /** Set the yaw the character should face (radians, 0 = +Z forward). */

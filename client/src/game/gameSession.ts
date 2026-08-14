@@ -43,6 +43,15 @@
 // correctly. `meleePressed` is cleared by the inputListener on read()
 // so it's true for exactly one frame per RMB press.
 //
+// **Health & respawn (PR 10)**: damage application lives in
+// `game/health.ts`. On each rising-edge combat event we call
+// `applyDamage(opponent, ...)`; both controllers' respawn timers are
+// ticked every frame via `tickRespawn`. `wasRemoteFiring` /
+// `wasRemoteMelee` mirror the local trackers so the same damage flow
+// runs for the peer player's input. Both clients compute identical
+// damage events from identical inputs (lockstep), apply them to the
+// opponent locally, and teleport to spawn at the same `nowMs`.
+//
 // **Two-character scene**: we have *one* Havok controller per rig. Each tab
 // runs both controllers — local receives the tab's own encoded input, remote
 // receives whatever the peer's `LockstepRuntime` has for that frame. Both
@@ -65,6 +74,7 @@ import {
   type DualPistolResult,
   type MeleeResult,
 } from "./combat";
+import { applyDamage, tickRespawn, type HealthSnapshot } from "./health";
 
 /** One combat event the HUD / tracer render can react to. */
 export type CombatEvent =
@@ -120,6 +130,8 @@ export interface GameSession {
   /** Drain the combat events since the last call; the tracer render uses
    *  this so each event triggers exactly one tracer line. */
   consumeUnrenderedCombatEvents(): CombatEvent[];
+  /** PR 10: snapshot of both controllers' HP + respawn timer for the HUD. */
+  getHealthSnapshot(): HealthSnapshot;
   /** Tear down both rigs + the runtime. */
   dispose(): void;
 }
@@ -153,7 +165,10 @@ export function createGameSession(
   const applyLocalPose = attachPoseUpdater(localModel, localController);
 
   // ---- Remote rig + controller ------------------------------------------------
-  const remote = createRemotePlayer(scene, "remote", remoteSpawn);
+  // PR 10.2: the remote rig spawns at an offset (visual clarity when no peer
+  // is connected yet), but respawns to `localSpawn` (so the cyan rig mirrors
+  // the actual remote player's red rig, not the offset initial position).
+  const remote = createRemotePlayer(scene, "remote", remoteSpawn, localSpawn);
   const remoteController = remote.controller;
   const applyRemotePose = attachPoseUpdater(remote.model, remoteController);
 
@@ -169,6 +184,13 @@ export function createGameSession(
   let wasFiring = false;
   /** Previous `input.meleePressed` value — tracks rising edges. */
   let wasMelee = false;
+  /** PR 10: same trackers for the REMOTE input — symmetric damage flow. */
+  let wasRemoteFiring = false;
+  let wasRemoteMelee = false;
+  /** PR 10: cached `nowMs` from the last tick — used to compute the
+   *  remaining respawn countdown for the HUD snapshot. Updated every
+   *  tick; read by `getHealthSnapshot()`. */
+  let lastNowMs = 0;
 
   /**
    * One tick: encode local input → submit → advance → apply decoded inputs to
@@ -180,6 +202,9 @@ export function createGameSession(
     deltaSeconds: number,
     nowMs: number,
   ): SessionFrame => {
+    // PR 10: cache `nowMs` so `getHealthSnapshot()` can compute the
+    // remaining respawn countdown without re-reading the wall clock.
+    lastNowMs = nowMs;
     // 1. Encode + submit local input + advance one frame. The runtime uses
     //    the on-wire remote input if it's already arrived, or repeats the
     //    last-known input otherwise.
@@ -218,6 +243,11 @@ export function createGameSession(
         tracerTo: result.tracerTo,
         damage: result.damage,
       });
+      // PR 10: local fired → remote takes the damage (lockstep
+      // guarantees identical events on both clients).
+      if (result.hit) {
+        applyDamage(remoteController, { source: "fire", amount: result.damage }, nowMs);
+      }
     }
     if (input.meleePressed && !wasMelee) {
       const result: MeleeResult = meleeSwing(
@@ -231,10 +261,51 @@ export function createGameSession(
           kind: "melee_hit",
           damage: result.damage,
         });
+        // PR 10: melee hit also applies damage to the remote rig.
+        applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
       }
     }
     wasFiring = input.fireHeld;
     wasMelee = input.meleePressed;
+
+    // PR 10: symmetric damage flow on the REMOTE input. Both clients run
+    // the same lockstep, so this runs identically on both ends — the
+    // local controller's HP drops by the same amount on the same frame
+    // on both clients (no out-of-sync). The remote-fired raycast/melee
+    // uses the same `dualPistolShoot` / `meleeSwing` helpers — the
+    // helpers take the *firing* controller as the source and the *other*
+    // as the target, which lines up exactly with what we want here.
+    if (remoteDecoded.fireHeld && !wasRemoteFiring) {
+      const result: DualPistolResult = dualPistolShoot(
+        remoteDecoded,
+        remoteController,
+        localController,
+        scene,
+      );
+      if (result.hit) {
+        applyDamage(localController, { source: "fire", amount: result.damage }, nowMs);
+      }
+    }
+    if (remoteDecoded.meleePressed && !wasRemoteMelee) {
+      const result: MeleeResult = meleeSwing(
+        remoteDecoded,
+        remoteController,
+        localController,
+      );
+      if (result.hit) {
+        applyDamage(localController, { source: "melee", amount: result.damage }, nowMs);
+      }
+    }
+    wasRemoteFiring = remoteDecoded.fireHeld;
+    wasRemoteMelee = remoteDecoded.meleePressed;
+
+    // PR 10: tick the respawn timer for both controllers every frame.
+    // The teleport fires on the first frame where `nowMs >=
+    // respawningUntilMs`, which both clients reach on the same frame
+    // because their `nowMs` values are both engine-driven.
+    tickRespawn(localController, nowMs);
+    tickRespawn(remoteController, nowMs);
+
     // Push the per-frame events onto the session-level buffer so the HUD
     // and tracer render can read them.
     for (const ev of frameCombatEvents) combatEvents.push(ev);
@@ -271,6 +342,26 @@ export function createGameSession(
       lastRenderedIdx = combatEvents.length;
       return drain;
     },
+    getHealthSnapshot: (): HealthSnapshot => ({
+      local: {
+        hp: localController.state.hp,
+        // Convert the absolute respawning-until timestamp to a remaining
+        // countdown for the HUD. Clamped at 0 — past-deadline renders 0
+        // (teleport fires this frame). `lastNowMs` was captured inside
+        // the last `tick()`; same value the tick uses to fire the teleport.
+        respawningMs:
+          localController.state.respawningUntilMs > 0
+            ? Math.max(0, localController.state.respawningUntilMs - lastNowMs)
+            : 0,
+      },
+      remote: {
+        hp: remoteController.state.hp,
+        respawningMs:
+          remoteController.state.respawningUntilMs > 0
+            ? Math.max(0, remoteController.state.respawningUntilMs - lastNowMs)
+            : 0,
+      },
+    }),
     dispose: () => {
       runtime.dispose();
       localModel.dispose();

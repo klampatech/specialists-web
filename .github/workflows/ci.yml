@@ -285,6 +285,70 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  # Phase 0 / PR 10: health regression smoke. Asserts that the new
+  # HP pool actually drains to 0 under sustained LMB fire, that the
+  # respawn timer fires after HEALTH.respawnDelayMs (1s + slack), and
+  # that the controller teleports back to SPAWN_POSITION. Uses a
+  # DEV-only `window.__teleportRemote(x, z)` accessor (gated behind
+  # `import.meta.env.DEV`) so every shot in the smoke is a guaranteed
+  # hit without depending on the visual position of the two rigs.
+  #
+  # Why a separate job: this PR introduces real HP mutation + the
+  # respawn path. Both are easy to silently regress in a future PR
+  # that touches CharacterController or GameSession. The smoke is the
+  # regression guard. Port 5177 so it stays independent of all the
+  # other smoke jobs (5173 / 5174 / 5175 / 5176).
+  client-health-smoke:
+    name: client — health regression smoke (PR 10)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server (port 5177)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5177 > /tmp/vite-dev5.log 2>&1 &
+          echo $! > /tmp/vite-dev5.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5177/ > /dev/null; then
+              echo "Dev server (health smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5177/ > /dev/null; then
+            echo "::error::Dev server (health smoke) did not come up in 60s"
+            cat /tmp/vite-dev5.log
+            exit 1
+          fi
+      - name: Run health regression smoke
+        run: node ./tools/health-regression-smoke.mjs
+        env:
+          HEALTH_SMOKE_URL: http://localhost:5177/
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-regression-screenshot
+          path: client/health-regression.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev5.pid ]]; then
+            kill "$(cat /tmp/vite-dev5.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   spec-canonical:
     name: spec layout — canonical at docs/SPEC.md
     runs-on: ubuntu-latest
