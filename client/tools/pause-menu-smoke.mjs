@@ -73,11 +73,14 @@ try {
 
   // ── 3. Unlock: menu IS in DOM ────────────────────────────────────────────
   await page.evaluate(() => window.__pointerLockToggle(false));
-  await page.waitForTimeout(200);
-  const menu3 = await page.$('[data-testid="pause-menu"]');
-  if (menu3 === null) {
-    FAIL("Unlocked + everLocked should render the pause menu");
-  }
+  // PR 11.2.1: wait for the React HUD's 10Hz poll to re-render the menu.
+  // waitForSelector polls the DOM until the element exists — robust
+  // against CI timing variance where the React render may lag the
+  // probe by 100-300ms.
+  await page.waitForSelector('[data-testid="pause-menu"]', {
+    state: "visible",
+    timeout: 2000,
+  });
   PASS("Unlocked + everLocked: pause menu rendered");
 
   // ── 4. Backdrop pointer-events: auto (HUD-overlay-eats-clicks guard) ────
