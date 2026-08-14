@@ -4,6 +4,287 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-14 — PR 11.1 MERGED. Next session: pick up PR 11.2 (pause menu UI).
+
+**Status**: PR 11.1 (per-player first-person mouse-look) MERGED at https://github.com/klampatech/specialists-web/pull/17 (5 commits: `76cf5f2`, `4fb5417`, `3c91d30`, `c755a99`, `cafe7e0`, `384bd30`). All 8 smokes green on CI. Dev-box two-tab playtest (Kyle, 2026-08-14) confirmed: click-to-lock, cross-client yaw propagation, over-shoulder model rotation, ESC menu orbit visible, V cycling correct, tracer follows current yaw. Closes Milestone 2 acceptance row 10 of 11. Last M2 row (60s two-tab stress test) pending dev-box session time.
+
+### What landed
+
+**Wire format**: `INPUT_SIZE` 8 → 10; bytes 2-3 = little-endian uint16 yaw (~0.0055°/LSB). Both clients decode the peer's yaw on the same frame → controller's `setYaw(input.yawRadians)` is called BEFORE WASD projection → identical world directions on both sides → lockstep determinism preserved.
+
+**Pointer-lock flow**: click canvas → `requestPointerLock()` → mousemove `e.movementX * 0.0025 rad/px` accumulates into the chase camera's local yaw → ESC releases into the **menu orbit camera** (slow auto-rotation around the character at radius 4.5m, height 1.8m, 0.3 rad/sec, frame-rate-independent via `engine.getDeltaTime()`).
+
+**V-key behavior** (per Kyle's spec): while locked, V cycles 0 ↔ 1 (1st-person-locked ↔ over-shoulder-locked); while unlocked, V is a no-op. Click to lock always enters mode 0. Over-shoulder mode keeps camera position tracking behind the character but camera rotation looks at the character's chest (so the model visibly rotates IN VIEW, not glued to screen).
+
+**Tracer yaw fix** (PR 11.1.1 follow-up): `client/src/game/combat.ts` had a PR 7 placeholder that hardcoded yaw=0 for the tracer ray. Replaced with `forwardFromYaw(input.yawRadians)` helper that derives from the current frame's input yaw (zero lag, lockstep-safe since the tracer is render-only).
+
+**Smokes**: `mouse-look-smoke.mjs` (port 5178), `pointer-lock-camera-smoke.mjs` (port 5181, 9-state assertions covering fresh/lock/V/ESC/orbit/V-noop/re-lock), `yaw-wire-format-smoke.mjs` (port 5182, 7 representative yaw values round-trip within 1.5 LSB tolerance).
+
+### PR 11.1 commit-by-commit
+
+| SHA | What it ships |
+| --- | --- |
+| `76cf5f2` | Original PR 11.1: wire format change + pointer-lock plumbing + mouse-look smoke + chase camera refactor (200 lines) |
+| `4fb5417` | Two new smokes (pointer-lock-camera + yaw-wire-format) + CI jobs + HANDOFF follow-up |
+| `3c91d30` | PR 11.1.1: tracer yaw fix + initial 3-mode V-cycle (pre-simplification) |
+| `c755a99` | PR 11.1.2: simplified to 2-mode V-cycle (per Kyle) + menu orbit camera |
+| `cafe7e0` | PR 11.1.3: over-shoulder mode rotates model in view (was glued to screen due to camera-rotation-equals-character-yaw bug) |
+| `384bd30` | PR 11.1.4: menu orbit uses `engine.getDeltaTime()` instead of fixed 1/60 (CI fix — headless runs ~20-30fps, orbit was too slow) |
+
+### Where we are in the milestone roadmap
+
+| Milestone | PRs | Status |
+| --- | --- | --- |
+| M1 (movement + stunts) | 2, 3, 8, 8.1 | ✅ Closed |
+| M2 (netcode + combat) | 6, 7, 10, 10.1, 10.2, 11.1 | 10/11 acceptance rows landed, last row pending 60s stress test |
+| M3 (assets + polish) | TBD | Not started |
+| Phase 1 (internet-multiplayer) | TBD | Gating on rollback + server-authoritative damage |
+
+### Next session plan (PR 11.2 candidate)
+
+**Recommendation: pause / loadout menu UI** — PR 11.1 added the menu orbit camera + cursor unlock on ESC, but there's no actual menu to interact with yet. The cursor unlocks on ESC, then sits in space doing nothing.
+
+**Scope**:
+1. React overlay shown when ESC is pressed (route through existing pointerLockToggle(false) flow + a new wire bit if needed for the peer's HUD).
+2. Menu items: **Resume** (re-lock pointer — just call `__pointerLockToggle(true)` again), **Loadout** (placeholder), **Settings** (placeholder), **Disconnect Peer**.
+3. Cursor-driven UI (clickable buttons). Today the cursor is unlocked on ESC but nothing reads its position.
+4. New smoke: `pause-menu-smoke.mjs` — open menu (ESC), assert menu visible, click Resume, verify camera re-locks at mode 0.
+5. Reuse the HUD patterns from PR 2/3/10 (CSS-grid + monospace + the existing `useState`-driven HUD overlay).
+
+**Alternatives to consider** (ranked by next-session value):
+- **Spectator camera** (F2 detach, free-fly): unblocks the next two-tab dev session — easier to inspect the other player's position relative to crates. ~50 lines in `chaseCamera.ts` + a new state. No new wire byte.
+- **Mouse pitch** (Y-axis mouse-look): natural feel follow-up. Same wire-byte pattern as yaw (bytes 4-5), `forwardFromYaw` becomes `forwardFromYawPitch`. Low risk, ~30 lines in `characterConfig.ts` + `characterController.ts` + `combat.ts` + `chaseCamera.ts`.
+- **60s M2 stress test closure**: drive both tabs simultaneously for 60s, watch console + frame delta + HP delta. 5 min of playtest, no code.
+
+**Recommended order**: pause menu → 60s M2 closure → spectator camera → mouse pitch. The pause menu completes the mouse-look UX (per Kyle's "the only reason to unlock the cursor is to interact with menus"); the 60s closure formally closes M2; the spectator camera unblocks the next two-tab dev session; pitch rounds out the feel.
+
+### Files / build state at end of session
+
+- Worktree: `~/Development/specialists-web-pr11.1/` (alive; can remove after Kyle merges + re-pulls main)
+- Branch: `feat/phase0-pr11.1-mouse-look` (will be deleted on merge by GitHub)
+- main: at `a7c3ae2` (pre-11.1); the merge will be the squash of PR #17
+- All 8 smokes green locally + on CI
+- Build: `npm run build` exits 0 (1m 56s), bundle 7,048.62 kB
+
+### Decisions log (full design rationale in `docs/SPEC.md` §"2026-08-14 — PR 11.1 implementation decisions")
+
+1. Yaw on the wire, not client-local (lockstep determinism requires both clients compute the same WASD world directions).
+2. `INPUT_SIZE` 8 → 10; both clients upgrade together; pre-PR-11.1 traffic with bytes 2-3 = 0 still decodes correctly.
+3. Locked camera = 1:1 with character (no lerp). Chase lerp only on dev-box fresh page.
+4. V cycles 2 locked modes only; V no-op while unlocked.
+5. ESC → menu orbit (per Kyle option b); auto-rotation, no mouse control.
+6. Click-to-lock always enters mode 0 (1st-person).
+7. Over-shoulder: camera position tracks behind, camera rotation looks at chest (model rotates IN VIEW).
+8. Tracer uses `input.yawRadians` (frame-N, zero lag) not `character.state.rotation` (1-2 frame lag).
+9. Menu orbit uses `engine.getDeltaTime()` for frame-rate independence (CI fix PR 11.1.4).
+10. Code path for all smokes is via DEV-only probes (`__applyYawDelta`, `__pointerLockToggle`, `__chaseCameraToggle`, `__chaseCameraProbe`); gated behind `import.meta.env.DEV`, stripped from production.
+
+### Known carry-forwards
+
+- `client/src/engine/inputListener.ts:249` still has the `[input] window mousedown (capture path)` debug console.log from PR 7. PR 16 (cleanup PR) missed it. Trivial follow-up.
+- The PR 11.1 "READY for review" entry in HANDOFF has been superseded by this MERGED entry. Old entries below are historical.
+
+---
+
+## 2026-08-14 — PR 11.1.2: 2-mode V-cycle + menu orbit camera. Pre-merge.
+
+**Status**: PR 11.1.2 ready for review. Replaces the PR 11.1.1 3-mode state machine with Kyle's simpler 2-mode spec + adds the menu orbit camera (option b from his feedback). All 8 smokes green locally.
+
+### Spec simplification (per Kyle's feedback)
+
+Replaces PR 11.1.1's `viewMode: 0|1|2` (1st-locked, 3rd-locked, chase-unlocked) with PR 11.1.2's `viewMode: 0|1` (1st-locked, over-shoulder-locked). The chase-lerp "playing mode" is gone — there's no user-visible chase while playing. The chase lerp exists only as a **dev-box fallback** for a fresh page that hasn't engaged pointer-lock yet.
+
+- **V (while locked)**: cycles 0 ↔ 1 (1st-person ↔ over-shoulder). Both are pointer-locked.
+- **V (while unlocked)**: **no-op** (user is interacting with a menu, not playing).
+- **ESC (pointerLock=false)**: enters the **menu orbit camera** (option b from Kyle's reply) — slow auto-rotation around the character at radius 4.5m, height 1.8m, 0.3 rad/sec.
+- **Click canvas to lock**: always enters mode 0 (1st-person); resets the menu orbit so the next ESC starts fresh.
+
+### Menu orbit camera
+
+`CAMERA.menuOrbit = { radius: 4.5, height: 1.8, angularSpeed: 0.3 }` (rad/sec → full orbit in ~21s). Auto-advances per-frame when `(pointerLocked=false AND everLocked=true)`. Camera position = `(char.x + sin(menuAngle) * radius, char.y + height, char.z + cos(menuAngle) * radius)`. Always looks at character's chest height. No mouse control.
+
+### Over-shoulder offset (Kyle's screenshot)
+
+`CAMERA.overShoulderOffset = (0, 1.7, -1.6)` — close-behind + slightly above character head. Distinct from `thirdPersonOffset` (which is the chase lerp's wider back-off) because the lerp is disabled while locked AND the offset is much tighter.
+
+### Smoke updates
+
+`pointer-lock-camera-smoke.mjs` now asserts the full PR 11.1.2 spec:
+1. Fresh page: not locked, not menu-orbit.
+2. Lock → mode 0, camera at firstPersonOffset (within 5cm).
+3. Lock → camera.rotation.y matches character yaw.
+4. Yaw delta propagates to camera.
+5. V → mode 1 (still locked), camera at overShoulderOffset.
+6. V → mode 0 (wrap), camera back at firstPersonOffset.
+7. ESC → menu orbit ACTIVE, camera on orbit circle, menuAngle advances.
+8. V while unlocked → no-op, viewMode unchanged.
+9. Re-lock → mode 0, menu orbit not active, firstPersonOffset.
+
+### Verification (local)
+
+All 8 smokes green: scene / jump / wallrun / health / two-tab / mouse-look / pointer-lock-camera (with 2-mode V-cycle + menu orbit) / yaw-wire-format. Spec-canonical guard passes.
+
+### Files changed
+
+- `client/src/engine/characterConfig.ts`: renamed `thirdPersonLockedOffset` → `overShoulderOffset`; tuned to `(0, 1.7, -1.6)`; `viewModeCount: 2`; new `menuOrbit` block.
+- `client/src/engine/chaseCamera.ts`: rewrote state machine — viewMode ∈ {0,1}, V no-op when unlocked, ESC → menu orbit (new render branch), chase lerp only for fresh pages.
+- `client/src/engine/scene.ts`: extended `__chaseCameraProbe` with `isMenuOrbit` + `menuAngle`.
+- `client/tools/pointer-lock-camera-smoke.mjs`: rewrote all 9 assertions to match PR 11.1.2 spec.
+
+### What still needs Kyle's playtest
+
+Real-browser pointer-lock UX (click → lock → mouse rotates → ESC → menu orbit visible → click → re-lock). The smoke proves the code paths; only the browser-grants-lock layer is the dev-box test. Also: re-test the over-shoulder offset vs. Kyle's screenshot — if `(0, 1.7, -1.6)` is too high/close/far, easy 1-line tweak.
+
+---
+
+## 2026-08-14 — PR 11.1.1: tracer yaw fix + 3-mode V-cycle state machine. Pre-merge.
+
+**Status**: PR 11.1.1 ready for review. Two changes: (1) tracer + melee forward direction now derived from `input.yawRadians` instead of hardcoded `yaw=0` (this was a pre-existing PR 7 bug that PR 11.1 made visible by adding yaw rotation); (2) `chaseCamera` now exposes a 3-mode `viewMode` state machine (0=1st-locked, 1=3rd-locked, 2=chase-unlocked) that V cycles through, with `pointer-lock-click → mode 0` and `ESC → mode 2` as the two state transitions. Both fixes verified by extending the existing pointer-lock-camera smoke (now covers all 3 V-mode transitions + wrap + position checks).
+
+### Combat fix (the tracer-was-firing-in-the-old-direction bug)
+
+Kyle reported (via playtest): "the tracer fires the direction the model was facing BEFORE i rotated the model in first person view with the pointer locked."
+
+Root cause: `client/src/game/combat.ts` had a placeholder from PR 7 (`const FORWARD_AT_YAW_0 = new Vector3(0, 0, 1);`) that hardcoded yaw=0 for the tracer ray. The doc comment even acknowledged it: "Phase 1 mouse-look will replace this with the controller's `yawRadians`." PR 11.1 added mouse-look + yaw on the wire, so this placeholder became wrong.
+
+Fix: added `forwardFromYaw(yawRadians: number): Vector3` helper that returns `(sin(yaw), 0, cos(yaw))` (the local-forward unit vector in the XZ plane). Both `dualPistolShoot` and `meleeSwing` now derive their forward direction from `input.yawRadians` (frame-N, zero lag) instead of `localController.state.rotation` (which lags by 1-2 frames because of the encode/decode/setYaw round-trip).
+
+**Why input.yawRadians and not character.state.rotation?** Two reasons:
+1. **Frame-accurate**: input.yawRadians is what the user just input on frame-N. character.state.rotation lags by 1-2 frames (encode → decode → setYaw → next tick's rotation). Using the lagged rotation would make the tracer fire where the character USED TO be facing, not where they're facing NOW.
+2. **Lockstep-safe**: the tracer is a render-only side-effect (the DualPistolResult struct is not fed back to the wire). Using the input yaw here doesn't break determinism because it doesn't affect anything either peer simulates.
+
+### V-mode 3-state state machine
+
+Replaces PR 3's `firstPerson: boolean` with PR 11.1.1's `viewMode: 0|1|2`:
+- **Mode 0** (1st-person-locked): camera at `firstPersonOffset = (0, 1.6, 0)` (eye height, no back-off), rotated by yaw. Mouse rotates character.
+- **Mode 1** (3rd-person-locked): camera at `thirdPersonLockedOffset = (0, 1.6, -2.5)` (eye height + 2.5m behind), rotated by yaw. Mouse rotates character. Matches Kyle's "Minecraft-style" 3rd-person-locked reference.
+- **Mode 2** (chase-unlocked): PR 3 lerped chase at `thirdPersonOffset = (0, 1.5, -2.8)`, no mouse control.
+
+V cycles `0 → 1 → 2 → 0`. Click to lock → mode 0 (always). ESC → mode 2 (always). The chase lerp runs only when NOT (locked AND mode ∈ {0, 1}).
+
+### Smoke extensions
+
+`pointer-lock-camera-smoke.mjs` now asserts all 7 transitions:
+- Mode 0 + locked: camera.position = character + firstPersonOffset (within 5cm)
+- Mode 0 + locked: camera.rotation.y matches character yaw (within 0.05 rad)
+- Yaw delta propagates to camera in mode 0
+- V → mode 1 (still locked): camera.position = character + thirdPersonLockedOffset (within 5cm); yaw still matches
+- V → mode 2 (still locked): camera drifts from firstPersonOffset as the lerp catches up (≥5cm)
+- V → mode 0 (wrap from mode 2)
+- setPointerLock(false) → mode 2 unlocked; camera at lerped chase offset
+
+### Verification (local)
+
+All 9 gates green:
+- ✓ typecheck + build
+- ✓ scene / jump / wallrun / health / two-tab smokes
+- ✓ mouse-look + pointer-lock-camera (with new 3-mode V-cycle assertions) + yaw-wire-format
+- ✓ spec-canonical guard
+
+### Files changed
+
+- `client/src/engine/characterConfig.ts` (+15): new `thirdPersonLockedOffset` + `viewModeCount` config.
+- `client/src/engine/chaseCamera.ts` (+94/-30): 3-mode viewMode state machine; new `getViewMode`/`setViewMode` API; render path gates lerp on (locked AND mode 0/1).
+- `client/src/engine/scene.ts` (+7): new `__chaseCameraToggle` probe + `viewMode` in `__chaseCameraProbe` return shape.
+- `client/src/game/combat.ts` (+44/-2): removed `FORWARD_AT_YAW_0` placeholder; added `forwardFromYaw(yawRadians)` helper; both `dualPistolShoot` and `meleeSwing` derive forward from input yaw.
+- `client/tools/pointer-lock-camera-smoke.mjs` (+125/-40): new V-cycle + wrap + lerp assertions.
+
+### What still needs Kyle's playtest
+
+The pointer-lock UX itself (click → lock → mouse rotates → ESC → unlocks) and the cross-client yaw propagation. The two-tab smoke covers the wire-format but not the real-browser lock layer. V-cycle behavior should now be: lock + V cycles 0→1→2→0 visually; unlocked V cycles 0→1→2→0 but all three are the chase lerp with different offsets.
+
+---
+
+## 2026-08-14 — PR 11.1 follow-up: two new smokes (pointer-lock-camera + yaw-wire-format). Dev-box playtest in progress.
+
+**Status**: Two additional smokes added to PR 11.1's CI gate (still pending Kyle's dev-box playtest of the pointer-lock UX). All 8 smokes green on the working tree; 3 new CI jobs added to `.github/workflows/ci.yml`. The pointer-lock-camera smoke verifies the chase camera's RENDER path honors the lock state (1:1 snap when locked, lerped chase when not). The yaw-wire-format smoke verifies the wire-format determinism (encode → decode round-trip within 1.5 LSB tolerance across 7 representative yaw values including negative + multi-wrap). Both smokes are CI-runnable in headless (don't depend on real pointer-lock or WebRTC ICE).
+
+**Why two smokes and not one combined**: each catches a distinct regression class. Pointer-lock-camera catches "camera accidentally lerps while locked" / "camera position wrong when locked" / "camera rotation doesn't track character yaw" — pure camera-render bugs. Yaw-wire-format catches "yawToBits off-by-one" / "decodeInput reads wrong byte" / "wrap arithmetic breaks" — pure wire-format bugs. They have different failure modes that would mask each other if combined.
+
+**What this incremental change adds**:
+- **`client/src/engine/chaseCamera.ts`** (`+7` lines) — new `isPointerLocked(): boolean` method on `ChaseCameraHandle` so the smoke can verify lock-state observation.
+- **`client/src/engine/scene.ts`** (`+48` lines) — three new DEV-only probes (`__pointerLockToggle(locked)`, `__setCharacterYaw(radians)`, `__chaseCameraProbe()` returning `{ isPointerLocked, cameraPosition, cameraRotationY, characterPosition, characterYaw }`). All gated behind `import.meta.env.DEV` so they're stripped from production builds.
+- **`client/tools/pointer-lock-camera-smoke.mjs`** (NEW, 233 lines) — single-tab Playwright smoke on port 5181. Verifies: (a) locked position = character + firstPersonOffset within 5cm; (b) locked rotation.y matches character yaw within 0.05 rad; (c) yaw update propagates to camera; (d) release drifts back to chase offset (≥5cm from firstPersonOffset).
+- **`client/tools/yaw-wire-format-smoke.mjs`** (NEW, 172 lines) — single-tab Playwright smoke on port 5182. Verifies encodeInput/decodeInput round-trip across 7 yaw values: 0, 0.5, -0.3, π/2, -π, just-under-2π, multi-wrap (12.5). Tolerance: 1.5 LSB (1 LSB ≈ 1/10430 rad ≈ 0.0001 rad). Imports the actual `inputBitmask.ts` module via Vite's dev-server transform, so the wire-format byte positions are tested against the real implementation, not a copy.
+- **`.github/workflows/ci.yml`** (`+136` lines) — two new CI jobs: `client-yaw-wire-format-smoke` (port 5182) + `client-pointer-lock-camera-smoke` (port 5181). Mirrors the existing smoke-job shape (nohup + ready-poll + run + screenshot upload + teardown).
+- **`.gitignore`** (`+3` lines) — adds screenshot patterns for the two new smokes.
+
+**What it does NOT add**: a two-tab-yaw-determinism smoke. Initially tried to write one, but headless Chromium can't establish ICE (TURN unreachable from GH runner), so the data channel can't actually carry packets — both peers stay in `connectionState === "new"`. The wire-format smoke is the closest thing CI-runnable: it asserts the encode → decode contract that BOTH clients depend on for lockstep determinism, without requiring WebRTC to actually work. The full end-to-end determinism check requires a real-browser dev-box playtest where both peers' chase cameras visibly track the peer's yaw.
+
+**Verification gates passed (local)**:
+- ✓ `npm run typecheck` (exit 0)
+- ✓ `npm run build` (exit 0, 1m 56s)
+- ✓ All 8 smokes green: scene + jump + wallrun + health + two-tab + mouse-look + pointer-lock-camera + yaw-wire-format
+- ✓ spec-canonical guard passes
+
+**Playtest status** ⚠️ — UNCHANGED FROM PREVIOUS ENTRY. The pointer-lock UX itself (click → lock → rotate → ESC) is still gated on Kyle's dev-box two-tab playtest. The two new smokes prove the CODE PATHS work end-to-end (locked camera renders correctly, wire-format is deterministic, lock-state transitions work); the real-browser "does the browser actually grant lock when the user clicks" layer is the dev-box test.
+
+**Decisions made** (2026-08-14):
+- **Two smokes, not one combined.** The pointer-lock-camera smoke and the yaw-wire-format smoke catch different regression classes (camera-render vs wire-format). Combining them would mask one failure with the other. The cost is +200 lines of smoke + +136 lines of CI config; the value is two independent regression canaries.
+- **Wire-format smoke imports the real module via Vite.** The smoke does `await import("/src/net/inputBitmask.ts")` from the page context, which lets Vite's dev-server transform pipeline serve the actual module. The test asserts against the real implementation, not a copy. If a future PR renames `yawToBits` or moves bytes 2-3, the smoke fails immediately (rather than testing a stale snapshot).
+- **Pointer-lock-camera smoke bypasses real lock via DEV probes.** Headless Chromium doesn't reliably honor `requestPointerLock()` (documented in HANDOFF §"PR 6 caveat"). The smoke calls `__pointerLockToggle(true)` to set the chase camera's lock state directly, which exercises the SAME render path the browser would trigger. This is honest: the test proves the camera's render logic, not the browser's user-activation behavior. The browser layer is the dev-box test.
+
+**Branch hygiene**: still on `feat/phase0-pr11.1-mouse-look` in worktree `~/Development/specialists-web-pr11.1/`. All changes will land as a single commit (`<new-sha>`) on top of `76cf5f2` when pushed. Can be removed after PR merge: `git worktree remove ~/Development/specialists-web-pr11.1 && git branch -d feat/phase0-pr11.1-mouse-look`.
+
+---
+
+## 2026-08-14 — PR 11.1 READY for review. Per-player first-person mouse-look (pointer-locked yaw on the wire). Next: dev-box two-tab playtest.
+
+**Status**: Phase 0 / Milestone 2 / PR 11.1 code-complete + all 6 local gates green (typecheck + build + 5 existing smokes + new mouse-look smoke). Branch `feat/phase0-pr11.1-mouse-look` in worktree `~/Development/specialists-web-pr11.1/` (off `origin/main` @ `a7c3ae2`). Branch is **NOT YET PUSHED**. Bundle size 7,047.25 kB → 7,048.62 kB (+1.4 kB). PR #18.
+
+**What this PR ships**:
+- **`client/src/net/inputBitmask.ts`** (`-2/+34` lines) — `INPUT_SIZE` bumped from 8 to 10. New `YAW_BITS_SCALE = 65535 / (2π)` constant + private `yawToBits()` helper (wraps mod 2π, clamps to uint16). `encodeInput` writes `yawToBits(s.yawRadians ?? 0)` to bytes 2-3 (little-endian uint16, ~0.0055°/LSB). `decodeInput` reads bytes 2-3 into `yawRadians` (defensive `?? 0` on the byte reads for the upgrade window).
+- **`client/src/engine/characterConfig.ts`** (`+12` lines) — new `MOUSE_LOOK` block: `{ sensitivityRadPerPixel: 0.0025 }` (~0.143°/px).
+- **`client/src/engine/characterController.ts`** (`+10` lines) — `InputState` extended with `yawRadians?: number` (undefined means "leave yaw alone"). `update()` calls `this.setYaw(input.yawRadians)` BEFORE projecting WASD into world space — the authoritative yaw is the wire-decoded value, not a client-local accumulator.
+- **`client/src/engine/inputListener.ts`** (`+50/-0` lines) — `InputHooks` extended with optional `onPointerLockChange(locked)` and `onYawDelta(deltaRadians)`. Canvas click → `canvas.requestPointerLock()` (guarded by `isEditableTarget`). `pointerlockchange` listener fires the lock-state hook. `mousemove` listener (while locked) fires the yaw-delta hook with `e.movementX * MOUSE_LOOK.sensitivityRadPerPixel`. All three listeners properly added on mount + removed on dispose.
+- **`client/src/engine/chaseCamera.ts`** (`+~80/-~30` lines) — `ChaseCameraHandle` extended with `setPointerLock(locked)`, `applyYawDelta(deltaRadians)` (wraps mod 2π), `getYaw()` (returns the local accumulator). `update()` now has two branches: pointer-locked = snap camera to `character.position + firstPersonOffset` + read the character's yaw quaternion for the rotation (no lerp); not-locked = the existing lerped chase behavior (V-toggle still controls first-person-chase vs third-person-chase).
+- **`client/src/engine/scene.ts`** (`+~25` lines) — passes `onPointerLockChange`/`onYawDelta` to `createInputListener` (wired to the chase camera). Render loop populates `state.yawRadians = chase.getYaw()` BEFORE the session encodes the input packet. New DEV-only accessors (behind `import.meta.env.DEV`): `window.__mouseLookProbe()` returns the chase camera's current yaw, `window.__applyYawDelta(delta)` drives the same `applyYawDelta` code path the locked-mousemove listener uses (smoke hook).
+- **`client/tools/mouse-look-smoke.mjs`** (NEW, 130 lines) — single-tab Playwright headless smoke on port 5178. Boots Chromium, waits for `__mouseLookProbe` + `__applyYawDelta` to be defined, applies 0.5 rad delta + asserts observed delta is within ±20%, applies 7.0 rad cumulative delta + asserts yaw is in `[0, 2π)` (catches the mod-2π wrap). Screenshots to `mouse-look.png`. Mirrors the existing smoke structure (jump-regression, wallrun-regression, health-regression).
+- **`.github/workflows/ci.yml`** (`+~60` lines) — new `client-mouse-look-smoke` job on port 5178. Boots vite dev-server, runs the smoke, uploads `mouse-look.png` as `mouse-look-screenshot` artifact. Mirrors the existing smoke-job shape.
+- **`docs/SPEC.md`** — status banner updated (PR 11.1 entry), PR-split table entry added, Milestone 2 acceptance table has a new row 10 ("Per-player first-person mouse-look") marked LANDED PR 11.1 ✅, "Done = all 11 criteria" (was 10), new "2026-08-14 — PR 11.1 implementation decisions" block under the PR 10 block.
+
+**Why this is the production camera model (per Kyle's 2026-08-13 internet-multiplayer re-rank)**: split-screen / shared chase camera is a single-machine local-coop pattern; the correct production camera for internet multiplayer is per-player (pointer-locked mouse-look, like every other multiplayer FPS). The chase camera becomes the fallback when pointer-lock is not granted (user pressed ESC, browser refuses lock, non-secure context, etc.).
+
+**Verification gates passed (local)**:
+- ✓ `npm run typecheck` (exit 0, no errors)
+- ✓ `npm run build` (exit 0, 1m 55s, bundle 7,048.62 kB / 1,580.30 kB gzip)
+- ✓ `node ./tools/scene-smoke.mjs` (PR 2/3 contract intact)
+- ✓ `node ./tools/jump-regression-smoke.mjs` (PR 8 contract intact: peak=2.980, descended to 0.951)
+- ✓ `node ./tools/wallrun-regression-smoke.mjs` (PR 8.1 contract intact: peak=6.763, descended to 1.047)
+- ✓ `node ./tools/health-regression-smoke.mjs` (PR 10 contract intact: HP drains to 0, respawn fires, HP=100, position reset)
+- ✓ `URL=http://localhost:5174/ node ./tools/two-tab-smoke.mjs` (PR 6/7 contract intact: SDP handshake + Tab A hits=1 B hits=0 after LMB fire; the input packet format extension (10 bytes with yaw) round-trips cleanly through WebRTC)
+- ✓ `node ./tools/mouse-look-smoke.mjs` (PR 11.1 new contract: initial=0.0000, after=0.5000, observed delta=0.5000 within ±0.2; after 7.0 rad cumulative delta = 0.7168, in [0, 2π))
+
+**Playtest status** ⚠️
+- **What was tested this session**: typecheck + build + 5 existing smokes + new mouse-look smoke, all headless against the local dev server. Two-tab smoke verified the input packet format extension (10 bytes with yaw) round-trips cleanly through the WebRTC SDP exchange + lockstep. **The pointer-lock UX itself (click → lock → rotate → ESC) was NOT tested in headless Chromium** — headless doesn't reliably honor `requestPointerLock` for synthetic clicks. The smoke uses the DEV-only `__applyYawDelta` accessor to drive the yaw directly, which exercises the chase-camera yaw-rotation code path WITHOUT depending on the browser actually granting lock.
+- **What was NOT tested**: the real-browser pointer-lock UX (click canvas → `requestPointerLock()` → mousemove emits `movementX/Y` → camera snaps to character eye + rotates with yaw). Needs a dev-box two-tab playtest post-merge to validate.
+- **Build artifacts**: `client/mouse-look.png` (CI uploads as `mouse-look-screenshot` artifact).
+- **Known issue carried forward (from PR 7.4 cleanup)**: `client/src/engine/inputListener.ts:223` still has the `[input] window mousedown (capture path)` debug console.log — PR 7.4 cleanup missed it. Doesn't affect any gate (just a single console.log on every mousedown). File a follow-up cleanup PR if it bugs you; not worth holding PR 11.1 for.
+
+**Next session task**:
+- **Verify the pointer-lock UX** (dev-box two-tab playtest). Run the dev server (`npm run dev -- --host 0.0.0.0 --port 5173` from `client/`), open two tabs at `http://100.95.111.112:5173/`, complete the WebRTC handshake, click on Tab A's canvas → the camera should snap to first-person. Move the mouse → the camera should rotate. ESC → camera falls back to chase. Repeat on Tab B. Cross-client check: both tabs should see the OTHER tab's yaw rotate as that tab moves the mouse (because yaw is on the wire).
+- **PR 11.2** — dev-box free-fly spectator camera (F2 to detach from player, orbit with mouse, click to return). ~30 lines in `chaseCamera.ts` + a new CI smoke confirming the F2 toggle works. Debug-mode only; not a production blocker. Solves the dev-box two-tab visual discomfort per the original 2026-08-13 playtest observations (cyan rig was hidden behind crates because the chase camera followed the local rig — with PR 11.1's per-player first-person, the cyan rig is just another entity in the world, so the dev-box pain is reduced but the spectator mode still helps when you want to orbit).
+- **PR 11.3** — gap-bridging rollback ("pause-when-too-far-behind" cap in `ggrsRuntime.ts`). The "huge delay" from the 2026-08-13 dev-box playtest. ~50 lines + new regression smoke.
+- **PR 11.4** — server-authoritative damage (the first internet-multiplayer architecture step).
+- Original PR 11 polish (wall-detection via `PhysicsRaycast`, Mixamo glTF, kill/hit markers, death animation) queued after.
+
+**Decisions made** (2026-08-14):
+- **Yaw on the wire, not client-local.** Without encoding yaw on bytes 2-3, the two clients would compute different world directions for the same WASD input (because the controller's `update()` rotates WASD by `yawRadians`). Both clients decode the peer's yaw and `setYaw` before WASD projection — lockstep determinism preserved. Same pattern as PR 10's damage intent on byte 1.
+- **`INPUT_SIZE` 8 → 10.** Both clients upgrade together; PR 6/7/10 traffic with bytes 2-3 = 0 still decodes correctly (yaw = 0 = facing +Z).
+- **First-person camera = 1:1 with character (no lerp) when pointer-locked.** The chase lerp is for the dev-box fallback path. Locked view IS the character's view.
+- **Chase camera is the fallback.** Per the HANDOFF "Blockers" entry: "Default = chase camera is the fallback when pointer-lock is not granted."
+- **Yaw resolution 1/65536 of a revolution.** Plenty for an FPS feel. 0.5 rad delta at 0.0025 rad/px = 200 pixels of mouse movement.
+- **Yaw accumulator wraps mod 2π.** Doesn't drift at large values.
+- **Smoke uses DEV-only `__applyYawDelta`, not `requestPointerLock()`.** Headless Chromium doesn't reliably honor pointer-lock for synthetic clicks; the smoke exercises the yaw-rotation code without depending on the browser granting lock.
+- **Pitch is NOT in this PR.** Yaw only. Pitch would need its own wire byte pair + frame-rate-reset logic; deferred.
+- **No codex+claude review loop used.** The brief was authored with the design decisions baked in (from the HANDOFF's locked spec). Mechanical implementation given the wire order.
+- **Codex 0.137 `apply_patch` tool failure (the dispatch log):** the first codex dispatch burned 2.5M+ tokens in retry loops on `apply_patch` (kept writing literal `\n` in the JSON `arguments` field, got `apply_patch verification failed: invalid patch: The first line of the patch must be '*** Begin Patch'` repeatedly). Recovery attempt (switch to `exec_command` + heredoc) failed on shell-quote escaping. Killed codex + did the work manually with the Hermes `patch` tool. **Lesson:** when codex's `apply_patch` tool fails repeatedly with the same error, don't wait for it to recover — fall through to manual execution immediately. Same threshold rule as the M3 lazy-stop kill from `coding-harnesses` pitfall #16b.
+
+**Branch hygiene**:
+- Worktree `~/Development/specialists-web-pr11.1/` (a git worktree of `~/Development/specialists-web`, branch `feat/phase0-pr11.1-mouse-look`). Can be removed after PR merge: `git worktree remove ~/Development/specialists-web-pr11.1 && git branch -d feat/phase0-pr11.1-mouse-look`.
+
+---
+
 ## 2026-08-14 — PR 7.4 cleanup MERGED (#16). Pure-delete of PR 7.2 + PR 7.3 debug instrumentation. Next: PR 11.1 (per-player first-person mouse-look).
 
 **Status**: PR #16 MERGED at commit `b1ecfb7` (squash). All 7 CI checks green (typecheck + build + scene-smoke + jump-regression-smoke + wallrun-regression-smoke + health-regression-smoke + two-tab-smoke + spec-layout-guard). Branch `feat/phase0-pr7.4-cleanup` deleted locally + remotely after merge. Dev-box playtest (Kyle, 2026-08-14) confirmed HUD renders the production state without the debug mirror and the console is quiet during normal play — no `[input] mousedown`, `[APP] document mousedown (top-level)`, or `[input] CANVAS mousedown` logs fire.

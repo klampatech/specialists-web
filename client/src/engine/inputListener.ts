@@ -10,6 +10,7 @@
 // and frame-driven without pulling in a state machine library.
 
 import type { InputState } from "./characterController";
+import { MOUSE_LOOK } from "./characterConfig";
 
 /** Handlers the listener calls when an edge key goes down. */
 export interface InputHooks {
@@ -17,6 +18,13 @@ export interface InputHooks {
   onFrame: (state: InputState) => void;
   /** Called when V (camera toggle) is pressed. */
   onCameraToggle: () => void;
+  /** PR 11.1: pointer-lock state changed (user clicked canvas to lock,
+   *  or pressed ESC to unlock). */
+  onPointerLockChange?: (locked: boolean) => void;
+  /** PR 11.1: while pointer-locked, fires on every mousemove with
+   *  `e.movementX * sensitivity`. The chase camera accumulates this
+   *  into its yaw state. */
+  onYawDelta?: (deltaRadians: number) => void;
 }
 
 /** Returned by `createInputListener`. */
@@ -176,6 +184,28 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
   // work in headless smoke and real play. The default right-click menu
   // would otherwise steal the click on every press.
   const onContextMenu = (e: MouseEvent) => { e.preventDefault(); };
+
+  // PR 11.1: pointer-lock + mouse-delta handlers. The click handler
+  // requests lock on canvas click; the `pointerlockchange` listener
+  // notifies the chase camera; the `mousemove` listener forwards
+  // movementX * sensitivity to the chase camera's yaw accumulator.
+  const onCanvasClick = (e: Event) => {
+    if (isEditableTarget(e.target)) return;
+    if (!target) return;
+    if (document.pointerLockElement === target) return; // already locked
+    target.requestPointerLock();
+  };
+  const onPointerLockChange = () => {
+    const locked = !!target && document.pointerLockElement === target;
+    hooks.onPointerLockChange?.(locked);
+  };
+  const onMouseMoveLocked = (e: MouseEvent) => {
+    if (!target) return;
+    if (document.pointerLockElement !== target) return; // not locked
+    if (e.movementX === 0) return; // no horizontal delta, skip
+    hooks.onYawDelta?.(e.movementX * MOUSE_LOOK.sensitivityRadPerPixel);
+  };
+
   if (typeof window !== "undefined") {
     // PR 7.3 fix: bind mousedown/mouseup/contextmenu DIRECTLY to the canvas
     // element when provided, instead of just window/document. Babylon's
@@ -200,6 +230,10 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
       target.addEventListener("pointerup", onPointerUp);
       document.addEventListener("mousedown", onMouseDown);
       document.addEventListener("pointerdown", onPointerDown);
+      // PR 11.1: pointer-lock acquire + mouse-delta plumbing.
+      target.addEventListener("click", onCanvasClick);
+      document.addEventListener("pointerlockchange", onPointerLockChange);
+      document.addEventListener("mousemove", onMouseMoveLocked);
     } else {
       document.addEventListener("mousedown", onMouseDown);
       document.addEventListener("mouseup", onMouseUp);
@@ -226,6 +260,11 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
         slideHeld: held.slideHeld,
         wallrunPressed: held.wallrunPressed,
         cameraTogglePressed: held.cameraTogglePressed, fireHeld: held.fireHeld, meleePressed: held.meleePressed, bulletTimeHeld: held.bulletTimeHeld,
+        // PR 11.1: yawRadians is populated by the scene.ts render loop
+        // AFTER `read()` returns — scene pulls the latest yaw from the
+        // chase camera and writes it onto the state object before
+        // `encodeInput`. Keeping the listener pure-input (no camera
+        // coupling) is what lets this stay a self-contained unit.
       };
       hooks.onFrame(state);
       // Clear one-shot flags. Held flags stay until the matching keyup.
@@ -250,6 +289,10 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
           target.removeEventListener("pointerup", onPointerUp);
           document.removeEventListener("mousedown", onMouseDown);
           document.removeEventListener("pointerdown", onPointerDown);
+          // PR 11.1: cleanup pointer-lock + mousemove listeners.
+          target.removeEventListener("click", onCanvasClick);
+          document.removeEventListener("pointerlockchange", onPointerLockChange);
+          document.removeEventListener("mousemove", onMouseMoveLocked);
         } else {
           document.removeEventListener("mousedown", onMouseDown);
           document.removeEventListener("mouseup", onMouseUp);

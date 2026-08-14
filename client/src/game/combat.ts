@@ -120,17 +120,32 @@ function buildCombatPickPredicate(localPrefix: string): (mesh: AbstractMesh) => 
 }
 
 // ---------------------------------------------------------------------------
-// Forward vector at yaw=0
-// ---------------------------------------------------------------------------
+// -------------------------------------------------------------------
+// Forward vector from yaw
+// -------------------------------------------------------------------
 
 /**
- * In PR 7 the local rig has no setYaw call (no mouse-look yet), so the
- * controller always faces yaw=0 = +Z forward. We hardcode that here so the
- * tracer ray points in a sensible direction without needing a yaw
- * parameter on the controller. Phase 1 mouse-look will replace this with
- * the controller's `yawRadians`.
+ * Compute the local-forward direction (XZ-plane unit vector) from the
+ * current frame's `input.yawRadians`. PR 7 originally hardcoded yaw=0
+ * because no mouse-look existed; PR 11.1 added yaw on the wire, so we
+ * now derive forward from the input the user just produced (frame-N).
+ *
+ * Why `input.yawRadians` and not `localController.state.rotation`:
+ *   - `input.yawRadians` is what the user just input (frame-N) — zero lag.
+ *   - `localController.state.rotation` lags by 1-2 frames because:
+ *       (a) encodeInput happens on frame-N
+ *       (b) decodeInput + setYaw happens on frame-N+1 (the next tick)
+ *       (c) character.state.rotation reflects frame-N+1 yaw
+ *     So the tracer would fire in the direction the character USED TO
+ *     be facing, which is exactly the "tracer fires where I used to
+ *     be facing" bug Kyle reported.
+ *   - The tracer is a render-only side-effect (the DualPistolResult is
+ *     not fed back to the wire), so using the input yaw here is
+ *     lockstep-safe.
  */
-const FORWARD_AT_YAW_0 = new Vector3(0, 0, 1);
+function forwardFromYaw(yawRadians: number): Vector3 {
+  return new Vector3(Math.sin(yawRadians), 0, Math.cos(yawRadians));
+}
 
 /** Chest-height ray origin: capsule centre plus a quarter-height offset up. */
 function chestPosition(controller: CharacterController): Vector3 {
@@ -164,13 +179,16 @@ export interface DualPistolResult {
  * real application to a target's health pool.
  */
 export function dualPistolShoot(
-  _input: InputState,
+  input: InputState,
   localController: CharacterController,
   _remoteController: CharacterController,
   scene: Scene,
 ): DualPistolResult {
   const origin = chestPosition(localController);
-  const forward = FORWARD_AT_YAW_0.clone();
+  // PR 11.1: derive forward from input.yawRadians (the current frame's
+  // user input). See forwardFromYaw() for why this is frame-accurate.
+  const yaw = input.yawRadians ?? 0;
+  const forward = forwardFromYaw(yaw);
   const range = COMBAT.dualPistol.maxRangeMeters;
   const rayEnd = origin.add(forward.scale(range));
   const ray = new Ray(origin, forward, range);
@@ -217,12 +235,14 @@ export interface MeleeResult {
  * forward vector against the vector to the target position.
  */
 export function meleeSwing(
-  _input: InputState,
+  input: InputState,
   localController: CharacterController,
   remoteController: CharacterController,
 ): MeleeResult {
   const attackerOrigin = chestPosition(localController);
-  const forward = FORWARD_AT_YAW_0.clone();
+  // PR 11.1: derive forward from input.yawRadians, same as dualPistolShoot.
+  const yaw = input.yawRadians ?? 0;
+  const forward = forwardFromYaw(yaw);
   const targetPos = remoteController.state.position.clone();
 
   const inCone = isWithinMeleeCone(attackerOrigin, forward, targetPos);

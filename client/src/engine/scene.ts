@@ -297,6 +297,14 @@ export async function createScene(
       // available for future per-frame UI updates.
     },
     onCameraToggle: () => chase.toggle(),
+    // PR 11.1: pointer-lock + mouse-look hooks. The input listener does
+    // the browser-API plumbing (requestPointerLock on click, mousemove
+    // while locked); the chase camera owns the yaw accumulator and the
+    // camera render path. `applyYawDelta` is called per mousemove
+    // (movementX * sensitivity); `setPointerLock(true|false)` toggles
+    // between the first-person 1:1 render path and the chase fallback.
+    onPointerLockChange: (locked) => chase.setPointerLock(locked),
+    onYawDelta: (delta) => chase.applyYawDelta(delta),
   }, canvas);  // PR 7.3: bind mouse handlers directly to the canvas so clicks
                // always reach the listener regardless of Babylon's attachControl
                // pointer-capture behavior.
@@ -309,6 +317,13 @@ export async function createScene(
     lastTimestamp = now;
     const state: InputState = input.read();
     latestInput = state;
+    // PR 11.1: populate the per-frame yaw from the chase camera before
+    // the session encodes the input packet. Both clients compute their
+    // own yaw from their own mousemove (and pull the peer's yaw off the
+    // wire via decodeInput → controller.setYaw on the next frame), so
+    // the wire packet here carries THIS client's yaw to the peer. The
+    // session's tick() will read this yaw via `state.yawRadians`.
+    state.yawRadians = chase.getYaw();
     if (gameSession) {
       // Multiplayer path: the session drives both controllers, applies the
       // stunt pose, and pushes the visual transforms into each rig's root.
@@ -345,6 +360,77 @@ export async function createScene(
   if (import.meta.env.DEV && typeof window !== "undefined") {
     (window as unknown as { __jumpProbe?: () => number }).__jumpProbe = () =>
       character.state.position.y;
+    // PR 11.1: smoke-only accessor for the mouse-look smoke. Returns
+    // the local yaw in radians (0..2π) so the smoke can dispatch a
+    // synthetic mousemove (via window.__applyYawDelta) and assert the
+    // yaw changed. Headless Chromium doesn't always honor
+    // requestPointerLock; the smoke uses a manual yaw-delta path so
+    // the test exercises the yaw-rotation code WITHOUT depending on
+    // pointer-lock being granted. Same DEV-only gate as __jumpProbe /
+    // __teleportRemote — stripped from production by Vite.
+    (window as unknown as { __applyYawDelta?: (deltaRadians: number) => void }).__applyYawDelta =
+      (deltaRadians: number) => chase.applyYawDelta(deltaRadians);
+    (window as unknown as { __mouseLookProbe?: () => number }).__mouseLookProbe = () =>
+      chase.getYaw();
+    // PR 11.1: pointer-lock toggle probe. Calls chase.setPointerLock
+    // directly so the camera-render smoke can test the locked path
+    // without depending on headless Chromium honoring
+    // requestPointerLock. Same DEV-only gate as __mouseLookProbe.
+    (window as unknown as { __pointerLockToggle?: (locked: boolean) => void }).__pointerLockToggle =
+      (locked: boolean) => chase.setPointerLock(locked);
+    // PR 11.1.1: chase-camera toggle probe. Calls chase.toggle() so the
+    // smoke can advance the viewMode state machine without dispatching
+    // a synthetic V key event. Same DEV-only gate.
+    (window as unknown as { __chaseCameraToggle?: () => void }).__chaseCameraToggle =
+      () => chase.toggle();
+    // PR 11.1: set-character-yaw probe. Calls character.setYaw(radians)
+    // so the camera-render smoke can verify camera.rotation.y updates
+    // when the character yaw changes. The chase camera reads
+    // character.state.rotation (a Quaternion) in its update() loop
+    // when pointerLocked — without this probe, the smoke can only
+    // observe the initial state where charYaw = 0. DEV-only.
+    (window as unknown as { __setCharacterYaw?: (radians: number) => void }).__setCharacterYaw =
+      (radians: number) => character.setYaw(radians);
+    // PR 11.1: pointer-lock camera probe. Exposes the chase camera's
+    // internal state so the pointer-lock-camera smoke can assert:
+    //   - When pointerLocked, camera.position === character.position + firstPersonOffset
+    //   - camera.rotation.y matches the character yaw
+    //   - When pointerLocked is false, the camera lerps back to the
+    //     chase offset (i.e., position drifts away from firstPersonOffset)
+    // DEV-only (stripped from production by Vite). Same shape as
+    // __mouseLookProbe / __applyYawDelta above.
+    (window as unknown as { __chaseCameraProbe?: () => {
+      isPointerLocked: boolean;
+      viewMode: number;
+      isMenuOrbit: boolean;
+      menuAngle: number;
+      cameraPosition: { x: number; y: number; z: number };
+      cameraRotationY: number;
+      characterPosition: { x: number; y: number; z: number };
+      characterYaw: number;
+    } }).__chaseCameraProbe = () => ({
+      isPointerLocked: chase.isPointerLocked(),
+      viewMode: chase.getViewMode(),
+      isMenuOrbit: chase.isMenuOrbit(),
+      menuAngle: chase.getMenuAngle(),
+      cameraPosition: {
+        x: chase.camera.position.x,
+        y: chase.camera.position.y,
+        z: chase.camera.position.z,
+      },
+      cameraRotationY: chase.camera.rotation.y,
+      characterPosition: {
+        x: character.state.position.x,
+        y: character.state.position.y,
+        z: character.state.position.z,
+      },
+      characterYaw: (() => {
+        const q = character.state.rotation;
+        const sinY = 2 * (q.w * q.y + q.z * q.x);
+        const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
+        return Math.atan2(sinY, cosY);
+      })(),
+    });
     // PR 10: smoke-only accessor for the health-regression test. Teleports
     // the REMOTE rig onto a known position so every shot in the smoke
     // is a guaranteed hit. Gated behind `import.meta.env.DEV` (same as
