@@ -202,20 +202,26 @@ export function createChaseCamera(
       const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
       const charYaw = Math.atan2(sinY, cosY);
       // Rotate the over-shoulder offset (character-local space) into
-      // world space. With offset = (0, 1.7, -1.6) at yaw=0, the camera
-      // sits at character + (-(-1.6)*sin(yaw), 1.7, (-1.6)*cos(yaw))
-      // = character + (1.6*sin(yaw), 1.7, -1.6*cos(yaw)) — wait let me
-      // re-derive. A point (0, 0, -1.6) rotated by yaw around the Y
-      // axis is (-(-1.6)*sin(yaw), 0, (-1.6)*cos(yaw)) — actually
-      // the Y-rotation matrix is:
+      // world space. The overShoulderOffset convention is
+      // `(0, +height, -distance)` — `-distance` means "1.6m behind the
+      // character at yaw=0" (the character's forward is +Z, so behind
+      // is -Z). The Y-rotation matrix is:
       //   [ cos  0  sin ]
       //   [  0   1   0  ]
       //   [-sin  0  cos ]
-      // so (0, y, -1.6) -> (sin(yaw)*-1.6, y, cos(yaw)*-1.6)
-      //                  = (-1.6*sin(yaw), y, -1.6*cos(yaw))
+      // so a point (0, y, -distance) rotated by yaw around Y becomes
+      // (-distance*sin(yaw), y, -distance*cos(yaw)).
+      //
+      // PR 11.2.1 fix (Kyle playtest 2026-08-14): the previous code used
+      // `-off.z * sin/cos` which flips BOTH signs because off.z is
+      // already negative — net result: camera placed IN FRONT of the
+      // character, not behind. W (character-forward) moved the character
+      // away from the camera, making controls feel reversed (W = back,
+      // D = left). Fixed by using `off.z` directly (which is already
+      // negative for the behind convention).
       const off = CAMERA.overShoulderOffset; // character-local
-      const worldOffX = -off.z * Math.sin(charYaw);
-      const worldOffZ = -off.z * Math.cos(charYaw);
+      const worldOffX = off.z * Math.sin(charYaw);
+      const worldOffZ = off.z * Math.cos(charYaw);
       camera.position.set(cp.x + worldOffX, cp.y + off.y, cp.z + worldOffZ);
       // Camera looks at the character's chest height (world-space target,
       // independent of yaw). This is the key difference from 1st-person:

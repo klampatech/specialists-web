@@ -323,15 +323,26 @@ export async function createScene(
     // between the first-person 1:1 render path and the chase fallback.
     onPointerLockChange: (locked) => chase.setPointerLock(locked),
     onYawDelta: (delta) => chase.applyYawDelta(delta),
-    // PR 11.2: ESC-equals-resume. When unlocked, fire `setPointerLock(true)`
-    // to close the pause menu + restore the last viewMode. When locked,
-    // the browser consumes ESC first and `pointerlockchange` fires
-    // `onPointerLockChange(false)` — by the time this hook would run, the
-    // menu is already visible and the next ESC (now unlocked) closes it
-    // via this same path. Calling `setPointerLock(true)` while already
-    // locked is a safe no-op (it just resets menuAngle, which is what
-    // we want anyway).
-    onEscapePressed: () => chase.setPointerLock(true),
+    // PR 11.2.1 fix (Kyle playtest 2026-08-14): ESC-equals-resume now goes
+    // through the BROWSER's requestPointerLock API instead of just
+    // flipping the internal flag. The previous `chase.setPointerLock(true)`
+    // updated the chase camera's render state but did NOT actually engage
+    // the browser's pointer-lock — the cursor stayed visible and the user
+    // couldn't aim. With this fix, the browser fires `pointerlockchange`
+    // synchronously (still within the ESC keydown's transient activation
+    // window), which routes through the existing `onPointerLockChange`
+    // handler and into `chase.setPointerLock(true)`. Single source of truth:
+    // the browser's pointer-lock state.
+    //
+    // Defense-in-depth: if the pointer is already locked when ESC fires,
+    // `onEscapePressed` no-ops. This prevents a flash where the menu
+    // briefly becomes visible (pointerlockchange fires first → unlock)
+    // before our handler re-locks it.
+    onEscapePressed: () => {
+      if (chase.isPointerLocked()) return;
+      // Will be picked up by onPointerLockChange(true) → chase.setPointerLock(true).
+      canvas.requestPointerLock();
+    },
   }, canvas);  // PR 7.3: bind mouse handlers directly to the canvas so clicks
                // always reach the listener regardless of Babylon's attachControl
                // pointer-capture behavior.
@@ -507,13 +518,32 @@ export async function createScene(
       everLocked: chase.isPointerLocked() || chase.isMenuOrbit(),
       viewMode: chase.getViewMode(),
     }),
-    // PR 11.2: programmatic Resume action — re-locks the pointer. Same
-    // entry point as the browser's `pointerlockchange` event and the
-    // `__pointerLockToggle` DEV probe; chase camera handles viewMode
-    // restoration. The browser may refuse outside a user-activation
-    // gesture (e.g., if called from a setTimeout), but it works inside
-    // button onClick handlers and the smoke's synthetic events.
-    setPointerLock: (locked: boolean) => chase.setPointerLock(locked),
+    // PR 11.2.1 fix (Kyle playtest 2026-08-14): programmatic Resume action —
+    // re-locks the pointer. Routes through the BROWSER's `requestPointerLock`
+    // / `exitPointerLock` APIs (not just flipping the internal flag).
+    // The browser fires `pointerlockchange` either way; the existing
+    // `onPointerLockChange` listener forwards to `chase.setPointerLock`,
+    // which is the single source of truth. Works inside button onClick
+    // handlers (user-activation present). May silently fail outside user-
+    // activation (e.g., setTimeout) — that's correct browser behavior.
+    // We wrap in try-catch because some browsers throw on document.exitPointerLock
+    // when not in pointer-lock (the user may have already exited via ESC).
+    setPointerLock: (locked: boolean) => {
+      try {
+        if (locked) {
+          canvas.requestPointerLock();
+        } else {
+          document.exitPointerLock();
+        }
+      } catch (e) {
+        // Silently ignore — the browser is the source of truth for
+        // pointer-lock state. If the call fails, the existing
+        // pointerlockchange listener will reflect the actual state.
+        if (typeof console !== "undefined") {
+          console.warn(`[PR 11.2.1] pointerlock API call failed (${locked ? "lock" : "unlock"}):`, e);
+        }
+      }
+    },
   };
 
   if (gameSession) {
