@@ -232,8 +232,13 @@ export function createChaseCamera(
     //     (the cursor is over a menu, not the canvas).
     if (everLocked) {
       // Menu orbit. Auto-rotate around the character at
-      // CAMERA.menuOrbit.{radius, height, angularSpeed}.
-      menuAngle += CAMERA.menuOrbit.angularSpeed * (1 / 60);
+      // CAMERA.menuOrbit.{radius, height, angularSpeed}. Uses the
+      // engine's actual delta-time (ms) instead of assuming 60fps —
+      // CI / headless rendering can be 20-30fps and we don't want the
+      // orbit to crawl in slow environments.
+      const engine = scene.getEngine();
+      const dtSeconds = engine.getDeltaTime() / 1000;
+      menuAngle += CAMERA.menuOrbit.angularSpeed * dtSeconds;
       // Keep menuAngle in [0, 2π) so it doesn't drift at large values.
       if (menuAngle >= 2 * Math.PI) menuAngle -= 2 * Math.PI;
       const radius = CAMERA.menuOrbit.radius;
