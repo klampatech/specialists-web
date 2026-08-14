@@ -1,4 +1,4 @@
-// Phase 0 / PR 4+7 — bottom-left HUD chip.
+// Phase 0 / PR 4+7+10 — bottom-left HUD chip.
 //
 // PR 4 shows the live lockstep frame number, how many frames the runtime had
 // to fill by repeating the last-known remote input (a tell-tale of packet
@@ -8,6 +8,16 @@
 // "Hits" here counts every tracer render (fire_hit + fire_miss + melee_hit)
 // — the test that proves the rising-edge combat code fired at least once in
 // the smoke. Updated ~10Hz from App.tsx; the chip itself is a pure render.
+//
+// PR 10 adds `HP me:` / `HP them:` lines for the local + remote controllers
+// with an optional `(respawn Xms)` countdown suffix when the respawn timer
+// is armed.
+//
+// PR 7.4 cleanup: removed the `fireHeld` / `meleePressed` / `bulletTime`
+// debug block that was originally added to prove the input listener was
+// firing during the LMB/RMB-eating-HUD bug hunt. Combat is now confirmed
+// working in headless + dev-box two-tab playtests, and the top-center
+// `<BulletTimeChip>` in App.tsx renders the production bullet-time state.
 
 interface BulletHudProps {
   frame: number;
@@ -16,11 +26,6 @@ interface BulletHudProps {
   hasRemote: boolean;
   /** Total combat events emitted by the GameSession so far. */
   hits: number;
-  /** PR 7.2 debug: live mouse-button state from the input listener. */
-  fireHeld: boolean;
-  meleePressed: boolean;
-  /** PR 7.2 debug: same as `bulletTime` but raw boolean. */
-  bulletTime: boolean;
   /** PR 10: live HP for the LOCAL controller (clamped 0..HEALTH.maxHp). */
   localHp: number;
   /** PR 10: live HP for the REMOTE controller (clamped 0..HEALTH.maxHp). */
@@ -50,7 +55,7 @@ function statusLabel(s: BulletHudProps["connectionStatus"]): string {
  * file MUST keep `pointerEvents: "none"` (or `pointerEvents: "auto"` only on
  * the buttons it contains — but right now there are no buttons in the HUD).
  */
-export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, fireHeld, meleePressed, bulletTime, localHp, remoteHp, localRespawningMs, remoteRespawningMs }: BulletHudProps) {
+export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, localHp, remoteHp, localRespawningMs, remoteRespawningMs }: BulletHudProps) {
   return (
     <div
       data-testid="bullet-hud"
@@ -78,22 +83,14 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
       <div data-testid="bullet-hud-hits" style={{ opacity: 0.95 }}>hits: {hits}</div>
       {/* PR 10: health pools + optional respawn countdown. The countdown
           shows the remaining ms on the respawning-until timestamp. When
-          the timer is 0 (idle) we render `idle` so the line still occupies
-          a stable row in the chip (no layout jitter on respawn). */}
+          the timer is 0 (idle) we render nothing in parens so the line
+          still occupies a stable row in the chip (no layout jitter on
+          respawn). */}
       <div data-testid="bullet-hud-hp-local" style={{ opacity: 0.95 }}>
         HP me: {localHp}{localRespawningMs > 0 ? ` (respawn ${localRespawningMs}ms)` : ""}
       </div>
       <div data-testid="bullet-hud-hp-remote" style={{ opacity: 0.95 }}>
         HP them: {remoteHp}{remoteRespawningMs > 0 ? ` (respawn ${remoteRespawningMs}ms)` : ""}
-      </div>
-      {/* PR 7.2 DEBUG BLOCK: shows live input listener state so we can
-          confirm whether the mouse/keyboard handlers are firing at all.
-          If these stay "false" while LMB/T are pressed, the inputListener
-          is the bug. Remove once combat is confirmed working. */}
-      <div style={{ borderTop: "1px dashed #444", marginTop: 2, paddingTop: 2, opacity: 0.85 }}>
-        <div>LMB: <span data-testid="debug-fire">{fireHeld ? "TRUE" : "false"}</span></div>
-        <div>RMB: <span data-testid="debug-melee">{meleePressed ? "TRUE" : "false"}</span></div>
-        <div>T: <span data-testid="debug-bullet">{bulletTime ? "TRUE" : "false"}</span></div>
       </div>
     </div>
   );

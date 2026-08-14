@@ -40,9 +40,6 @@ interface HudState {
   hits: number;
   /** PR 7: true while the local tab holds the T key (bullet time). */
   bulletTime: boolean;
-  /** PR 7.2 debug: live mouse-button state from the input listener. */
-  fireHeld: boolean;
-  meleePressed: boolean;
   /** PR 10: live HP for the LOCAL controller (drives the HUD chip). */
   localHp: number;
   /** PR 10: live HP for the REMOTE controller. */
@@ -68,8 +65,6 @@ export function App() {
     hasRemote: false,
     hits: 0,
     bulletTime: false,
-    fireHeld: false,
-    meleePressed: false,
     localHp: 100,
     remoteHp: 100,
     localRespawningMs: 0,
@@ -120,59 +115,8 @@ export function App() {
   }, [peer, reportConnection]);
 
   useEffect(() => {
-    // PR 7.2 debug: top-level window mousedown listener that's attached
-    // BEFORE createScene runs. If THIS one fires but createScene's doesn't,
-    // we know createScene's listener was never attached. If THIS one
-    // doesn't fire, we know something is preventing mousedown entirely.
-    const onDocMouseDown = (e: MouseEvent) => {
-      (window as unknown as Record<string, unknown>).__topLevelMouseDown = {
-        ts: performance.now(),
-        button: e.button,
-        target: e.target && (e.target as Element).tagName,
-        composedPath: e.composedPath?.().slice(0, 6).map((n) => (n as Element).tagName ?? typeof n),
-      };
-      console.log("[APP] document mousedown (top-level)", { button: e.button, target: (e.target as Element).tagName });
-    };
-    document.addEventListener("mousedown", onDocMouseDown, true); // CAPTURE PHASE
-    document.addEventListener("mouseup", onDocMouseDown, true);
-    return () => {
-      document.removeEventListener("mousedown", onDocMouseDown, true);
-      document.removeEventListener("mouseup", onDocMouseDown, true);
-    };
-  }, []);
-
-  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-
-    // PR 7.2 debug: attach mousedown directly to the canvas element so
-    // we can confirm whether the canvas itself is receiving events.
-    // If even THIS handler doesn't fire, the canvas is not where the
-    // user expects it to be OR it has a CSS issue.
-    const onCanvasDown = (e: MouseEvent) => {
-      (window as unknown as Record<string, unknown>).__canvasDown = {
-        ts: performance.now(),
-        button: e.button,
-        canvasRect: canvas.getBoundingClientRect(),
-        clientXY: { x: e.clientX, y: e.clientY },
-        canvasStyle: {
-          width: canvas.style.width,
-          height: canvas.style.height,
-          cssWidth: getComputedStyle(canvas).width,
-          cssHeight: getComputedStyle(canvas).height,
-          attrWidth: canvas.getAttribute("width"),
-          attrHeight: canvas.getAttribute("height"),
-          display: getComputedStyle(canvas).display,
-          pointerEvents: getComputedStyle(canvas).pointerEvents,
-        },
-      };
-      console.log("[input] CANVAS mousedown", {
-        button: e.button,
-        rect: canvas.getBoundingClientRect(),
-        canvasAttrWH: `${canvas.width}x${canvas.height}`,
-      });
-    };
-    canvas.addEventListener("mousedown", onCanvasDown);
 
     let disposed = false;
     const transport = new GgnetTransport(peer);
@@ -206,8 +150,6 @@ export function App() {
             hasRemote: session.runtime.hasRemote,
             hits: session.getCombatEvents().length,
             bulletTime: inputState?.bulletTimeHeld ?? false,
-            fireHeld: inputState?.fireHeld ?? false,
-            meleePressed: inputState?.meleePressed ?? false,
             localHp: health.local.hp,
             remoteHp: health.remote.hp,
             localRespawningMs: health.local.respawningMs,
@@ -224,9 +166,6 @@ export function App() {
       });
 
     return () => {
-      // canvas-direct listener cleanup — handles the case where the
-      // createScene promise never resolves before unmount.
-      canvas.removeEventListener("mousedown", onCanvasDown);
       disposed = true;
       const handle = sceneRef.current;
       if (handle) {
@@ -280,9 +219,6 @@ export function App() {
             connectionStatus={hud.connectionStatus}
             hasRemote={hud.hasRemote}
             hits={hud.hits}
-            fireHeld={hud.fireHeld}
-            meleePressed={hud.meleePressed}
-            bulletTime={hud.bulletTime}
             localHp={hud.localHp}
             remoteHp={hud.remoteHp}
             localRespawningMs={hud.localRespawningMs}

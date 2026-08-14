@@ -156,16 +156,6 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
   };
 
   const onMouseDown = (e: MouseEvent) => {
-    // PR 7.2 debug: visible HUD indicator proves whether THIS specific
-    // handler fired. If this stays false while the user is clearly
-    // mousedown'ing, something upstream ate the event before window.
-    (window as unknown as Record<string, unknown>).__lastMouseDown = {
-      ts: performance.now(),
-      button: e.button,
-      target: e.target && (e.target as Element).tagName,
-      composedPath: e.composedPath ? e.composedPath().slice(0, 5).map((n) => (n as Element).tagName || typeof n) : [],
-    };
-    console.log("[input] mousedown", { button: e.button, target: (e.target as Element).tagName });
     if (e.button === 0) held.fireHeld = true;
     if (e.button === 2) held.meleePressed = true;
   };
