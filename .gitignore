@@ -32,9 +32,16 @@ coverage/
 playwright-report/
 test-results/
 .caches/
+client/scene-smoke*.png
+client/jump-regression.png
+client/wallrun-regression.png
+client/health-regression.png
+client/two-tab-smoke*.png
+client/mouse-look.png
 
 # Codex delegation scratch (briefs + last-message files live here transiently,
 # alongside the AGENTS.md/handoff docs which are real artifacts).
 .codex-prompt-*.md
+.codex-prompt.md
 .codex-last-message*.txt
 .codex-last*.txt

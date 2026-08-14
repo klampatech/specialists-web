@@ -82,6 +82,19 @@ export const CAMERA = {
   fovDegrees: 65,
 } as const;
 
+/**
+ * PR 11.1: pointer-locked mouse-look tunables. The chase camera reads
+ * `sensitivityRadPerPixel` when applying a mouse-delta to the local yaw
+ * accumulator (one mousemove event → `e.movementX * sensitivityRadPerPixel`
+ * added to yaw). 0.0025 rad/px ≈ 0.143°/px — comfortable for a typical
+ * 1080p display with the OS pointer speed at default; tune via in-game
+ * settings later.
+ */
+export const MOUSE_LOOK = {
+  /** Radians of yaw per pixel of mouse-delta. */
+  sensitivityRadPerPixel: 0.0025,
+} as const;
+
 /** Spawn position for the character (capsule centre sits at half-height above ground). */
 export const SPAWN_POSITION = new Vector3(0, CAPSULE.height / 2, 0);
 

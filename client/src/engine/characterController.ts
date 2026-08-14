@@ -47,6 +47,14 @@ export interface InputState {
   wallrunPressed: boolean;
   cameraTogglePressed: boolean;
   fireHeld: boolean; meleePressed: boolean; bulletTimeHeld: boolean;
+  /** PR 11.1: per-frame yaw in radians (0..2π). Sourced from the wire
+   *  via `decodeInput` (bytes 2-3). The controller's `update()` applies
+   *  it via `setYaw()` BEFORE projecting the character-relative WASD
+   *  input into world space — both clients must see identical yaw on
+   *  the same frame for lockstep determinism. `undefined` means
+   *  "don't touch yaw" (used by single-tab tests + the upgrade window
+   *  when bytes 2-3 haven't been wired yet). */
+  yawRadians?: number;
 }
 
 /** Snapshot the controller publishes each frame for the visual + camera. */
@@ -249,6 +257,17 @@ export class CharacterController {
   public update(input: InputState, deltaSeconds: number, nowMs: number): void {
     // 1. Stunt state machine: enter on input, exit on timer / release.
     this.refreshStuntState(input, nowMs);
+
+    // 1a. PR 11.1: apply the per-frame yaw (if supplied) BEFORE projecting
+    //     the character-relative WASD input. Both clients must see the same
+    //     yaw on the same frame for lockstep determinism — yaw arrives on
+    //     bytes 2-3 of the wire packet (see net/inputBitmask.ts), so the
+    //     authoritative value is the one decoded from the peer's input
+    //     history. `undefined` means "leave yaw alone" — single-tab tests +
+    //     the upgrade window use this.
+    if (input.yawRadians !== undefined) {
+      this.setYaw(input.yawRadians);
+    }
 
     // 2. Compute the desired planar velocity in world space from the
     //    character-relative input rotated by the current yaw.

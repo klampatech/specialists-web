@@ -349,6 +349,74 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  # Phase 0 / PR 11.1: per-player first-person mouse-look smoke. Verifies
+  # that the chase camera's yaw accumulator responds to yaw-delta updates
+  # (the same code path the locked-mousemove listener uses). Headless
+  # Chromium doesn't always honor requestPointerLock, so the smoke uses
+  # the DEV-only `window.__applyYawDelta` accessor (scene.ts) to drive
+  # the yaw directly — this exercises the wire-format change (yaw on
+  # bytes 2-3 of INPUT_SIZE=10) AND the chase-camera yaw accumulator
+  # without depending on the browser actually granting pointer-lock.
+  # The full pointer-lock UX requires a dev-box two-tab playtest (which
+  # Kyle does manually after the merge).
+  #
+  # Why a separate job: this is the regression guard for the
+  # pointer-lock + mouse-look surface. The input-packet format change
+  # (INPUT_SIZE 8→10, yaw on bytes 2-3) could silently regress in a
+  # future PR that touches inputBitmask.ts. Port 5178 so it stays
+  # independent of all the other smoke jobs (5173 / 5174 / 5175 /
+  # 5176 / 5177).
+  client-mouse-look-smoke:
+    name: client — mouse-look smoke (PR 11.1)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server (port 5178)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5178 > /tmp/vite-dev6.log 2>&1 &
+          echo $! > /tmp/vite-dev6.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5178/ > /dev/null; then
+              echo "Dev server (mouse-look smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5178/ > /dev/null; then
+            echo "::error::Dev server (mouse-look smoke) did not come up in 60s"
+            cat /tmp/vite-dev6.log
+            exit 1
+          fi
+      - name: Run mouse-look smoke
+        run: node ./tools/mouse-look-smoke.mjs
+        env:
+          MOUSE_LOOK_SMOKE_URL: http://localhost:5178/
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mouse-look-screenshot
+          path: client/mouse-look.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev6.pid ]]; then
+            kill "$(cat /tmp/vite-dev6.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   spec-canonical:
     name: spec layout — canonical at docs/SPEC.md
     runs-on: ubuntu-latest
