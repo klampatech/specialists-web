@@ -4,6 +4,72 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-13 (post-merge, evening) — PR 10 + 10.1 + 10.2 MERGED (#13). PR 14 MERGED (Phase 1 follow-up re-rank for internet-multiplayer goal). Next: PR 7.4 cleanup (smallest, do first), then PR 11.1 (per-player first-person mouse-look).
+
+**Status**: PR 10 + PR 10.1 + PR 10.2 stacked onto `feat/phase0-ice-candidate-bundling-rebased` MERGED at commit `fe6ce14` (squash) — squash message is the rebased-stack summary from the worktree. PR 14 (the docs-only "re-rank Phase 1 follow-ups for internet-multiplayer goal" commit) MERGED at commit `6360185`. Both branches deleted locally + remotely. All 5 local gates green on main. Dev-box two-tab playtest (Kyle, 2026-08-13 18:30) confirmed cross-client HP drain + respawn sync + ICE handshake.
+
+**What PR #13 shipped** (squash of the rebased stack):
+1. **`characterConfig.ts`** — new `HEALTH` block (`maxHp: 100`, `respawnDelayMs: 1000`).
+2. **`characterController.ts`** — `hp` + `respawningUntilMs` on `CharacterState`; public `respawn(nowMs)`; `startPosition` now `public readonly`; PR 10.2 added `respawnPosition` field separate from `startPosition` so the cyan rig respawns to the same spot as the red rig.
+3. **`health.ts` (NEW)** — `applyDamage()` + `tickRespawn()` + `HealthSnapshot` type. Single source of truth for damage flow.
+4. **`gameSession.ts`** — per-rising-edge local + remote damage application to the opposing controller, both directions; per-frame respawn timer tick; `getHealthSnapshot()` returns remaining-ms countdown.
+5. **`scene.ts`** — DEV-only `__teleportRemote(x, z)` accessor (Vite-stripped from prod) for the headless smoke.
+6. **`BulletHud.tsx`** — `HP me:` / `HP them:` lines (testid'd) with optional `(respawn Xms)` suffix.
+7. **`App.tsx`** — `HudState` gains 4 health fields; the 100ms HUD interval reads `session.getHealthSnapshot()`.
+8. **`health-regression-smoke.mjs` (NEW)** — single-tab Playwright smoke on port 5177: teleports remote onto local, fires 9 LMB hits, asserts HP drains 100→0, respawn fires at 1000ms, HP restores to 100, local Y returns to 0.9m.
+9. **`ci.yml`** — new `client-health-smoke` job on port 5177; uploads `health-regression.png` artifact.
+10. **`peer.ts` (PR 10.1 real bug fix)** — both `createOffer` and `createAnswer` used to fire-and-forget `this.ice()` AFTER the return blob was serialized, so the blob's `candidates: []` was always empty. Fixed: `this.ice()` is now `await`ed (timeout 30s → 5s); the return blob serializes `[...this.candidates]`. `acceptAnswer`'s `for c of a.candidates` loop now does real work.
+11. **`PeerOverlay.tsx` (PR 10.1 UX)** — "Gathering ICE…" then "Offer ready (N candidates) — copy and share" with N≥2 if TURN is reachable.
+12. **`pr10.1-connection-test.mjs` (NEW)** — dev-box diagnostic (not a CI smoke; TURN unreachable from GH runner).
+13. **`remotePlayer.ts` (PR 10.2)** — accepts optional `respawnPosition`, defaults to `spawnPosition`.
+14. **`docs/SPEC.md`** — PR 10 entry, Milestone 2 row 9 → LANDED, "PR 10 implementation decisions" block.
+
+**What PR #14 shipped** (docs-only, squash `6360185`):
+- Re-ranks Phase 1 follow-ups for the project's actual goal (internet multiplayer, not local-coop). The previously-#1 candidate (split-screen / shared chase camera) was wrong-direction: split-screen is a single-machine local-coop pattern, not an internet-multiplayer pattern. The correct production camera model is per-player (pointer-locked mouse-look, like every other multiplayer FPS); the dev-box viewing discomfort is solved by a debug-mode spectator camera toggle, not by changing the production camera.
+- Also updates the top banner of `docs/SPEC.md` to mark PR 10 + 10.1 + 10.2 as MERGED (#13) and fixes the cyan-rig-visibility bullet wording.
+
+**Next session task** — per Kyle's 2026-08-13 23:30 internet-multiplayer re-rank, in order:
+
+1. **PR 7.4 cleanup** (smallest, do this first — gets the cleanup out of the way before the bigger Phase 1 lifts). Pure-delete PR. Remove PR 7.3 debug instrumentation: `__lastMouseDown`, `__canvasDown`, `__topLevelMouseDown`, the `[input] mousedown` console logs, and the HUD debug `LMB:/RMB:/T:` lines. Combat + HP + respawn are all confirmed working in headless + on dev-box two-tab playtests. Approximately 30-40 lines removed across `inputListener.ts` + `BulletHud.tsx` + `App.tsx`. ~1 file-area of trivial deletion + a new gate (or reuse an existing smoke) to confirm combat still fires.
+2. **PR 11.1 — per-player first-person mouse-look** (production camera model for internet multiplayer). Pointer-locked yaw (click to lock, ESC to release, mouse-delta → yaw). Affects `chaseCamera.ts` + `inputListener.ts` + a small `setYaw` plumbing change in `characterController.ts`. Medium-sized PR (3 files, ~80-120 lines net). Ships a new CI smoke (`client-mouse-look-smoke`) that confirms the camera yaw updates on mouse-delta events. Note: the current chase camera IS the dev-box viewing model — it follows the local rig. The PR replaces the camera model in production (with a fallback to chase when pointer-lock is not granted).
+3. **PR 11.2 — dev-box free-fly spectator camera (debug-mode only)**. F2 to detach from player, orbit with mouse, click to return. ~30 lines in `chaseCamera.ts` + a new CI smoke confirming the F2 toggle works. **Not a production blocker** — solves the dev-box two-tab visual discomfort per Kyle's 2026-08-13 18:30 playtest observations. The cyan rig is hard to see because the chase camera follows the local rig; spectator mode lets the developer orbit and look at both rigs.
+4. **PR 11.3 — gap-bridging rollback**. The "huge delay" Kyle saw in the playtest. The no-rollback lockstep is fundamentally limited — both tabs agree on world state but their `frame` HUD counters drift by ~70s of game-time after a few minutes of play. Real rollback (ggrs/wasm) is the long-term answer; the first cut is a "pause-when-too-far-behind" cap in `ggrsRuntime.ts` (~50 lines + a new regression smoke): if Tab A's `frame` > Tab B's `frame` + N, Tab A pauses until Tab B catches up. This naturally absorbs the Chrome tab-throttling issue too.
+5. **PR 11.4 — server-authoritative damage** (the first internet-multiplayer architecture step). Current damage is derived locally from lockstep, which is fine for LAN / Tailscale but doesn't survive 100ms+ WAN latency. Move `applyDamage` from `gameSession.tick` (per-client local) to a server-broadcast packet handler (per-authority). The controller's HP slot is unchanged; the source of the `applyDamage` call moves. This is the seed of a real dedicated server, which is the actual internet-multiplayer architecture.
+6. **Original Phase 1 polish** (queued after the above):
+   - **Real wall-detection for the Q-stunt via `PhysicsRaycast`**: ~20-line change + new regression smoke. The original row-6 follow-up.
+   - **Real Mixamo glTF character model**: replace the procedural rig with an actual animated humanoid.
+   - **Kill-marker, hit-marker, death animation**: polish for the combat feel.
+7. **Phase 1 prep** (deferred): Rust WebTransport server, ggrs/wasm binding when one lands on npm, self-hosted coturn on Hetzner.
+
+**Blockers / open questions**:
+- **None for the merged work.** PR #13 + PR #14 both on main, all 5 CI jobs green on main, Kyle-confirmed dev-box playtest of HP drain + respawn sync + ICE handshake.
+- **For PR 7.4 cleanup**: none — it's a pure-delete PR.
+- **For PR 11.1 (mouse-look)**: design decision on whether the chase camera is the fallback when pointer-lock is not granted (e.g., user has ESC'd, or the browser refuses pointer-lock for non-secure-context reasons). Default = chase camera is the fallback (preserves the current dev-box behavior).
+- **For PR 11.3 (rollback)**: design decision on the N threshold for "pause-when-too-far-behind". Default = N=120 frames (2 seconds at 60fps). Tab throttling alone can cause this gap, so N shouldn't be too aggressive.
+- **For PR 11.4 (server-authoritative damage)**: needs a signing server, which is the Rust WebTransport deferred work. The damage flow itself is a small change (~10 lines + tests); the server is the bigger lift.
+
+**Decisions made** (2026-08-13):
+- **Internet multiplayer is the project's goal, not local-coop.** Split-screen / shared chase camera is a single-machine local-coop pattern; not the right direction. Production camera model = per-player first-person (or third-person) mouse-look. Dev-box visual discomfort is solved by a debug-mode spectator camera toggle, not by changing the production camera.
+- **Phase 1 follow-up order**: (1) PR 7.4 cleanup, (2) PR 11.1 mouse-look, (3) PR 11.2 spectator camera, (4) PR 11.3 rollback, (5) PR 11.4 server-authoritative damage. Original Phase 1 polish (wall-detection, Mixamo, kill/hit markers, death animation) queued after.
+- **PR 7.4 cleanup is the first lift**, even though it's the smallest. Reason: it gets the cleanup out of the way before the bigger PR 11 changes start touching the same files (`inputListener.ts`, `BulletHud.tsx`, `App.tsx`). Doing the cleanup first means the PR 11 changes don't have to coexist with the debug instrumentation.
+- **No new wire byte for PR 10** — damage intent is carried on the existing byte-2 of the input packet (the FIRE/MELEE/BULLET bits that PR 7 reserved). Lockstep determinism guarantees identical damage application on both clients without round-tripping a damage event. Phase 1 swaps to server-authoritative damage without touching the `applyDamage` API.
+
+**Playtest status** ✅
+- **Single-tab headless**: all 5 smokes green (scene + jump + wallrun + health + two-tab SDP state). Health smoke proves HP drains 100→0 across 9 LMB hits, respawn countdown visible, HP restores to 100, position reset. Build green.
+- **Two-tab dev-box playtest (Kyle, 2026-08-13 18:30)**: cross-client HP drain + respawn sync confirmed working.
+  - **HP sync**: Tab A (shooter) fires LMB, both Tab A's `HP them:` AND Tab B's `HP me:` drop by 12 per hit. Take 9 hits on either tab → both tabs see `HP: 0` → after 1s, both tabs see `HP: 100` (respawn).
+  - **Respawn sync**: both tabs observed `respawns: 1` after one death/respawn cycle. Console logs confirmed `controller.respawn()` fired for the appropriate controller on each tab (local on the dying tab, remote-mirror on the surviving tab). PR 10.2's `respawnPosition` separation means the cyan rig teleports to (0, 0.9, 0) (same as the red rig) instead of (2.5, 0.9, 0).
+  - **WebRTC handshake**: PR 10.1's `await this.ice()` fix is in effect — both tabs reach "Connected" with the candidate count surfaced in the status text.
+- **Honest limitations observed** (carry into Phase 1):
+  - **Frame-count desync (~70s gap)**: Tab A has run ~28,000 frames while Tab B has run ~26,000 frames. At 60fps that's ~35s of game-time drift. Both tabs agree on the world state (HP, position) because both compute the same lockstep from the same input history, but their `frame` HUD counters differ. This is the documented no-rollback lockstep limitation in `ggrsRuntime.ts` — repeated inputs fill the gap. **Phase 1 fix: real rollback / pause-when-too-far-behind (PR 11.3).**
+  - **Cyan rig visibility / occlusion**: the chase camera follows the LOCAL rig, so when the local rig walks away from spawn, the cyan rig (which mirrors the OTHER tab's local rig) is often off-screen or hidden behind crates. **This is the correct per-player camera behavior; the dev-box viewing discomfort is solved by a debug-mode spectator camera (PR 11.2), not by changing the production camera model.**
+  - **Tab throttling**: when one tab is backgrounded, Chrome throttles RAF to ~1Hz, so that tab's simulation effectively pauses. The lockstep doesn't crash (it just runs slower on one side), but it exacerbates the desync. **Phase 1 fix: same rollback / pause-when-too-far-behind (PR 11.3).**
+
+**Branch hygiene**:
+- Deleted `docs/post-merge-pr13-handoff` locally + on origin (its content is identical to `origin/main` after PR #14 landed). Worktree `~/Development/specialists-web-pr10.1-rebased/` is no longer needed — `feat/phase0-ice-candidate-bundling-rebased` was squashed into PR #13 and the branch deleted on merge. The local rebased worktree at `~/Development/specialists-web-pr10.1-rebased/` may be safely removed.
+
+---
+
 ## 2026-08-13 — PR 10 (health/damage/respawn) + PR 10.1 (ICE candidate bundling) + PR 10.2 (respawnPosition fix) stacked onto a single branch. All 5 local gates green. Dev-box two-tab playtest confirms cross-client HP drain + respawn sync working.
 
 **Status**: Phase 0 / Milestone 2 / PR 10 + PR 10.1 + PR 10.2 stacked onto a single branch `feat/phase0-ice-candidate-bundling-rebased` in worktree `~/Development/specialists-web-pr10.1-rebased/` (off `feat/phase0-health-damage-respawn` @ `a853c8b`, which is itself off `main` @ `dab3c3e`). Branch is **NOT YET PUSHED**. **Three** PRs' work lands together in this single rebased branch so the dev box can ship health/damage/respawn + the ICE-candidate bundling fix + the respawn-position sync fix together.
