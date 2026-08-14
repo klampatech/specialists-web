@@ -73,20 +73,34 @@ export const CAMERA = {
   /** First-person offset from the character (eye height, no back-off). */
   firstPersonOffset: new Vector3(0, 1.6, 0),
   /**
-   * PR 11.1.1: third-person-locked offset. Camera at eye height + 2.5m
-   * behind. Used when the user is pointer-locked and presses V (mode 1).
-   * Mouse still rotates the character via the wire-yaw; the camera
-   * follows the character's yaw with this back-off. Distinct from
-   * `thirdPersonOffset` because the chase lerp is disabled while locked.
+   * PR 11.1.2: third-person-locked offset (over-shoulder). Camera at
+   * eye height + 1.6m behind + slightly above character head. Used
+   * when the user is pointer-locked and presses V (mode 1). Mouse
+   * still rotates the character via the wire-yaw; the camera follows
+   * the character's yaw with this back-off. Distinct from
+   * `thirdPersonOffset` because (a) the chase lerp is disabled while
+   * locked, (b) the offset is much tighter (over-shoulder, not wide
+   * chase-cam). Tuned from Kyle's screenshot of the original mod.
    */
-  thirdPersonLockedOffset: new Vector3(0, 1.6, -2.5),
+  overShoulderOffset: new Vector3(0, 1.7, -1.6),
   /**
-   * PR 11.1.1: cycle direction for V. When pointer-locked, V cycles
-   * through the locked modes (0 → 1 → 2 → 0); when unlocked, V cycles
-   * through the unlocked modes (which all behave like the chase lerp
-   * but with different fixed offsets). See chaseCamera.ts viewMode.
+   * PR 11.1.2: user-visible viewMode is {0, 1}. Kept as a config
+   * value (rather than hardcoded 2) so future expansion is cheap.
    */
-  viewModeCount: 3 as const,
+  viewModeCount: 2 as const,
+  /**
+   * PR 11.1.2: menu orbit camera tunables. When pointer-locked=false
+   * AND everLocked=true, the camera slowly auto-rotates around the
+   * character at `radius` metres, `height` metres above ground, at
+   * `angularSpeed` rad/sec. This is the "menu camera" — when ESC
+   * opens a pause/loadout menu, the cursor is free and the camera
+   * drifts so the menu doesn't feel static.
+   */
+  menuOrbit: {
+    radius: 4.5,
+    height: 1.8,
+    angularSpeed: 0.3, // rad/sec; one full orbit in ~21s
+  },
   /** Look-at point relative to the character (chest height). */
   lookAtOffset: new Vector3(0, 0.9, 0),
   /** Lerp factor for the chase position (0 = no follow, 1 = snap). */

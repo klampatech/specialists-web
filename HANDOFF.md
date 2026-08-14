@@ -4,6 +4,57 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-14 — PR 11.1.2: 2-mode V-cycle + menu orbit camera. Pre-merge.
+
+**Status**: PR 11.1.2 ready for review. Replaces the PR 11.1.1 3-mode state machine with Kyle's simpler 2-mode spec + adds the menu orbit camera (option b from his feedback). All 8 smokes green locally.
+
+### Spec simplification (per Kyle's feedback)
+
+Replaces PR 11.1.1's `viewMode: 0|1|2` (1st-locked, 3rd-locked, chase-unlocked) with PR 11.1.2's `viewMode: 0|1` (1st-locked, over-shoulder-locked). The chase-lerp "playing mode" is gone — there's no user-visible chase while playing. The chase lerp exists only as a **dev-box fallback** for a fresh page that hasn't engaged pointer-lock yet.
+
+- **V (while locked)**: cycles 0 ↔ 1 (1st-person ↔ over-shoulder). Both are pointer-locked.
+- **V (while unlocked)**: **no-op** (user is interacting with a menu, not playing).
+- **ESC (pointerLock=false)**: enters the **menu orbit camera** (option b from Kyle's reply) — slow auto-rotation around the character at radius 4.5m, height 1.8m, 0.3 rad/sec.
+- **Click canvas to lock**: always enters mode 0 (1st-person); resets the menu orbit so the next ESC starts fresh.
+
+### Menu orbit camera
+
+`CAMERA.menuOrbit = { radius: 4.5, height: 1.8, angularSpeed: 0.3 }` (rad/sec → full orbit in ~21s). Auto-advances per-frame when `(pointerLocked=false AND everLocked=true)`. Camera position = `(char.x + sin(menuAngle) * radius, char.y + height, char.z + cos(menuAngle) * radius)`. Always looks at character's chest height. No mouse control.
+
+### Over-shoulder offset (Kyle's screenshot)
+
+`CAMERA.overShoulderOffset = (0, 1.7, -1.6)` — close-behind + slightly above character head. Distinct from `thirdPersonOffset` (which is the chase lerp's wider back-off) because the lerp is disabled while locked AND the offset is much tighter.
+
+### Smoke updates
+
+`pointer-lock-camera-smoke.mjs` now asserts the full PR 11.1.2 spec:
+1. Fresh page: not locked, not menu-orbit.
+2. Lock → mode 0, camera at firstPersonOffset (within 5cm).
+3. Lock → camera.rotation.y matches character yaw.
+4. Yaw delta propagates to camera.
+5. V → mode 1 (still locked), camera at overShoulderOffset.
+6. V → mode 0 (wrap), camera back at firstPersonOffset.
+7. ESC → menu orbit ACTIVE, camera on orbit circle, menuAngle advances.
+8. V while unlocked → no-op, viewMode unchanged.
+9. Re-lock → mode 0, menu orbit not active, firstPersonOffset.
+
+### Verification (local)
+
+All 8 smokes green: scene / jump / wallrun / health / two-tab / mouse-look / pointer-lock-camera (with 2-mode V-cycle + menu orbit) / yaw-wire-format. Spec-canonical guard passes.
+
+### Files changed
+
+- `client/src/engine/characterConfig.ts`: renamed `thirdPersonLockedOffset` → `overShoulderOffset`; tuned to `(0, 1.7, -1.6)`; `viewModeCount: 2`; new `menuOrbit` block.
+- `client/src/engine/chaseCamera.ts`: rewrote state machine — viewMode ∈ {0,1}, V no-op when unlocked, ESC → menu orbit (new render branch), chase lerp only for fresh pages.
+- `client/src/engine/scene.ts`: extended `__chaseCameraProbe` with `isMenuOrbit` + `menuAngle`.
+- `client/tools/pointer-lock-camera-smoke.mjs`: rewrote all 9 assertions to match PR 11.1.2 spec.
+
+### What still needs Kyle's playtest
+
+Real-browser pointer-lock UX (click → lock → mouse rotates → ESC → menu orbit visible → click → re-lock). The smoke proves the code paths; only the browser-grants-lock layer is the dev-box test. Also: re-test the over-shoulder offset vs. Kyle's screenshot — if `(0, 1.7, -1.6)` is too high/close/far, easy 1-line tweak.
+
+---
+
 ## 2026-08-14 — PR 11.1.1: tracer yaw fix + 3-mode V-cycle state machine. Pre-merge.
 
 **Status**: PR 11.1.1 ready for review. Two changes: (1) tracer + melee forward direction now derived from `input.yawRadians` instead of hardcoded `yaw=0` (this was a pre-existing PR 7 bug that PR 11.1 made visible by adding yaw rotation); (2) `chaseCamera` now exposes a 3-mode `viewMode` state machine (0=1st-locked, 1=3rd-locked, 2=chase-unlocked) that V cycles through, with `pointer-lock-click → mode 0` and `ESC → mode 2` as the two state transitions. Both fixes verified by extending the existing pointer-lock-camera smoke (now covers all 3 V-mode transitions + wrap + position checks).

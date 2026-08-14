@@ -402,6 +402,8 @@ export async function createScene(
     (window as unknown as { __chaseCameraProbe?: () => {
       isPointerLocked: boolean;
       viewMode: number;
+      isMenuOrbit: boolean;
+      menuAngle: number;
       cameraPosition: { x: number; y: number; z: number };
       cameraRotationY: number;
       characterPosition: { x: number; y: number; z: number };
@@ -409,6 +411,8 @@ export async function createScene(
     } }).__chaseCameraProbe = () => ({
       isPointerLocked: chase.isPointerLocked(),
       viewMode: chase.getViewMode(),
+      isMenuOrbit: chase.isMenuOrbit(),
+      menuAngle: chase.getMenuAngle(),
       cameraPosition: {
         x: chase.camera.position.x,
         y: chase.camera.position.y,

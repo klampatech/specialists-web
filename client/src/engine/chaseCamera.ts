@@ -36,18 +36,28 @@ export interface ChaseCameraHandle {
   update: () => void;
   /** True when the camera is in first-person mode (chase fallback). */
   isFirstPerson: () => boolean;
-  /** Toggle programmatically. PR 11.1.1: now cycles 3-mode viewMode. */
+  /** Toggle programmatically. PR 11.1.2: V cycles 0↔1, only while locked. */
   toggle: () => void;
   /**
-   * PR 11.1.1: current view mode (0=1st-locked, 1=3rd-locked, 2=chase).
+   * PR 11.1.2: current locked view mode (0=1st, 1=over-shoulder).
    * Exposed so the smoke can assert V cycles correctly.
    */
   getViewMode: () => number;
   /**
-   * PR 11.1.1: jump directly to a specific viewMode (mod viewModeCount).
-   * Used by setPointerLock to enter mode 0 when the user clicks the canvas.
+   * PR 11.1.2: jump directly to a specific viewMode (mod 2 wrap).
    */
   setViewMode: (mode: number) => void;
+  /**
+   * PR 11.1.2: true when the camera is in menu orbit mode
+   * (locked=false, everLocked=true). Exposed so the smoke + UI can
+   * know the camera state.
+   */
+  isMenuOrbit: () => boolean;
+  /**
+   * PR 11.1.2: current menu orbit angle (radians). Exposed so the
+   * smoke can assert the orbit advances over time.
+   */
+  getMenuAngle: () => number;
   /** Reset back to third-person. */
   reset: () => void;
   /**
@@ -109,13 +119,22 @@ export function createChaseCamera(
   }
   scene.activeCamera = camera;
 
-  // PR 11.1.1 viewMode state machine (replaces PR 3 firstPerson: boolean).
+  // PR 11.1.2 viewMode state machine (simplified per Kyle's spec).
   //   0 = first-person-locked: camera at firstPersonOffset, rotated by yaw
-  //   1 = third-person-locked: camera at thirdPersonLockedOffset, rotated by yaw
-  //   2 = chase-unlocked: PR 3 lerped chase, no mouse control
-  // V cycles 0 -> 1 -> 2 -> 0. Clicking the canvas to lock ALWAYS enters
-  // mode 0 (first-person). Pressing ESC ALWAYS releases to mode 2 (chase).
-  let viewMode = 2; // start in chase-unlocked (PR 3 default)
+  //   1 = over-shoulder-locked: camera at overShoulderOffset, rotated by yaw
+  // The user-visible mode set is {0, 1} only. There is NO chase-lerp
+  // "playing mode" — the chase lerp exists only as a dev-box fallback
+  // when pointer-lock has never been acquired (initial load, fresh page).
+  //
+  // V cycles 0 <-> 1 while pointer-locked. V does nothing while unlocked
+  // (the user is interacting with a menu, not playing).
+  //
+  // ESC (pointerLock=false) switches to the menu orbit camera (a slow
+  // auto-rotation around the character) — NOT a chase lerp, NOT a
+  // user-controlled view. When the user clicks the canvas again to
+  // re-engage, pointerLock=true resets the menu camera and re-enters
+  // mode 0 (1st-person).
+  let viewMode = 0;
   // PR 11.1 state: pointer-lock engaged → render 1:1 with character at
   // the current viewMode's offset, ignore the lerp chase.
   let pointerLocked = false;
@@ -123,6 +142,12 @@ export function createChaseCamera(
   // (set via the controller's `setYaw` in scene.ts) so the camera can
   // render with the same orientation as the character on each frame.
   let yawRadians = 0;
+  // PR 11.1.2: menu orbit state. When pointerLocked is false AND the
+  // user has previously locked at least once, the camera enters the
+  // orbit mode — a slow auto-rotation around the character. `menuAngle`
+  // accumulates per-frame, `menuAngularSpeed` is rad/sec.
+  let menuAngle = 0;
+  let everLocked = false; // distinguishes "fresh page" from "user ESC'd"
 
   const tmpOffset = new Vector3();
   const tmpDesired = new Vector3();
@@ -130,34 +155,23 @@ export function createChaseCamera(
   const tmpCurrentLook = new Vector3(0, 0.9, 0);
 
   /**
-   * Offset for a given viewMode (locked or unlocked).
-   *   0 → firstPersonOffset
-   *   1 → thirdPersonLockedOffset (or thirdPersonOffset when unlocked)
-   *   2 → thirdPersonOffset (chase lerp)
+   * Offset for a given locked viewMode.
+   *   0 → firstPersonOffset (eye height, no back-off)
+   *   1 → overShoulderOffset (close-behind + slightly above)
    */
-  const offsetForMode = (mode: number, locked: boolean): Vector3 => {
+  const offsetForMode = (mode: number): Vector3 => {
     if (mode === 0) return CAMERA.firstPersonOffset;
-    if (mode === 1) return locked ? CAMERA.thirdPersonLockedOffset : CAMERA.thirdPersonOffset;
-    return CAMERA.thirdPersonOffset; // mode 2 (and any future modes >= 2)
+    return CAMERA.overShoulderOffset;
   };
 
   const update = (): void => {
     const cp = character.state.position;
-    // PR 11.1.1: pointer-locked path (modes 0 and 1). Snap camera to
+    // PR 11.1.2: pointer-locked path (modes 0 and 1). Snap camera to
     // character + offset; render at the character's exact yaw (no lerp —
     // the locked view IS the character's view, not a follow-camera).
-    // Yaw here is the value the scene.ts render loop pulled from the
-    // controller's state (via `setYaw` driven by the decoded input
-    // packet), so both clients see identical camera orientation on the
-    // same frame.
-    if (pointerLocked && (viewMode === 0 || viewMode === 1)) {
-      const offset = offsetForMode(viewMode, true);
+    if (pointerLocked) {
+      const offset = offsetForMode(viewMode);
       camera.position.set(cp.x + offset.x, cp.y + offset.y, cp.z + offset.z);
-      // Babylon: camera.rotation is a Vector3 in Euler angles. yaw =
-      // rotation around world Y. Convert character.state.rotation (a
-      // Quaternion) to Euler Y. The character only rotates around Y
-      // (yaw only — pitch is camera-side and not in PR 11.1's scope),
-      // so the Y component is authoritative.
       const q = character.state.rotation;
       const sinY = 2 * (q.w * q.y + q.z * q.x);
       const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
@@ -166,13 +180,41 @@ export function createChaseCamera(
       return;
     }
 
-    // PR 3 path: lerped chase (first-person-chase OR third-person-chase
-    // depending on V-toggle). Unchanged from pre-PR-11.1 behavior.
-    // viewMode 0 (unlocked): chase from firstPersonOffset (eye height).
-    // viewMode 1 or 2 (unlocked): chase from thirdPersonOffset (behind+above).
-    tmpOffset.copyFrom(offsetForMode(viewMode, false));
+    // PR 11.1.2: unlocked path.
+    //   - Fresh page (never locked): use the existing PR 3 chase lerp
+    //     at thirdPersonOffset. This is the dev-box viewing mode — the
+    //     user hasn't engaged with the game yet, so the chase is the
+    //     sensible default.
+    //   - User previously locked and ESC'd: use the menu orbit camera.
+    //     Slow auto-rotation around the character. No mouse control
+    //     (the cursor is over a menu, not the canvas).
+    if (everLocked) {
+      // Menu orbit. Auto-rotate around the character at
+      // CAMERA.menuOrbit.{radius, height, angularSpeed}.
+      menuAngle += CAMERA.menuOrbit.angularSpeed * (1 / 60);
+      // Keep menuAngle in [0, 2π) so it doesn't drift at large values.
+      if (menuAngle >= 2 * Math.PI) menuAngle -= 2 * Math.PI;
+      const radius = CAMERA.menuOrbit.radius;
+      const height = CAMERA.menuOrbit.height;
+      camera.position.set(
+        cp.x + Math.sin(menuAngle) * radius,
+        cp.y + height,
+        cp.z + Math.cos(menuAngle) * radius,
+      );
+      // Always look at the character's chest height.
+      camera.setTarget(new Vector3(
+        cp.x + CAMERA.lookAtOffset.x,
+        cp.y + CAMERA.lookAtOffset.y,
+        cp.z + CAMERA.lookAtOffset.z,
+      ));
+      return;
+    }
 
-    // Anchor: world-space character position + offset.
+    // Fresh-page fallback: PR 3 chase lerp at thirdPersonOffset. This
+    // is the only path where the camera follows the character via
+    // lerp. Once the user clicks to lock, everLocked flips to true
+    // and this path is never taken again.
+    tmpOffset.copyFrom(CAMERA.thirdPersonOffset);
     tmpDesired.set(
       cp.x + tmpOffset.x,
       cp.y + tmpOffset.y,
@@ -185,7 +227,6 @@ export function createChaseCamera(
     );
     camera.position.copyFrom(tmpCurrent);
 
-    // Look at the chest-height target, also lerped.
     const lookDesired = new Vector3(
       cp.x + CAMERA.lookAtOffset.x,
       cp.y + CAMERA.lookAtOffset.y,
@@ -202,36 +243,58 @@ export function createChaseCamera(
   return {
     camera,
     update,
-    /** PR 3 API — returns true when in mode 0 (1st-person-ish). */
+    /** PR 3 API — returns true when in mode 0 (1st-person). */
     isFirstPerson: () => viewMode === 0,
-    /** PR 3 API — now cycles through the 3-mode state machine. */
+    /**
+     * PR 11.1.2: V cycles 0 <-> 1, but ONLY while pointer-locked. When
+     * unlocked, V is a no-op (the user is in a menu, not playing).
+     */
     toggle: () => {
-      viewMode = (viewMode + 1) % CAMERA.viewModeCount;
+      if (!pointerLocked) return;
+      viewMode = viewMode === 0 ? 1 : 0;
     },
     /**
-     * PR 11.1.1: current view mode (0/1/2). Exposed for the smoke so it
-     * can assert V cycles correctly.
+     * PR 11.1.2: current locked view mode (0 or 1). Exposed for the smoke.
      */
     getViewMode: () => viewMode,
     /**
-     * PR 11.1.1: jump directly to a specific viewMode. Used by
-     * setPointerLock to enter mode 0 when the user clicks the canvas.
+     * PR 11.1.2: jump directly to a specific viewMode (only valid for 0/1).
+     * Mod-2 wrap so out-of-range values clamp safely.
      */
     setViewMode: (mode: number) => {
-      viewMode = ((mode % CAMERA.viewModeCount) + CAMERA.viewModeCount) % CAMERA.viewModeCount;
+      viewMode = ((mode % 2) + 2) % 2;
     },
+    /**
+     * PR 11.1.2: true when the camera is in menu orbit mode (locked=false,
+     * everLocked=true). Exposed for the smoke + UI to know the camera
+     * state.
+     */
+    isMenuOrbit: () => !pointerLocked && everLocked,
+    /**
+     * PR 11.1.2: current menu orbit angle (radians). Exposed for the
+     * smoke so it can assert the orbit is happening (angle advances
+     * over time).
+     */
+    getMenuAngle: () => menuAngle,
     reset: () => {
-      viewMode = 2;
+      viewMode = 0;
       pointerLocked = false;
       yawRadians = 0;
+      menuAngle = 0;
+      everLocked = false;
     },
     setPointerLock: (locked) => {
       pointerLocked = locked;
-      // PR 11.1.1: clicking the canvas to lock ALWAYS enters mode 0
-      // (first-person), regardless of the previous viewMode. ESC ALWAYS
-      // releases to mode 2 (chase).
-      if (locked) viewMode = 0;
-      else viewMode = 2;
+      if (locked) {
+        // Click to lock: always enter mode 0 (1st-person). Reset menu
+        // orbit so the next ESC starts fresh.
+        viewMode = 0;
+        menuAngle = 0;
+        everLocked = true;
+      }
+      // When unlocking, leave viewMode alone (preserve user's preference
+      // for the next lock); menuAngle starts advancing from 0 (or
+      // wherever it was).
     },
     applyYawDelta: (deltaRadians) => {
       // Wrap mod 2π so the accumulator doesn't drift at large values

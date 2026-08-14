@@ -1,36 +1,39 @@
 #!/usr/bin/env node
-// Phase 0 / PR 11.1.1 — pointer-lock + 3-mode V-cycle camera-render smoke.
+// Phase 0 / PR 11.1.2 — pointer-lock + 2-mode V-cycle + menu orbit smoke.
 //
-// Verifies the chase camera's RENDER path honors the pointer-lock state
-// + the PR 11.1.1 3-mode V-cycle state machine:
+// Verifies the chase camera's RENDER path honors the PR 11.1.2 spec:
 //
-//   Mode 0 (1st-person-locked): camera at firstPersonOffset, rotated by yaw
-//   Mode 1 (3rd-person-locked): camera at thirdPersonLockedOffset, rotated by yaw
-//   Mode 2 (chase-unlocked):    lerped chase, no mouse control
+//   Mode 0 (1st-person-locked):  camera at firstPersonOffset, rotated by yaw
+//   Mode 1 (over-shoulder-locked): camera at overShoulderOffset, rotated by yaw
+//
+//   V (while locked) cycles 0 <-> 1. V (while unlocked) is a no-op.
+//
+//   ESC (pointerLock=false) → menu orbit camera (slow auto-rotation
+//     around the character). Click to lock → always enters mode 0.
 //
 // What this smoke verifies:
-//   1. Mode 0 + locked: camera.position = character.position + firstPersonOffset
-//   2. Mode 0 + locked: camera.rotation.y matches character yaw
-//   3. Yaw update propagates to camera in mode 0
-//   4. Toggle V → mode 1 (still locked) → camera.position = character + thirdPersonLockedOffset
-//   5. V again → mode 2 (still locked, but camera uses lerp chase)
-//      Wait — actually, in mode 2 the chase lerp kicks in; verify the
-//      camera drifts away from firstPersonOffset
-//   6. Toggle V while in mode 2 + locked → wraps back to mode 0
-//   7. setPointerLock(false) → falls back to chase lerp (mode 2)
-//   8. setViewMode(0) + setPointerLock(false) → unlocked first-person-chase
-//      (camera at firstPersonOffset, but lerped — drift check)
+//   1. After clicking to lock: viewMode=0, locked, menu orbit NOT active
+//   2. camera.position = character + firstPersonOffset (within 5cm)
+//   3. camera.rotation.y matches character yaw (within 0.05 rad)
+//   4. Yaw delta propagates to camera in mode 0
+//   5. V → viewMode=1, still locked. camera.position = character + overShoulderOffset
+//   6. V → viewMode=0 (wrap). camera.position back to firstPersonOffset
+//   7. ESC (pointerLock=false) → menu orbit ACTIVE. camera.position
+//      equals (character.x + sin(menuAngle)*radius, character.y + height,
+//      character.z + cos(menuAngle)*radius). menuAngle advances over time.
+//   8. Re-lock → viewMode=0, menu orbit NOT active, first-person offset
+//   9. V while unlocked is a no-op (viewMode unchanged)
 //
 // Bypasses real pointer-lock (headless Chromium won't grant it) by
-// calling `chase.setPointerLock(true)` directly via the smoke.
+// calling chase.setPointerLock(true|false) directly via the smoke.
 
 import { chromium } from "playwright";
 
 const URL = process.env.POINTER_LOCK_CAMERA_SMOKE_URL ?? "http://localhost:5181/";
 const SCREENSHOT = process.env.POINTER_LOCK_CAMERA_SMOKE_PNG ?? "pointer-lock-camera.png";
 const FIRST_PERSON_OFFSET = { x: 0, y: 1.6, z: 0 }; // CAMERA.firstPersonOffset from characterConfig.ts
-const THIRD_PERSON_LOCKED_OFFSET = { x: 0, y: 1.6, z: -2.5 }; // CAMERA.thirdPersonLockedOffset
-const THIRD_PERSON_OFFSET = { x: 0, y: 1.5, z: -2.8 }; // CAMERA.thirdPersonOffset
+const OVER_SHOULDER_OFFSET = { x: 0, y: 1.7, z: -1.6 }; // CAMERA.overShoulderOffset
+const MENU_ORBIT = { radius: 4.5, height: 1.8, angularSpeed: 0.3 }; // CAMERA.menuOrbit
 const POSITION_TOLERANCE = 0.05; // 5cm slack for float drift
 const YAW_TOLERANCE = 0.05; // 0.05 rad slack
 
@@ -54,17 +57,19 @@ try {
   );
   await page.waitForTimeout(200); // one frame for scene to settle
 
-  // ── Snapshot 1: initial state (not pointer-locked) ────────────────────────
+  // ── Snapshot 1: initial state (not pointer-locked, never locked) ───────────
   const s1 = await page.evaluate(() => window.__chaseCameraProbe());
   console.log(
-    `INITIAL: isLocked=${s1.isPointerLocked} ` +
-    `cameraPos=(${s1.cameraPosition.x.toFixed(3)},${s1.cameraPosition.y.toFixed(3)},${s1.cameraPosition.z.toFixed(3)}) ` +
-    `charPos=(${s1.characterPosition.x.toFixed(3)},${s1.characterPosition.y.toFixed(3)},${s1.characterPosition.z.toFixed(3)}) ` +
-    `camRotY=${s1.cameraRotationY.toFixed(4)} charYaw=${s1.characterYaw.toFixed(4)}`,
+    `INITIAL: isLocked=${s1.isPointerLocked} viewMode=${s1.viewMode} ` +
+    `isMenuOrbit=${s1.isMenuOrbit} menuAngle=${s1.menuAngle.toFixed(4)} ` +
+    `cameraPos=(${s1.cameraPosition.x.toFixed(3)},${s1.cameraPosition.y.toFixed(3)},${s1.cameraPosition.z.toFixed(3)})`,
   );
 
   if (s1.isPointerLocked) {
     throw new Error("[bad-initial] Pointer-lock should start as false");
+  }
+  if (s1.isMenuOrbit) {
+    throw new Error("[bad-initial] Menu orbit should not be active on a fresh page");
   }
 
   // ── Engage pointer-lock via the chase camera's setPointerLock method ─────
@@ -177,8 +182,8 @@ try {
   }
   console.log(`LOCKED_YAW_UPDATE_OK: |camRotY-charYaw|=${afterYawDrift.toFixed(4)} ≤ ${YAW_TOLERANCE}`);
 
-  // (d) PR 11.1.1: V cycles mode 0 → 1 (still locked). Camera should
-  // snap to character.position + thirdPersonLockedOffset.
+  // (d) PR 11.1.2: V cycles mode 0 → 1 (still locked). Camera should
+  // snap to character.position + overShoulderOffset.
   await page.evaluate(() => window.__chaseCameraToggle());
   await page.waitForTimeout(200);
 
@@ -194,9 +199,9 @@ try {
     throw new Error(`[V-unlocked] V while locked shouldn't release lock; isLocked=${sMode1.isPointerLocked}`);
   }
   const expectedMode1 = {
-    x: sMode1.characterPosition.x + THIRD_PERSON_LOCKED_OFFSET.x,
-    y: sMode1.characterPosition.y + THIRD_PERSON_LOCKED_OFFSET.y,
-    z: sMode1.characterPosition.z + THIRD_PERSON_LOCKED_OFFSET.z,
+    x: sMode1.characterPosition.x + OVER_SHOULDER_OFFSET.x,
+    y: sMode1.characterPosition.y + OVER_SHOULDER_OFFSET.y,
+    z: sMode1.characterPosition.z + OVER_SHOULDER_OFFSET.z,
   };
   const mode1Drift = Math.sqrt(
     Math.pow(sMode1.cameraPosition.x - expectedMode1.x, 2) +
@@ -219,83 +224,120 @@ try {
   }
   console.log(`V_MODE1_OK: viewMode=1, locked, drift=${mode1Drift.toFixed(4)}m, yaw matches`);
 
-  // (e) V again → mode 2. Still locked but lerp chase kicks in.
-  await page.evaluate(() => window.__chaseCameraToggle());
-  await page.waitForTimeout(200);
-
-  const sMode2 = await page.evaluate(() => window.__chaseCameraProbe());
-  console.log(
-    `V→MODE2: isLocked=${sMode2.isPointerLocked} viewMode=${sMode2.viewMode}`,
-  );
-  if (sMode2.viewMode !== 2) {
-    throw new Error(`[V-cycle-fail] expected viewMode=2 after two V presses, got ${sMode2.viewMode}`);
-  }
-  // In mode 2 with locked=true, the chase lerp STILL doesn't fire because
-  // our render path only short-circuits to "no lerp" when (pointerLocked
-  // && (viewMode 0 or 1)). So mode 2 + locked = the lerp chase runs.
-  // The camera should drift away from firstPersonOffset over a few frames.
-  await page.waitForTimeout(500); // ~30 frames of lerp
-  const sMode2Drift = await page.evaluate(() => window.__chaseCameraProbe());
-  const offsetFromFirstPerson = Math.sqrt(
-    Math.pow(sMode2Drift.cameraPosition.x - sMode2Drift.characterPosition.x - FIRST_PERSON_OFFSET.x, 2) +
-    Math.pow(sMode2Drift.cameraPosition.y - sMode2Drift.characterPosition.y - FIRST_PERSON_OFFSET.y, 2) +
-    Math.pow(sMode2Drift.cameraPosition.z - sMode2Drift.characterPosition.z - FIRST_PERSON_OFFSET.z, 2),
-  );
-  if (offsetFromFirstPerson < POSITION_TOLERANCE) {
-    throw new Error(
-      `[V-mode2-lerp-fail] mode 2 + locked should engage lerp chase; camera is still ` +
-      `at firstPersonOffset (offset=${offsetFromFirstPerson.toFixed(4)}m)`,
-    );
-  }
-  console.log(`V_MODE2_OK: viewMode=2, lerp chase engaged (offset from firstPersonOffset=${offsetFromFirstPerson.toFixed(4)}m)`);
-
-  // (f) V again → wraps back to mode 0.
+  // (e) PR 11.1.2: V again → mode 0 (wrap). Camera back at firstPersonOffset.
   await page.evaluate(() => window.__chaseCameraToggle());
   await page.waitForTimeout(200);
   const sWrapped = await page.evaluate(() => window.__chaseCameraProbe());
   if (sWrapped.viewMode !== 0) {
-    throw new Error(`[V-wrap-fail] expected viewMode=0 after three V presses, got ${sWrapped.viewMode}`);
+    throw new Error(`[V-wrap-fail] expected viewMode=0 after two V presses, got ${sWrapped.viewMode}`);
   }
-  console.log(`V_WRAP_OK: viewMode=0 after 3 V presses`);
-
-  // (g) Release pointer-lock. Camera falls back to chase lerp at mode 2.
-  await page.evaluate(() => window.__pointerLockToggle(false));
-  await page.waitForTimeout(200);
-
-  const s4 = await page.evaluate(() => window.__chaseCameraProbe());
-  console.log(
-    `RELEASED: isLocked=${s4.isPointerLocked} ` +
-    `cameraPos=(${s4.cameraPosition.x.toFixed(3)},${s4.cameraPosition.y.toFixed(3)},${s4.cameraPosition.z.toFixed(3)}) ` +
-    `charPos=(${s4.characterPosition.x.toFixed(3)},${s4.characterPosition.y.toFixed(3)},${s4.characterPosition.z.toFixed(3)})`,
-  );
-
-  if (s4.isPointerLocked) {
-    throw new Error("[release-failed] __pointerLockToggle(false) didn't update probe");
-  }
-
-  // After release, the camera should NOT be at firstPersonOffset — it
-  // should be lerping back toward the third-person chase offset.
-  // Initial V-toggle state defaults to firstPerson=false (third-person
-  // chase), so the target is thirdPersonOffset = (0, 1.5, -2.8).
-  // The current camera.position should NOT match firstPersonOffset
-  // (we just left that state).
-  const releasedOffset = {
-    x: s4.cameraPosition.x - s4.characterPosition.x,
-    y: s4.cameraPosition.y - s4.characterPosition.y,
-    z: s4.cameraPosition.z - s4.characterPosition.z,
+  const expectedWrap = {
+    x: sWrapped.characterPosition.x + FIRST_PERSON_OFFSET.x,
+    y: sWrapped.characterPosition.y + FIRST_PERSON_OFFSET.y,
+    z: sWrapped.characterPosition.z + FIRST_PERSON_OFFSET.z,
   };
-  const distFromFirstPerson = Math.sqrt(
-    Math.pow(releasedOffset.x - FIRST_PERSON_OFFSET.x, 2) +
-    Math.pow(releasedOffset.y - FIRST_PERSON_OFFSET.y, 2) +
-    Math.pow(releasedOffset.z - FIRST_PERSON_OFFSET.z, 2),
+  const wrapDrift = Math.sqrt(
+    Math.pow(sWrapped.cameraPosition.x - expectedWrap.x, 2) +
+    Math.pow(sWrapped.cameraPosition.y - expectedWrap.y, 2) +
+    Math.pow(sWrapped.cameraPosition.z - expectedWrap.z, 2),
   );
-  if (distFromFirstPerson < POSITION_TOLERANCE) {
+  if (wrapDrift > POSITION_TOLERANCE) {
     throw new Error(
-      `[release-position] After releasing lock, camera is still at firstPersonOffset ` +
-      `(distance=${distFromFirstPerson.toFixed(4)}m). Lerp fallback not engaging.`,
+      `[V-wrap-position] drift ${wrapDrift.toFixed(4)}m from firstPersonOffset ${JSON.stringify(expectedWrap)}, ` +
+      `got=${JSON.stringify(sWrapped.cameraPosition)}`,
     );
   }
-  console.log(`RELEASE_POSITION_OK: dist from firstPersonOffset=${distFromFirstPerson.toFixed(4)}m > ${POSITION_TOLERANCE}m`);
+  console.log(`V_WRAP_OK: viewMode=0 after 2 V presses, drift=${wrapDrift.toFixed(4)}m`);
+
+  // (f) PR 11.1.2: ESC → menu orbit ACTIVE. Camera enters slow auto-rotation.
+  await page.evaluate(() => window.__pointerLockToggle(false));
+  await page.waitForTimeout(50); // let one or two frames pass so menuAngle advances
+  const sMenu1 = await page.evaluate(() => window.__chaseCameraProbe());
+  console.log(
+    `ESC→MENU: isLocked=${sMenu1.isPointerLocked} isMenuOrbit=${sMenu1.isMenuOrbit} ` +
+    `menuAngle=${sMenu1.menuAngle.toFixed(4)} ` +
+    `cameraPos=(${sMenu1.cameraPosition.x.toFixed(3)},${sMenu1.cameraPosition.y.toFixed(3)},${sMenu1.cameraPosition.z.toFixed(3)})`,
+  );
+  if (sMenu1.isPointerLocked) {
+    throw new Error(`[menu-lock] after ESC, isLocked should be false; got ${sMenu1.isPointerLocked}`);
+  }
+  if (!sMenu1.isMenuOrbit) {
+    throw new Error(`[menu-inactive] after ESC, isMenuOrbit should be true; got ${sMenu1.isMenuOrbit}`);
+  }
+  // Camera position should be on the orbit circle: at angle=0 it's at
+  // (char.x + 0, char.y + height, char.z + radius). The smoke just
+  // unlocked, so menuAngle starts at 0 and quickly advances.
+  const menuRadiusDrift = Math.sqrt(
+    Math.pow(sMenu1.cameraPosition.x - sMenu1.characterPosition.x - Math.sin(sMenu1.menuAngle) * MENU_ORBIT.radius, 2) +
+    Math.pow(sMenu1.cameraPosition.y - sMenu1.characterPosition.y - MENU_ORBIT.height, 2) +
+    Math.pow(sMenu1.cameraPosition.z - sMenu1.characterPosition.z - Math.cos(sMenu1.menuAngle) * MENU_ORBIT.radius, 2),
+  );
+  if (menuRadiusDrift > POSITION_TOLERANCE) {
+    throw new Error(
+      `[menu-position] camera not on orbit circle (drift=${menuRadiusDrift.toFixed(4)}m) ` +
+      `at menuAngle=${sMenu1.menuAngle.toFixed(4)}`,
+    );
+  }
+  // Wait a bit and verify menuAngle is advancing (proves the orbit is happening).
+  await page.waitForTimeout(500); // ~30 frames of orbit
+  const sMenu2 = await page.evaluate(() => window.__chaseCameraProbe());
+  const menuAngleDelta = sMenu2.menuAngle - sMenu1.menuAngle;
+  console.log(`MENU_ORBIT_OK: angle advanced by ${menuAngleDelta.toFixed(4)} rad in ~30 frames`);
+  if (menuAngleDelta < 0.05) {
+    throw new Error(
+      `[menu-static] menuAngle should advance over time (got delta ${menuAngleDelta.toFixed(4)} rad); ` +
+      `orbit might not be running`,
+    );
+  }
+
+  // (g) PR 11.1.2: V while unlocked is a NO-OP. viewMode stays the same.
+  // (We're currently in mode 0 from the last V wrap.)
+  const sBeforeVunlocked = await page.evaluate(() => window.__chaseCameraProbe());
+  await page.evaluate(() => window.__chaseCameraToggle());
+  await page.waitForTimeout(50);
+  const sVunlocked = await page.evaluate(() => window.__chaseCameraProbe());
+  if (sVunlocked.viewMode !== sBeforeVunlocked.viewMode) {
+    throw new Error(
+      `[V-unlocked-noop-fail] V while unlocked should be a no-op; viewMode changed ` +
+      `from ${sBeforeVunlocked.viewMode} to ${sVunlocked.viewMode}`,
+    );
+  }
+  console.log(`V_UNLOCKED_NOOP_OK: viewMode stayed at ${sVunlocked.viewMode} after V while unlocked`);
+
+  // (h) PR 11.1.2: Re-lock → viewMode=0, menu orbit NOT active.
+  await page.evaluate(() => window.__pointerLockToggle(true));
+  await page.waitForTimeout(200);
+  const sRelock = await page.evaluate(() => window.__chaseCameraProbe());
+  console.log(
+    `RELOCK: isLocked=${sRelock.isPointerLocked} viewMode=${sRelock.viewMode} ` +
+    `isMenuOrbit=${sRelock.isMenuOrbit}`,
+  );
+  if (!sRelock.isPointerLocked) {
+    throw new Error(`[relock-fail] isLocked should be true after re-lock; got ${sRelock.isPointerLocked}`);
+  }
+  if (sRelock.viewMode !== 0) {
+    throw new Error(`[relock-mode] viewMode should be 0 after re-lock; got ${sRelock.viewMode}`);
+  }
+  if (sRelock.isMenuOrbit) {
+    throw new Error(`[relock-menu] isMenuOrbit should be false after re-lock; got ${sRelock.isMenuOrbit}`);
+  }
+  // Camera back at firstPersonOffset.
+  const relockExpected = {
+    x: sRelock.characterPosition.x + FIRST_PERSON_OFFSET.x,
+    y: sRelock.characterPosition.y + FIRST_PERSON_OFFSET.y,
+    z: sRelock.characterPosition.z + FIRST_PERSON_OFFSET.z,
+  };
+  const relockDrift = Math.sqrt(
+    Math.pow(sRelock.cameraPosition.x - relockExpected.x, 2) +
+    Math.pow(sRelock.cameraPosition.y - relockExpected.y, 2) +
+    Math.pow(sRelock.cameraPosition.z - relockExpected.z, 2),
+  );
+  if (relockDrift > POSITION_TOLERANCE) {
+    throw new Error(
+      `[relock-position] drift ${relockDrift.toFixed(4)}m from firstPersonOffset`,
+    );
+  }
+  console.log(`RELOCK_OK: viewMode=0, locked, firstPersonOffset, drift=${relockDrift.toFixed(4)}m`);
 
   await page.screenshot({ path: SCREENSHOT });
 
@@ -305,7 +347,7 @@ try {
     process.exit(1);
   }
 
-  console.log("OK — pointer-lock camera render path verified");
+  console.log("OK — pointer-lock + 2-mode V-cycle + menu orbit camera render path verified");
   await browser.close();
   process.exit(0);
 } catch (err) {
