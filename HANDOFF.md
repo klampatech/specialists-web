@@ -4,6 +4,64 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-14 — PR 11.1.1: tracer yaw fix + 3-mode V-cycle state machine. Pre-merge.
+
+**Status**: PR 11.1.1 ready for review. Two changes: (1) tracer + melee forward direction now derived from `input.yawRadians` instead of hardcoded `yaw=0` (this was a pre-existing PR 7 bug that PR 11.1 made visible by adding yaw rotation); (2) `chaseCamera` now exposes a 3-mode `viewMode` state machine (0=1st-locked, 1=3rd-locked, 2=chase-unlocked) that V cycles through, with `pointer-lock-click → mode 0` and `ESC → mode 2` as the two state transitions. Both fixes verified by extending the existing pointer-lock-camera smoke (now covers all 3 V-mode transitions + wrap + position checks).
+
+### Combat fix (the tracer-was-firing-in-the-old-direction bug)
+
+Kyle reported (via playtest): "the tracer fires the direction the model was facing BEFORE i rotated the model in first person view with the pointer locked."
+
+Root cause: `client/src/game/combat.ts` had a placeholder from PR 7 (`const FORWARD_AT_YAW_0 = new Vector3(0, 0, 1);`) that hardcoded yaw=0 for the tracer ray. The doc comment even acknowledged it: "Phase 1 mouse-look will replace this with the controller's `yawRadians`." PR 11.1 added mouse-look + yaw on the wire, so this placeholder became wrong.
+
+Fix: added `forwardFromYaw(yawRadians: number): Vector3` helper that returns `(sin(yaw), 0, cos(yaw))` (the local-forward unit vector in the XZ plane). Both `dualPistolShoot` and `meleeSwing` now derive their forward direction from `input.yawRadians` (frame-N, zero lag) instead of `localController.state.rotation` (which lags by 1-2 frames because of the encode/decode/setYaw round-trip).
+
+**Why input.yawRadians and not character.state.rotation?** Two reasons:
+1. **Frame-accurate**: input.yawRadians is what the user just input on frame-N. character.state.rotation lags by 1-2 frames (encode → decode → setYaw → next tick's rotation). Using the lagged rotation would make the tracer fire where the character USED TO be facing, not where they're facing NOW.
+2. **Lockstep-safe**: the tracer is a render-only side-effect (the DualPistolResult struct is not fed back to the wire). Using the input yaw here doesn't break determinism because it doesn't affect anything either peer simulates.
+
+### V-mode 3-state state machine
+
+Replaces PR 3's `firstPerson: boolean` with PR 11.1.1's `viewMode: 0|1|2`:
+- **Mode 0** (1st-person-locked): camera at `firstPersonOffset = (0, 1.6, 0)` (eye height, no back-off), rotated by yaw. Mouse rotates character.
+- **Mode 1** (3rd-person-locked): camera at `thirdPersonLockedOffset = (0, 1.6, -2.5)` (eye height + 2.5m behind), rotated by yaw. Mouse rotates character. Matches Kyle's "Minecraft-style" 3rd-person-locked reference.
+- **Mode 2** (chase-unlocked): PR 3 lerped chase at `thirdPersonOffset = (0, 1.5, -2.8)`, no mouse control.
+
+V cycles `0 → 1 → 2 → 0`. Click to lock → mode 0 (always). ESC → mode 2 (always). The chase lerp runs only when NOT (locked AND mode ∈ {0, 1}).
+
+### Smoke extensions
+
+`pointer-lock-camera-smoke.mjs` now asserts all 7 transitions:
+- Mode 0 + locked: camera.position = character + firstPersonOffset (within 5cm)
+- Mode 0 + locked: camera.rotation.y matches character yaw (within 0.05 rad)
+- Yaw delta propagates to camera in mode 0
+- V → mode 1 (still locked): camera.position = character + thirdPersonLockedOffset (within 5cm); yaw still matches
+- V → mode 2 (still locked): camera drifts from firstPersonOffset as the lerp catches up (≥5cm)
+- V → mode 0 (wrap from mode 2)
+- setPointerLock(false) → mode 2 unlocked; camera at lerped chase offset
+
+### Verification (local)
+
+All 9 gates green:
+- ✓ typecheck + build
+- ✓ scene / jump / wallrun / health / two-tab smokes
+- ✓ mouse-look + pointer-lock-camera (with new 3-mode V-cycle assertions) + yaw-wire-format
+- ✓ spec-canonical guard
+
+### Files changed
+
+- `client/src/engine/characterConfig.ts` (+15): new `thirdPersonLockedOffset` + `viewModeCount` config.
+- `client/src/engine/chaseCamera.ts` (+94/-30): 3-mode viewMode state machine; new `getViewMode`/`setViewMode` API; render path gates lerp on (locked AND mode 0/1).
+- `client/src/engine/scene.ts` (+7): new `__chaseCameraToggle` probe + `viewMode` in `__chaseCameraProbe` return shape.
+- `client/src/game/combat.ts` (+44/-2): removed `FORWARD_AT_YAW_0` placeholder; added `forwardFromYaw(yawRadians)` helper; both `dualPistolShoot` and `meleeSwing` derive forward from input yaw.
+- `client/tools/pointer-lock-camera-smoke.mjs` (+125/-40): new V-cycle + wrap + lerp assertions.
+
+### What still needs Kyle's playtest
+
+The pointer-lock UX itself (click → lock → mouse rotates → ESC → unlocks) and the cross-client yaw propagation. The two-tab smoke covers the wire-format but not the real-browser lock layer. V-cycle behavior should now be: lock + V cycles 0→1→2→0 visually; unlocked V cycles 0→1→2→0 but all three are the chase lerp with different offsets.
+
+---
+
 ## 2026-08-14 — PR 11.1 follow-up: two new smokes (pointer-lock-camera + yaw-wire-format). Dev-box playtest in progress.
 
 **Status**: Two additional smokes added to PR 11.1's CI gate (still pending Kyle's dev-box playtest of the pointer-lock UX). All 8 smokes green on the working tree; 3 new CI jobs added to `.github/workflows/ci.yml`. The pointer-lock-camera smoke verifies the chase camera's RENDER path honors the lock state (1:1 snap when locked, lerped chase when not). The yaw-wire-format smoke verifies the wire-format determinism (encode → decode round-trip within 1.5 LSB tolerance across 7 representative yaw values including negative + multi-wrap). Both smokes are CI-runnable in headless (don't depend on real pointer-lock or WebRTC ICE).

@@ -1,30 +1,35 @@
 #!/usr/bin/env node
-// Phase 0 / PR 11.1 — pointer-lock camera-render smoke.
+// Phase 0 / PR 11.1.1 — pointer-lock + 3-mode V-cycle camera-render smoke.
 //
-// Verifies the camera RENDER path honors the pointer-lock state.
-// The mouse-look smoke (separate file) covers the yaw-rotation code
-// path; this smoke covers the render path:
+// Verifies the chase camera's RENDER path honors the pointer-lock state
+// + the PR 11.1.1 3-mode V-cycle state machine:
 //
-//   1. When pointerLocked === true:
-//      - camera.position === character.position + CAMERA.firstPersonOffset
-//      - camera.rotation.y matches the character's yaw (Euler-Y of state.rotation)
-//   2. When pointerLocked === false:
-//      - camera.position is somewhere OTHER than firstPersonOffset (the
-//        lerped chase is happening — the back-off distance is what we
-//        assert against)
-//   3. After a yaw delta while pointer-locked, camera.rotation.y
-//      updates to match the new character yaw.
+//   Mode 0 (1st-person-locked): camera at firstPersonOffset, rotated by yaw
+//   Mode 1 (3rd-person-locked): camera at thirdPersonLockedOffset, rotated by yaw
+//   Mode 2 (chase-unlocked):    lerped chase, no mouse control
+//
+// What this smoke verifies:
+//   1. Mode 0 + locked: camera.position = character.position + firstPersonOffset
+//   2. Mode 0 + locked: camera.rotation.y matches character yaw
+//   3. Yaw update propagates to camera in mode 0
+//   4. Toggle V → mode 1 (still locked) → camera.position = character + thirdPersonLockedOffset
+//   5. V again → mode 2 (still locked, but camera uses lerp chase)
+//      Wait — actually, in mode 2 the chase lerp kicks in; verify the
+//      camera drifts away from firstPersonOffset
+//   6. Toggle V while in mode 2 + locked → wraps back to mode 0
+//   7. setPointerLock(false) → falls back to chase lerp (mode 2)
+//   8. setViewMode(0) + setPointerLock(false) → unlocked first-person-chase
+//      (camera at firstPersonOffset, but lerped — drift check)
 //
 // Bypasses real pointer-lock (headless Chromium won't grant it) by
-// calling `chase.setPointerLock(true)` directly via the smoke — the
-// camera's render path is the same regardless of whether the lock
-// was acquired via the browser API or programmatically.
+// calling `chase.setPointerLock(true)` directly via the smoke.
 
 import { chromium } from "playwright";
 
 const URL = process.env.POINTER_LOCK_CAMERA_SMOKE_URL ?? "http://localhost:5181/";
 const SCREENSHOT = process.env.POINTER_LOCK_CAMERA_SMOKE_PNG ?? "pointer-lock-camera.png";
 const FIRST_PERSON_OFFSET = { x: 0, y: 1.6, z: 0 }; // CAMERA.firstPersonOffset from characterConfig.ts
+const THIRD_PERSON_LOCKED_OFFSET = { x: 0, y: 1.6, z: -2.5 }; // CAMERA.thirdPersonLockedOffset
 const THIRD_PERSON_OFFSET = { x: 0, y: 1.5, z: -2.8 }; // CAMERA.thirdPersonOffset
 const POSITION_TOLERANCE = 0.05; // 5cm slack for float drift
 const YAW_TOLERANCE = 0.05; // 0.05 rad slack
@@ -159,7 +164,7 @@ try {
 
   const s3 = await page.evaluate(() => window.__chaseCameraProbe());
   console.log(
-    `LOCKED+0.7rad: isLocked=${s3.isPointerLocked} ` +
+    `LOCKED+0.7rad: isLocked=${s3.isPointerLocked} viewMode=${s3.viewMode} ` +
     `camRotY=${s3.cameraRotationY.toFixed(4)} charYaw=${s3.characterYaw.toFixed(4)}`,
   );
   const afterYawDrift = Math.abs(s3.cameraRotationY - s3.characterYaw);
@@ -172,10 +177,90 @@ try {
   }
   console.log(`LOCKED_YAW_UPDATE_OK: |camRotY-charYaw|=${afterYawDrift.toFixed(4)} ≤ ${YAW_TOLERANCE}`);
 
-  // (d) Release pointer-lock + assert the camera drifts back to the
-  // third-person chase position over the next few frames.
+  // (d) PR 11.1.1: V cycles mode 0 → 1 (still locked). Camera should
+  // snap to character.position + thirdPersonLockedOffset.
+  await page.evaluate(() => window.__chaseCameraToggle());
+  await page.waitForTimeout(200);
+
+  const sMode1 = await page.evaluate(() => window.__chaseCameraProbe());
+  console.log(
+    `V→MODE1: isLocked=${sMode1.isPointerLocked} viewMode=${sMode1.viewMode} ` +
+    `cameraPos=(${sMode1.cameraPosition.x.toFixed(3)},${sMode1.cameraPosition.y.toFixed(3)},${sMode1.cameraPosition.z.toFixed(3)})`,
+  );
+  if (sMode1.viewMode !== 1) {
+    throw new Error(`[V-cycle-fail] expected viewMode=1 after one V press, got ${sMode1.viewMode}`);
+  }
+  if (!sMode1.isPointerLocked) {
+    throw new Error(`[V-unlocked] V while locked shouldn't release lock; isLocked=${sMode1.isPointerLocked}`);
+  }
+  const expectedMode1 = {
+    x: sMode1.characterPosition.x + THIRD_PERSON_LOCKED_OFFSET.x,
+    y: sMode1.characterPosition.y + THIRD_PERSON_LOCKED_OFFSET.y,
+    z: sMode1.characterPosition.z + THIRD_PERSON_LOCKED_OFFSET.z,
+  };
+  const mode1Drift = Math.sqrt(
+    Math.pow(sMode1.cameraPosition.x - expectedMode1.x, 2) +
+    Math.pow(sMode1.cameraPosition.y - expectedMode1.y, 2) +
+    Math.pow(sMode1.cameraPosition.z - expectedMode1.z, 2),
+  );
+  if (mode1Drift > POSITION_TOLERANCE) {
+    throw new Error(
+      `[V-mode1-position] drift ${mode1Drift.toFixed(4)}m from expected ${JSON.stringify(expectedMode1)}, ` +
+      `got=${JSON.stringify(sMode1.cameraPosition)}`,
+    );
+  }
+  // Yaw should still match (mode 1 is locked, mouse still rotates).
+  const mode1YawDrift = Math.abs(sMode1.cameraRotationY - sMode1.characterYaw);
+  if (mode1YawDrift > YAW_TOLERANCE) {
+    throw new Error(
+      `[V-mode1-yaw] camera.rotation.y=${sMode1.cameraRotationY.toFixed(4)} should match ` +
+      `character yaw=${sMode1.characterYaw.toFixed(4)} (drift=${mode1YawDrift.toFixed(4)})`,
+    );
+  }
+  console.log(`V_MODE1_OK: viewMode=1, locked, drift=${mode1Drift.toFixed(4)}m, yaw matches`);
+
+  // (e) V again → mode 2. Still locked but lerp chase kicks in.
+  await page.evaluate(() => window.__chaseCameraToggle());
+  await page.waitForTimeout(200);
+
+  const sMode2 = await page.evaluate(() => window.__chaseCameraProbe());
+  console.log(
+    `V→MODE2: isLocked=${sMode2.isPointerLocked} viewMode=${sMode2.viewMode}`,
+  );
+  if (sMode2.viewMode !== 2) {
+    throw new Error(`[V-cycle-fail] expected viewMode=2 after two V presses, got ${sMode2.viewMode}`);
+  }
+  // In mode 2 with locked=true, the chase lerp STILL doesn't fire because
+  // our render path only short-circuits to "no lerp" when (pointerLocked
+  // && (viewMode 0 or 1)). So mode 2 + locked = the lerp chase runs.
+  // The camera should drift away from firstPersonOffset over a few frames.
+  await page.waitForTimeout(500); // ~30 frames of lerp
+  const sMode2Drift = await page.evaluate(() => window.__chaseCameraProbe());
+  const offsetFromFirstPerson = Math.sqrt(
+    Math.pow(sMode2Drift.cameraPosition.x - sMode2Drift.characterPosition.x - FIRST_PERSON_OFFSET.x, 2) +
+    Math.pow(sMode2Drift.cameraPosition.y - sMode2Drift.characterPosition.y - FIRST_PERSON_OFFSET.y, 2) +
+    Math.pow(sMode2Drift.cameraPosition.z - sMode2Drift.characterPosition.z - FIRST_PERSON_OFFSET.z, 2),
+  );
+  if (offsetFromFirstPerson < POSITION_TOLERANCE) {
+    throw new Error(
+      `[V-mode2-lerp-fail] mode 2 + locked should engage lerp chase; camera is still ` +
+      `at firstPersonOffset (offset=${offsetFromFirstPerson.toFixed(4)}m)`,
+    );
+  }
+  console.log(`V_MODE2_OK: viewMode=2, lerp chase engaged (offset from firstPersonOffset=${offsetFromFirstPerson.toFixed(4)}m)`);
+
+  // (f) V again → wraps back to mode 0.
+  await page.evaluate(() => window.__chaseCameraToggle());
+  await page.waitForTimeout(200);
+  const sWrapped = await page.evaluate(() => window.__chaseCameraProbe());
+  if (sWrapped.viewMode !== 0) {
+    throw new Error(`[V-wrap-fail] expected viewMode=0 after three V presses, got ${sWrapped.viewMode}`);
+  }
+  console.log(`V_WRAP_OK: viewMode=0 after 3 V presses`);
+
+  // (g) Release pointer-lock. Camera falls back to chase lerp at mode 2.
   await page.evaluate(() => window.__pointerLockToggle(false));
-  await page.waitForTimeout(500); // ~30 frames for the lerp to catch up
+  await page.waitForTimeout(200);
 
   const s4 = await page.evaluate(() => window.__chaseCameraProbe());
   console.log(

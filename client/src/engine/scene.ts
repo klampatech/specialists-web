@@ -378,6 +378,11 @@ export async function createScene(
     // requestPointerLock. Same DEV-only gate as __mouseLookProbe.
     (window as unknown as { __pointerLockToggle?: (locked: boolean) => void }).__pointerLockToggle =
       (locked: boolean) => chase.setPointerLock(locked);
+    // PR 11.1.1: chase-camera toggle probe. Calls chase.toggle() so the
+    // smoke can advance the viewMode state machine without dispatching
+    // a synthetic V key event. Same DEV-only gate.
+    (window as unknown as { __chaseCameraToggle?: () => void }).__chaseCameraToggle =
+      () => chase.toggle();
     // PR 11.1: set-character-yaw probe. Calls character.setYaw(radians)
     // so the camera-render smoke can verify camera.rotation.y updates
     // when the character yaw changes. The chase camera reads
@@ -396,12 +401,14 @@ export async function createScene(
     // __mouseLookProbe / __applyYawDelta above.
     (window as unknown as { __chaseCameraProbe?: () => {
       isPointerLocked: boolean;
+      viewMode: number;
       cameraPosition: { x: number; y: number; z: number };
       cameraRotationY: number;
       characterPosition: { x: number; y: number; z: number };
       characterYaw: number;
     } }).__chaseCameraProbe = () => ({
       isPointerLocked: chase.isPointerLocked(),
+      viewMode: chase.getViewMode(),
       cameraPosition: {
         x: chase.camera.position.x,
         y: chase.camera.position.y,

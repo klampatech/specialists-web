@@ -72,6 +72,21 @@ export const CAMERA = {
   thirdPersonOffset: new Vector3(0, 1.5, -2.8),
   /** First-person offset from the character (eye height, no back-off). */
   firstPersonOffset: new Vector3(0, 1.6, 0),
+  /**
+   * PR 11.1.1: third-person-locked offset. Camera at eye height + 2.5m
+   * behind. Used when the user is pointer-locked and presses V (mode 1).
+   * Mouse still rotates the character via the wire-yaw; the camera
+   * follows the character's yaw with this back-off. Distinct from
+   * `thirdPersonOffset` because the chase lerp is disabled while locked.
+   */
+  thirdPersonLockedOffset: new Vector3(0, 1.6, -2.5),
+  /**
+   * PR 11.1.1: cycle direction for V. When pointer-locked, V cycles
+   * through the locked modes (0 → 1 → 2 → 0); when unlocked, V cycles
+   * through the unlocked modes (which all behave like the chase lerp
+   * but with different fixed offsets). See chaseCamera.ts viewMode.
+   */
+  viewModeCount: 3 as const,
   /** Look-at point relative to the character (chest height). */
   lookAtOffset: new Vector3(0, 0.9, 0),
   /** Lerp factor for the chase position (0 = no follow, 1 = snap). */

@@ -36,8 +36,18 @@ export interface ChaseCameraHandle {
   update: () => void;
   /** True when the camera is in first-person mode (chase fallback). */
   isFirstPerson: () => boolean;
-  /** Toggle programmatically. */
+  /** Toggle programmatically. PR 11.1.1: now cycles 3-mode viewMode. */
   toggle: () => void;
+  /**
+   * PR 11.1.1: current view mode (0=1st-locked, 1=3rd-locked, 2=chase).
+   * Exposed so the smoke can assert V cycles correctly.
+   */
+  getViewMode: () => number;
+  /**
+   * PR 11.1.1: jump directly to a specific viewMode (mod viewModeCount).
+   * Used by setPointerLock to enter mode 0 when the user clicks the canvas.
+   */
+  setViewMode: (mode: number) => void;
   /** Reset back to third-person. */
   reset: () => void;
   /**
@@ -99,10 +109,15 @@ export function createChaseCamera(
   }
   scene.activeCamera = camera;
 
-  // PR 3 state: V-toggle chase vs first-person-chase.
-  let firstPerson = false;
-  // PR 11.1 state: pointer-lock engaged → render 1:1 with character,
-  // ignore firstPerson, drive yaw from mousemove-deltas.
+  // PR 11.1.1 viewMode state machine (replaces PR 3 firstPerson: boolean).
+  //   0 = first-person-locked: camera at firstPersonOffset, rotated by yaw
+  //   1 = third-person-locked: camera at thirdPersonLockedOffset, rotated by yaw
+  //   2 = chase-unlocked: PR 3 lerped chase, no mouse control
+  // V cycles 0 -> 1 -> 2 -> 0. Clicking the canvas to lock ALWAYS enters
+  // mode 0 (first-person). Pressing ESC ALWAYS releases to mode 2 (chase).
+  let viewMode = 2; // start in chase-unlocked (PR 3 default)
+  // PR 11.1 state: pointer-lock engaged → render 1:1 with character at
+  // the current viewMode's offset, ignore the lerp chase.
   let pointerLocked = false;
   // PR 11.1 state: local yaw accumulator. Mirrors character.yawRadians
   // (set via the controller's `setYaw` in scene.ts) so the camera can
@@ -114,29 +129,36 @@ export function createChaseCamera(
   const tmpCurrent = camera.position.clone();
   const tmpCurrentLook = new Vector3(0, 0.9, 0);
 
+  /**
+   * Offset for a given viewMode (locked or unlocked).
+   *   0 → firstPersonOffset
+   *   1 → thirdPersonLockedOffset (or thirdPersonOffset when unlocked)
+   *   2 → thirdPersonOffset (chase lerp)
+   */
+  const offsetForMode = (mode: number, locked: boolean): Vector3 => {
+    if (mode === 0) return CAMERA.firstPersonOffset;
+    if (mode === 1) return locked ? CAMERA.thirdPersonLockedOffset : CAMERA.thirdPersonOffset;
+    return CAMERA.thirdPersonOffset; // mode 2 (and any future modes >= 2)
+  };
+
   const update = (): void => {
-    // PR 11.1: pointer-locked path. Snap camera to character eye position;
-    // render at the character's exact yaw (no lerp — the locked view IS
-    // the character's view, not a follow-camera). Yaw here is the value
-    // the scene.ts render loop pulled from the controller's state (via
-    // `setYaw` driven by the decoded input packet), so both clients see
-    // identical camera orientation on the same frame.
-    if (pointerLocked) {
-      const cp = character.state.position;
-      camera.position.set(
-        cp.x + CAMERA.firstPersonOffset.x,
-        cp.y + CAMERA.firstPersonOffset.y,
-        cp.z + CAMERA.firstPersonOffset.z,
-      );
+    const cp = character.state.position;
+    // PR 11.1.1: pointer-locked path (modes 0 and 1). Snap camera to
+    // character + offset; render at the character's exact yaw (no lerp —
+    // the locked view IS the character's view, not a follow-camera).
+    // Yaw here is the value the scene.ts render loop pulled from the
+    // controller's state (via `setYaw` driven by the decoded input
+    // packet), so both clients see identical camera orientation on the
+    // same frame.
+    if (pointerLocked && (viewMode === 0 || viewMode === 1)) {
+      const offset = offsetForMode(viewMode, true);
+      camera.position.set(cp.x + offset.x, cp.y + offset.y, cp.z + offset.z);
       // Babylon: camera.rotation is a Vector3 in Euler angles. yaw =
       // rotation around world Y. Convert character.state.rotation (a
       // Quaternion) to Euler Y. The character only rotates around Y
       // (yaw only — pitch is camera-side and not in PR 11.1's scope),
       // so the Y component is authoritative.
       const q = character.state.rotation;
-      // Standard quaternion → Euler-Y (only the Y component; X/Z are
-      // zero in practice because the controller's setYaw only rotates
-      // around the world up axis).
       const sinY = 2 * (q.w * q.y + q.z * q.x);
       const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
       const eulerY = Math.atan2(sinY, cosY);
@@ -146,10 +168,11 @@ export function createChaseCamera(
 
     // PR 3 path: lerped chase (first-person-chase OR third-person-chase
     // depending on V-toggle). Unchanged from pre-PR-11.1 behavior.
-    tmpOffset.copyFrom(firstPerson ? CAMERA.firstPersonOffset : CAMERA.thirdPersonOffset);
+    // viewMode 0 (unlocked): chase from firstPersonOffset (eye height).
+    // viewMode 1 or 2 (unlocked): chase from thirdPersonOffset (behind+above).
+    tmpOffset.copyFrom(offsetForMode(viewMode, false));
 
     // Anchor: world-space character position + offset.
-    const cp = character.state.position;
     tmpDesired.set(
       cp.x + tmpOffset.x,
       cp.y + tmpOffset.y,
@@ -179,17 +202,36 @@ export function createChaseCamera(
   return {
     camera,
     update,
-    isFirstPerson: () => firstPerson,
+    /** PR 3 API — returns true when in mode 0 (1st-person-ish). */
+    isFirstPerson: () => viewMode === 0,
+    /** PR 3 API — now cycles through the 3-mode state machine. */
     toggle: () => {
-      firstPerson = !firstPerson;
+      viewMode = (viewMode + 1) % CAMERA.viewModeCount;
+    },
+    /**
+     * PR 11.1.1: current view mode (0/1/2). Exposed for the smoke so it
+     * can assert V cycles correctly.
+     */
+    getViewMode: () => viewMode,
+    /**
+     * PR 11.1.1: jump directly to a specific viewMode. Used by
+     * setPointerLock to enter mode 0 when the user clicks the canvas.
+     */
+    setViewMode: (mode: number) => {
+      viewMode = ((mode % CAMERA.viewModeCount) + CAMERA.viewModeCount) % CAMERA.viewModeCount;
     },
     reset: () => {
-      firstPerson = false;
+      viewMode = 2;
       pointerLocked = false;
       yawRadians = 0;
     },
     setPointerLock: (locked) => {
       pointerLocked = locked;
+      // PR 11.1.1: clicking the canvas to lock ALWAYS enters mode 0
+      // (first-person), regardless of the previous viewMode. ESC ALWAYS
+      // releases to mode 2 (chase).
+      if (locked) viewMode = 0;
+      else viewMode = 2;
     },
     applyYawDelta: (deltaRadians) => {
       // Wrap mod 2π so the accumulator doesn't drift at large values
