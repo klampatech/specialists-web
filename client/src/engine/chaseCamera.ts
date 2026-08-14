@@ -148,6 +148,13 @@ export function createChaseCamera(
   // accumulates per-frame, `menuAngularSpeed` is rad/sec.
   let menuAngle = 0;
   let everLocked = false; // distinguishes "fresh page" from "user ESC'd"
+  // PR 11.2: remembers the last locked viewMode so the Resume action
+  // (ESC-equals-resume OR explicit Resume button) can restore the user's
+  // preference across pause cycles. `-1` means "never set" — the very
+  // first lock falls back to mode 0 (first-person). After that, every
+  // V-toggle updates this; every `setPointerLock(true)` with this set
+  // restores it.
+  let lastLockedViewMode = -1;
 
   const tmpOffset = new Vector3();
   const tmpDesired = new Vector3();
@@ -299,6 +306,8 @@ export function createChaseCamera(
     toggle: () => {
       if (!pointerLocked) return;
       viewMode = viewMode === 0 ? 1 : 0;
+      // PR 11.2: record the new mode so a future Resume restores it.
+      lastLockedViewMode = viewMode;
     },
     /**
      * PR 11.1.2: current locked view mode (0 or 1). Exposed for the smoke.
@@ -333,9 +342,18 @@ export function createChaseCamera(
     setPointerLock: (locked) => {
       pointerLocked = locked;
       if (locked) {
-        // Click to lock: always enter mode 0 (1st-person). Reset menu
-        // orbit so the next ESC starts fresh.
-        viewMode = 0;
+        // PR 11.2: restore the user's last locked viewMode if we have one
+        // (i.e., this is NOT the very first lock — they had time to V-toggle
+        // before pausing). Otherwise default to mode 0 (first-person).
+        if (lastLockedViewMode === 0 || lastLockedViewMode === 1) {
+          viewMode = lastLockedViewMode;
+        } else {
+          // First lock ever: enter mode 0 and remember it so the NEXT
+          // pause-resume cycle restores 0 (no behavior change for the
+          // first lock; the change kicks in once the user has toggled).
+          viewMode = 0;
+          lastLockedViewMode = 0;
+        }
         menuAngle = 0;
         everLocked = true;
       }

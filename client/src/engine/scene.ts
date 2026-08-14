@@ -92,6 +92,24 @@ export interface SceneHandle {
   getGameSession?: () => GameSession | null;
   /** Snapshot of the most recent LOCAL InputState — used by the HUD bullet-time chip. */
   getInputState?: () => InputState | null;
+  /** PR 11.2: chase camera state — pointer lock + menu-orbit. Used by
+   *  the React HUD + pause-menu layer to know when to show the menu.
+   *  Single source of truth: the chase camera's internal flags. */
+  getChaseState?: () => {
+    isPointerLocked: boolean;
+    isMenuOrbit: boolean;
+    /** True once the user has locked at least once. Drives the
+     *  everLocked gate on the pause-menu visibility. */
+    everLocked: boolean;
+    /** Current locked viewMode (0 first-person, 1 over-shoulder). */
+    viewMode: number;
+  };
+  /** PR 11.2: programmatic Resume action — re-locks the pointer. Same
+   *  effect as a real `requestPointerLock()` (well, almost — the user
+   *  gesture requirement is bypassed here, so this only works inside a
+   *  user-initiated event handler or the smoke; the browser will refuse
+   *  in random places). The chase camera handles viewMode restoration. */
+  setPointerLock?: (locked: boolean) => void;
 }
 
 /** Try WebGPU first; fall back to WebGL2 if anything throws during init. */
@@ -305,6 +323,15 @@ export async function createScene(
     // between the first-person 1:1 render path and the chase fallback.
     onPointerLockChange: (locked) => chase.setPointerLock(locked),
     onYawDelta: (delta) => chase.applyYawDelta(delta),
+    // PR 11.2: ESC-equals-resume. When unlocked, fire `setPointerLock(true)`
+    // to close the pause menu + restore the last viewMode. When locked,
+    // the browser consumes ESC first and `pointerlockchange` fires
+    // `onPointerLockChange(false)` — by the time this hook would run, the
+    // menu is already visible and the next ESC (now unlocked) closes it
+    // via this same path. Calling `setPointerLock(true)` while already
+    // locked is a safe no-op (it just resets menuAngle, which is what
+    // we want anyway).
+    onEscapePressed: () => chase.setPointerLock(true),
   }, canvas);  // PR 7.3: bind mouse handlers directly to the canvas so clicks
                // always reach the listener regardless of Babylon's attachControl
                // pointer-capture behavior.
@@ -462,6 +489,31 @@ export async function createScene(
     isFirstPerson: () => chase.isFirstPerson(),
     toggleCamera: () => chase.toggle(),
     resetCharacter: () => character.reset(),
+    // PR 11.2: chase state snapshot for the React HUD + pause menu. The
+    // chase camera is the single source of truth for pointer-lock + menu
+    // orbit state; the React layer polls this at ~10Hz (same cadence as
+    // the rest of the HUD) and renders accordingly. `everLocked` is
+    // exposed so the React layer can implement the `everLocked === true`
+    // gate that prevents the menu from flashing on a fresh page.
+    getChaseState: () => ({
+      isPointerLocked: chase.isPointerLocked(),
+      isMenuOrbit: chase.isMenuOrbit(),
+      // `everLocked` is internal to chaseCamera — we surface it via the
+      // `isMenuOrbit` shape (`isMenuOrbit === true` implies `everLocked`)
+      // plus `chase.isPointerLocked()` (true when locked, regardless of
+      // everLocked). The React layer derives `everLocked` as
+      // `isPointerLocked || isMenuOrbit`. This avoids adding a new
+      // accessor to the chase camera for the same logic.
+      everLocked: chase.isPointerLocked() || chase.isMenuOrbit(),
+      viewMode: chase.getViewMode(),
+    }),
+    // PR 11.2: programmatic Resume action — re-locks the pointer. Same
+    // entry point as the browser's `pointerlockchange` event and the
+    // `__pointerLockToggle` DEV probe; chase camera handles viewMode
+    // restoration. The browser may refuse outside a user-activation
+    // gesture (e.g., if called from a setTimeout), but it works inside
+    // button onClick handlers and the smoke's synthetic events.
+    setPointerLock: (locked: boolean) => chase.setPointerLock(locked),
   };
 
   if (gameSession) {

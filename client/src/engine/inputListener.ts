@@ -25,6 +25,12 @@ export interface InputHooks {
    *  `e.movementX * sensitivity`. The chase camera accumulates this
    *  into its yaw state. */
   onYawDelta?: (deltaRadians: number) => void;
+  /** PR 11.2: Escape pressed while pointer is unlocked. The host
+   *  decides what to do (typically: re-lock pointer to close the pause
+   *  menu). When locked, the browser consumes ESC and fires
+   *  `pointerlockchange` first; this hook is for the unlocked case
+   *  (ESC-equals-resume UX). */
+  onEscapePressed?: () => void;
 }
 
 /** Returned by `createInputListener`. */
@@ -133,6 +139,15 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
         hooks.onCameraToggle();
       }
       e.preventDefault();
+      return;
+    }
+    // PR 11.2: Escape pressed. When the pointer is locked the browser
+    // already consumed ESC to fire `pointerlockchange` — this listener
+    // won't see it (browsers stop propagation). When unlocked, ESC fires
+    // here and we route to `onEscapePressed` so the host can close the
+    // pause menu (typically by calling `chase.setPointerLock(true)`).
+    if (key === "Escape" && !e.repeat) {
+      hooks.onEscapePressed?.();
       return;
     }
   };
@@ -245,9 +260,6 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", onBlur);
     window.addEventListener("mouseup", onMouseUp);
-    window.addEventListener("mousedown", (e) => {
-      console.log("[input] window mousedown (capture path)", { button: e.button, target: (e.target as Element).tagName });
-    }, true);
   }
 
   return {
