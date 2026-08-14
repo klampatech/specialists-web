@@ -60,6 +60,12 @@ export interface ChaseCameraHandle {
    * see the same yaw → same WASD world direction → lockstep determinism.
    */
   getYaw: () => number;
+  /**
+   * PR 11.1: current pointer-lock state (true when the browser has
+   * the canvas locked). Exposed for the camera-render smoke so it
+   * can assert the render path is honoring the lock state.
+   */
+  isPointerLocked: () => boolean;
   dispose: () => void;
 }
 
@@ -192,6 +198,7 @@ export function createChaseCamera(
       yawRadians = ((yawRadians + deltaRadians) % TWO_PI + TWO_PI) % TWO_PI;
     },
     getYaw: () => yawRadians,
+    isPointerLocked: () => pointerLocked,
     dispose: () => {
       camera.dispose();
     },

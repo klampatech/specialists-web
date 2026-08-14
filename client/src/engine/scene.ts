@@ -372,6 +372,54 @@ export async function createScene(
       (deltaRadians: number) => chase.applyYawDelta(deltaRadians);
     (window as unknown as { __mouseLookProbe?: () => number }).__mouseLookProbe = () =>
       chase.getYaw();
+    // PR 11.1: pointer-lock toggle probe. Calls chase.setPointerLock
+    // directly so the camera-render smoke can test the locked path
+    // without depending on headless Chromium honoring
+    // requestPointerLock. Same DEV-only gate as __mouseLookProbe.
+    (window as unknown as { __pointerLockToggle?: (locked: boolean) => void }).__pointerLockToggle =
+      (locked: boolean) => chase.setPointerLock(locked);
+    // PR 11.1: set-character-yaw probe. Calls character.setYaw(radians)
+    // so the camera-render smoke can verify camera.rotation.y updates
+    // when the character yaw changes. The chase camera reads
+    // character.state.rotation (a Quaternion) in its update() loop
+    // when pointerLocked — without this probe, the smoke can only
+    // observe the initial state where charYaw = 0. DEV-only.
+    (window as unknown as { __setCharacterYaw?: (radians: number) => void }).__setCharacterYaw =
+      (radians: number) => character.setYaw(radians);
+    // PR 11.1: pointer-lock camera probe. Exposes the chase camera's
+    // internal state so the pointer-lock-camera smoke can assert:
+    //   - When pointerLocked, camera.position === character.position + firstPersonOffset
+    //   - camera.rotation.y matches the character yaw
+    //   - When pointerLocked is false, the camera lerps back to the
+    //     chase offset (i.e., position drifts away from firstPersonOffset)
+    // DEV-only (stripped from production by Vite). Same shape as
+    // __mouseLookProbe / __applyYawDelta above.
+    (window as unknown as { __chaseCameraProbe?: () => {
+      isPointerLocked: boolean;
+      cameraPosition: { x: number; y: number; z: number };
+      cameraRotationY: number;
+      characterPosition: { x: number; y: number; z: number };
+      characterYaw: number;
+    } }).__chaseCameraProbe = () => ({
+      isPointerLocked: chase.isPointerLocked(),
+      cameraPosition: {
+        x: chase.camera.position.x,
+        y: chase.camera.position.y,
+        z: chase.camera.position.z,
+      },
+      cameraRotationY: chase.camera.rotation.y,
+      characterPosition: {
+        x: character.state.position.x,
+        y: character.state.position.y,
+        z: character.state.position.z,
+      },
+      characterYaw: (() => {
+        const q = character.state.rotation;
+        const sinY = 2 * (q.w * q.y + q.z * q.x);
+        const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
+        return Math.atan2(sinY, cosY);
+      })(),
+    });
     // PR 10: smoke-only accessor for the health-regression test. Teleports
     // the REMOTE rig onto a known position so every shot in the smoke
     // is a guaranteed hit. Gated behind `import.meta.env.DEV` (same as

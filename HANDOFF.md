@@ -4,6 +4,39 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-14 — PR 11.1 follow-up: two new smokes (pointer-lock-camera + yaw-wire-format). Dev-box playtest in progress.
+
+**Status**: Two additional smokes added to PR 11.1's CI gate (still pending Kyle's dev-box playtest of the pointer-lock UX). All 8 smokes green on the working tree; 3 new CI jobs added to `.github/workflows/ci.yml`. The pointer-lock-camera smoke verifies the chase camera's RENDER path honors the lock state (1:1 snap when locked, lerped chase when not). The yaw-wire-format smoke verifies the wire-format determinism (encode → decode round-trip within 1.5 LSB tolerance across 7 representative yaw values including negative + multi-wrap). Both smokes are CI-runnable in headless (don't depend on real pointer-lock or WebRTC ICE).
+
+**Why two smokes and not one combined**: each catches a distinct regression class. Pointer-lock-camera catches "camera accidentally lerps while locked" / "camera position wrong when locked" / "camera rotation doesn't track character yaw" — pure camera-render bugs. Yaw-wire-format catches "yawToBits off-by-one" / "decodeInput reads wrong byte" / "wrap arithmetic breaks" — pure wire-format bugs. They have different failure modes that would mask each other if combined.
+
+**What this incremental change adds**:
+- **`client/src/engine/chaseCamera.ts`** (`+7` lines) — new `isPointerLocked(): boolean` method on `ChaseCameraHandle` so the smoke can verify lock-state observation.
+- **`client/src/engine/scene.ts`** (`+48` lines) — three new DEV-only probes (`__pointerLockToggle(locked)`, `__setCharacterYaw(radians)`, `__chaseCameraProbe()` returning `{ isPointerLocked, cameraPosition, cameraRotationY, characterPosition, characterYaw }`). All gated behind `import.meta.env.DEV` so they're stripped from production builds.
+- **`client/tools/pointer-lock-camera-smoke.mjs`** (NEW, 233 lines) — single-tab Playwright smoke on port 5181. Verifies: (a) locked position = character + firstPersonOffset within 5cm; (b) locked rotation.y matches character yaw within 0.05 rad; (c) yaw update propagates to camera; (d) release drifts back to chase offset (≥5cm from firstPersonOffset).
+- **`client/tools/yaw-wire-format-smoke.mjs`** (NEW, 172 lines) — single-tab Playwright smoke on port 5182. Verifies encodeInput/decodeInput round-trip across 7 yaw values: 0, 0.5, -0.3, π/2, -π, just-under-2π, multi-wrap (12.5). Tolerance: 1.5 LSB (1 LSB ≈ 1/10430 rad ≈ 0.0001 rad). Imports the actual `inputBitmask.ts` module via Vite's dev-server transform, so the wire-format byte positions are tested against the real implementation, not a copy.
+- **`.github/workflows/ci.yml`** (`+136` lines) — two new CI jobs: `client-yaw-wire-format-smoke` (port 5182) + `client-pointer-lock-camera-smoke` (port 5181). Mirrors the existing smoke-job shape (nohup + ready-poll + run + screenshot upload + teardown).
+- **`.gitignore`** (`+3` lines) — adds screenshot patterns for the two new smokes.
+
+**What it does NOT add**: a two-tab-yaw-determinism smoke. Initially tried to write one, but headless Chromium can't establish ICE (TURN unreachable from GH runner), so the data channel can't actually carry packets — both peers stay in `connectionState === "new"`. The wire-format smoke is the closest thing CI-runnable: it asserts the encode → decode contract that BOTH clients depend on for lockstep determinism, without requiring WebRTC to actually work. The full end-to-end determinism check requires a real-browser dev-box playtest where both peers' chase cameras visibly track the peer's yaw.
+
+**Verification gates passed (local)**:
+- ✓ `npm run typecheck` (exit 0)
+- ✓ `npm run build` (exit 0, 1m 56s)
+- ✓ All 8 smokes green: scene + jump + wallrun + health + two-tab + mouse-look + pointer-lock-camera + yaw-wire-format
+- ✓ spec-canonical guard passes
+
+**Playtest status** ⚠️ — UNCHANGED FROM PREVIOUS ENTRY. The pointer-lock UX itself (click → lock → rotate → ESC) is still gated on Kyle's dev-box two-tab playtest. The two new smokes prove the CODE PATHS work end-to-end (locked camera renders correctly, wire-format is deterministic, lock-state transitions work); the real-browser "does the browser actually grant lock when the user clicks" layer is the dev-box test.
+
+**Decisions made** (2026-08-14):
+- **Two smokes, not one combined.** The pointer-lock-camera smoke and the yaw-wire-format smoke catch different regression classes (camera-render vs wire-format). Combining them would mask one failure with the other. The cost is +200 lines of smoke + +136 lines of CI config; the value is two independent regression canaries.
+- **Wire-format smoke imports the real module via Vite.** The smoke does `await import("/src/net/inputBitmask.ts")` from the page context, which lets Vite's dev-server transform pipeline serve the actual module. The test asserts against the real implementation, not a copy. If a future PR renames `yawToBits` or moves bytes 2-3, the smoke fails immediately (rather than testing a stale snapshot).
+- **Pointer-lock-camera smoke bypasses real lock via DEV probes.** Headless Chromium doesn't reliably honor `requestPointerLock()` (documented in HANDOFF §"PR 6 caveat"). The smoke calls `__pointerLockToggle(true)` to set the chase camera's lock state directly, which exercises the SAME render path the browser would trigger. This is honest: the test proves the camera's render logic, not the browser's user-activation behavior. The browser layer is the dev-box test.
+
+**Branch hygiene**: still on `feat/phase0-pr11.1-mouse-look` in worktree `~/Development/specialists-web-pr11.1/`. All changes will land as a single commit (`<new-sha>`) on top of `76cf5f2` when pushed. Can be removed after PR merge: `git worktree remove ~/Development/specialists-web-pr11.1 && git branch -d feat/phase0-pr11.1-mouse-look`.
+
+---
+
 ## 2026-08-14 — PR 11.1 READY for review. Per-player first-person mouse-look (pointer-locked yaw on the wire). Next: dev-box two-tab playtest.
 
 **Status**: Phase 0 / Milestone 2 / PR 11.1 code-complete + all 6 local gates green (typecheck + build + 5 existing smokes + new mouse-look smoke). Branch `feat/phase0-pr11.1-mouse-look` in worktree `~/Development/specialists-web-pr11.1/` (off `origin/main` @ `a7c3ae2`). Branch is **NOT YET PUSHED**. Bundle size 7,047.25 kB → 7,048.62 kB (+1.4 kB). PR #18.
