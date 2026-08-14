@@ -4,9 +4,58 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
-## 2026-08-13 (post-merge, evening) — PR 10 + 10.1 + 10.2 MERGED (#13). PR 14 MERGED (Phase 1 follow-up re-rank for internet-multiplayer goal). Next: PR 7.4 cleanup (smallest, do first), then PR 11.1 (per-player first-person mouse-look).
+## 2026-08-14 — PR 7.4 cleanup MERGED (#16). Pure-delete of PR 7.2 + PR 7.3 debug instrumentation. Next: PR 11.1 (per-player first-person mouse-look).
 
-**Status**: PR 10 + PR 10.1 + PR 10.2 stacked onto `feat/phase0-ice-candidate-bundling-rebased` MERGED at commit `fe6ce14` (squash) — squash message is the rebased-stack summary from the worktree. PR 14 (the docs-only "re-rank Phase 1 follow-ups for internet-multiplayer goal" commit) MERGED at commit `6360185`. Both branches deleted locally + remotely. All 5 local gates green on main. Dev-box two-tab playtest (Kyle, 2026-08-13 18:30) confirmed cross-client HP drain + respawn sync + ICE handshake.
+**Status**: PR #16 MERGED at commit `b1ecfb7` (squash). All 7 CI checks green (typecheck + build + scene-smoke + jump-regression-smoke + wallrun-regression-smoke + health-regression-smoke + two-tab-smoke + spec-layout-guard). Branch `feat/phase0-pr7.4-cleanup` deleted locally + remotely after merge. Dev-box playtest (Kyle, 2026-08-14) confirmed HUD renders the production state without the debug mirror and the console is quiet during normal play — no `[input] mousedown`, `[APP] document mousedown (top-level)`, or `[input] CANVAS mousedown` logs fire.
+
+**What PR #16 shipped** (squash of `b1ecfb7`):
+- **`client/src/engine/inputListener.ts`** (`-10` lines): removed the `__lastMouseDown` DEV-only accessor and the `[input] mousedown` console.log from `onMouseDown`.
+- **`client/src/ui/App.tsx`** (`-64` lines): removed the top-level `__topLevelMouseDown` document mousedown/mouseup capture-phase useEffect; the canvas-direct `__canvasDown` listener (with its 30+ lines of canvas-state dumping — `getBoundingClientRect`, clientXY, canvas-style attrs); the `fireHeld` + `meleePressed` fields from `HudState` + initial state; the `fireHeld` + `meleePressed` props read into the HUD updater; the `fireHeld` + `meleePressed` + `bulletTime` props passed to `<BulletHud>` (the `bulletTime` duplicate was the debug line — the production bullet-time chip is `<BulletTimeChip>` in `App.tsx`).
+- **`client/src/ui/BulletHud.tsx`** (`-18/+15` lines): removed `fireHeld` + `meleePressed` + `bulletTime` from props; removed the entire PR 7.2 debug block (the dashed-border div with `LMB:/RMB:/T:` raw boolean lines + testids `debug-fire` / `debug-melee` / `debug-bullet`); updated header comment to reflect PR 7.4 cleanup + PR 10 HP lines.
+- **`docs/SPEC.md` + `HANDOFF.md`**: this entry + the status banner PR #16 entry.
+
+**Why this PR is a strict cleanup**: the rising-edge detection in `gameSession.ts` was never touched — only the debug aids that mirrored the input listener state to HUD testids + console.logs are gone. Combat, health/damage/respawn, bullet-time, and chase camera are all functionally identical to PR #13. Bundle size dropped 7,049.30 kB → 7,047.25 kB (~2 KB of debug code).
+
+**Next session task** — per Kyle's 2026-08-13 23:30 internet-multiplayer re-rank, in order:
+
+1. **PR 11.1 — per-player first-person mouse-look** (production camera model for internet multiplayer). Pointer-locked yaw (click to lock, ESC to release, mouse-delta → yaw). Affects `chaseCamera.ts` + `inputListener.ts` + a small `setYaw` plumbing change in `characterController.ts`. Medium-sized PR (3 files, ~80-120 lines net). Ships a new CI smoke (`client-mouse-look-smoke`) that confirms the camera yaw updates on mouse-delta events. **Design decision still open** (see Blockers): whether the chase camera is the fallback when pointer-lock is not granted (e.g., user has ESC'd, or the browser refuses pointer-lock for non-secure-context reasons). Default = chase camera is the fallback (preserves the current dev-box behavior).
+2. **PR 11.2 — dev-box free-fly spectator camera (debug-mode only)**. F2 to detach from player, orbit with mouse, click to return. ~30 lines in `chaseCamera.ts` + a new CI smoke confirming the F2 toggle works. **Not a production blocker** — solves the dev-box two-tab visual discomfort per Kyle's 2026-08-13 18:30 playtest observations. The cyan rig is hard to see because the chase camera follows the local rig; spectator mode lets the developer orbit and look at both rigs.
+3. **PR 11.3 — gap-bridging rollback**. The "huge delay" Kyle saw in the playtest. The no-rollback lockstep is fundamentally limited — both tabs agree on world state but their `frame` HUD counters drift by ~70s of game-time after a few minutes of play. Real rollback (ggrs/wasm) is the long-term answer; the first cut is a "pause-when-too-far-behind" cap in `ggrsRuntime.ts` (~50 lines + a new regression smoke): if Tab A's `frame` > Tab B's `frame` + N, Tab A pauses until Tab B catches up. This naturally absorbs the Chrome tab-throttling issue too.
+4. **PR 11.4 — server-authoritative damage** (the first internet-multiplayer architecture step). Current damage is derived locally from lockstep, which is fine for LAN / Tailscale but doesn't survive 100ms+ WAN latency. Move `applyDamage` from `gameSession.tick` (per-client local) to a server-broadcast packet handler (per-authority). The controller's HP slot is unchanged; the source of the `applyDamage` call moves. This is the seed of a real dedicated server, which is the actual internet-multiplayer architecture.
+5. **Original Phase 1 polish** (queued after the above):
+   - **Real wall-detection for the Q-stunt via `PhysicsRaycast`**: ~20-line change + new regression smoke. The original row-6 follow-up.
+   - **Real Mixamo glTF character model**: replace the procedural rig with an actual animated humanoid.
+   - **Kill-marker, hit-marker, death animation**: polish for the combat feel.
+6. **Phase 1 prep** (deferred): Rust WebTransport server, ggrs/wasm binding when one lands on npm, self-hosted coturn on Hetzner.
+
+**Blockers / open questions**:
+- **None for the merged work.** PR #13 + PR #14 + PR #15 + PR #16 all on main, all CI jobs green on main, Kyle-confirmed dev-box playtest of HUD-clean (no debug mirror) + combat still fires.
+- **For PR 11.1 (mouse-look)**: design decision on whether the chase camera is the fallback when pointer-lock is not granted. Default = chase camera is the fallback.
+- **For PR 11.3 (rollback)**: design decision on the N threshold for "pause-when-too-far-behind". Default = N=120 frames (2 seconds at 60fps). Tab throttling alone can cause this gap, so N shouldn't be too aggressive.
+- **For PR 11.4 (server-authoritative damage)**: needs a signing server, which is the Rust WebTransport deferred work. The damage flow itself is a small change (~10 lines + tests); the server is the bigger lift.
+
+**Decisions made** (2026-08-13 / 14):
+- **Internet multiplayer is the project's goal, not local-coop.** Split-screen / shared chase camera is a single-machine local-coop pattern; not the right direction. Production camera model = per-player first-person (or third-person) mouse-look. Dev-box visual discomfort is solved by a debug-mode spectator camera toggle, not by changing the production camera.
+- **Phase 1 follow-up order**: (1) PR 7.4 cleanup ✅, (2) PR 11.1 mouse-look, (3) PR 11.2 spectator camera, (4) PR 11.3 rollback, (5) PR 11.4 server-authoritative damage. Original Phase 1 polish (wall-detection, Mixamo, kill/hit markers, death animation) queued after.
+- **PR 7.4 cleanup landed first** so the bigger PR 11 changes (mouse-look + spectator both touch `inputListener.ts` + `chaseCamera.ts` + `App.tsx`) don't have to coexist with the debug instrumentation. Done.
+- **No new wire byte for PR 10** — damage intent is carried on the existing byte-2 of the input packet (the FIRE/MELEE/BULLET bits that PR 7 reserved). Lockstep determinism guarantees identical damage application on both clients without round-tripping a damage event. Phase 1 swaps to server-authoritative damage without touching the `applyDamage` API.
+
+**Playtest status** ✅
+- **Single-tab headless**: all 7 smokes green on PR #16 (scene + jump + wallrun + health + two-tab + typecheck + build). Health smoke proves HP drains 100→0 across 9 LMB hits, respawn countdown visible, HP restores to 100, position reset. Build green.
+- **Two-tab dev-box playtest (Kyle, 2026-08-13 18:30)**: cross-client HP drain + respawn sync confirmed working — see PR #15 entry.
+- **Single-tab dev-box playtest of PR #16 (Kyle, 2026-08-14)**: HUD renders clean production state (`frame / confirmed / repeated / status / hits / HP me / HP them`); no `LMB:/RMB:/T:` debug lines, no dashed-border debug block. Console quiet — no `[input] mousedown`, `[APP] document mousedown (top-level)`, or `[input] CANVAS mousedown` logs during normal play. Combat still fires (`hits:` advances on LMB/RMB), bullet-time chip still toggles via T.
+- **Honest limitations observed** (carry into Phase 1):
+  - **Frame-count desync (~70s gap)**: Tab A has run ~28,000 frames while Tab B has run ~26,000 frames. At 60fps that's ~35s of game-time drift. Both tabs agree on the world state (HP, position) because both compute the same lockstep from the same input history, but their `frame` HUD counters differ. This is the documented no-rollback lockstep limitation in `ggrsRuntime.ts` — repeated inputs fill the gap. **Phase 1 fix: real rollback / pause-when-too-far-behind (PR 11.3).**
+  - **Cyan rig visibility / occlusion**: the chase camera follows the LOCAL rig, so when the local rig walks away from spawn, the cyan rig (which mirrors the OTHER tab's local rig) is often off-screen or hidden behind crates. **This is the correct per-player camera behavior; the dev-box viewing discomfort is solved by a debug-mode spectator camera (PR 11.2), not by changing the production camera model. PR 11.1 replaces the chase camera with first-person mouse-look (the production model).**
+  - **Tab throttling**: when one tab is backgrounded, Chrome throttles RAF to ~1Hz, so that tab's simulation effectively pauses. The lockstep doesn't crash (it just runs slower on one side), but it exacerbates the desync. **Phase 1 fix: same rollback / pause-when-too-far-behind (PR 11.3).**
+
+**Branch hygiene**:
+- Deleted `feat/phase0-pr7.4-cleanup` locally + on origin after PR #16 merge. Worktree `~/Development/specialists-web-pr7.4/` is no longer needed and may be safely removed (`git worktree remove ~/Development/specialists-web-pr7.4 && git branch -d feat/phase0-pr7.4-cleanup`).
+- Dev server on `http://100.95.111.112:5173/` is still running on the merged main; kill it whenever (or before the PR 11.1 worktree spawns its own vite).
+
+---
+
+## 2026-08-13 (post-merge, evening) — PR 10 + 10.1 + 10.2 MERGED (#13). PR 14 MERGED (Phase 1 follow-up re-rank for internet-multiplayer goal). Next: PR 7.4 cleanup (smallest, do first), then PR 11.1 (per-player first-person mouse-look).
 
 **What PR #13 shipped** (squash of the rebased stack):
 1. **`characterConfig.ts`** — new `HEALTH` block (`maxHp: 100`, `respawnDelayMs: 1000`).
