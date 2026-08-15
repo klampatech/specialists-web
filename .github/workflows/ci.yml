@@ -839,6 +839,58 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+
+  client-spectator-camera-smoke:
+    name: client — spectator camera smoke (PR 11.4, debug-only free-fly)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server (port 5187)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5187 > /tmp/vite-dev10.log 2>&1 &
+          echo $! > /tmp/vite-dev10.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5187/ > /dev/null; then
+              echo "Dev server (spectator camera smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5187/ > /dev/null; then
+            echo "::error::Dev server (spectator camera smoke) did not come up in 60s"
+            cat /tmp/vite-dev10.log
+            exit 1
+          fi
+      - name: Run spectator camera smoke
+        run: node ./tools/spectator-camera-smoke.mjs
+        env:
+          SPECTATOR_CAMERA_SMOKE_URL: http://localhost:5187/
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spectator-camera-screenshot
+          path: client/spectator-camera.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev10.pid ]]; then
+            kill "$(cat /tmp/vite-dev10.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   spec-canonical:
     name: spec layout — canonical at docs/SPEC.md
     runs-on: ubuntu-latest

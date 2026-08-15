@@ -51,6 +51,7 @@ import HavokPhysics from "@babylonjs/havok";
 
 import { attachPoseUpdater, createCharacterModel } from "./characterModel";
 import { createChaseCamera, type ChaseCameraHandle } from "./chaseCamera";
+import { createSpectatorCamera, type SpectatorCameraHandle } from "./spectatorCamera";
 import {
   createCharacterController,
   type CharacterController,
@@ -309,6 +310,17 @@ export async function createScene(
   // Follows the LOCAL controller regardless of mode.
   const chase: ChaseCameraHandle = createChaseCamera(scene, character, canvas);
 
+  // ---- Spectator camera (PR 11.4, dev-only) -------------------------------
+  // Lazy-allocated UniversalCamera. Instantiated UNCONDITIONALLY in DEV
+  // (the constructor is cheap — one UniversalCamera + 4 window listeners
+  // that no-op while inactive). The `import.meta.env.DEV` gate below
+  // strips this entire block from production builds via Vite's static
+  // removal. Production bundles contain zero spectator code.
+  // PR 11.4: dev-box spectator camera (DEV-only). Constructed inside
+  // the existing DEV block below; declared at this scope so the render
+  // loop can pump WASD via the optional handle. `null` in production.
+  let spectator: SpectatorCameraHandle | null = null;
+
   // ---- Input listener ------------------------------------------------------
   // PR 7: keep a closure ref to the most recent InputState so the HUD's
   // bullet-time chip can poll `input.bulletTimeHeld` via the SceneHandle.
@@ -319,6 +331,26 @@ export async function createScene(
       // available for future per-frame UI updates.
     },
     onCameraToggle: () => chase.toggle(),
+    // PR 11.4: F2 toggles the dev-box spectator camera. The handler
+    // also tells the GameSession (if any) to gate the character
+    // controller's per-tick update — WASD absorbed by the spectator
+    // means the character shouldn't move. The chase camera continues
+    // running so re-attaching on F2-off is seamless.
+    // PR 11.4: F2 fires this hook. ONLY attached in DEV — in
+    // production the property is omitted entirely, so the production
+    // bundle has zero reference to "onSpectatorToggle" (Vite strips
+    // the entire spread). The input listener's F2 dispatch is also
+    // gated by `import.meta.env.DEV` (see inputListener.ts), so this
+    // is double-belt-and-suspenders: even if a stray F2 fires, the
+    // hook doesn't exist to receive it.
+    ...(import.meta.env.DEV
+      ? {
+        onSpectatorToggle: () => {
+          spectator?.toggle(chase.getCameraPosition());
+          gameSession?.setSpectatorActive?.(spectator?.isActive() ?? false);
+        },
+      }
+      : {}),
     // PR 11.1: pointer-lock + mouse-look hooks. The input listener does
     // the browser-API plumbing (requestPointerLock on click, mousemove
     // while locked); the chase camera owns the yaw accumulator and the
@@ -374,10 +406,28 @@ export async function createScene(
       }
     } else {
       // Single-player path (PR 3 behaviour).
-      character.update(state, deltaSeconds, now);
-      applyPose();
+      // PR 11.4: gate the local controller on `!spectator.active`. The
+      // multiplayer path gates the same thing inside `gameSession.tick()`
+      // (both controllers gated together). The single-player path has no
+      // game session, so we gate here. Input listener still fires (it
+      // only reads key state) — the gate is on whether we ACT on it.
+      if (spectator === null || !spectator.isActive()) {
+        character.update(state, deltaSeconds, now);
+        applyPose();
+      }
     }
     chase.update();
+    // PR 11.4: spectator WASD pump. Only does work while the spectator
+    // is active (early-out inside pumpWASD); the gate here is a tiny
+    // micro-optimisation so we don't read the input state struct for
+    // the spectator branch on every frame in production (the spectator
+    // branch is stripped in production, so this whole line is a no-op).
+    // PR 11.4: spectator WASD pump. The whole block is DEV-only —
+    // Vite strips it from production because `import.meta.env.DEV` is
+    // statically replaced with `false` there.
+    if (import.meta.env.DEV && spectator !== null && spectator.isActive()) {
+      spectator.pumpWASD({ forward: state.forward, right: state.right });
+    }
   });
 
   engine.runRenderLoop(() => scene.render());
@@ -394,6 +444,13 @@ export async function createScene(
   if (import.meta.env.DEV && typeof window !== "undefined") {
     (window as unknown as { __jumpProbe?: () => number }).__jumpProbe = () =>
       character.state.position.y;
+    // PR 11.4: dev-box free-fly spectator camera — construct it inside
+    // the DEV block so Vite strips it from production. The construction
+    // is cheap (one UniversalCamera + 4 no-op-while-inactive window
+    // listeners), but we still don't want the listener registrations
+    // in production bundles — the F2 keydown check in inputListener.ts
+    // also gates this same way, so neither side fires in production.
+    spectator = createSpectatorCamera(scene, chase.camera);
     // PR 11.1: smoke-only accessor for the mouse-look smoke. Returns
     // the local yaw in radians (0..2π) so the smoke can dispatch a
     // synthetic mousemove (via window.__applyYawDelta) and assert the
@@ -497,6 +554,44 @@ export async function createScene(
           gameSession.remoteController.havok.setPosition(new Vector3(x, 1, z));
         };
     }
+    // PR 11.4: dev-box free-fly spectator camera DEV probes. The
+    // spectator is constructed unconditionally (the constructor is
+    // cheap), but every probe here + the whole spectator code path
+    // is wrapped in `import.meta.env.DEV` so Vite strips it from
+    // production. The smoke relies on these probes to drive the
+    // spectator headlessly.
+    // Non-null assertion: spectator is assigned at the top of this DEV
+    // block (just below `if (import.meta.env.DEV && typeof window...)`).
+    (window as unknown as { __spectatorToggle?: () => void }).__spectatorToggle = () => {
+      // Inline DEV-gate — the surrounding block is already inside the
+      // `import.meta.env.DEV` check above, but this nested lambda
+      // runs at probe-call time so we gate the body for safety.
+      if (import.meta.env.DEV) {
+        spectator!.toggle(chase.getCameraPosition());
+        gameSession?.setSpectatorActive?.(spectator!.isActive());
+      }
+    };
+    (window as unknown as { __spectatorProbe?: () => {
+      active: boolean;
+      yaw: number;
+      pitch: number;
+      cameraPos: { x: number; y: number; z: number };
+    } }).__spectatorProbe = () => ({
+      active: spectator!.isActive(),
+      yaw: spectator!.getYaw(),
+      pitch: spectator!.getPitch(),
+      cameraPos: {
+        x: spectator!.camera.position.x,
+        y: spectator!.camera.position.y,
+        z: spectator!.camera.position.z,
+      },
+    });
+    (window as unknown as { __spectatorMoveDelta?: (dx: number, dy: number, dz: number) => void }).__spectatorMoveDelta =
+      (dx: number, dy: number, dz: number) => spectator!.moveDelta(dx, dy, dz);
+    (window as unknown as { __spectatorYawDelta?: (deltaRadians: number) => void }).__spectatorYawDelta =
+      (deltaRadians: number) => spectator!.applyYawDelta(deltaRadians);
+    (window as unknown as { __spectatorPitchDelta?: (deltaRadians: number) => void }).__spectatorPitchDelta =
+      (deltaRadians: number) => spectator!.applyPitchDelta(deltaRadians);
   }
 
   const handle: SceneHandle = {
@@ -506,6 +601,7 @@ export async function createScene(
       window.removeEventListener("resize", onResize);
       input.dispose();
       chase.dispose();
+      spectator?.dispose();
       gameSession?.dispose();
       scene.dispose();
       engine.dispose();

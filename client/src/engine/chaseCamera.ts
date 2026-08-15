@@ -125,6 +125,14 @@ export interface ChaseCameraHandle {
    * can assert the render path is honoring the lock state.
    */
   isPointerLocked: () => boolean;
+  /**
+   * PR 11.4: current camera world position (wherever `update()` last
+   * placed it). The spectator camera's enter-path reads this so F2
+   * doesn't teleport — the spectator spawns at the chase camera's
+   * current world position. Returns a fresh clone so callers can
+   * safely retain / mutate the result.
+   */
+  getCameraPosition: () => Vector3;
   dispose: () => void;
 }
 
@@ -514,6 +522,9 @@ export function createChaseCamera(
       pitchRadians = Math.max(-HALF_PI, Math.min(HALF_PI, radians));
     },
     isPointerLocked: () => pointerLocked,
+    // PR 11.4: clone of camera.position. Scene.ts uses this as the
+    // spectator's enter-position so F2 doesn't teleport.
+    getCameraPosition: () => camera.position.clone(),
     dispose: () => {
       camera.dispose();
     },

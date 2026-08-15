@@ -132,6 +132,14 @@ export interface GameSession {
   consumeUnrenderedCombatEvents(): CombatEvent[];
   /** PR 10: snapshot of both controllers' HP + respawn timer for the HUD. */
   getHealthSnapshot(): HealthSnapshot;
+  /**
+   * PR 11.4: scene.ts calls this on F2 toggle. When `active === true`,
+   * BOTH controllers' per-tick `update()` is skipped (the spectator
+   * camera has absorbed the WASD keys; the character shouldn't move).
+   * Combat events are gated the same way — no F2-during-spectator fire.
+   * DEV-only in practice (production bundles omit this method entirely).
+   */
+  setSpectatorActive?: (active: boolean) => void;
   /** Tear down both rigs + the runtime. */
   dispose(): void;
 }
@@ -191,6 +199,13 @@ export function createGameSession(
    *  remaining respawn countdown for the HUD snapshot. Updated every
    *  tick; read by `getHealthSnapshot()`. */
   let lastNowMs = 0;
+  /**
+   * PR 11.4: when true, BOTH controllers skip their per-tick
+   * `update()` call (the spectator camera has absorbed the WASD keys,
+   * so neither character should move). Set by `setSpectatorActive` from
+   * scene.ts on F2 toggle. Default false (no spectator effect).
+   */
+  let spectatorActive = false;
 
   /**
    * One tick: encode local input → submit → advance → apply decoded inputs to
@@ -224,8 +239,14 @@ export function createGameSession(
     // 4. Step both Havok controllers with their respective inputs.
     //    Same physics, same timestep, same inputs ⇒ same world, modulo the
     //    documented Havok float-rounding acknowledgements.
-    localController.update(localDecoded, scaledDt, nowMs);
-    remoteController.update(remoteDecoded, deltaSeconds, nowMs);
+    // PR 11.4: gate both controller updates on `!spectatorActive`. When
+    // the spectator is free-flying, the character controller shouldn't
+    // see any movement (WASD absorbed by the spectator, no character
+    // velocity). Combat events also gated — no F2-during-spectator fire.
+    if (!spectatorActive) {
+      localController.update(localDecoded, scaledDt, nowMs);
+      remoteController.update(remoteDecoded, deltaSeconds, nowMs);
+    }
 
     // 5. PR 7: rising-edge combat semantics on the local input.
     const frameCombatEvents: CombatEvent[] = [];
@@ -362,6 +383,25 @@ export function createGameSession(
             : 0,
       },
     }),
+    /**
+     * PR 11.4: scene.ts calls this on F2 toggle. Skips both
+     * `controller.update()` calls + combat semantics while active.
+     * The chase camera still runs its `update()` (so reattaching
+     * after F2-off is seamless), but the characters freeze in place.
+     */
+    // PR 11.4: dev-only spectator gate on both controllers. Attached
+    // to the returned handle ONLY in DEV — in production the spread
+    // resolves to `{}` and the property is omitted entirely. The
+    // `spectatorActive` flag stays false in production (default),
+    // so `if (!spectatorActive)` always passes and the controllers
+    // update normally.
+    ...(import.meta.env.DEV
+      ? {
+        setSpectatorActive: (active: boolean) => {
+          spectatorActive = active;
+        },
+      }
+      : {}),
     dispose: () => {
       runtime.dispose();
       localModel.dispose();

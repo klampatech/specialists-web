@@ -10,7 +10,7 @@
 // and frame-driven without pulling in a state machine library.
 
 import type { InputState } from "./characterController";
-import { MOUSE_LOOK } from "./characterConfig";
+import { MOUSE_LOOK, SPECTATOR } from "./characterConfig";
 
 /** Handlers the listener calls when an edge key goes down. */
 export interface InputHooks {
@@ -30,6 +30,14 @@ export interface InputHooks {
    *  into its CLAMPED pitch state [-π/2, +π/2] (clamps, not wraps).
    *  Same sensitivity as yaw (MOUSE_LOOK.sensitivityRadPerPixel). */
   onPitchDelta?: (deltaRadians: number) => void;
+  /**
+   * PR 11.4: F2 fires this. Dev-box free-fly spectator camera
+   * (debug-only — gated by `import.meta.env.DEV` at the call site
+   * in scene.ts). Filtered for `!e.repeat` so auto-repeat doesn't
+   * double-toggle. NOT preventDefault'd — F2 is a dev-only key, no
+   * menu / browser conflict.
+   */
+  onSpectatorToggle?: () => void;
 }
 
 /** Returned by `createInputListener`. */
@@ -138,6 +146,20 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
         hooks.onCameraToggle();
       }
       e.preventDefault();
+      return;
+    }
+    // PR 11.4: F2 toggles the dev-box spectator camera. Wrapped in
+    // `import.meta.env.DEV` so production bundles contain zero F2
+    // handling (Vite statically replaces `import.meta.env.DEV` with
+    // `false` in production, and Rollup eliminates the dead branch).
+    // Filtered for `!e.repeat` (no auto-repeat double-toggle). NOT
+    // preventDefault'd — F2 is a dev-only key, no menu / browser
+    // shortcut conflict. The hook is OPTIONAL on InputHooks, so this
+    // also no-ops cleanly when a host doesn't register one.
+    if (import.meta.env.DEV && key === SPECTATOR.toggleKey) {
+      if (!e.repeat) {
+        hooks.onSpectatorToggle?.();
+      }
       return;
     }
   };
