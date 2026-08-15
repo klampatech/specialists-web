@@ -219,15 +219,16 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
     if (e.movementX !== 0) {
       hooks.onYawDelta?.(e.movementX * MOUSE_LOOK.sensitivityRadPerPixel);
     }
-    // PR 11.3: pitch delta on vertical mouse movement. Note: `movementY`
-    // is positive when the user moves the mouse DOWN (away from them),
-    // but in every FPS "looking down" = positive pitch = mouse moves
-    // down, so the natural sign convention is `e.movementY * sens` =
-    // positive pitch delta. The chase camera clamps the result to
-    // [-π/2, +π/2] so users physically hitting the limits see the
-    // pitch hold at ±π/2 (not wrap).
+    // PR 11.3: pitch delta on vertical mouse movement. The convention is
+    // "mouse up = look up = positive pitch", but the browser reports
+    // `movementY` as POSITIVE when the mouse moves DOWN (away from the
+    // user). So we NEGATE `movementY` to get the correct sign for pitch:
+    //   mouse up    → movementY < 0 → -movementY > 0 → pitch increases → look up
+    //   mouse down  → movementY > 0 → -movementY < 0 → pitch decreases → look down
+    // The chase camera clamps to [-π/2, +π/2] so users physically hitting
+    // the limits see the pitch hold at ±π/2 (not wrap).
     if (e.movementY !== 0) {
-      hooks.onPitchDelta?.(e.movementY * MOUSE_LOOK.sensitivityRadPerPixel);
+      hooks.onPitchDelta?.(-e.movementY * MOUSE_LOOK.sensitivityRadPerPixel);
     }
   };
 
