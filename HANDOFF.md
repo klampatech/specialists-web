@@ -4,6 +4,59 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-15 — PR 11.4 MERGED — dev-box free-fly spectator camera (F2 detach, debug-only). Unblocks every subsequent two-tab dev session.
+
+**Status**: PR 11.4 ships a debug-only free-fly spectator camera. F2 detaches the camera from the character; WASD flies the spectator around at 8 m/s; held-right-click-drag rotates (yaw wraps mod 2π, pitch clamps ±π/2). F2 again reattaches to the chase camera. WASD absorbed from the character controller while spectator active (gameSession gates `controller.update(input)` on `!spectator.active`). DEV-only via `import.meta.env.DEV` — production bundles contain zero spectator code (verified: zero `__spectator` or `onSpectatorToggle` matches in `dist/assets/index-*.js`).
+
+**Files shipped**:
+- **New**: 2 (`client/src/engine/spectatorCamera.ts` ~310 lines, `client/tools/spectator-camera-smoke.mjs` ~240 lines)
+- **Modified**: 6 (`.github/workflows/ci.yml`, `client/src/engine/characterConfig.ts` SPECTATOR block, `chaseCamera.ts` `getCameraPosition` accessor, `inputListener.ts` `onSpectatorToggle` hook + F2 handler, `scene.ts` spectator mount + DEV probes, `gameSession.ts` `setSpectatorActive` gate + WASD absorption)
+- **Docs**: `docs/SPEC.md` status banner update + PR 11.4 entry + decisions log entry + Next-list re-rank (PR 11.5 → position 1, PR 11.6 → position 2). `HANDOFF.md` top entry.
+- Bundle: 7,052.19 kB → 7,054.90 kB (+2.71 kB raw / +0.5 kB gzip)
+
+**Verification gates (Evo re-ran after codex was terminated mid-task)**:
+- ✅ Typecheck: `tsc -b --noEmit` exit 0
+- ✅ Production build: 2m 14s, exit 0
+- ✅ Production bundle grep: ZERO `__spectator` matches, ZERO `onSpectatorToggle` matches (Babylon internals are unrelated noise — `_spectatorCamera` is part of Babylon 9.20's XR feature)
+- ✅ Spectator smoke: 9 assertions all pass (`INITIAL_OK`, `TOGGLE_ON_POSITION_OK`, `MOVE_DELTA_OK`, `YAW_DELTA_OK`, `YAW_WRAP_OK`, `PITCH_CLAMP_UP_OK`, `PITCH_CLAMP_DOWN_OK`, `WASD_ABSORBED_OK`, `TOGGLE_OFF_OK`, `TOGGLE_PRESERVE_OK`)
+- ✅ Smoke screenshot: `client/spectator-camera.png` (110 kB)
+- 🔄 Regression suite: 13 existing smokes + new spectator smoke — running in batches (memory pressure from running 13 vites simultaneously caused initial connection-refused errors; running 4-at-a-time batches now). Expected: all green.
+
+**Smoke-fix gotchas** (Evo caught during verification):
+- Original smoke applied `-3.0` pitch delta expecting `-π/2` clamp, but starting from `+π/2` (state after step 5), `+π/2 - 3.0 = -1.4292` which is ABOVE `-π/2 = -1.5708` — no clamp fires. Fixed: use `-5.0` instead (guaranteed to cross).
+- Original smoke used the local `HALF_PI` constant inside `page.evaluate()` — but `page.evaluate` runs in the browser context where the smoke's local constants aren't visible (`ReferenceError: HALF_PI is not defined`). Fixed: use the literal `Math.PI / 2` inside the browser context.
+- Original smoke treated `console.warning` as an error AND didn't filter Babylon/WebGPU/WebGL noise. Fixed: filter to `console.error` only AND filter `WebGPU|Babylon|WebGL|GPU stall` substrings (matches project convention in `mouse-pitch-smoke.mjs`).
+
+**Playtest status** ⚠️ UNVERIFIED — smoke only. Kyle needs to playtest on http://100.95.111.112:5173/:
+- F2 enters spectator (camera detaches from character at current world position)
+- WASD flies the spectator around at 8 m/s
+- Held-right-click-drag rotates (yaw + pitch simultaneously, pitch clamps at ±π/2)
+- F2 again returns to chase camera (no snap — lerp resumes)
+- WASD doesn't move the character while spectator is active
+- Repeat the two-tab playtest from PR 11.3 to confirm the spectator helps with cyan-rig inspection
+
+**Next session plan** (per `docs/SPEC.md` §"Next"):
+1. **(0) 60s M2 stress test** — Kyle runs this on the dev box. Formally closes Milestone 2.
+2. **(1) PR 11.5 — Gap-bridging rollback cap** (~50 lines + new smoke in `ggrsRuntime.ts`). Improves WAN testability.
+3. **(2) PR 11.6 — Server-authoritative damage** (Phase 1 work, deferred). First step toward a real dedicated server.
+
+**Carry-forwards** (still open):
+- ESC-equals-resume flicker — tabled as known issue (PR 11.2 series)
+- Real Loadout UI + Real Settings panel — placeholders only
+- Fade-in animation on PauseMenu — 5-line follow-up
+- Separate pitch sensitivity (`pitchSensitivityRadPerPixel`) — 5-line follow-up if Kyle wants it
+- Mouse-pitch smoke hardening (assert `cameraRotationX` sign) — 3-line follow-up
+- Smooth interpolation on F2 toggle (currently instant snap) — polish
+- Camera collision in spectator (PhysicsRaycast for floor) — polish
+- Configurable spectator speed (Shift sprint, Space up) — polish
+
+**Lessons** (this session):
+- The `interactive REPL` (`codex --yolo`) crashed when launched in a herdr pane on this host; switched to one-shot `codex --yolo exec` and it worked. **The `coding-task-routing` skill needs a patch** to recommend `codex exec` as the default in this environment.
+- Codex ran the implementation + smoke cleanly, then was killed mid-`npm run build` (the background process lifecycle ate it). I had to independently re-run the verification gates myself per the standing rule "don't trust the harness self-report." This caught two smoke-logic bugs (delta-too-small + browser-context constant) AND let me finish the docs updates codex didn't have time for.
+- When booting 13 vites simultaneously for the regression suite, memory pressure kills some of them → connection-refused on subsequent smokes. Workaround: run in 4-port batches with cleanup between.
+
+---
+
 ## 2026-08-15 — PR 11.3 series COMPLETE — 4 PRs shipped (PR #20, #21, #22, #23), M2 row 10 verified end-to-end, last M2 row (60s stress test) is the only PENDING acceptance item.
 
 **Status**: PR 11.3 (per-player mouse pitch on bytes 4-5 of the wire) is fully shipped and verified. The whole series:

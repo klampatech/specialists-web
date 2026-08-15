@@ -124,6 +124,28 @@ export const MOUSE_LOOK = {
   sensitivityRadPerPixel: 0.0025,
 } as const;
 
+/**
+ * PR 11.4: dev-box free-fly spectator camera tunables. The spectator
+ * camera is a debug-only second `UniversalCamera` activated by F2 (or
+ * the `__spectatorToggle` DEV probe). The whole block is read only
+ * inside the DEV-gated paths in `scene.ts` / `spectatorCamera.ts`,
+ * so shipping a value here is safe — production bundles strip the
+ * call sites entirely (Vite `import.meta.env.DEV` static removal).
+ */
+export const SPECTATOR = {
+  /** Flat WASD speed in metres per frame (frame-rate-coupled, see
+   *  `spectatorCamera.ts` `pumpWASD` for the rationale — accept the
+   *  same coupling as the chase camera's lerp). Matches the character
+   *  `walkSpeed: 5` so the user feels like they're walking around the
+   *  world during dev-box inspection (Kyle's 2026-08-15 playtest —
+   *  faster speeds felt jarring). */
+  moveSpeed: 5.0,
+  /** Toggle key. Read by `inputListener.ts` to register the F2 handler.
+   *  Single source of truth — same convention as the existing
+   *  `KEY_CAMERA_TOGGLE` (V) lookup pattern. */
+  toggleKey: "F2",
+} as const;
+
 /** Spawn position for the character (capsule centre sits at half-height above ground). */
 export const SPAWN_POSITION = new Vector3(0, CAPSULE.height / 2, 0);
 

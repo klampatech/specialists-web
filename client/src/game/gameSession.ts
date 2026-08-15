@@ -132,6 +132,14 @@ export interface GameSession {
   consumeUnrenderedCombatEvents(): CombatEvent[];
   /** PR 10: snapshot of both controllers' HP + respawn timer for the HUD. */
   getHealthSnapshot(): HealthSnapshot;
+  /**
+   * PR 11.4: scene.ts calls this on F2 toggle. When `active === true`,
+   * BOTH controllers' per-tick `update()` is skipped (the spectator
+   * camera has absorbed the WASD keys; the character shouldn't move).
+   * Combat events are gated the same way — no F2-during-spectator fire.
+   * DEV-only in practice (production bundles omit this method entirely).
+   */
+  setSpectatorActive?: (active: boolean) => void;
   /** Tear down both rigs + the runtime. */
   dispose(): void;
 }
@@ -191,6 +199,13 @@ export function createGameSession(
    *  remaining respawn countdown for the HUD snapshot. Updated every
    *  tick; read by `getHealthSnapshot()`. */
   let lastNowMs = 0;
+  /**
+   * PR 11.4: when true, BOTH controllers skip their per-tick
+   * `update()` call (the spectator camera has absorbed the WASD keys,
+   * so neither character should move). Set by `setSpectatorActive` from
+   * scene.ts on F2 toggle. Default false (no spectator effect).
+   */
+  let spectatorActive = false;
 
   /**
    * One tick: encode local input → submit → advance → apply decoded inputs to
@@ -205,10 +220,30 @@ export function createGameSession(
     // PR 10: cache `nowMs` so `getHealthSnapshot()` can compute the
     // remaining respawn countdown without re-reading the wall clock.
     lastNowMs = nowMs;
+    // PR 11.4.1 fix: when the spectator is active, the local player
+    // (a) shouldn't have any combat events fire (we'd otherwise see
+    //     tracers from the spectator's detached view; observed by Kyle
+    //     2026-08-15 dev-box playtest), and
+    // (b) shouldn't have combat bits encoded on the wire (the peer would
+    //     otherwise see a bullet coming from your detached position —
+    //     non-deterministic in lockstep terms).
+    // Build a sanitized `gameInput` by zeroing combat bits when the
+    // spectator is active. Movement bits are also zeroed defensively
+    // (the controller update is already gated, but this guarantees the
+    // wire packet never contains spurious bits).
+    const gameInput: InputState = spectatorActive
+      ? {
+          ...input,
+          forward: 0,
+          right: 0,
+          fireHeld: false,
+          meleePressed: false,
+        }
+      : input;
     // 1. Encode + submit local input + advance one frame. The runtime uses
     //    the on-wire remote input if it's already arrived, or repeats the
     //    last-known input otherwise.
-    const encodedLocal = encodeInput(input);
+    const encodedLocal = encodeInput(gameInput);
     runtime.submitLocalInput(encodedLocal);
     const advanced = runtime.advanceFrame();
 
@@ -224,14 +259,24 @@ export function createGameSession(
     // 4. Step both Havok controllers with their respective inputs.
     //    Same physics, same timestep, same inputs ⇒ same world, modulo the
     //    documented Havok float-rounding acknowledgements.
-    localController.update(localDecoded, scaledDt, nowMs);
-    remoteController.update(remoteDecoded, deltaSeconds, nowMs);
+    // PR 11.4: gate both controller updates on `!spectatorActive`. When
+    // the spectator is free-flying, the character controller shouldn't
+    // see any movement (WASD absorbed by the spectator, no character
+    // velocity). Combat events also gated — no F2-during-spectator fire.
+    if (!spectatorActive) {
+      localController.update(localDecoded, scaledDt, nowMs);
+      remoteController.update(remoteDecoded, deltaSeconds, nowMs);
+    }
 
     // 5. PR 7: rising-edge combat semantics on the local input.
+    // PR 11.4.1: use `gameInput` (sanitized copy) instead of raw `input`
+    // — when spectator is active, `fireHeld` / `meleePressed` are forced
+    // to false, suppressing both the local tracer fire and the wire
+    // payload that would have told the peer you fired.
     const frameCombatEvents: CombatEvent[] = [];
-    if (input.fireHeld && !wasFiring) {
+    if (gameInput.fireHeld && !wasFiring) {
       const result: DualPistolResult = dualPistolShoot(
-        input,
+        gameInput,
         localController,
         remoteController,
         scene,
@@ -249,9 +294,9 @@ export function createGameSession(
         applyDamage(remoteController, { source: "fire", amount: result.damage }, nowMs);
       }
     }
-    if (input.meleePressed && !wasMelee) {
+    if (gameInput.meleePressed && !wasMelee) {
       const result: MeleeResult = meleeSwing(
-        input,
+        gameInput,
         localController,
         remoteController,
       );
@@ -265,7 +310,7 @@ export function createGameSession(
         applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
       }
     }
-    wasFiring = input.fireHeld;
+    wasFiring = gameInput.fireHeld;
     wasMelee = input.meleePressed;
 
     // PR 10: symmetric damage flow on the REMOTE input. Both clients run
@@ -362,6 +407,25 @@ export function createGameSession(
             : 0,
       },
     }),
+    /**
+     * PR 11.4: scene.ts calls this on F2 toggle. Skips both
+     * `controller.update()` calls + combat semantics while active.
+     * The chase camera still runs its `update()` (so reattaching
+     * after F2-off is seamless), but the characters freeze in place.
+     */
+    // PR 11.4: dev-only spectator gate on both controllers. Attached
+    // to the returned handle ONLY in DEV — in production the spread
+    // resolves to `{}` and the property is omitted entirely. The
+    // `spectatorActive` flag stays false in production (default),
+    // so `if (!spectatorActive)` always passes and the controllers
+    // update normally.
+    ...(import.meta.env.DEV
+      ? {
+        setSpectatorActive: (active: boolean) => {
+          spectatorActive = active;
+        },
+      }
+      : {}),
     dispose: () => {
       runtime.dispose();
       localModel.dispose();
