@@ -64,6 +64,14 @@ export function PauseMenu({ visible, onResume, onDisconnect, viewMode }: PauseMe
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !e.repeat) {
         e.preventDefault();
+        // PR 11.2.3 DEBUG: log every menu-visible ESC keydown with
+        // timestamp + the chase camera's lock state at that moment.
+        // Filter on "[PR-11.2.3-DEBUG]" in DevTools.
+        if (typeof console !== "undefined") {
+          console.log(
+            `[PR-11.2.3-DEBUG] PauseMenu keydown(Escape) t=${(performance.now() / 1000).toFixed(3)}s visible=${visible} → calling onResume()`,
+          );
+        }
         onResume();
       }
     };

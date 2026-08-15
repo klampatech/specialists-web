@@ -260,6 +260,14 @@ export function App() {
           <PauseMenu
             visible={!hud.isPointerLocked && hud.everLocked}
             onResume={() => {
+              // PR 11.2.3 DEBUG: log every Resume action (whether triggered
+              // by the button click or by ESC-while-menu-visible — they
+              // both funnel through here). Filter on "[PR-11.2.3-DEBUG]".
+              if (typeof console !== "undefined") {
+                console.log(
+                  `[PR-11.2.3-DEBUG] App.onResume() t=${(performance.now() / 1000).toFixed(3)}s → calling handle.setPointerLock(true)`,
+                );
+              }
               const handle = sceneRef.current;
               if (!handle) return;
               handle.setPointerLock?.(true);

@@ -4,6 +4,35 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-14 — PR 11.2.2 single-handler ESC shipped but flicker still UNVERIFIED. Next: PR 11.2.3 debug logging.
+
+**Status**: PR 11.2.2 (`070df25`) open on PR #18 (`feat/phase0-pr11.2-pause-menu`). All 11 CI checks green, all 9 smokes green locally. Stack: 5 commits ahead of `2fdda30` (PR 11.2 + 11.2.1 + 11.2.2). Dev server live on http://100.95.111.112:5173/.
+
+**PR 11.2.2 architecture** (Kyle's prescription, implemented via Claude Code on herdr):
+- **Removed** `inputListener.ts`'s ESC handler chain entirely (no `onEscapePressed` hook, no `if (key === "Escape")` block, no `e.preventDefault()`).
+- **Added** a single `useEffect` keydown listener inside `PauseMenu.tsx`, registered only when `visible === true`. Handler calls `onResume()` which routes through the React `<button>` `onClick` chain → `handle.setPointerLock(true)` → `canvas.requestPointerLock()`. Single handler, single `requestPointerLock()` call, preserves user-activation through React's onClick path.
+- **Locked → ESC** = browser handles natively (fires `pointerlockchange(false)` cleanly through existing `onPointerLockChange` listener).
+- **Menu visible → ESC** = PauseMenu's `useEffect` keydown fires; `onResume()`; `setPointerLock(true)`; `pointerlockchange(true)`; menu hides.
+
+**Playtest ⚠️ UNVERIFIED**: Kyle's follow-up playtest reported the same flicker (menu briefly hides then re-appears; camera resets to `menuAngle = 0` then continues rotating). The single-handler architecture did NOT fix the flicker — PR 11.2.1's three intermediate attempts (dual→single listener swap, `e.preventDefault()`, `canvas.focus()`) also did not fix it. Root cause is now PR 11.2.3 territory.
+
+**Next session**:
+1. **PR 11.2.3**: add `console.log` instrumentation to capture the actual sequence in browser DevTools. Specifically:
+   - `inputListener.ts`'s `onPointerLockChange` — log every event with timestamp + locked flag.
+   - `PauseMenu.tsx`'s `useEffect` keydown — log every ESC keydown with `visible` state at time of fire.
+   - `chaseCamera.ts`'s `setPointerLock(true|false)` — log every call with the resulting internal flag value.
+   - `scene.ts`'s `setPointerLock` — log every `requestPointerLock` / `exitPointerLock` call + success/failure.
+   - Then have Kyle reproduce the flicker and share the console log sequence. Three hypotheses: (a) Chrome's user-activation policy revokes after first sync tick; (b) browser fires `pointerlockchange(true)` followed by `pointerlockchange(false)` from a queued exit; (c) canvas-lost-focus interaction with menu-visible ESC.
+2. **Once root-caused**: PR 11.2.3 with the actual fix (whatever it turns out to be). Most-likely-candidate: add a debounce on `chase.setPointerLock` that ignores `pointerlockchange` events firing within ~50ms of a previous lock-state change (would suppress the "lock-then-unlock" flicker even if the browser fires both).
+
+**Other open items** (carried from earlier):
+- 60s M2 stress test (no code, ~5 min playtest) — formal Milestone 2 closure.
+- PR 11.3 (dev-box spectator camera, F2 detach, ~30 lines) — Phase 0 dev-tooling.
+- PR 11.4 (mouse pitch on wire, bytes 4-5, ~30 lines) — natural PR 11.1 follow-up.
+- Phase 1 (Rust WebTransport server + rollback) — actual internet-multiplayer work.
+
+**Subagent used**: Claude Code on herdr with delegation_id `deleg_97ffbe1c` (212.32s, 23 tool calls). Implemented the single-handler refactor + commit + push cleanly. Used for the architecture exploration + precise code edits; I'll handle the debug-instrumentation work in PR 11.2.3 myself since the experiment requires observing Kyle's browser DevTools output directly.
+
 ## 2026-08-14 — PR 11.2.1 MERGED. Two playtest fixes. Next: 60s M2 stress test.
 
 **Status**: PR 11.2.1 (over-shoulder camera sign fix + setPointerLock through browser API + viewMode preservation retry-tested) MERGED locally. All 9 smokes green locally. Branch `feat/phase0-pr11.2-pause-menu` (the same branch as PR 11.2 — the fix is stacked on top per the PR 11.1.1 → 11.1.4 pattern). Squash on merge will fold both PR 11.2 and PR 11.2.1 into a single commit.

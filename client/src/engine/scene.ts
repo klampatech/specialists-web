@@ -509,6 +509,14 @@ export async function createScene(
     // We wrap in try-catch because some browsers throw on document.exitPointerLock
     // when not in pointer-lock (the user may have already exited via ESC).
     setPointerLock: (locked: boolean) => {
+      // PR 11.2.3 DEBUG: log every browser-API call (requestPointerLock /
+      // exitPointerLock) with timestamp + direction. Filter on
+      // "[PR-11.2.3-DEBUG]" in DevTools.
+      if (typeof console !== "undefined") {
+        console.log(
+          `[PR-11.2.3-DEBUG] scene.setPointerLock(${locked}) t=${(performance.now() / 1000).toFixed(3)}s → calling ${locked ? "canvas.requestPointerLock()" : "document.exitPointerLock()"}`,
+        );
+      }
       try {
         if (locked) {
           canvas.requestPointerLock();

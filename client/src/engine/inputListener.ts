@@ -197,6 +197,14 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
   };
   const onPointerLockChange = () => {
     const locked = !!target && document.pointerLockElement === target;
+    // PR 11.2.3 DEBUG: log every browser pointerlockchange event with
+    // timestamp + the locked/unlocked result. Filter on "[PR-11.2.3-DEBUG]"
+    // in DevTools to see only this trace.
+    if (typeof console !== "undefined") {
+      console.log(
+        `[PR-11.2.3-DEBUG] inputListener.onPointerLockChange t=${(performance.now() / 1000).toFixed(3)}s locked=${locked} pointerLockElement=${document.pointerLockElement ? (document.pointerLockElement as Element).tagName : "null"}`,
+      );
+    }
     hooks.onPointerLockChange?.(locked);
   };
   const onMouseMoveLocked = (e: MouseEvent) => {

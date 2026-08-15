@@ -346,6 +346,14 @@ export function createChaseCamera(
       everLocked = false;
     },
     setPointerLock: (locked) => {
+      // PR 11.2.3 DEBUG: log every internal setPointerLock call with
+      // timestamp + previous locked state + stack trace. Filter on
+      // "[PR-11.2.3-DEBUG]" in DevTools to see only this trace.
+      if (typeof console !== "undefined") {
+        console.log(
+          `[PR-11.2.3-DEBUG] chase.setPointerLock(${locked}) t=${(performance.now() / 1000).toFixed(3)}s prevLocked=${pointerLocked} menuAngle=${menuAngle.toFixed(3)} everLocked=${everLocked}`,
+        );
+      }
       pointerLocked = locked;
       if (locked) {
         // PR 11.2: restore the user's last locked viewMode if we have one
