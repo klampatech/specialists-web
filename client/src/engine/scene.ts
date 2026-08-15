@@ -323,31 +323,6 @@ export async function createScene(
     // between the first-person 1:1 render path and the chase fallback.
     onPointerLockChange: (locked) => chase.setPointerLock(locked),
     onYawDelta: (delta) => chase.applyYawDelta(delta),
-    // PR 11.2.1 fix (Kyle playtest 2026-08-14): ESC-equals-resume now goes
-    // through the BROWSER's requestPointerLock API instead of just
-    // flipping the internal flag. The previous `chase.setPointerLock(true)`
-    // updated the chase camera's render state but did NOT actually engage
-    // the browser's pointer-lock — the cursor stayed visible and the user
-    // couldn't aim. With this fix, the browser fires `pointerlockchange`
-    // synchronously (still within the ESC keydown's transient activation
-    // window), which routes through the existing `onPointerLockChange`
-    // handler and into `chase.setPointerLock(true)`. Single source of truth:
-    // the browser's pointer-lock state.
-    //
-    // Defense-in-depth: if the pointer is already locked when ESC fires,
-    // `onEscapePressed` no-ops. This prevents a flash where the menu
-    // briefly becomes visible (pointerlockchange fires first → unlock)
-    // before our handler re-locks it.
-    onEscapePressed: () => {
-      if (chase.isPointerLocked()) return;
-      try {
-        canvas.focus();
-      } catch {
-        // focus() can throw if the canvas was removed from the DOM; ignore.
-      }
-      // Will be picked up by onPointerLockChange(true) → chase.setPointerLock(true).
-      canvas.requestPointerLock();
-    },
   }, canvas);  // PR 7.3: bind mouse handlers directly to the canvas so clicks
                // always reach the listener regardless of Babylon's attachControl
                // pointer-capture behavior.

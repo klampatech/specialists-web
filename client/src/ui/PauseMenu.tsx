@@ -25,8 +25,20 @@
 // keydown (inputListener.ts + PauseMenu's useEffect) caused a race where
 // the browser fired a follow-up `pointerlockchange(false)` immediately
 // after our `requestPointerLock()` succeeded, causing the menu to flash
-// and reappear. The single source of truth is `inputListener.ts`'s
-// `onEscapePressed` hook, which fires once per keydown.
+// and reappear. The single source of truth was `inputListener.ts`'s
+// `onEscapePressed` hook.
+//
+// PR 11.2.2 fix (Kyle playtest 2026-08-14 session): REMOVED the
+// inputListener ESC handler entirely. Now:
+//   - When menu is visible (pointer unlocked): PauseMenu's own keydown
+//     listener catches ESC and calls onResume() — single handler, no race.
+//   - When menu is NOT visible (pointer locked): browser natively fires
+//     pointerlockchange(false) on ESC, which the chase camera handles
+//     through onPointerLockChange → setPointerLock(false). No double-fire.
+//
+// PR 11.2.1 note above is WRONG — kept as historical record.
+
+import { useEffect } from "react";
 
 interface PauseMenuProps {
   /** True when the menu should be visible. */
@@ -42,11 +54,23 @@ interface PauseMenuProps {
 }
 
 export function PauseMenu({ visible, onResume, onDisconnect, viewMode }: PauseMenuProps) {
-  // PR 11.2.1 fix: ESC-equals-resume is owned by inputListener.ts's
-  // onEscapePressed hook (single source of truth). The previous
-  // duplicate keydown listener here caused a race where the browser
-  // fired a follow-up pointerlockchange(false) immediately after our
-  // requestPointerLock() succeeded, making the menu flash + reappear.
+  // PR 11.2.2 fix: When menu is visible, catch ESC here and call
+  // onResume() directly. This is the SOLE ESC handler for the menu-visible
+  // case — no more race with inputListener. When the menu is NOT visible,
+  // the browser handles ESC natively (pointerlockchange(false) fires,
+  // which the chase camera handles through onPointerLockChange).
+  useEffect(() => {
+    if (!visible) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !e.repeat) {
+        e.preventDefault();
+        onResume();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [visible, onResume]);
+
   if (!visible) return null;
 
   const cameraLabel =

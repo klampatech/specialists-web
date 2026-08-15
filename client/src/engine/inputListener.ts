@@ -25,12 +25,6 @@ export interface InputHooks {
    *  `e.movementX * sensitivity`. The chase camera accumulates this
    *  into its yaw state. */
   onYawDelta?: (deltaRadians: number) => void;
-  /** PR 11.2: Escape pressed while pointer is unlocked. The host
-   *  decides what to do (typically: re-lock pointer to close the pause
-   *  menu). When locked, the browser consumes ESC and fires
-   *  `pointerlockchange` first; this hook is for the unlocked case
-   *  (ESC-equals-resume UX). */
-  onEscapePressed?: () => void;
 }
 
 /** Returned by `createInputListener`. */
@@ -139,24 +133,6 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
         hooks.onCameraToggle();
       }
       e.preventDefault();
-      return;
-    }
-    // PR 11.2: Escape pressed. When the pointer is locked the browser
-    // already consumed ESC to fire `pointerlockchange` — this listener
-    // won't see it (browsers stop propagation). When unlocked, ESC fires
-    // here and we route to `onEscapePressed` so the host can close the
-    // pause menu (typically by calling `chase.setPointerLock(true)`).
-    //
-    // PR 11.2.1 fix (Kyle playtest 2026-08-14): call `e.preventDefault()`
-    // BEFORE firing the hook. Browsers treat the ESC keydown as a user
-    // gesture when it can be prevented — without preventDefault, some
-    // browser/headless combinations silently fail `requestPointerLock()`
-    // because the event has already been "consumed" by the default action.
-    // With preventDefault, the keydown retains its user-activation
-    // validity for the duration of the synchronous handler chain.
-    if (key === "Escape" && !e.repeat) {
-      e.preventDefault();
-      hooks.onEscapePressed?.();
       return;
     }
   };
