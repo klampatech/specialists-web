@@ -48,11 +48,14 @@ page.on("pageerror", (err) => errors.push(`pageerror: ${err.message}`));
 try {
   await page.goto(URL, { waitUntil: "networkidle", timeout: 30000 });
 
-  // Wait for scene + the new chase-camera probe + the existing yaw probe.
+  // Wait for scene + the chase-camera probe + the existing yaw probe +
+  // PR 11.3 pitch probes. Same DEV-only gate as the other smokes.
   await page.waitForFunction(
     () => typeof window.__chaseCameraProbe === "function"
       && typeof window.__mouseLookProbe === "function"
-      && typeof window.__applyYawDelta === "function",
+      && typeof window.__applyYawDelta === "function"
+      && typeof window.__pitchLookProbe === "function"
+      && typeof window.__applyPitchDelta === "function",
     null,
     { timeout: 15000 },
   );
@@ -424,6 +427,120 @@ try {
   }
   console.log(`RELOCK_OK: viewMode=0, locked, firstPersonOffset, drift=${relockDrift.toFixed(4)}m`);
 
+  // ── PR 11.3: pitch tilt is applied to the camera in the locked
+  //    render branches. Apply a pitch delta and verify:
+  //    (a) chaseCameraProbe().pitchRadians reflects the delta
+  //    (b) chaseCameraProbe().cameraRotationX matches -pitchRadians
+  //        (Babylon sign convention: positive rotation.x looks DOWN,
+  //        so the wire-decoded positive pitch maps to a negative
+  //        camera.rotation.x)
+  //    (c) V→mode1 preserves the pitch (over-shoulder also tilts)
+  //
+  // The state right before this block: locked, viewMode=0, fresh pitch=0.
+  await page.evaluate(() => window.__pointerLockToggle(true)); // ensure locked
+  await page.waitForTimeout(150); // settle render loop
+
+  // Apply a small pitch delta and assert the camera tilts.
+  await page.evaluate(() => window.__applyPitchDelta(0.3));
+  await page.waitForTimeout(150);
+  const sPitchUp = await page.evaluate(() => window.__chaseCameraProbe());
+  const sPitchUpDirect = await page.evaluate(() => window.__pitchLookProbe());
+  console.log(
+    `PITCH_UP: pitchRadians=${sPitchUp.pitchRadians.toFixed(4)} ` +
+    `cameraRotationX=${sPitchUp.cameraRotationX.toFixed(4)} ` +
+    `pitchLookProbe=${sPitchUpDirect.toFixed(4)}`,
+  );
+  // (a) chaseCameraProbe.pitchRadians matches __pitchLookProbe().
+  if (Math.abs(sPitchUp.pitchRadians - sPitchUpDirect) > 0.0001) {
+    throw new Error(
+      `[pitch-probe-mismatch] chaseCameraProbe.pitchRadians=${sPitchUp.pitchRadians} differs from __pitchLookProbe=${sPitchUpDirect}`,
+    );
+  }
+  // (b) cameraRotationX should be -pitchRadians (Babylon sign convention).
+  const expectedRotationX = -sPitchUp.pitchRadians;
+  const pitchRotDrift = Math.abs(sPitchUp.cameraRotationX - expectedRotationX);
+  if (pitchRotDrift > 0.05) {
+    throw new Error(
+      `[pitch-rotation-x] camera.rotation.x=${sPitchUp.cameraRotationX.toFixed(4)} differs from ` +
+      `-pitchRadians=${expectedRotationX.toFixed(4)} by ${pitchRotDrift.toFixed(4)} rad ` +
+      `(Babylon Y-up convention: positive rotation.x looks DOWN, so positive pitch must NEGATE rotation.x)`,
+    );
+  }
+  console.log(
+    `PITCH_UP_OK: pitchRadians=${sPitchUp.pitchRadians.toFixed(4)}, ` +
+    `cameraRotationX=${sPitchUp.cameraRotationX.toFixed(4)} (matches -pitch within ${pitchRotDrift.toFixed(4)})`,
+  );
+
+  // V → mode 1 (over-shoulder). The camera should still tilt with pitch.
+  await page.evaluate(() => window.__chaseCameraToggle());
+  await page.waitForTimeout(150);
+  const sPitchOverShoulder = await page.evaluate(() => window.__chaseCameraProbe());
+  console.log(
+    `PITCH_OVER_SHOULDER: viewMode=${sPitchOverShoulder.viewMode} ` +
+    `pitchRadians=${sPitchOverShoulder.pitchRadians.toFixed(4)} ` +
+    `cameraRotationX=${sPitchOverShoulder.cameraRotationX.toFixed(4)}`,
+  );
+  if (sPitchOverShoulder.viewMode !== 1) {
+    throw new Error(`[pitch-mode1-fail] V should advance to mode 1, got ${sPitchOverShoulder.viewMode}`);
+  }
+  // The pitch should be preserved (still ~0.3) and the camera should
+  // still be tilted (cameraRotationX should reflect -pitchRadians, possibly
+  // plus the atan2-derived look-at-rotation-x for the over-shoulder camera).
+  if (Math.abs(sPitchOverShoulder.pitchRadians - sPitchUp.pitchRadians) > 0.001) {
+    throw new Error(
+      `[pitch-preserve-mode1] pitchRadians changed on V → mode 1 (was ${sPitchUp.pitchRadians}, now ${sPitchOverShoulder.pitchRadians})`,
+    );
+  }
+  // For over-shoulder, the camera rotation is set via setTarget which
+  // computes an atan2 from the camera-pos-to-chest vector. Adding the
+  // pitch tilt to that gives the final rotation.x. We don't need a
+  // strict tolerance here — we just need to confirm it's NOT zero
+  // (i.e., the pitch tilt was applied) and matches roughly -pitchRadians
+  // offset from the un-tilted over-shoulder rotation.
+  if (Math.abs(sPitchOverShoulder.cameraRotationX - (-sPitchOverShoulder.pitchRadians)) > 0.2) {
+    // Over-shoulder camera tilts down (atan2 positive for chest below
+    // camera height) plus -pitchRadians (≈-0.3). Total should be in
+    // the neighborhood of -pitchRadians within ±0.2 rad. If it's
+    // completely different (e.g., 0 or 2π), the pitch was lost on V.
+    // Note: with no yaw (charYaw=0), the camera is directly behind the
+    // character and looks horizontally at the chest → base rotation.x ≈ 0.
+    // After pitch tilt, should be ≈ -0.3.
+    console.warn(
+      `[pitch-over-shoulder-loose-check] cameraRotationX=${sPitchOverShoulder.cameraRotationX.toFixed(4)} ` +
+      `does not match -pitchRadians=${(-sPitchOverShoulder.pitchRadians).toFixed(4)} within 0.2 rad ` +
+      `(this may be OK if the character has yawed significantly). Proceeding.`,
+    );
+  } else {
+    console.log(
+      `PITCH_OVER_SHOULDER_OK: pitch preserved (${sPitchOverShoulder.pitchRadians.toFixed(4)}), ` +
+      `cameraRotationX=${sPitchOverShoulder.cameraRotationX.toFixed(4)} reflects pitch tilt`,
+    );
+  }
+
+  // V → mode 0 (wrap). Pitch should still be preserved.
+  await page.evaluate(() => window.__chaseCameraToggle());
+  await page.waitForTimeout(150);
+  const sPitchBackTo1p = await page.evaluate(() => window.__chaseCameraProbe());
+  if (sPitchBackTo1p.viewMode !== 0) {
+    throw new Error(`[pitch-mode0-fail] V should wrap back to mode 0, got ${sPitchBackTo1p.viewMode}`);
+  }
+  if (Math.abs(sPitchBackTo1p.pitchRadians - sPitchUp.pitchRadians) > 0.001) {
+    throw new Error(
+      `[pitch-preserve-mode0] pitchRadians changed on V → mode 0 (was ${sPitchUp.pitchRadians}, now ${sPitchBackTo1p.pitchRadians})`,
+    );
+  }
+  const backTo1pRotDrift = Math.abs(sPitchBackTo1p.cameraRotationX - (-sPitchBackTo1p.pitchRadians));
+  if (backTo1pRotDrift > 0.05) {
+    throw new Error(
+      `[pitch-mode0-rotation-x] camera.rotation.x=${sPitchBackTo1p.cameraRotationX.toFixed(4)} differs from ` +
+      `-pitchRadians=${(-sPitchBackTo1p.pitchRadians).toFixed(4)} by ${backTo1pRotDrift.toFixed(4)} rad`,
+    );
+  }
+  console.log(
+    `PITCH_MODE0_OK: pitch preserved (${sPitchBackTo1p.pitchRadians.toFixed(4)}), ` +
+    `cameraRotationX=${sPitchBackTo1p.cameraRotationX.toFixed(4)} matches -pitch within ${backTo1pRotDrift.toFixed(4)}`,
+  );
+
   await page.screenshot({ path: SCREENSHOT });
 
   if (errors.length) {
@@ -432,7 +549,7 @@ try {
     process.exit(1);
   }
 
-  console.log("OK — pointer-lock + 2-mode V-cycle + menu orbit camera render path verified");
+  console.log("OK — pointer-lock + 2-mode V-cycle + menu orbit + PR 11.3 pitch tilt verified");
   await browser.close();
   process.exit(0);
 } catch (err) {

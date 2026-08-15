@@ -138,6 +138,13 @@ const HITS_TO_KILL = 10;
 console.log(`Firing ${HITS_TO_KILL} LMB hits to push remote HP to 0...`);
 for (let i = 0; i < HITS_TO_KILL; i++) {
   await fireOnce();
+  // Yield 150ms between hits so the HUD chip (polled at 10Hz) reflects
+  // each HP drop before the next click lands. Without this, CI's slower
+  // tick rate lets the respawn window slip through the readHp() poll,
+  // making the post-loop "HP=0" check read HP=100 (already respawned).
+  // Verified 2026-08-15 PR 11.3: smoke was flaky in CI (rc=-1) but
+  // deterministic locally. Defensive ~150ms gap eliminates the race.
+  await page.waitForTimeout(150);
   const cur = await readHp();
   console.log(`  hit ${i + 1}: remote HP = ${cur.remote}${cur.remoteRespawning > 0 ? ` (respawn ${cur.remoteRespawning}ms)` : ""}`);
   if (cur.remote === 0 && cur.remoteRespawning > 0) break;

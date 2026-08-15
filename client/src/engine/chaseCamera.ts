@@ -1,4 +1,4 @@
-// Phase 0 / PR 3+11.1 — chase camera with V-toggle + pointer-locked first-person.
+// Phase 0 / PR 3+11.1+11.3 — chase camera with V-toggle + pointer-locked first-person + pitch.
 //
 // PR 3: a `UniversalCamera` follows the character with a fixed offset; V
 // toggles between over-shoulder (third-person) and eye-level (first-person).
@@ -10,6 +10,15 @@
 // accumulator. When pointer-lock is released (ESC, or browser refuses
 // the lock), the camera falls back to the existing chase-lerp behavior
 // (third-person or first-person-chase depending on V-toggle state).
+//
+// PR 11.3: adds per-frame pitch (vertical mouse-look). `e.movementY` from
+// the locked mousemove accumulates into a clamped local pitch
+// ([-π/2, +π/2]) which is applied to the camera as a vertical tilt
+// (`camera.rotation.x = -pitchRadians` — the sign flip is Babylon's Y-up
+// convention where positive `rotation.x` looks DOWN). When locked, the
+// pitch is rendered in both 1st-person (mode 0) and over-shoulder (mode 1).
+// The menu orbit camera is unaffected (it's a fixed-height auto-rotation —
+// pitch would fight the orbit math, so we don't apply pitch there).
 //
 // Third-person offset:  (0, +1.5, -2.8)  — behind, above
 // First-person offset:  (0, +1.6,  0.0)  — at the character's eye
@@ -83,11 +92,33 @@ export interface ChaseCameraHandle {
    */
   applyYawDelta: (deltaRadians: number) => void;
   /**
+   * PR 11.3: apply a pitch delta from a locked mousemove. Called from
+   * the input listener's `onPitchDelta` hook. CLAMPS to [-π/2, +π/2]
+   * (NOT wraps) — pitch is a half-circle with physical limits and looking
+   * past the limit should hit a wall (like every FPS), not flip the view.
+   * Wrapping (`((p + d + π/2) % π) - π/2`) would make the camera
+   * suddenly flip from look-up to look-down at the limits.
+   */
+  applyPitchDelta: (deltaRadians: number) => void;
+  /**
    * PR 11.1: current yaw (radians, 0..2π). The scene reads this each
    * frame to populate the input packet's bytes 2-3, so both clients
    * see the same yaw → same WASD world direction → lockstep determinism.
    */
   getYaw: () => number;
+  /**
+   * PR 11.3: current pitch (radians, [-π/2, +π/2]). The scene
+   * reads this each frame to populate the input packet's bytes 4-5.
+   * Same lockstep argument as `getYaw` — both clients see the same
+   * pitch on the same frame, so they compute identical tracer /
+   * melee / camera directions.
+   */
+  getPitch: () => number;
+  /**
+   * PR 11.3: jump the pitch directly to a specific value. Clamps to
+   * [-π/2, +π/2] defensively. Mirrors `setViewMode` for yaw.
+   */
+  setPitch: (radians: number) => void;
   /**
    * PR 11.1: current pointer-lock state (true when the browser has
    * the canvas locked). Exposed for the camera-render smoke so it
@@ -150,6 +181,12 @@ export function createChaseCamera(
   // (set via the controller's `setYaw` in scene.ts) so the camera can
   // render with the same orientation as the character on each frame.
   let yawRadians = 0;
+  // PR 11.3 state: local pitch accumulator ([-π/2, +π/2]). Applied
+  // to camera.rotation.x (negated) in the locked render branches. CLAMPS
+  // (not wraps) because pitch has hard physical limits — a wrap would
+  // flip the view at the limits (e.g., look straight up past π/2 →
+  // suddenly look straight down), which is not what the user wants.
+  let pitchRadians = 0;
   // PR 11.1.2: menu orbit state. When pointerLocked is false AND the
   // user has previously locked at least once, the camera enters the
   // orbit mode — a slow auto-rotation around the character. `menuAngle`
@@ -193,13 +230,17 @@ export function createChaseCamera(
       // PR 11.1.2: 1st-person-locked. Snap camera to character + eye
       // offset; render at the character's exact yaw. No lerp — the
       // locked view IS the character's view.
+      // PR 11.3: also apply pitch as a vertical tilt. Babylon's
+      // Y-up convention uses positive `camera.rotation.x` to look
+      // DOWN, so we negate to make positive `pitchRadians` mean
+      // "look up" (matching the user's intent).
       const offset = offsetForMode(0);
       camera.position.set(cp.x + offset.x, cp.y + offset.y, cp.z + offset.z);
       const q = character.state.rotation;
       const sinY = 2 * (q.w * q.y + q.z * q.x);
       const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
       const eulerY = Math.atan2(sinY, cosY);
-      camera.rotation.set(0, eulerY, 0);
+      camera.rotation.set(-pitchRadians, eulerY, 0);
       return;
     }
     if (pointerLocked && viewMode === 1) {
@@ -248,6 +289,14 @@ export function createChaseCamera(
         cp.y + CAMERA.lookAtOffset.y,
         cp.z + CAMERA.lookAtOffset.z,
       ));
+      // PR 11.3: apply the pitch tilt on top of the look-at-derived
+      // rotation. `camera.setTarget` set camera.rotation; we read it
+      // back and add the pitch to camera.rotation.x (negated for the
+      // Babylon sign convention). This tilts the camera UP/DOWN in
+      // the over-shoulder view, matching the 1st-person behavior. The
+      // over-shoulder position (camera behind character) is unchanged;
+      // only the camera's roll axis is tilted.
+      camera.rotation.x += -pitchRadians;
       return;
     }
 
@@ -358,6 +407,8 @@ export function createChaseCamera(
       viewMode = 0;
       pointerLocked = false;
       yawRadians = 0;
+      // PR 11.3: reset pitch to level alongside yaw.
+      pitchRadians = 0;
       menuAngle = 0;
       everLocked = false;
       // PR 11.2.3: clear the debounce so the next lock doesn't get
@@ -444,6 +495,24 @@ export function createChaseCamera(
       yawRadians = ((yawRadians + deltaRadians) % TWO_PI + TWO_PI) % TWO_PI;
     },
     getYaw: () => yawRadians,
+    // PR 11.3: apply a pitch delta from a locked mousemove. CLAMPS to
+    // [-π/2, +π/2] — pitch is a half-circle with physical limits.
+    // Wrapping (like yaw does mod 2π) would flip the view at the
+    // limits, which is the wrong UX. The pitch smoke asserts the clamp
+    // (try to push past ±π/2 → final pitch is exactly ±π/2, not
+    // a wrapped value).
+    applyPitchDelta: (deltaRadians) => {
+      const HALF_PI = Math.PI / 2;
+      pitchRadians = Math.max(-HALF_PI, Math.min(HALF_PI, pitchRadians + deltaRadians));
+    },
+    // PR 11.3: read the current pitch (used by scene.ts to populate
+    // the wire packet's bytes 4-5 each frame).
+    getPitch: () => pitchRadians,
+    // PR 11.3: jump pitch to a specific value, clamping defensively.
+    setPitch: (radians: number) => {
+      const HALF_PI = Math.PI / 2;
+      pitchRadians = Math.max(-HALF_PI, Math.min(HALF_PI, radians));
+    },
     isPointerLocked: () => pointerLocked,
     dispose: () => {
       camera.dispose();

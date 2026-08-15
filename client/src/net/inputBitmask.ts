@@ -1,16 +1,20 @@
-// Phase 0 / PR 7+11.1 — wire-format encoder/decoder for the per-frame input packet.
+// Phase 0 / PR 7+11.1+11.3 — wire-format encoder/decoder for the per-frame input packet.
 //
-// Wire format is INPUT_SIZE = 10 bytes. PR 4 reserved byte 1 for
+// Wire format is INPUT_SIZE = 12 bytes. PR 4 reserved byte 1 for
 // FIRE/MELEE/BULLET bits but never wrote them; PR 7 fixed that. PR 11.1
 // extends bytes 2-3 to carry the per-player yaw (little-endian uint16,
-// 1/65536 of a full revolution) so both clients compute identical
-// movement directions from the same yaw on the same frame.
+// ~0.0055°/LSB). PR 11.3 extends bytes 4-5 to carry the per-player pitch
+// (little-endian uint16, [-π/2, +π/2] → [0, 65535], ~0.00275°/LSB).
+// Both yaw AND pitch are on the wire so both clients compute identical
+// look directions from the same per-frame state on the same frame —
+// lockstep determinism preserved (the same argument as PR 11.1 for yaw).
 //
 //   byte 0: movement bits (MoveBits below)
 //   byte 1: combat bits   (CombatBits below) — PR 7 actually encodes these
 //   bytes 2-3: yaw as little-endian uint16 (PR 11.1)
-//   bytes 4-9: reserved, currently always 0 (the lockstep rounds up to 10
-//              bytes for forward-compat — Phase 1 may pack more there)
+//   bytes 4-5: pitch as little-endian uint16 (PR 11.3)
+//   bytes 6-11: reserved, currently always 0 (the lockstep rounds up to 12
+//               bytes for forward-compat — Phase 1 may pack more there)
 //
 // `InputBits` used to be a single `as const` object that aliased FIRE=1
 // against LEFT=1 (both byte-0 names and byte-1 names lived in the same object
@@ -20,9 +24,9 @@
 
 import type { InputState } from "../engine/characterController";
 
-/** Total wire bytes per input packet. PR 11.1 bumped from 8 to 10
- *  to carry yaw on bytes 2-3. Both clients upgrade together. */
-export const INPUT_SIZE = 10;
+/** Total wire bytes per input packet. PR 11.1 bumped 8→10 (yaw on bytes 2-3).
+ *  PR 11.3 bumps 10→12 (pitch on bytes 4-5). Both clients upgrade together. */
+export const INPUT_SIZE = 12;
 
 /**
  * PR 11.1: scale for encoding yaw radians as a uint16 on bytes 2-3.
@@ -30,6 +34,32 @@ export const INPUT_SIZE = 10;
  * Plenty of resolution for a multiplayer FPS feel.
  */
 export const YAW_BITS_SCALE = 65535 / (2 * Math.PI);
+
+/**
+ * PR 11.3: scale for encoding pitch radians as a uint16 on bytes 4-5.
+ * Pitch range is [-π/2, +π/2] (half a circle — you can't physically
+ * look behind in the vertical axis), so 65535 maps to the full π radians
+ * of pitch range. PITCH_BITS_SCALE = 65535 / π ≈ 20861.9 — so 1 LSB ≈
+ * 0.0000479 rad ≈ 0.00275°. Plenty of resolution for FPS feel.
+ */
+export const PITCH_BITS_SCALE = 65535 / Math.PI;
+
+/**
+ * PR 11.3: encode a pitch (radians, [-π/2, +π/2]) as a uint16
+ * representing the same angle linearly in [0, 65535]. Clamps to
+ * [-π/2, +π/2] before encoding so float drift at exactly ±π/2
+ * can't overflow the peer's uint16 read. Mirrors `yawToBits` but with a
+ * different range (pitch is half a circle; yaw is a full circle).
+ */
+function pitchToBits(radians: number): number {
+  const HALF_PI = Math.PI / 2;
+  // Defensive clamp — caller should already have clamped, but catches
+  // NaN / out-of-range drift before it overflows the uint16 read.
+  const clamped = Math.max(-HALF_PI, Math.min(HALF_PI, radians));
+  // Map [-π/2, +π/2] → [0, 65535].
+  const scaled = Math.round((clamped + HALF_PI) * PITCH_BITS_SCALE);
+  return Math.min(65535, Math.max(0, scaled));
+}
 
 /**
  * Encode a yaw (radians, any real number) as a uint16 representing the
@@ -88,6 +118,13 @@ export function encodeInput(s: InputState): EncodedInput {
   const yawBits = yawToBits(s.yawRadians ?? 0);
   b[2] = yawBits & 0xff;
   b[3] = (yawBits >>> 8) & 0xff;
+  // PR 11.3: pitch lives on bytes 4-5 as a little-endian uint16. Same
+  // `?? 0` default as yaw — pre-PR-11.3 traffic has bytes 4-5 = 0, which
+  // `decodeInput` special-cases back to pitchRadians = 0 (level) for
+  // backward compat with the upgrade window.
+  const pitchBits = pitchToBits(s.pitchRadians ?? 0);
+  b[4] = pitchBits & 0xff;
+  b[5] = (pitchBits >>> 8) & 0xff;
   return b;
 }
 
@@ -109,5 +146,16 @@ export function decodeInput(b: Uint8Array): InputState {
     // robust against truncated packets (e.g., a PR 6 replay buffer
     // with only 8 bytes during the upgrade window).
     yawRadians: (((b[2] ?? 0) | ((b[3] ?? 0) << 8)) & 0xffff) / YAW_BITS_SCALE,
+    // PR 11.3: pitchRadians pulled off bytes 4-5. Special-case `bits === 0`
+    // → `pitchRadians = 0` (level) so pre-PR-11.3 traffic — which has
+    // bytes 4-5 = 0 — decodes as "no pitch" rather than the linear formula
+    // (0 / PITCH_BITS_SCALE) - π/2 = -π/2 (looking straight DOWN). This
+    // is the only backward-compat shim needed for the upgrade window;
+    // post-PR-11.3 clients always emit bits > 0 for any non-zero pitch.
+    pitchRadians: (() => {
+      const pitchBits = ((b[4] ?? 0) | ((b[5] ?? 0) << 8)) & 0xffff;
+      if (pitchBits === 0) return 0; // backward-compat: zero bits = level
+      return pitchBits / PITCH_BITS_SCALE - Math.PI / 2;
+    })(),
   };
 }

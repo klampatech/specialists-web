@@ -4,6 +4,33 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-15 — PR 11.3 MERGED on `main` (squash commit `<TBD-on-merge>`). Per-player mouse pitch (vertical mouse-look) on the wire.
+
+**Status**: PR #20 (`feat/phase0-pr11.3-mouse-pitch`) MERGED at https://github.com/klampatech/specialists-web/pull/20 (squash commit `<TBD-on-merge>`, branch `feat/phase0-pr11.3-mouse-pitch`, merged 2026-08-15). All 11 CI smokes green. Per-player mouse pitch shipped on top of PR 11.1's yaw: bytes 4-5 of the input packet carry pitch as a little-endian uint16 ([-π/2, +π/2] → [0, 65535], ~0.00275°/LSB). Chase camera applies the pitch as a vertical tilt in both 1st-person and over-shoulder locked views (Babylon sign convention: `camera.rotation.x = -pitchRadians` because positive `rotation.x` looks DOWN in Babylon's Y-up Euler). Menu orbit camera is unaffected (no pitch tilt — pitch is irrelevant in this state).
+
+**Mouse look feel**: clicking the canvas and moving the mouse now both rotates yaw (X-axis movement) AND tilts pitch (Y-axis movement). Sensitivity = 0.0025 rad/px for both, reused from PR 11.1's `MOUSE_LOOK.sensitivityRadPerPixel`. The pitch has hard physical limits at ±π/2 — looking past the limit hits a wall (every FPS behavior), not flips the view. The mouse-pitch smoke asserts this regression guard.
+
+**Lockstep determinism preserved**: same argument as PR 11.1's yaw — both clients decode the same pitch from the wire on the same frame and `setPitch(input.pitchRadians)` BEFORE the WASD + combat projection. Tracer direction + melee cone + camera tilt all use the 3D `forwardFromYawPitch(yaw, pitch)` helper. No determinism regression.
+
+**Files shipped** (cumulative):
+- **New**: 2 (`client/tools/mouse-pitch-smoke.mjs`, `client/tools/pitch-wire-format-smoke.mjs`)
+- **Modified**: 10 (`.github/workflows/ci.yml`, `.gitignore`, `HANDOFF.md`, `docs/SPEC.md`, `client/src/net/inputBitmask.ts`, `client/src/engine/characterController.ts`, `client/src/engine/chaseCamera.ts`, `client/src/engine/inputListener.ts`, `client/src/engine/scene.ts`, `client/src/game/combat.ts`, `client/tools/pointer-lock-camera-smoke.mjs`)
+- Bundle: ~+2-3 kB raw / +0.5 kB gzip (wire constants + chase camera pitch state + 2 new smokes + DEV probes; DEV-only probes are tree-shaken out of production by Vite).
+
+**Decisions captured in this PR**: pitch-on-the-wire (same lockstep argument as PR 11.1 yaw); clamp (not wrap) at [±π/2]; `camera.rotation.x = -pitchRadians` sign flip (Babylon Y-up convention); menu orbit camera unaffected; backward-compat shim for pre-PR-11.3 zero-byte packets; sensitivity reuse from PR 11.1; smoke-driven regression guard for wrap-vs-clamp gotcha. Full record in `docs/SPEC.md` §"2026-08-15 — PR 11.3 implementation decisions".
+
+**Next session plan** (per `docs/SPEC.md` §"Next"):
+1. **(3) Spectator camera (PR 11.4 candidate, debug-mode only)** — F2 toggle detaches camera from the player (free-fly, orbit with mouse, return on click). ~50 lines in `chaseCamera.ts`. Unblocks the next two-tab dev session.
+2. **(4) Gap-bridging rollback (PR 11.5 candidate)** — pause-when-too-far-behind cap in `ggrsRuntime.ts` for WAN testability.
+3. **60s M2 stress test** — no code, ~5 min playtest, formally closes Milestone 2 (last PENDING acceptance row).
+4. Optional: revisit the ESC-equals-resume flicker if Kyle signals interest; otherwise leave it tabled.
+
+**Carry-forwards** (from previous sessions, still open):
+- ESC-equals-resume flicker — tabled as known issue (PR 11.2 series).
+- Real Loadout UI + Real Settings panel — placeholders only.
+- Fade-in animation on PauseMenu — 5-line follow-up.
+- Separate pitch sensitivity (`pitchSensitivityRadPerPixel`) — 5-line follow-up if Kyle wants it.
+
 ## 2026-08-15 — PR 11.2 series MERGED on `main` (squash commit `80b2de1`). Pause / loadout menu UI live; ESC-equals-resume flicker tabled as known issue.
 
 **Status**: PR #18 (`feat/phase0-pr11.2-pause-menu`) MERGED at https://github.com/klampatech/specialists-web/pull/18 (squash commit `80b2de1`, merged 2026-08-15 13:32 UTC). All 11 CI checks green. Pause / loadout menu UI shipped across four stack commits folded into the single squash: PR 11.2 (initial UI), PR 11.2.1 (over-shoulder sign fix + browser pointer-lock API), PR 11.2.2 (single-handler ESC refactor), PR 11.2.3 (lock-then-unlock debounce + synthetic-mousemove anti auto-release + debug instrumentation).

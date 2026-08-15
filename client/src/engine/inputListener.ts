@@ -25,6 +25,11 @@ export interface InputHooks {
    *  `e.movementX * sensitivity`. The chase camera accumulates this
    *  into its yaw state. */
   onYawDelta?: (deltaRadians: number) => void;
+  /** PR 11.3: while pointer-locked, fires on every mousemove with
+   *  `e.movementY * sensitivity`. The chase camera accumulates this
+   *  into its CLAMPED pitch state [-π/2, +π/2] (clamps, not wraps).
+   *  Same sensitivity as yaw (MOUSE_LOOK.sensitivityRadPerPixel). */
+  onPitchDelta?: (deltaRadians: number) => void;
 }
 
 /** Returned by `createInputListener`. */
@@ -210,8 +215,20 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
   const onMouseMoveLocked = (e: MouseEvent) => {
     if (!target) return;
     if (document.pointerLockElement !== target) return; // not locked
-    if (e.movementX === 0) return; // no horizontal delta, skip
-    hooks.onYawDelta?.(e.movementX * MOUSE_LOOK.sensitivityRadPerPixel);
+    // PR 11.1: yaw delta on horizontal mouse movement.
+    if (e.movementX !== 0) {
+      hooks.onYawDelta?.(e.movementX * MOUSE_LOOK.sensitivityRadPerPixel);
+    }
+    // PR 11.3: pitch delta on vertical mouse movement. Note: `movementY`
+    // is positive when the user moves the mouse DOWN (away from them),
+    // but in every FPS "looking down" = positive pitch = mouse moves
+    // down, so the natural sign convention is `e.movementY * sens` =
+    // positive pitch delta. The chase camera clamps the result to
+    // [-π/2, +π/2] so users physically hitting the limits see the
+    // pitch hold at ±π/2 (not wrap).
+    if (e.movementY !== 0) {
+      hooks.onPitchDelta?.(e.movementY * MOUSE_LOOK.sensitivityRadPerPixel);
+    }
   };
 
   if (typeof window !== "undefined") {

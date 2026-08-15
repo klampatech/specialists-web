@@ -42,6 +42,8 @@ client/pointer-lock-camera.png
 client/yaw-wire-format*.png
 client/two-tab-yaw*.png
 client/pause-menu.png
+client/mouse-pitch.png
+client/pitch-wire-format.png
 
 # Codex delegation scratch (briefs + last-message files live here transiently,
 # alongside the AGENTS.md/handoff docs which are real artifacts).
