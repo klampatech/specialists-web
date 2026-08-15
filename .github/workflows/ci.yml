@@ -630,6 +630,89 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  # Phase 0 / PR 11.3: cross-context pitch wire-format determinism smoke.
+  # Verifies that pitch bytes encoded in Tab A are decoded identically by
+  # Tab B (and vice versa), catching any Vite module-cache / version drift
+  # between the two browser contexts that would silently break lockstep
+  # determinism. Uses two SEPARATE browser contexts (separate JS runtimes +
+  # separate Vite module caches) on the same dev-server origin.
+  #
+  # The smoke:
+  #   1. Boots the page in context A AND context B.
+  #   2. Each context imports /src/net/inputBitmask.ts independently.
+  #   3. Context A encodes 7 pitch values via encodeInput(); passes the
+  #      encoded byte arrays to context B.
+  #   4. Context B decodes them via ITS OWN decodeInput() and asserts the
+  #      decoded pitchRadians matches the linear formula (bits /
+  #      PITCH_BITS_SCALE - π/2) within 0.001 rad.
+  #   5. Reverse direction too (B encode → A decode).
+  #   6. INPUT_SIZE = 12 assertion (no regression to INPUT_SIZE = 10).
+  #
+  # Why a separate job: this is the regression guard for the load-bearing
+  # cross-tab lockstep path on the pitch axis. The single-context
+  # pitch-wire-format-smoke.mjs (port 5185) catches encoder/decoder drift
+  # within one context; this smoke catches drift ACROSS contexts (the
+  # shape that actually matters when two tabs exchange wire bytes).
+  #
+  # Port 5186 so it stays independent of all the other smoke jobs.
+  client-pitch-2tab-wire-format-smoke:
+    name: client — pitch 2-tab wire-format smoke (PR 11.3)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server (port 5186)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5186 > /tmp/vite-dev-pitch2tab.log 2>&1 &
+          echo $! > /tmp/vite-dev-pitch2tab.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5186/ > /dev/null; then
+              echo "Dev server (pitch 2-tab smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5186/ > /dev/null; then
+            echo "::error::Dev server (pitch 2-tab smoke) did not come up in 60s"
+            cat /tmp/vite-dev-pitch2tab.log
+            exit 1
+          fi
+      - name: Run pitch 2-tab wire-format smoke
+        run: node ./tools/pitch-2tab-wire-format-smoke.mjs
+        env:
+          PITCH_2TAB_SMOKE_URL: http://localhost:5186/
+      - name: Upload screenshot (context A)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pitch-2tab-wire-format-screenshot-A
+          path: client/pitch-2tab-wire-format-A.png
+          if-no-files-found: warn
+      - name: Upload screenshot (context B)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pitch-2tab-wire-format-screenshot-B
+          path: client/pitch-2tab-wire-format-B.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev-pitch2tab.pid ]]; then
+            kill "$(cat /tmp/vite-dev-pitch2tab.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   # Phase 0 / PR 11.1: pointer-lock camera-render smoke. Verifies that
   # the chase camera's render path honors the pointer-lock state:
   #   - When pointerLocked, camera.position === character.position + firstPersonOffset
