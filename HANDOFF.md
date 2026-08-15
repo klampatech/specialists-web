@@ -4,6 +4,29 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-15 — PR 11.2 series: residual ESC-equals-resume flicker tabled as known issue. Awaiting Kyle's merge.
+
+**Status**: PR 11.2 + 11.2.1 + 11.2.2 + 11.2.3 stacked on PR #18 (`feat/phase0-pr11.2-pause-menu`), all 11 CI checks green, all 9 smokes green locally. **Awaiting Kyle's merge decision.**
+
+**Decision (Kyle, 2026-08-15)**: The PR 11.2.3 root-cause narrative — "Bug B = lock-then-unlock race, 64ms after lock" + "Bug A = Chrome 1.5s mouse-inactivity auto-release" — was a *candidate hypothesis* based on the debug-log trace, not a confirmed root cause. Kyle is not convinced the debounce + synthetic-mousemove fixes are addressing the actual cause. **Table this as a known issue.** The Resume button (from the UI) behaves correctly and is the supported UX path; the residual ESC-equals-resume flicker is a UX papercut, not a blocker. Ship the PR.
+
+**What's in the docs now** (per `docs/SPEC.md`):
+- **Status banner** (`SPEC.md:7`): rewritten to drop the "root cause + fix landed" framing.
+- **PR 11.2 series entry** (`SPEC.md:24`): consolidated four-stack description + cross-reference to "Known issues".
+- **New `## Known issues` section** (`SPEC.md:582`): ESC-equals-resume flicker documented with symptom + workaround (Resume button) + why tabled + severity (UX papercut).
+- **Open Questions section** (`SPEC.md:609`): PR 11.2.3 root-cause bullet removed (it was a question, not an issue); the section now holds only real open questions (game name, mobile, voice chat, account persistence, modding).
+- **Working with this doc** (`SPEC.md:433`): added "Known issues" routing rule (log known defects in the Known Issues section when shipping a workaround-deferred behavior).
+
+**Debug instrumentation**: The 5-site `[PR-11.2.3-DEBUG]` instrumentation remains in place (in `onPointerLockChange`, the PauseMenu `useEffect` keydown, `chase.setPointerLock(true|false)`, and `scene.ts`'s `setPointerLock`). Not blocking; if/when this issue is reopened, the logs are already there.
+
+**Code changes left on the branch**: unchanged. PR 11.2.3's debounce + synthetic-mousemove are still in `chaseCamera.ts` + `scene.ts`; they may or may not be addressing the actual cause, but they're not actively harmful.
+
+**Next session** (after Kyle merges PR #18):
+1. Move to **(2) Mouse pitch** (PR 11.3 candidate) — natural follow-up to PR 11.1 yaw.
+2. **(3) Spectator camera** (PR 11.4 candidate) — debug-only, unblocks next two-tab dev session.
+3. **(4) Gap-bridging rollback** (PR 11.5 candidate) — pause-when-too-far-behind cap.
+4. Optional: revisit the ESC flicker if the user signals interest; otherwise leave it tabled.
+
 ## 2026-08-14 — PR 11.2.3 debounce + synthetic mousemove landed. **Playtest verification needed.**
 
 **Status**: PR 11.2.3 (`91aca85`) open on PR #18 (`feat/phase0-pr11.2-pause-menu`). All 11 CI checks green, all 9 smokes green locally. Stack: 6 commits ahead of `2fdda30` (PR 11.2 + 11.2.1 + 11.2.2 + 11.2.3).
