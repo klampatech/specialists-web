@@ -591,6 +591,8 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 - **Bundle delta**: +2-3 kB raw / +0.5 kB gzip — wire constants (PITCH_BITS_SCALE, pitchToBits) + chase camera pitch state (pitchRadians + 4 accessors) + 2 new smokes (~13 kB total smoke code) + DEV probes. The DEV-only probes are tree-shaken out of production by Vite.
 - **No codex+claude review loop used**. The brief was authored with the design decisions baked in (based on the PR 11.1 + 11.2 patterns + the HANDOFF's locked spec). The implementation is mechanical once the wire order is fixed. The honest gate is the smoke + the dev-box two-tab playtest.
 
+- **Y-axis sign convention** (Kyle dev-box playtest 2026-08-15): initial PR 11.3 missed a sign flip on `e.movementY` in the input listener — the browser reports `movementY > 0` for mouse-DOWN, but FPS convention says mouse-DOWN should look DOWN, so we need `-movementY` to drive positive pitch = look up. Caught by Kyle's manual playtest on http://100.95.111.112:5173/ — fixed in the same PR follow-up. The chase camera's `camera.rotation.x = -pitchRadians` flip was correct (Babylon Y-up: positive rotation.x looks DOWN, we negate to make positive pitchRadians mean look UP). The smoke only verified the state accumulator, not the render direction, so it didn't catch this.
+
 ### 2026-08-11 — Project location
 - **Vault**: `~/Obsidian/mem/projects/specialists-web.md` (this file)
 - **Repo**: `~/Development/specialists-web/`

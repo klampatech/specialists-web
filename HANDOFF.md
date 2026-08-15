@@ -4,6 +4,22 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-15 — PR 11.3 follow-up: pitch Y-axis sign fix (1 line in inputListener.ts)
+
+**Status**: PR 11.3 was MERGED to `main` (squash `e0ce05e`), but Kyle's dev-box playtest surfaced a 1-line bug: **dragging the mouse down made the camera look up, and vice versa** (pitch direction inverted).
+
+**Root cause**: `inputListener.ts` line 230 used `e.movementY * sens` for the pitch delta. The browser reports `e.movementY > 0` when the mouse moves DOWN, but FPS convention is "mouse down = look down = negative pitch", so the sign needed to be flipped. The chase camera's `camera.rotation.x = -pitchRadians` was correct (Babylon Y-up: positive rotation.x looks DOWN, we negate).
+
+**Fix**: change `e.movementY * MOUSE_LOOK.sensitivityRadPerPixel` → `-e.movementY * MOUSE_LOOK.sensitivityRadPerPixel` in `client/src/engine/inputListener.ts`. The chase camera's render path is unchanged.
+
+**Why the smokes didn't catch it**: `mouse-pitch-smoke.mjs` only verifies the **state accumulator** (`__pitchLookProbe()` returns the right value) — it does NOT assert which direction the camera renders. The fix is a smoke-hardening candidate for the next session (assert `cameraRotationX` sign matches `pitchRadians` sign with appropriate negation).
+
+**Playtest status update** (was ⚠️ UNVERIFIED on PR 11.3) — now partially ✅ verified by Kyle on http://100.95.111.112:5173/. Direction verified, but **two-tab cross-client pitch propagation** is still UNVERIFIED (the most load-bearing test — same fix as PR 11.1's yaw cross-tab test). Run that on the dev box before declaring M2 row 10 fully closed.
+
+**Branch**: `fix/pr11.3-pitch-direction` (1-line fix + docs). Open as a docs/code PR after green CI.
+
+---
+
 ## 2026-08-15 — PR 11.3 MERGED on `main` (squash commit `<TBD-on-merge>`). Per-player mouse pitch (vertical mouse-look) on the wire.
 
 **Status**: PR #20 (`feat/phase0-pr11.3-mouse-pitch`) MERGED at https://github.com/klampatech/specialists-web/pull/20 (squash commit `<TBD-on-merge>`, branch `feat/phase0-pr11.3-mouse-pitch`, merged 2026-08-15). All 11 CI smokes green. Per-player mouse pitch shipped on top of PR 11.1's yaw: bytes 4-5 of the input packet carry pitch as a little-endian uint16 ([-π/2, +π/2] → [0, 65535], ~0.00275°/LSB). Chase camera applies the pitch as a vertical tilt in both 1st-person and over-shoulder locked views (Babylon sign convention: `camera.rotation.x = -pitchRadians` because positive `rotation.x` looks DOWN in Babylon's Y-up Euler). Menu orbit camera is unaffected (no pitch tilt — pitch is irrelevant in this state).
