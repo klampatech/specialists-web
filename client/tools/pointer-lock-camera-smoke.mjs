@@ -184,10 +184,12 @@ try {
   console.log(`LOCKED_YAW_UPDATE_OK: |camRotY-charYaw|=${afterYawDrift.toFixed(4)} ≤ ${YAW_TOLERANCE}`);
 
   // (d) PR 11.1.3: V cycles mode 0 → 1 (over-shoulder-locked).
-  // Camera should be at character + overShoulderOffset rotated by
-  // character yaw (so it stays behind the character relative to facing).
-  // Camera ROTATION is NOT the character yaw — it looks at the character's
-  // chest height (so the model rotates in view, not glued to the screen).
+  // PR 11.2.1: Camera should be at character + overShoulderOffset rotated
+  // by character yaw, putting it BEHIND the character (1.6m back in the
+  // character's facing direction). The offset convention `(0, 1.7, -1.6)`
+  // means: at yaw=0, character faces +Z, so "behind" is -Z, and the camera
+  // sits at character + (0, 1.7, -1.6). Camera looks at character's chest
+  // (which is in front of the camera, in the character's forward direction).
   await page.evaluate(() => window.__chaseCameraToggle());
   await page.waitForTimeout(200);
 
@@ -205,14 +207,14 @@ try {
   }
   // Compute expected camera position: character + offset rotated by yaw.
   // With offset = (0, 1.7, -1.6) and yaw rotated around Y:
-  //   worldOffsetX = -(-1.6) * sin(yaw) = 1.6 * sin(yaw)
+  //   worldOffsetX = off.z * sin(yaw) = -1.6 * sin(yaw)
   //   worldOffsetY = 1.7
-  //   worldOffsetZ = -1.6 * cos(yaw)
+  //   worldOffsetZ = off.z * cos(yaw) = -1.6 * cos(yaw)
   const yaw1 = sMode1.characterYaw;
   const expectedMode1 = {
-    x: sMode1.characterPosition.x + (-OVER_SHOULDER_OFFSET.z) * Math.sin(yaw1),
+    x: sMode1.characterPosition.x + OVER_SHOULDER_OFFSET.z * Math.sin(yaw1),
     y: sMode1.characterPosition.y + OVER_SHOULDER_OFFSET.y,
-    z: sMode1.characterPosition.z + (-OVER_SHOULDER_OFFSET.z) * Math.cos(yaw1),
+    z: sMode1.characterPosition.z + OVER_SHOULDER_OFFSET.z * Math.cos(yaw1),
   };
   const mode1Drift = Math.sqrt(
     Math.pow(sMode1.cameraPosition.x - expectedMode1.x, 2) +
@@ -230,20 +232,34 @@ try {
   // character's chest, not in the character's facing direction). The
   // camera's forward vector points toward the character's chest.
   // We can verify this by computing the expected camera.rotation.y from
-  // the camera position → chest position vector. If the camera were
-  // glued to character yaw, camera.rotation.y would equal character yaw.
+  // the camera position → chest position vector. If the camera is
+  // BEHIND the character (the post-PR-11.2.1 fix), camera.rotation.y
+  // WILL equal character yaw by geometry (camera-to-chest is parallel
+  // to character forward when camera is directly behind). The old
+  // assertion that camera.rotation.y != character yaw was for the buggy
+  // "camera in front" behavior; PR 11.2.1 changed that to "camera
+  // behind" which makes the camera-rotation-equals-character-yaw by
+  // construction. What we still assert is that the camera's forward
+  // vector points AT the character's chest.
   const dx = (sMode1.characterPosition.x + CAMERA_LOOK_AT.x) - sMode1.cameraPosition.x;
   const dz = (sMode1.characterPosition.z + CAMERA_LOOK_AT.z) - sMode1.cameraPosition.z;
   const expectedCameraYaw = Math.atan2(dx, dz); // Babylon: camera.rotation.y = atan2(forwardX, forwardZ)
-  const yawGlueDrift = Math.abs(sMode1.cameraRotationY - yaw1);
-  if (yawGlueDrift < 0.1 && Math.abs(yaw1) > 0.1) {
-    // Camera is glued to character yaw — that's the OLD buggy behavior.
+  // PR 11.2.1: camera is BEHIND the character (camera.z < character.z when
+  // yaw=0). Verify camera position is behind — the actual gameplay-relevant
+  // assertion. With the over-shoulder offset (0, 1.7, -1.6), camera should
+  // be 1.6m behind the character in the character's facing direction.
+  const cameraBehindDistance = Math.sqrt(
+    Math.pow(sMode1.cameraPosition.x - sMode1.characterPosition.x, 2) +
+    Math.pow(sMode1.cameraPosition.z - sMode1.characterPosition.z, 2),
+  );
+  // Expected: camera is ~1.6m behind (matches overShoulderOffset.z magnitude).
+  if (Math.abs(cameraBehindDistance - 1.6) > 0.1) {
     throw new Error(
-      `[V-mode1-yaw-glued] camera.rotation.y=${sMode1.cameraRotationY.toFixed(4)} matches ` +
-      `character yaw=${yaw1.toFixed(4)} (drift=${yawGlueDrift.toFixed(4)}). PR 11.1.3 expects ` +
-      `camera to look at character chest, NOT match character yaw.`,
+      `[V-mode1-behind] camera should be ~1.6m behind character; ` +
+      `actual distance=${cameraBehindDistance.toFixed(4)}m`,
     );
   }
+  console.log(`V_MODE1_BEHIND_OK: camera ${cameraBehindDistance.toFixed(4)}m behind character`);
   // Camera should look toward character chest.
   const cameraLookAtDrift = Math.abs(sMode1.cameraRotationY - expectedCameraYaw);
   if (cameraLookAtDrift > 0.1) {
@@ -252,7 +268,7 @@ try {
       `toward character chest (expected=${expectedCameraYaw.toFixed(4)}, drift=${cameraLookAtDrift.toFixed(4)})`,
     );
   }
-  console.log(`V_MODE1_OK: viewMode=1, drift=${mode1Drift.toFixed(4)}m, camera looks at chest (rotation=${sMode1.cameraRotationY.toFixed(4)} != charYaw=${yaw1.toFixed(4)})`);
+  console.log(`V_MODE1_OK: viewMode=1, drift=${mode1Drift.toFixed(4)}m, camera looks at chest (rotation=${sMode1.cameraRotationY.toFixed(4)} matches expectedLookAt=${expectedCameraYaw.toFixed(4)})`);
 
   // PR 11.1.3: simulate a mouse-rotation in over-shoulder mode by
   // pushing a delta through the chase camera's yaw accumulator (the
@@ -271,9 +287,9 @@ try {
   // Camera position should be at character + rotated offset.
   const yaw1b = sMode1Rotated.characterYaw;
   const expectedMode1Rotated = {
-    x: sMode1Rotated.characterPosition.x + (-OVER_SHOULDER_OFFSET.z) * Math.sin(yaw1b),
+    x: sMode1Rotated.characterPosition.x + OVER_SHOULDER_OFFSET.z * Math.sin(yaw1b),
     y: sMode1Rotated.characterPosition.y + OVER_SHOULDER_OFFSET.y,
-    z: sMode1Rotated.characterPosition.z + (-OVER_SHOULDER_OFFSET.z) * Math.cos(yaw1b),
+    z: sMode1Rotated.characterPosition.z + OVER_SHOULDER_OFFSET.z * Math.cos(yaw1b),
   };
   const mode1RotatedDrift = Math.sqrt(
     Math.pow(sMode1Rotated.cameraPosition.x - expectedMode1Rotated.x, 2) +

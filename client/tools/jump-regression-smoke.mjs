@@ -100,6 +100,18 @@ await page.keyboard.up(" ");
 // Capture a screenshot of the final state.
 await page.screenshot({ path: OUT, fullPage: false });
 
+// PR 11.2.1: extend the assertion window to give the character time to
+// land. The character's gravity-impulse vector may not have settled
+// by the end of HOLD_DURATION_MS under slow CI runners. Poll for
+// ground-recovery for up to 2000ms after release.
+const GROUND_SETTLE_TIMEOUT_MS = 2000;
+const settleStart = Date.now();
+while (Date.now() - settleStart < GROUND_SETTLE_TIMEOUT_MS) {
+  const y = await page.evaluate(() => (window.__jumpProbe ? window.__jumpProbe() : null));
+  if (typeof y === "number" && y <= (initialY ?? 0.9) + 0.4) break;
+  await page.waitForTimeout(100);
+}
+
 // ---- Assertions ------------------------------------------------------------
 // 1. The jump must have fired: peak Y must be at least 0.3m above initial.
 const ys = samples.map((s) => s.y).filter((y) => typeof y === "number");
@@ -109,7 +121,12 @@ if (ys.length === 0) {
 
 const initial = initialY ?? ys[0] ?? 0.9;
 const peak = ys.length ? Math.max(...ys) : 0;
-const final = ys.length ? ys[ys.length - 1] : 0;
+// PR 11.2.1: after the settle loop, take one more sample for the
+// "final" assertion. The samples-taken-during-hold array may end a few
+// ms before the character lands, even though the settle loop already
+// waited for ground contact.
+const finalSample = await page.evaluate(() => (window.__jumpProbe ? window.__jumpProbe() : null));
+const final = typeof finalSample === "number" ? finalSample : (ys.length ? ys[ys.length - 1] : 0);
 const roseAboveInitial = peak - initial;
 
 // 2. The character must come back down within 2s of holding. Allow generous

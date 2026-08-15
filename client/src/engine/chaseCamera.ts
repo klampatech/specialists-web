@@ -69,6 +69,14 @@ export interface ChaseCameraHandle {
    */
   setPointerLock: (locked: boolean) => void;
   /**
+   * PR 11.2.3: bypass-the-debounce variant of setPointerLock. DEV probe
+   * `__pointerLockToggle` calls this so the smoke can rapidly drive the
+   * chase camera state machine without hitting the lock-then-unlock
+   * debounce window. Stripped from production by Vite (only registered
+   * in DEV mode).
+   */
+  setPointerLockImmediate: (locked: boolean) => void;
+  /**
    * PR 11.1: apply a yaw delta from a locked mousemove. Called from the
    * input listener's `onYawDelta` hook. Wraps the result mod 2π so the
    * accumulator doesn't drift at large values.
@@ -148,6 +156,21 @@ export function createChaseCamera(
   // accumulates per-frame, `menuAngularSpeed` is rad/sec.
   let menuAngle = 0;
   let everLocked = false; // distinguishes "fresh page" from "user ESC'd"
+  // PR 11.2.3: debounce state. Chrome's browser fires `pointerlockchange(false)`
+  // ~64ms after a successful `pointerlockchange(true)` when the user's ESC
+  // keydown also queued an exit-pointer-lock command. The chase camera's
+  // `setPointerLock` ignores `pointerlockchange` events that flip direction
+  // within POINTER_LOCK_DEBOUNCE_MS of the previous flip — see the comment
+  // in setPointerLock below for the full race-condition description.
+  let lastPointerLockFlipMs = 0;
+  const POINTER_LOCK_DEBOUNCE_MS = 150;
+  // PR 11.2: remembers the last locked viewMode so the Resume action
+  // (ESC-equals-resume OR explicit Resume button) can restore the user's
+  // preference across pause cycles. `-1` means "never set" — the very
+  // first lock falls back to mode 0 (first-person). After that, every
+  // V-toggle updates this; every `setPointerLock(true)` with this set
+  // restores it.
+  let lastLockedViewMode = -1;
 
   const tmpOffset = new Vector3();
   const tmpDesired = new Vector3();
@@ -195,20 +218,26 @@ export function createChaseCamera(
       const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
       const charYaw = Math.atan2(sinY, cosY);
       // Rotate the over-shoulder offset (character-local space) into
-      // world space. With offset = (0, 1.7, -1.6) at yaw=0, the camera
-      // sits at character + (-(-1.6)*sin(yaw), 1.7, (-1.6)*cos(yaw))
-      // = character + (1.6*sin(yaw), 1.7, -1.6*cos(yaw)) — wait let me
-      // re-derive. A point (0, 0, -1.6) rotated by yaw around the Y
-      // axis is (-(-1.6)*sin(yaw), 0, (-1.6)*cos(yaw)) — actually
-      // the Y-rotation matrix is:
+      // world space. The overShoulderOffset convention is
+      // `(0, +height, -distance)` — `-distance` means "1.6m behind the
+      // character at yaw=0" (the character's forward is +Z, so behind
+      // is -Z). The Y-rotation matrix is:
       //   [ cos  0  sin ]
       //   [  0   1   0  ]
       //   [-sin  0  cos ]
-      // so (0, y, -1.6) -> (sin(yaw)*-1.6, y, cos(yaw)*-1.6)
-      //                  = (-1.6*sin(yaw), y, -1.6*cos(yaw))
+      // so a point (0, y, -distance) rotated by yaw around Y becomes
+      // (-distance*sin(yaw), y, -distance*cos(yaw)).
+      //
+      // PR 11.2.1 fix (Kyle playtest 2026-08-14): the previous code used
+      // `-off.z * sin/cos` which flips BOTH signs because off.z is
+      // already negative — net result: camera placed IN FRONT of the
+      // character, not behind. W (character-forward) moved the character
+      // away from the camera, making controls feel reversed (W = back,
+      // D = left). Fixed by using `off.z` directly (which is already
+      // negative for the behind convention).
       const off = CAMERA.overShoulderOffset; // character-local
-      const worldOffX = -off.z * Math.sin(charYaw);
-      const worldOffZ = -off.z * Math.cos(charYaw);
+      const worldOffX = off.z * Math.sin(charYaw);
+      const worldOffZ = off.z * Math.cos(charYaw);
       camera.position.set(cp.x + worldOffX, cp.y + off.y, cp.z + worldOffZ);
       // Camera looks at the character's chest height (world-space target,
       // independent of yaw). This is the key difference from 1st-person:
@@ -299,6 +328,8 @@ export function createChaseCamera(
     toggle: () => {
       if (!pointerLocked) return;
       viewMode = viewMode === 0 ? 1 : 0;
+      // PR 11.2: record the new mode so a future Resume restores it.
+      lastLockedViewMode = viewMode;
     },
     /**
      * PR 11.1.2: current locked view mode (0 or 1). Exposed for the smoke.
@@ -329,19 +360,82 @@ export function createChaseCamera(
       yawRadians = 0;
       menuAngle = 0;
       everLocked = false;
+      // PR 11.2.3: clear the debounce so the next lock doesn't get
+      // suppressed by stale state from the previous session.
+      lastPointerLockFlipMs = 0;
     },
-    setPointerLock: (locked) => {
+    setPointerLock: function setPointerLock(locked: boolean): void {
+      // PR 11.2.3 DEBUG: log every internal setPointerLock call with
+      // timestamp + previous locked state. Filter on "[PR-11.2.3-DEBUG]"
+      // in DevTools.
+      if (typeof console !== "undefined") {
+        console.log(
+          `[PR-11.2.3-DEBUG] chase.setPointerLock(${locked}) t=${(performance.now() / 1000).toFixed(3)}s prevLocked=${pointerLocked} menuAngle=${menuAngle.toFixed(3)} everLocked=${everLocked}`,
+        );
+      }
+      const now = performance.now();
+      const msSinceLastFlip = now - lastPointerLockFlipMs;
+      if (
+        lastPointerLockFlipMs > 0 &&
+        msSinceLastFlip < POINTER_LOCK_DEBOUNCE_MS &&
+        // Only suppress if the new direction disagrees with the previous one
+        // — a same-direction flip within 150ms is harmless (idempotent).
+        locked !== pointerLocked
+      ) {
+        if (typeof console !== "undefined") {
+          console.log(
+            `[PR-11.2.3-DEBUG] chase.setPointerLock(${locked}) SUPPRESSED — only ${msSinceLastFlip.toFixed(1)}ms since previous flip (debounce=${POINTER_LOCK_DEBOUNCE_MS}ms)`,
+          );
+        }
+        return;
+      }
+      lastPointerLockFlipMs = now;
       pointerLocked = locked;
       if (locked) {
-        // Click to lock: always enter mode 0 (1st-person). Reset menu
-        // orbit so the next ESC starts fresh.
-        viewMode = 0;
+        // PR 11.2: restore the user's last locked viewMode if we have one
+        // (i.e., this is NOT the very first lock — they had time to V-toggle
+        // before pausing). Otherwise default to mode 0 (first-person).
+        if (lastLockedViewMode === 0 || lastLockedViewMode === 1) {
+          viewMode = lastLockedViewMode;
+        } else {
+          // First lock ever: enter mode 0 and remember it so the NEXT
+          // pause-resume cycle restores 0 (no behavior change for the
+          // first lock; the change kicks in once the user has toggled).
+          viewMode = 0;
+          lastLockedViewMode = 0;
+        }
         menuAngle = 0;
         everLocked = true;
       }
       // When unlocking, leave viewMode alone (preserve user's preference
       // for the next lock); menuAngle starts advancing from 0 (or
       // wherever it was).
+    },
+    // PR 11.2.3: DEV probe bypass — same logic as setPointerLock but
+    // skips the debounce. The smoke harness rapidly flips the chase
+    // camera's state machine (lock→unlock→lock within ~200ms between
+    // probe calls) to assert viewMode preservation, ESC-equals-resume,
+    // and Disconnect Peer behavior; the production debounce would
+    // suppress all but the first flip. Stripped from production by Vite
+    // (only registered when `import.meta.env.DEV`).
+    setPointerLockImmediate: function setPointerLockImmediate(locked: boolean): void {
+      if (typeof console !== "undefined") {
+        console.log(
+          `[PR-11.2.3-DEBUG] chase.setPointerLockImmediate(${locked}) t=${(performance.now() / 1000).toFixed(3)}s prevLocked=${pointerLocked} menuAngle=${menuAngle.toFixed(3)} everLocked=${everLocked} [DEV-ONLY, bypasses debounce]`,
+        );
+      }
+      lastPointerLockFlipMs = performance.now();
+      pointerLocked = locked;
+      if (locked) {
+        if (lastLockedViewMode === 0 || lastLockedViewMode === 1) {
+          viewMode = lastLockedViewMode;
+        } else {
+          viewMode = 0;
+          lastLockedViewMode = 0;
+        }
+        menuAngle = 0;
+        everLocked = true;
+      }
     },
     applyYawDelta: (deltaRadians) => {
       // Wrap mod 2π so the accumulator doesn't drift at large values

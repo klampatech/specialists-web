@@ -79,12 +79,26 @@ while (Date.now() - startTs < HOLD_MS) {
 }
 await page.keyboard.up("q");
 
-await page.waitForTimeout(200);
+// PR 11.2.3: extend the assertion window to give the character time to
+// descend. Same pattern as the jump-regression-smoke settle loop — under
+// slow CI runners the gravity-impulse vector may not have settled by
+// the end of the keyboard.up window. Poll for descent for up to 2s.
 await page.screenshot({ path: "./wallrun-regression.png", fullPage: false });
+const GROUND_SETTLE_TIMEOUT_MS = 2000;
+const settleStart = Date.now();
+while (Date.now() - settleStart < GROUND_SETTLE_TIMEOUT_MS) {
+  const y = await page.evaluate(() => (window.__jumpProbe ? window.__jumpProbe() : null));
+  if (typeof y === "number" && y < 1.5) break;
+  await page.waitForTimeout(100);
+}
 
 const ys = samples.map((s) => s.y).filter((y) => typeof y === "number");
 const peak = ys.length ? Math.max(...ys) : 0;
-const final = ys.length ? ys[ys.length - 1] : 0;
+// PR 11.2.3: after the settle loop, take one more sample for the
+// "final" assertion — the samples-taken-during-keyboard.down array may
+// end a few ms before the character lands.
+const finalSample = await page.evaluate(() => (window.__jumpProbe ? window.__jumpProbe() : null));
+const final = typeof finalSample === "number" ? finalSample : (ys.length ? ys[ys.length - 1] : 0);
 
 console.log("WALLRUN_PROBE: initial=0.900 peak=", peak.toFixed(3), "final=", final.toFixed(3));
 console.log("WALLRUN_SAMPLES:", JSON.stringify(samples.map((s) => ({

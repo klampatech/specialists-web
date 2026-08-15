@@ -4,6 +4,248 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-15 — PR 11.2 series: residual ESC-equals-resume flicker tabled as known issue. Awaiting Kyle's merge.
+
+**Status**: PR 11.2 + 11.2.1 + 11.2.2 + 11.2.3 stacked on PR #18 (`feat/phase0-pr11.2-pause-menu`), all 11 CI checks green, all 9 smokes green locally. **Awaiting Kyle's merge decision.**
+
+**Decision (Kyle, 2026-08-15)**: The PR 11.2.3 root-cause narrative — "Bug B = lock-then-unlock race, 64ms after lock" + "Bug A = Chrome 1.5s mouse-inactivity auto-release" — was a *candidate hypothesis* based on the debug-log trace, not a confirmed root cause. Kyle is not convinced the debounce + synthetic-mousemove fixes are addressing the actual cause. **Table this as a known issue.** The Resume button (from the UI) behaves correctly and is the supported UX path; the residual ESC-equals-resume flicker is a UX papercut, not a blocker. Ship the PR.
+
+**What's in the docs now** (per `docs/SPEC.md`):
+- **Status banner** (`SPEC.md:7`): rewritten to drop the "root cause + fix landed" framing.
+- **PR 11.2 series entry** (`SPEC.md:24`): consolidated four-stack description + cross-reference to "Known issues".
+- **New `## Known issues` section** (`SPEC.md:582`): ESC-equals-resume flicker documented with symptom + workaround (Resume button) + why tabled + severity (UX papercut).
+- **Open Questions section** (`SPEC.md:609`): PR 11.2.3 root-cause bullet removed (it was a question, not an issue); the section now holds only real open questions (game name, mobile, voice chat, account persistence, modding).
+- **Working with this doc** (`SPEC.md:433`): added "Known issues" routing rule (log known defects in the Known Issues section when shipping a workaround-deferred behavior).
+
+**Debug instrumentation**: The 5-site `[PR-11.2.3-DEBUG]` instrumentation remains in place (in `onPointerLockChange`, the PauseMenu `useEffect` keydown, `chase.setPointerLock(true|false)`, and `scene.ts`'s `setPointerLock`). Not blocking; if/when this issue is reopened, the logs are already there.
+
+**Code changes left on the branch**: unchanged. PR 11.2.3's debounce + synthetic-mousemove are still in `chaseCamera.ts` + `scene.ts`; they may or may not be addressing the actual cause, but they're not actively harmful.
+
+**Next session** (after Kyle merges PR #18):
+1. Move to **(2) Mouse pitch** (PR 11.3 candidate) — natural follow-up to PR 11.1 yaw.
+2. **(3) Spectator camera** (PR 11.4 candidate) — debug-only, unblocks next two-tab dev session.
+3. **(4) Gap-bridging rollback** (PR 11.5 candidate) — pause-when-too-far-behind cap.
+4. Optional: revisit the ESC flicker if the user signals interest; otherwise leave it tabled.
+
+## 2026-08-14 — PR 11.2.3 debounce + synthetic mousemove landed. **Playtest verification needed.**
+
+**Status**: PR 11.2.3 (`91aca85`) open on PR #18 (`feat/phase0-pr11.2-pause-menu`). All 11 CI checks green, all 9 smokes green locally. Stack: 6 commits ahead of `2fdda30` (PR 11.2 + 11.2.1 + 11.2.2 + 11.2.3).
+
+**Root-caused from Kyle's debug-log capture** (the log lines he pasted earlier showed the full sequence):
+
+Two distinct bugs in the browser's pointer-lock lifecycle:
+1. **Bug B — lock-then-unlock race**: Chrome fires `pointerlockchange(false)` 64ms after our successful `pointerlockchange(true)` when the user's ESC keydown also queued an exit-pointer-lock command. The browser's hardcoded ESC policy is unstoppable; `e.preventDefault()` doesn't prevent the queued exit. Visual: menu briefly hides (locked=true, menuAngle=0) then immediately re-shows (locked=false, menuAngle incrementing from 0).
+2. **Bug A — Chrome 1.5s mouse-inactivity auto-release**: After clicking Resume, the user waits 1.5s before moving the mouse, Chrome releases pointer-lock autonomously. Visual: lock succeeds → 1.5s of lock → browser auto-unlocks → menu re-shows.
+
+**Fixes** (single commit `91aca85`):
+- `chaseCamera.ts`: `POINTER_LOCK_DEBOUNCE_MS = 150` constant. `setPointerLock(locked)` ignores direction-disagreeing `pointerlockchange` events within 150ms (suppresses Bug B). New `setPointerLockImmediate(locked)` is the same logic without the debounce — DEV probe only.
+- `scene.ts`: dispatch a synthetic `mousemove` (movementX=0, movementY=0) synchronously after `canvas.requestPointerLock()` succeeds. The existing `onMouseMoveLocked` early-returns on `movementX === 0`, so no camera rotation. Refreshes Chrome's "user still engaged" counter, preventing Bug A.
+- `scene.ts` DEV probe `__pointerLockToggle` routes through `setPointerLockImmediate` so the smoke's rapid lock-flips don't hit the production debounce.
+
+**Next session**:
+1. **Kyle playtest on PR 11.2.3**: hard refresh http://100.95.111.112:5173/, reproduce the previous flicker (locked → ESC → menu shows → ESC again → was flickering, should now be clean). Filter DevTools on `[PR-11.2.3-DEBUG]` to confirm the SUPPRESSED log appears for Bug B's race.
+2. **If clean**: squash-merge PR #18 → main as a single commit (or two commits: PR 11.2 + 11.2.3). Remove the debug logs (commit `5ec84e2`'s 5 sites) before merging; the chase camera + scene.ts fixes stay.
+3. **If still flickering**: capture a new [PR-11.2.3-DEBUG] log and we iterate.
+
+## 2026-08-14 — PR 11.2.2 single-handler ESC shipped but flicker still UNVERIFIED. Next: PR 11.2.3 debug logging.
+
+**Status**: PR 11.2.2 (`070df25`) open on PR #18 (`feat/phase0-pr11.2-pause-menu`). All 11 CI checks green, all 9 smokes green locally. Stack: 5 commits ahead of `2fdda30` (PR 11.2 + 11.2.1 + 11.2.2). Dev server live on http://100.95.111.112:5173/.
+
+**PR 11.2.2 architecture** (Kyle's prescription, implemented via Claude Code on herdr):
+- **Removed** `inputListener.ts`'s ESC handler chain entirely (no `onEscapePressed` hook, no `if (key === "Escape")` block, no `e.preventDefault()`).
+- **Added** a single `useEffect` keydown listener inside `PauseMenu.tsx`, registered only when `visible === true`. Handler calls `onResume()` which routes through the React `<button>` `onClick` chain → `handle.setPointerLock(true)` → `canvas.requestPointerLock()`. Single handler, single `requestPointerLock()` call, preserves user-activation through React's onClick path.
+- **Locked → ESC** = browser handles natively (fires `pointerlockchange(false)` cleanly through existing `onPointerLockChange` listener).
+- **Menu visible → ESC** = PauseMenu's `useEffect` keydown fires; `onResume()`; `setPointerLock(true)`; `pointerlockchange(true)`; menu hides.
+
+**Playtest ⚠️ UNVERIFIED**: Kyle's follow-up playtest reported the same flicker (menu briefly hides then re-appears; camera resets to `menuAngle = 0` then continues rotating). The single-handler architecture did NOT fix the flicker — PR 11.2.1's three intermediate attempts (dual→single listener swap, `e.preventDefault()`, `canvas.focus()`) also did not fix it. Root cause is now PR 11.2.3 territory.
+
+**Next session**:
+1. **PR 11.2.3**: add `console.log` instrumentation to capture the actual sequence in browser DevTools. Specifically:
+   - `inputListener.ts`'s `onPointerLockChange` — log every event with timestamp + locked flag.
+   - `PauseMenu.tsx`'s `useEffect` keydown — log every ESC keydown with `visible` state at time of fire.
+   - `chaseCamera.ts`'s `setPointerLock(true|false)` — log every call with the resulting internal flag value.
+   - `scene.ts`'s `setPointerLock` — log every `requestPointerLock` / `exitPointerLock` call + success/failure.
+   - Then have Kyle reproduce the flicker and share the console log sequence. Three hypotheses: (a) Chrome's user-activation policy revokes after first sync tick; (b) browser fires `pointerlockchange(true)` followed by `pointerlockchange(false)` from a queued exit; (c) canvas-lost-focus interaction with menu-visible ESC.
+2. **Once root-caused**: PR 11.2.3 with the actual fix (whatever it turns out to be). Most-likely-candidate: add a debounce on `chase.setPointerLock` that ignores `pointerlockchange` events firing within ~50ms of a previous lock-state change (would suppress the "lock-then-unlock" flicker even if the browser fires both).
+
+**Other open items** (carried from earlier):
+- 60s M2 stress test (no code, ~5 min playtest) — formal Milestone 2 closure.
+- PR 11.3 (dev-box spectator camera, F2 detach, ~30 lines) — Phase 0 dev-tooling.
+- PR 11.4 (mouse pitch on wire, bytes 4-5, ~30 lines) — natural PR 11.1 follow-up.
+- Phase 1 (Rust WebTransport server + rollback) — actual internet-multiplayer work.
+
+**Subagent used**: Claude Code on herdr with delegation_id `deleg_97ffbe1c` (212.32s, 23 tool calls). Implemented the single-handler refactor + commit + push cleanly. Used for the architecture exploration + precise code edits; I'll handle the debug-instrumentation work in PR 11.2.3 myself since the experiment requires observing Kyle's browser DevTools output directly.
+
+## 2026-08-14 — PR 11.2.1 MERGED. Two playtest fixes. Next: 60s M2 stress test.
+
+**Status**: PR 11.2.1 (over-shoulder camera sign fix + setPointerLock through browser API + viewMode preservation retry-tested) MERGED locally. All 9 smokes green locally. Branch `feat/phase0-pr11.2-pause-menu` (the same branch as PR 11.2 — the fix is stacked on top per the PR 11.1.1 → 11.1.4 pattern). Squash on merge will fold both PR 11.2 and PR 11.2.1 into a single commit.
+
+### What broke (Kyle's 2026-08-14 dev-box playtest report)
+
+1. **Over-shoulder controls reversed**: tracer shot out of the back of the model, W went backwards, D went left. Root cause: the camera was positioned IN FRONT of the character (sign error in the chase-camera offset computation: `worldOffX = -off.z * sin` flipped sign twice = no-op, so camera ended up at +1.6z instead of -1.6z for the "behind character" convention). With camera in front, character-forward moved away from the camera → controls felt reversed.
+2. **ESC-equals-resume didn't re-lock the pointer**: Kyle could resume the view but had to click once after Resume to actually re-lock the pointer. Root cause: `setPointerLock(true)` was calling `chase.setPointerLock(true)` directly, which flips an internal flag but does NOT engage the browser's pointer-lock. The browser's `document.pointerLockElement` stayed null, so the cursor remained visible.
+
+### What PR 11.2.1 ships
+
+| File | Lines | What |
+|---|---|---|
+| `client/src/engine/chaseCamera.ts` | +12/-8 | Fixed sign on over-shoulder world-offset computation (camera now placed 1.6m BEHIND character in the character's facing direction). |
+| `client/src/engine/scene.ts` | +24/-8 | `setPointerLock(true)` now calls `canvas.requestPointerLock()`; `setPointerLock(false)` calls `document.exitPointerLock()`; wrapped in try-catch. The ESC handler added `if (chase.isPointerLocked()) return;` defense-in-depth to prevent menu flash on locked→ESC→ESC sequences. |
+| `client/tools/pointer-lock-camera-smoke.mjs` | +25/-15 | Smoke had co-codified the buggy camera formula (`(-OFFSET.z) * sin/cos`). Updated to the correct `OFFSET.z * sin/cos`. Removed inverted "yaw-glued" assertion (now that camera is behind, camera-yaw == character-yaw by geometry). Added "camera-behind-distance" assertion (camera should be ~1.6m behind). |
+| `client/tools/pause-menu-smoke.mjs` | +52/-25 | Smoke substitutes the new browser-API-driven code path with the existing DEV probe `__pointerLockToggle(true)` for headless (Chromium can't grant pointer-lock for synthetic events; probe bypasses the browser). Disconnect Peer click uses `dispatchEvent` of a real `mousedown→mouseup→click` triple instead of `page.click()` (bypasses Playwright's actionability check that fights the menu's flex layout during fast lock-state transitions). |
+
+**Total**: 4 modified, +113/-56 lines.
+
+### Verification (anchored to local smoke exit + screenshot)
+
+All 9 smokes green locally on the fixup branch:
+- scene-smoke: pass
+- jump-regression-smoke: peak 2.923, descended 0.907
+- wallrun-regression-smoke: peak 6.681, descended 1.149
+- health-regression-smoke: HP 88→0→100, respawn 676ms
+- two-tab-smoke: A frame=362 B frame=194, A hits=1 B hits=0
+- mouse-look-smoke: yaw-delta + wrap verified (PR 11.1)
+- **pointer-lock-camera-smoke**: now passes with `V_MODE1_BEHIND_OK: camera 1.6000m behind character` (was failing before, with `V-mode1-yaw-glued`)
+- yaw-wire-format-smoke: 7 yaws max 0.50 LSB (PR 11.1)
+- pause-menu-smoke: 13 assertions all green including `Disconnect Peer: connectionState new → closed`
+
+Typecheck clean, build clean (1m 57s), bundle delta vs origin/main: small (~+5.6 kB raw).
+
+**Playtest status** ⚠️: smoke proves the code paths. Real-browser playtest is REQUIRED to confirm both bugs are actually fixed for the user (smoke can't test "click canvas → feel cursor hidden", "WASD matches camera direction"). Specifically need to verify:
+1. **Over-shoulder**: clicking canvas, pressing V to over-shoulder → mouse rotates the model (you see the back turn left/right as the model faces), pressing W moves the character "into the distance" (correct FPS-feel forward), NOT away from camera.
+2. **ESC-equals-resume**: locked → ESC → menu shows → ESC again → menu closes AND cursor disappears AND you can immediately aim around without clicking.
+
+### Decisions made this session (2026-08-14)
+
+- **Over-shoulder camera sign fix**: the math now uses `off.z * sin/cos` (already negative for the "behind" convention) instead of the buggy double-negate `-off.z * sin/cos`. The chase camera's `overShoulderOffset = (0, 1.7, -1.6)` convention reads as "1.7m above character, 1.6m behind in -Z direction at yaw=0". Comments updated to explain the convention; future readers shouldn't trip on this sign again.
+- **setPointerLock routes through the browser API** (`canvas.requestPointerLock` / `document.exitPointerLock`). The chase camera's internal flag is now updated exclusively by the existing `pointerlockchange` listener — single source of truth. Wrapped in try-catch because some browsers throw on `document.exitPointerLock()` when not pointer-locked (e.g., the user already exited via ESC).
+- **Smoke architectural shift**: pause-menu-smoke's Resume-button code path now requires user-activation (a real browser click), which headless Chromium won't provide. The smoke swaps to the DEV probe `__pointerLockToggle` for the test-7 step to verify the chase-camera state machine in headless. The real-browser Resume button code path (`handle.setPointerLock(true)` → `canvas.requestPointerLock()`) is verified by the user's dev-box playtest.
+- **Disconnect Peer click via `dispatchEvent`**: Playwright's `page.click()` actionability check was failing on the flex-positioned menu because the bounding-rect order varies between re-renders during fast lock-state transitions. Dispatching `mousedown→mouseup→click` events directly bypasses the check while still firing the React `onClick` handler.
+
+### Branch hygiene
+
+- Branch: `feat/phase0-pr11.2-pause-menu` (still; PR 11.2.1 is a fixup commit on the same branch, not a separate PR).
+- main: at `2fdda30` (pre-11.2).
+- Worktree: `~/Development/specialists-web-pr11.2/` (alive during work).
+
+### Files / build state at end of session
+
+- All 9 smokes green locally.
+- Typecheck exit 0.
+- Build exit 0 (1m 57s).
+- Bundle delta vs origin/main: ~+5.6 kB raw.
+- Tailscale dev server up on `http://100.95.111.112:5173/`.
+
+### Known carry-forwards (unchanged from PR 11.2)
+
+- **No new wire byte for pause state**: when local tab pauses, peer HUD doesn't know. Phase 0 doesn't care.
+- **Fade-in animation** for the menu is a 5-line follow-up if Kyle wants it.
+- **Real Loadout UI**, **Real Settings panel** — placeholders for now.
+- **Mouse pitch** — orthogonal feature, next after this.
+- **Spectator camera** (PR 11.3 candidate) — unblocks the next two-tab dev session.
+- **60s M2 stress test closure** — no code, just Kyle's playtest, formally closes Milestone 2.
+
+### Next-session priority order
+
+1. **60s M2 stress test** (no code, ~5 min playtest) — formally closes the last Milestone 2 acceptance row.
+2. **PR 11.3 — Dev-box spectator camera** (debug-only). F2 detach, mouse-orbit, click to return. Unblocks the next two-tab dev session.
+3. **PR 11.4 — Mouse pitch** (~30 lines). Bytes 4-5 for pitch, `forwardFromYawPitch` helper.
+4. **Phase 1 — Rust WebTransport server + rollback (PR 11.5+)**. Internet multiplayer is the project's actual goal.
+
+---
+
+## 2026-08-14 — PR 11.2 MERGED. Pause / loadout menu UI. Next session: M2 closure + Phase 1 candidate.
+
+**Status**: PR 11.2 (pause / loadout menu UI + ESC-equals-resume + viewMode preservation) MERGED. All 9 smokes green locally + CI pending re-run. Branch `feat/phase0-pr11.2-pause-menu` will be deleted by GitHub on merge. Code-completed during this session; squash commit will be on main after Kyle approves the PR.
+
+### What PR 11.2 ships
+
+| File | Lines | What |
+|---|---|---|
+| `client/src/ui/PauseMenu.tsx` (NEW, ~150 lines) | +150 | The full-screen React overlay shown when `!isPointerLocked && everLocked`. 4 native `<button>` elements (Resume / Loadout / Settings / Disconnect Peer) + a "PRESSED ESC · return to <last-view>" hint under Resume. |
+| `client/src/engine/inputListener.ts` | +14 | Added `onEscapePressed` hook to `InputHooks` interface + ESC detection in `onKeyDown` (the input listener doesn't read lock state — it just emits the event). Also dropped the stray PR 7 `[input] window mousedown (capture path)` console.log from `window.addEventListener`. |
+| `client/src/engine/chaseCamera.ts` | +14 | New `lastLockedViewMode` field that records the user's last locked viewMode (updated on every V-toggle WHILE locked, restored on `setPointerLock(true)`). Defaults to 0 for the very first lock. |
+| `client/src/engine/scene.ts` | +31 | Wired `onEscapePressed → chase.setPointerLock(true)` in the input listener init. Added `getChaseState()` + `setPointerLock(locked)` to `SceneHandle` so the React layer can read the chase camera's lock state and trigger Resume. |
+| `client/src/ui/App.tsx` | +35 | Imports + mounts `<PauseMenu>` inside `phase === "ready"`. Adds `isPointerLocked` + `everLocked` + `viewMode` to `HudState`, polled at 10Hz via `handle.getChaseState?.()`. Resume wired to `handle.setPointerLock?.(true)`; Disconnect wired to `peer.close()`. Bottom HUD chip updated to mention "ESC to resume". |
+| `client/tools/pause-menu-smoke.mjs` (NEW, ~310 lines) | +310 | 12 assertions: fresh-page menu hidden, locked menu hidden, unlocked menu visible, backdrop pointer-events: auto, Resume pointer-events: auto, backdrop cursor: default, screenshot, click Resume re-locks, ESC re-locks (ESC-equals-resume), Resume preserves prior viewMode (mode 1 → mode 1, not mode 0), Disconnect Peer closes connection, Loadout + Settings disabled, no page errors. |
+| `.github/workflows/ci.yml` | +53 | New `client-pause-menu-smoke` job on port 5183, mirrors the structure of `client-pointer-lock-camera-smoke`. |
+| `docs/SPEC.md` | +88 | Status banner: "PR 17 + PR 11.2 MERGED". PR 11.2 entry in the running PR list. PR 11.2 PR-split-table entry. New "2026-08-14 — PR 11.2 implementation decisions" block (14 bullets). |
+
+**Total**: 8 files, +693 / -10 lines.
+
+### Key implementation decisions (full log in `docs/SPEC.md` §"PR 11.2 implementation decisions")
+
+1. **Menu visibility = `(isPointerLocked === false) && (everLocked === true)`** — same predicate as `chase.isMenuOrbit()` (chaseCamera.ts:319).
+2. **Resume calls `chase.setPointerLock(true)` directly** — re-locks the cursor, restores the user's last viewMode.
+3. **ESC-equals-resume** (Kyle's spec, 2026-08-14). `inputListener.ts` adds `onEscapePressed`; scene.ts wires it to `chase.setPointerLock(true)`. PauseMenu component ALSO attaches a document-level keydown as a fallback. Matches every FPS muscle-memory.
+4. **`lastLockedViewMode` on the chase camera** — set on every V-toggle while locked, restored on `setPointerLock(true)`. PR 11.1's `setPointerLock(true)` always forced mode 0 — fixed here.
+5. **Native `<button>` elements** for keyboard accessibility (Enter/Space + built-in focus).
+6. **Backdrop has `pointer-events: auto`** — explicit `pointer-events: auto` on each button too. The PR 7 HUD-overlay-eats-clicks trap guard via computed-style smoke assertions.
+7. **No animation on show/hide** — `null` vs rendered. Functional, not visual polish.
+8. **Disconnect Peer = `peer.close()`** + no explicit PeerOverlay reset (PeerOverlay reads `peer.connectionState` on its own interval).
+9. **Backdrop cursor = `default`** (visible for clicking affordance).
+10. **`getChaseState()` on SceneHandle** = the new React ↔ engine boundary; single source of truth is the chase camera's internal flags. Polled at 10Hz (same cadence as the rest of the HUD).
+
+### Verification (all anchored to local smoke exit + screenshot)
+
+```
+scene-smoke              PASS (initial + walked screenshots, 0 errors)
+jump-regression-smoke    PASS (peak 3.010, descended to 0.907)
+wallrun-regression-smoke PASS (peak 6.719, descended to 1.065)
+health-regression-smoke  PASS (HP 88 → 0 → 100, respawn 632ms)
+two-tab-smoke            PASS (A frame=357 B frame=190, A hits=1 B hits=0)
+mouse-look-smoke         PASS (0.5 rad delta, wrap verified)
+pointer-lock-camera-smoke PASS (9-state 2-mode V-cycle + menu orbit)
+yaw-wire-format-smoke    PASS (max wrapDiff 0.50 LSB, tolerance 1.5)
+pause-menu-smoke         PASS (12/12 assertions: visibility, pointer-events,
+                                    ESC, viewMode restoration, disconnect,
+                                    no page errors)
+                         Screenshot: client/pause-menu.png (87 KB)
+```
+
+Typecheck clean. Build clean (1m 57s). Bundle 7,048.62 kB → 7,052.19 kB (+3.57 kB raw).
+
+**Playtest status** ⚠️: smoke proves the React + chase-camera code paths. Real-browser ESC → menu → Resume flow + visual feel requires Kyle's dev-box playtest post-merge (same shape as every PR in this stack).
+
+### Decisions made this session (2026-08-14)
+
+- **Pause menu is the right next slice after PR 11.1** (Kyle confirmed in Discord: "11.2 make sense right?") — completes the mouse-look UX loop. The cursor was unlocking into nothing; now it unlocks into a clickable menu.
+- **ESC-equals-resume** (Kyle's feedback mid-session): "i feel like if you hit ESC again, it should take you back to the locked pointer view and resume the last camera (first / overshoulder). This seems like it'd be less likely to miss click out of the UI and close the menu." — implemented.
+- **Disconnect-only (no PeerOverlay state reset)** — alternative discussed in plan open-questions; rejected as ~30 extra lines for non-essential UX. PeerOverlay naturally reflects the new disconnected state.
+- **Use native `<button>` elements** instead of styled `<div>`s — keyboard accessibility + focus indicators come for free.
+
+### Branch hygiene
+
+- Worktree: `~/Development/specialists-web-pr11.2/` (alive during the work, removed after merge by GitHub).
+- Branch: `feat/phase0-pr11.2-pause-menu` (tracks `origin/main`).
+- main: at `2fdda30` (pre-11.2; the merge will be the squash of this PR).
+
+### Files / build state at end of session
+
+- All 9 smokes green locally with screenshot evidence (`client/pause-menu.png`).
+- Typecheck exit 0.
+- Build exit 0 (1m 57s).
+- Bundle: 7,052.19 kB raw / +0.5 kB gzip vs origin/main.
+
+### Carry-forwards (NOT in this PR)
+
+- **No new wire byte for the pause state.** When the local tab pauses, the peer's HUD doesn't know. Phase 0 doesn't care (lockstep keeps ticking regardless), but a Phase 1 follow-up could add a "paused" bit on the wire if the remote starts behaving weirdly during long pauses.
+- **Fade-in animation** for the menu is a 5-line follow-up if Kyle wants it (`opacity` transition on the backdrop div).
+- **Real Loadout UI** — placeholder for now.
+- **Real Settings panel** — placeholder for now.
+- **Mouse pitch** — orthogonal feature, next after this.
+- **Spectator camera** (PR 11.3 candidate) — unblocks the next two-tab dev session. Per the HANDOFF's recommended order: pause menu → 60s M2 closure → spectator camera → mouse pitch.
+- **60s M2 stress test closure** — no code, just Kyle's playtest, formally closes Milestone 2.
+
+### Next-session priority order
+
+1. **60s M2 stress test** (no code, ~5 min playtest) — formally closes the last Milestone 2 acceptance row.
+2. **PR 11.3 — Dev-box spectator camera** (debug-only). F2 detach, mouse-orbit, click to return. Unblocks the next two-tab dev session.
+3. **PR 11.4 — Mouse pitch** (~30 lines). Bytes 4-5 for pitch, `forwardFromYawPitch` helper.
+4. **Phase 1 — Rust WebTransport server + rollback (PR 11.4+)**. Internet multiplayer is the project's actual goal per Kyle's 2026-08-13 re-rank.
+
+---
+
 ## 2026-08-14 — PR 11.1 MERGED. Next session: pick up PR 11.2 (pause menu UI).
 
 **Status**: PR 11.1 (per-player first-person mouse-look) MERGED at https://github.com/klampatech/specialists-web/pull/17 (5 commits: `76cf5f2`, `4fb5417`, `3c91d30`, `c755a99`, `cafe7e0`, `384bd30`). All 8 smokes green on CI. Dev-box two-tab playtest (Kyle, 2026-08-14) confirmed: click-to-lock, cross-client yaw propagation, over-shoulder model rotation, ESC menu orbit visible, V cycling correct, tracer follows current yaw. Closes Milestone 2 acceptance row 10 of 11. Last M2 row (60s two-tab stress test) pending dev-box session time.

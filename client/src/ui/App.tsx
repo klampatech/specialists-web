@@ -21,6 +21,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createScene, type SceneHandle } from "../engine/scene";
 import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
+import { PauseMenu } from "./PauseMenu";
 import { WebRTCPeer, smokeSignalPut, smokeSignalGet } from "../net/peer";
 import { GgnetTransport } from "../net/ggnet";
 
@@ -49,6 +50,17 @@ interface HudState {
   localRespawningMs: number;
   /** PR 10: same for the REMOTE controller. */
   remoteRespawningMs: number;
+  /** PR 11.2: pointer-lock state from the chase camera. Drives the
+   *  pause-menu visibility (visible when `!isPointerLocked && everLocked`,
+   *  which mirrors `chase.isMenuOrbit()`). */
+  isPointerLocked: boolean;
+  /** PR 11.2: true once the user has engaged pointer-lock at least once.
+   *  Used as the gate that prevents the menu from flashing on a fresh
+   *  page that hasn't been interacted with yet. */
+  everLocked: boolean;
+  /** PR 11.2: current locked viewMode (0 first-person, 1 over-shoulder).
+   *  Drives the "return to <view>" subtitle on the Resume button. */
+  viewMode: number;
 }
 
 export function App() {
@@ -69,6 +81,9 @@ export function App() {
     remoteHp: 100,
     localRespawningMs: 0,
     remoteRespawningMs: 0,
+    isPointerLocked: false,
+    everLocked: false,
+    viewMode: 0,
   });
 
   // Construct the WebRTC peer once per mount. The peer lives across scene
@@ -143,6 +158,16 @@ export function App() {
           // PR 10: pull the health snapshot so the HUD chip can render HP
           // + respawn countdown. Cheap read — just two field accesses.
           const health = session.getHealthSnapshot();
+          // PR 11.2: chase-camera state (pointer lock + menu orbit +
+          // viewMode). Drives the pause-menu visibility. Single source of
+          // truth: `handle.getChaseState?.()` returns a snapshot read of
+          // the chase camera's internal flags.
+          const chase = handle.getChaseState?.() ?? {
+            isPointerLocked: false,
+            isMenuOrbit: false,
+            everLocked: false,
+            viewMode: 0,
+          };
           setHud((h) => ({
             ...h,
             frame: session.frame,
@@ -154,6 +179,9 @@ export function App() {
             remoteHp: health.remote.hp,
             localRespawningMs: health.local.respawningMs,
             remoteRespawningMs: health.remote.respawningMs,
+            isPointerLocked: chase.isPointerLocked,
+            everLocked: chase.everLocked,
+            viewMode: chase.viewMode,
           }));
         }, 100);
         // Stash the timer on the scene ref so unmount can clear it.
@@ -224,8 +252,43 @@ export function App() {
             localRespawningMs={hud.localRespawningMs}
             remoteRespawningMs={hud.remoteRespawningMs}
           />
+          {/* PR 11.2: pause / loadout menu overlay. Visible when the
+              pointer is unlocked AND the user has locked at least once
+              (the `everLocked` gate prevents the menu from flashing on a
+              fresh page). Resume closes the menu; Disconnect Peer closes
+              the WebRTC connection. */}
+          <PauseMenu
+            visible={!hud.isPointerLocked && hud.everLocked}
+            onResume={() => {
+              // PR 11.2.3 DEBUG: log every Resume action (whether triggered
+              // by the button click or by ESC-while-menu-visible — they
+              // both funnel through here). Filter on "[PR-11.2.3-DEBUG]".
+              if (typeof console !== "undefined") {
+                console.log(
+                  `[PR-11.2.3-DEBUG] App.onResume() t=${(performance.now() / 1000).toFixed(3)}s → calling handle.setPointerLock(true)`,
+                );
+              }
+              const handle = sceneRef.current;
+              if (!handle) return;
+              handle.setPointerLock?.(true);
+            }}
+            onDisconnect={() => {
+              // Close the peer connection. The PeerOverlay shows its own
+              // host/join UI; closing the connection surfaces the local
+              // "disconnected" state and lets the user re-host or join
+              // a new peer. We don't reset the React state explicitly —
+              // PeerOverlay reads `peer.connectionState` on its own
+              // interval and updates accordingly.
+              try {
+                peer.close();
+              } catch (e) {
+                console.error("[pause-menu] peer.close failed:", e);
+              }
+            }}
+            viewMode={hud.viewMode}
+          />
           <OverlayBanner bottom={16} size="0.7rem" opacity={0.35}>
-            Phase 0 PR 10 — health & respawn (LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged
+            Phase 0 PR 11.2 — pause menu (ESC to resume · LMB fire · RMB melee · T bullet time) · WASD/Space/Shift/C/Q/V unchanged
           </OverlayBanner>
         </>
       )}

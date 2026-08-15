@@ -92,6 +92,24 @@ export interface SceneHandle {
   getGameSession?: () => GameSession | null;
   /** Snapshot of the most recent LOCAL InputState — used by the HUD bullet-time chip. */
   getInputState?: () => InputState | null;
+  /** PR 11.2: chase camera state — pointer lock + menu-orbit. Used by
+   *  the React HUD + pause-menu layer to know when to show the menu.
+   *  Single source of truth: the chase camera's internal flags. */
+  getChaseState?: () => {
+    isPointerLocked: boolean;
+    isMenuOrbit: boolean;
+    /** True once the user has locked at least once. Drives the
+     *  everLocked gate on the pause-menu visibility. */
+    everLocked: boolean;
+    /** Current locked viewMode (0 first-person, 1 over-shoulder). */
+    viewMode: number;
+  };
+  /** PR 11.2: programmatic Resume action — re-locks the pointer. Same
+   *  effect as a real `requestPointerLock()` (well, almost — the user
+   *  gesture requirement is bypassed here, so this only works inside a
+   *  user-initiated event handler or the smoke; the browser will refuse
+   *  in random places). The chase camera handles viewMode restoration. */
+  setPointerLock?: (locked: boolean) => void;
 }
 
 /** Try WebGPU first; fall back to WebGL2 if anything throws during init. */
@@ -376,8 +394,11 @@ export async function createScene(
     // directly so the camera-render smoke can test the locked path
     // without depending on headless Chromium honoring
     // requestPointerLock. Same DEV-only gate as __mouseLookProbe.
+    // PR 11.2.3: use setPointerLockImmediate (bypass-debounce variant)
+    // so rapid smoke lock-flips don't get suppressed by the production
+    // lock-then-unlock debounce window.
     (window as unknown as { __pointerLockToggle?: (locked: boolean) => void }).__pointerLockToggle =
-      (locked: boolean) => chase.setPointerLock(locked);
+      (locked: boolean) => chase.setPointerLockImmediate(locked);
     // PR 11.1.1: chase-camera toggle probe. Calls chase.toggle() so the
     // smoke can advance the viewMode state machine without dispatching
     // a synthetic V key event. Same DEV-only gate.
@@ -462,6 +483,77 @@ export async function createScene(
     isFirstPerson: () => chase.isFirstPerson(),
     toggleCamera: () => chase.toggle(),
     resetCharacter: () => character.reset(),
+    // PR 11.2: chase state snapshot for the React HUD + pause menu. The
+    // chase camera is the single source of truth for pointer-lock + menu
+    // orbit state; the React layer polls this at ~10Hz (same cadence as
+    // the rest of the HUD) and renders accordingly. `everLocked` is
+    // exposed so the React layer can implement the `everLocked === true`
+    // gate that prevents the menu from flashing on a fresh page.
+    getChaseState: () => ({
+      isPointerLocked: chase.isPointerLocked(),
+      isMenuOrbit: chase.isMenuOrbit(),
+      // `everLocked` is internal to chaseCamera — we surface it via the
+      // `isMenuOrbit` shape (`isMenuOrbit === true` implies `everLocked`)
+      // plus `chase.isPointerLocked()` (true when locked, regardless of
+      // everLocked). The React layer derives `everLocked` as
+      // `isPointerLocked || isMenuOrbit`. This avoids adding a new
+      // accessor to the chase camera for the same logic.
+      everLocked: chase.isPointerLocked() || chase.isMenuOrbit(),
+      viewMode: chase.getViewMode(),
+    }),
+    // PR 11.2.1 fix (Kyle playtest 2026-08-14): programmatic Resume action —
+    // re-locks the pointer. Routes through the BROWSER's `requestPointerLock`
+    // / `exitPointerLock` APIs (not just flipping the internal flag).
+    // The browser fires `pointerlockchange` either way; the existing
+    // `onPointerLockChange` listener forwards to `chase.setPointerLock`,
+    // which is the single source of truth. Works inside button onClick
+    // handlers (user-activation present). May silently fail outside user-
+    // activation (e.g., setTimeout) — that's correct browser behavior.
+    // We wrap in try-catch because some browsers throw on document.exitPointerLock
+    // when not in pointer-lock (the user may have already exited via ESC).
+    setPointerLock: (locked: boolean) => {
+      // PR 11.2.3 DEBUG: log every browser-API call (requestPointerLock /
+      // exitPointerLock) with timestamp + direction. Filter on
+      // "[PR-11.2.3-DEBUG]" in DevTools.
+      if (typeof console !== "undefined") {
+        console.log(
+          `[PR-11.2.3-DEBUG] scene.setPointerLock(${locked}) t=${(performance.now() / 1000).toFixed(3)}s → calling ${locked ? "canvas.requestPointerLock()" : "document.exitPointerLock()"}`,
+        );
+      }
+      try {
+        if (locked) {
+          canvas.requestPointerLock();
+          // PR 11.2.3 (Kyle playtest 2026-08-14 evening — debug log
+          // trace): Chrome auto-releases pointer-lock after ~1.5s of
+          // mouse inactivity (the user's tab is foreground, the user
+          // just clicked Resume, but they may not move the mouse for a
+          // second while orienting). The browser then fires
+          // `pointerlockchange(false)` and the menu re-shows. Dispatch
+          // a zero-delta mousemove synchronously after the lock request
+          // succeeds to refresh Chrome's "is the user still engaged"
+          // counter. movementX/Y = 0 so this does NOT rotate the camera.
+          // The mouse-move handler `onMouseMoveLocked` early-returns on
+          // movementX === 0, so this is a no-op for yaw.
+          canvas.dispatchEvent(
+            new MouseEvent("mousemove", {
+              bubbles: true,
+              cancelable: true,
+              movementX: 0,
+              movementY: 0,
+            }),
+          );
+        } else {
+          document.exitPointerLock();
+        }
+      } catch (e) {
+        // Silently ignore — the browser is the source of truth for
+        // pointer-lock state. If the call fails, the existing
+        // pointerlockchange listener will reflect the actual state.
+        if (typeof console !== "undefined") {
+          console.warn(`[PR 11.2.1] pointerlock API call failed (${locked ? "lock" : "unlock"}):`, e);
+        }
+      }
+    },
   };
 
   if (gameSession) {

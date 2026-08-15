@@ -553,6 +553,57 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  client-pause-menu-smoke:
+    name: client — pause menu smoke (PR 11.2)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server (port 5183)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5183 > /tmp/vite-dev9.log 2>&1 &
+          echo $! > /tmp/vite-dev9.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5183/ > /dev/null; then
+              echo "Dev server (pause menu smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5183/ > /dev/null; then
+            echo "::error::Dev server (pause menu smoke) did not come up in 60s"
+            cat /tmp/vite-dev9.log
+            exit 1
+          fi
+      - name: Run pause menu smoke
+        run: node ./tools/pause-menu-smoke.mjs
+        env:
+          PAUSE_MENU_SMOKE_URL: http://localhost:5183/
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pause-menu-screenshot
+          path: client/pause-menu.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev9.pid ]]; then
+            kill "$(cat /tmp/vite-dev9.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   spec-canonical:
     name: spec layout — canonical at docs/SPEC.md
     runs-on: ubuntu-latest
