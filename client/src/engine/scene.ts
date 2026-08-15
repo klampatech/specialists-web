@@ -394,8 +394,11 @@ export async function createScene(
     // directly so the camera-render smoke can test the locked path
     // without depending on headless Chromium honoring
     // requestPointerLock. Same DEV-only gate as __mouseLookProbe.
+    // PR 11.2.3: use setPointerLockImmediate (bypass-debounce variant)
+    // so rapid smoke lock-flips don't get suppressed by the production
+    // lock-then-unlock debounce window.
     (window as unknown as { __pointerLockToggle?: (locked: boolean) => void }).__pointerLockToggle =
-      (locked: boolean) => chase.setPointerLock(locked);
+      (locked: boolean) => chase.setPointerLockImmediate(locked);
     // PR 11.1.1: chase-camera toggle probe. Calls chase.toggle() so the
     // smoke can advance the viewMode state machine without dispatching
     // a synthetic V key event. Same DEV-only gate.
@@ -520,6 +523,25 @@ export async function createScene(
       try {
         if (locked) {
           canvas.requestPointerLock();
+          // PR 11.2.3 (Kyle playtest 2026-08-14 evening — debug log
+          // trace): Chrome auto-releases pointer-lock after ~1.5s of
+          // mouse inactivity (the user's tab is foreground, the user
+          // just clicked Resume, but they may not move the mouse for a
+          // second while orienting). The browser then fires
+          // `pointerlockchange(false)` and the menu re-shows. Dispatch
+          // a zero-delta mousemove synchronously after the lock request
+          // succeeds to refresh Chrome's "is the user still engaged"
+          // counter. movementX/Y = 0 so this does NOT rotate the camera.
+          // The mouse-move handler `onMouseMoveLocked` early-returns on
+          // movementX === 0, so this is a no-op for yaw.
+          canvas.dispatchEvent(
+            new MouseEvent("mousemove", {
+              bubbles: true,
+              cancelable: true,
+              movementX: 0,
+              movementY: 0,
+            }),
+          );
         } else {
           document.exitPointerLock();
         }
