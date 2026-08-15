@@ -46,8 +46,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5173 > /tmp/vite-dev.log 2>&1 &
@@ -113,8 +130,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot second dev server (port 5174)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5174 > /tmp/vite-dev2.log 2>&1 &
@@ -182,8 +216,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5175)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5175 > /tmp/vite-dev3.log 2>&1 &
@@ -248,8 +299,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5176)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5176 > /tmp/vite-dev4.log 2>&1 &
@@ -312,8 +380,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5177)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5177 > /tmp/vite-dev5.log 2>&1 &
@@ -380,8 +465,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5178)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5178 > /tmp/vite-dev6.log 2>&1 &
@@ -448,8 +550,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5182)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5182 > /tmp/vite-dev7.log 2>&1 &
@@ -522,8 +641,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5184)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5184 > /tmp/vite-dev-pitch.log 2>&1 &
@@ -593,8 +729,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5185)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5185 > /tmp/vite-dev-pitchwire.log 2>&1 &
@@ -669,8 +822,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5186)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5186 > /tmp/vite-dev-pitch2tab.log 2>&1 &
@@ -751,8 +921,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5181)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5181 > /tmp/vite-dev8.log 2>&1 &
@@ -802,8 +989,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5183)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5183 > /tmp/vite-dev9.log 2>&1 &
@@ -854,8 +1058,25 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
       - run: npm ci
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
+        # (apt install prompts for password). The system deps are already
+        # installed on the runner (Chromium runs fine for all 14 smokes).
+        # The Playwright cache below restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
       - name: Boot dev server (port 5187)
         run: |
           nohup npm run dev -- --host 0.0.0.0 --port 5187 > /tmp/vite-dev10.log 2>&1 &
