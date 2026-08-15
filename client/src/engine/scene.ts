@@ -103,6 +103,10 @@ export interface SceneHandle {
     everLocked: boolean;
     /** Current locked viewMode (0 first-person, 1 over-shoulder). */
     viewMode: number;
+    /** PR 11.3: current pitch (radians, [-π/2, +π/2]). Currently
+     *  not displayed in the HUD; exposed for forward-compat if the
+     *  pause menu or HUD ever wants to show a pitch indicator. */
+    pitchRadians: number;
   };
   /** PR 11.2: programmatic Resume action — re-locks the pointer. Same
    *  effect as a real `requestPointerLock()` (well, almost — the user
@@ -323,6 +327,11 @@ export async function createScene(
     // between the first-person 1:1 render path and the chase fallback.
     onPointerLockChange: (locked) => chase.setPointerLock(locked),
     onYawDelta: (delta) => chase.applyYawDelta(delta),
+    // PR 11.3: pitch delta from locked mousemove (movementY). Same
+    // sensitivity as yaw. The chase camera clamps the result to
+    // [-π/2, +π/2] so users see hard limits at the physical pitch
+    // boundary (every FPS behavior).
+    onPitchDelta: (delta) => chase.applyPitchDelta(delta),
   }, canvas);  // PR 7.3: bind mouse handlers directly to the canvas so clicks
                // always reach the listener regardless of Babylon's attachControl
                // pointer-capture behavior.
@@ -342,6 +351,13 @@ export async function createScene(
     // the wire packet here carries THIS client's yaw to the peer. The
     // session's tick() will read this yaw via `state.yawRadians`.
     state.yawRadians = chase.getYaw();
+    // PR 11.3: same lockstep argument as yaw (PR 11.1). Pitch lives on
+    // bytes 4-5 of the wire packet; populating from chase.getPitch() each
+    // frame means the peer decodes the same value on the same frame
+    // → identical look directions → determinism preserved. The
+    // controller's setPitch() applies the decoded pitch to the local
+    // controller on frame-N+1 (consistent with how yaw is applied).
+    state.pitchRadians = chase.getPitch();
     if (gameSession) {
       // Multiplayer path: the session drives both controllers, applies the
       // stunt pose, and pushes the visual transforms into each rig's root.
@@ -390,6 +406,15 @@ export async function createScene(
       (deltaRadians: number) => chase.applyYawDelta(deltaRadians);
     (window as unknown as { __mouseLookProbe?: () => number }).__mouseLookProbe = () =>
       chase.getYaw();
+    // PR 11.3: smoke-only accessor for the mouse-pitch smoke. Returns
+    // the local pitch in radians ([-π/2, +π/2]) so the smoke can
+    // dispatch a synthetic pitch-delta (via window.__applyPitchDelta)
+    // and assert the pitch changed + that the camera rotated. Same
+    // DEV-only gate as __applyYawDelta / __mouseLookProbe.
+    (window as unknown as { __applyPitchDelta?: (deltaRadians: number) => void }).__applyPitchDelta =
+      (deltaRadians: number) => chase.applyPitchDelta(deltaRadians);
+    (window as unknown as { __pitchLookProbe?: () => number }).__pitchLookProbe = () =>
+      chase.getPitch();
     // PR 11.1: pointer-lock toggle probe. Calls chase.setPointerLock
     // directly so the camera-render smoke can test the locked path
     // without depending on headless Chromium honoring
@@ -427,8 +452,10 @@ export async function createScene(
       menuAngle: number;
       cameraPosition: { x: number; y: number; z: number };
       cameraRotationY: number;
+      cameraRotationX: number;
       characterPosition: { x: number; y: number; z: number };
       characterYaw: number;
+      pitchRadians: number;
     } }).__chaseCameraProbe = () => ({
       isPointerLocked: chase.isPointerLocked(),
       viewMode: chase.getViewMode(),
@@ -440,6 +467,9 @@ export async function createScene(
         z: chase.camera.position.z,
       },
       cameraRotationY: chase.camera.rotation.y,
+      // PR 11.3: expose camera.rotation.x so smokes can assert the
+      // pitch tilt is being applied in the locked render branches.
+      cameraRotationX: chase.camera.rotation.x,
       characterPosition: {
         x: character.state.position.x,
         y: character.state.position.y,
@@ -451,6 +481,11 @@ export async function createScene(
         const cosY = 1 - 2 * (q.y * q.y + q.x * q.x);
         return Math.atan2(sinY, cosY);
       })(),
+      // PR 11.3: current pitch from the chase camera. Asserts in the
+      // pointer-lock-camera smoke verify this matches the
+      // __pitchLookProbe() reading + that cameraRotationX is its
+      // negation (Babylon sign convention).
+      pitchRadians: chase.getPitch(),
     });
     // PR 10: smoke-only accessor for the health-regression test. Teleports
     // the REMOTE rig onto a known position so every shot in the smoke
@@ -500,6 +535,11 @@ export async function createScene(
       // accessor to the chase camera for the same logic.
       everLocked: chase.isPointerLocked() || chase.isMenuOrbit(),
       viewMode: chase.getViewMode(),
+      // PR 11.3: expose pitch alongside viewMode. The pause menu
+      // doesn't render pitch today, but the React layer can read it
+      // via the existing 10Hz HUD poll if needed (e.g., a future
+      // pitch indicator chip).
+      pitchRadians: chase.getPitch(),
     }),
     // PR 11.2.1 fix (Kyle playtest 2026-08-14): programmatic Resume action —
     // re-locks the pointer. Routes through the BROWSER's `requestPointerLock`

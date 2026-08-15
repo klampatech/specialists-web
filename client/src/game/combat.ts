@@ -121,31 +121,52 @@ function buildCombatPickPredicate(localPrefix: string): (mesh: AbstractMesh) => 
 
 // ---------------------------------------------------------------------------
 // -------------------------------------------------------------------
-// Forward vector from yaw
+// Forward vector from yaw + pitch (PR 7+11.1+11.3)
 // -------------------------------------------------------------------
 
 /**
- * Compute the local-forward direction (XZ-plane unit vector) from the
- * current frame's `input.yawRadians`. PR 7 originally hardcoded yaw=0
- * because no mouse-look existed; PR 11.1 added yaw on the wire, so we
- * now derive forward from the input the user just produced (frame-N).
+ * Compute the 3D forward direction (unit vector) from yaw AND pitch.
+ * PR 7 originally hardcoded yaw=0 because no mouse-look existed; PR 11.1
+ * added yaw on the wire; PR 11.3 adds pitch on the wire (bytes 4-5).
  *
- * Why `input.yawRadians` and not `localController.state.rotation`:
- *   - `input.yawRadians` is what the user just input (frame-N) — zero lag.
+ *   yaw rotates in the XZ plane (around the world Y axis): yaw=0 means
+ *     "facing +Z", yaw=π/2 means "facing +X".
+ *   pitch rotates in the local YZ plane (around the local X axis):
+ *     pitch=0 means level, +π/2 means "facing +Y" (straight up),
+ *     -π/2 means "facing -Y" (straight down).
+ *
+ * Spherical-ish formula (yaw-pitch roll, no roll):
+ *   forwardX = sin(yaw) * cos(pitch)
+ *   forwardY = sin(pitch)
+ *   forwardZ = cos(yaw) * cos(pitch)
+ *
+ * This is the same parameterization every FPS uses for camera/aim
+ * direction. It's a unit vector for any (yaw, pitch).
+ *
+ * Why `input.yawRadians` / `input.pitchRadians` and not
+ * `localController.state.rotation`:
+ *   - `input.yawRadians` and `input.pitchRadians` are what the user just
+ *     input (frame-N) — zero lag.
  *   - `localController.state.rotation` lags by 1-2 frames because:
  *       (a) encodeInput happens on frame-N
- *       (b) decodeInput + setYaw happens on frame-N+1 (the next tick)
+ *       (b) decodeInput + setYaw / setPitch happens on frame-N+1 (the next tick)
  *       (c) character.state.rotation reflects frame-N+1 yaw
  *     So the tracer would fire in the direction the character USED TO
  *     be facing, which is exactly the "tracer fires where I used to
  *     be facing" bug Kyle reported.
  *   - The tracer is a render-only side-effect (the DualPistolResult is
- *     not fed back to the wire), so using the input yaw here is
+ *     not fed back to the wire), so using the input yaw/pitch here is
  *     lockstep-safe.
  */
-function forwardFromYaw(yawRadians: number): Vector3 {
-  return new Vector3(Math.sin(yawRadians), 0, Math.cos(yawRadians));
+function forwardFromYawPitch(yawRadians: number, pitchRadians: number): Vector3 {
+  const cp = Math.cos(pitchRadians);
+  return new Vector3(
+    Math.sin(yawRadians) * cp,
+    Math.sin(pitchRadians),
+    Math.cos(yawRadians) * cp,
+  );
 }
+
 
 /** Chest-height ray origin: capsule centre plus a quarter-height offset up. */
 function chestPosition(controller: CharacterController): Vector3 {
@@ -185,10 +206,14 @@ export function dualPistolShoot(
   scene: Scene,
 ): DualPistolResult {
   const origin = chestPosition(localController);
-  // PR 11.1: derive forward from input.yawRadians (the current frame's
-  // user input). See forwardFromYaw() for why this is frame-accurate.
+  // PR 11.1 + PR 11.3: derive forward from input.yawRadians AND
+  // input.pitchRadians (the current frame's user input). See
+  // forwardFromYawPitch() for why this is frame-accurate. Pre-PR-11.3
+  // input.pitchRadians is undefined; defaulting to 0 keeps the ray
+  // horizontal (level aim) for the upgrade window.
   const yaw = input.yawRadians ?? 0;
-  const forward = forwardFromYaw(yaw);
+  const pitch = input.pitchRadians ?? 0;
+  const forward = forwardFromYawPitch(yaw, pitch);
   const range = COMBAT.dualPistol.maxRangeMeters;
   const rayEnd = origin.add(forward.scale(range));
   const ray = new Ray(origin, forward, range);
@@ -240,9 +265,13 @@ export function meleeSwing(
   remoteController: CharacterController,
 ): MeleeResult {
   const attackerOrigin = chestPosition(localController);
-  // PR 11.1: derive forward from input.yawRadians, same as dualPistolShoot.
+  // PR 11.1 + PR 11.3: derive forward from input.yawRadians AND
+  // input.pitchRadians (3D direction), same as dualPistolShoot. The
+  // melee cone is a 60° cone around forward; pitch tilts the cone
+  // up/down so aiming at a higher / lower target actually hits.
   const yaw = input.yawRadians ?? 0;
-  const forward = forwardFromYaw(yaw);
+  const pitch = input.pitchRadians ?? 0;
+  const forward = forwardFromYawPitch(yaw, pitch);
   const targetPos = remoteController.state.position.clone();
 
   const inCone = isWithinMeleeCone(attackerOrigin, forward, targetPos);

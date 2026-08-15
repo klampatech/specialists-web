@@ -485,6 +485,151 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  # Phase 0 / PR 11.3: per-player mouse-pitch smoke. Verifies that
+  # the chase camera's pitch accumulator responds to pitch-delta
+  # updates (the same code path the locked-mousemove listener uses
+  # when dispatching on `e.movementY * sensitivity`). Headless
+  # Chromium doesn't always honor requestPointerLock, so the smoke
+  # uses the DEV-only `window.__applyPitchDelta` accessor (scene.ts)
+  # to drive the pitch directly — this exercises the wire-format
+  # change (pitch on bytes 4-5 of INPUT_SIZE=12) AND the chase-
+  # camera pitch accumulator WITHOUT depending on the browser
+  # actually granting pointer-lock. The full pointer-lock UX
+  # requires a dev-box two-tab playtest (Kyle does manually after
+  # the merge).
+  #
+  # The smoke asserts the regression guard for the wrap-vs-clamp
+  # gotcha: applyPitchDelta CLAMPS pitch to [±π/2], not WRAPS. Trying
+  # to push past the limit should hold at ±π/2 (not flip the view).
+  # The pointer-lock-camera smoke covers the camera-render side; this
+  # smoke covers the chase camera's pitch state machine.
+  #
+  # Why a separate job: this is the regression guard for the pitch
+  # surface (clamp vs. wrap). The pitch wire-format smoke guards the
+  # bytes; this guards the pitch accumulator. Port 5184 so it stays
+  # independent of all the other smoke jobs.
+  client-mouse-pitch-smoke:
+    name: client — mouse-pitch smoke (PR 11.3)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server (port 5184)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5184 > /tmp/vite-dev-pitch.log 2>&1 &
+          echo $! > /tmp/vite-dev-pitch.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5184/ > /dev/null; then
+              echo "Dev server (mouse-pitch smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5184/ > /dev/null; then
+            echo "::error::Dev server (mouse-pitch smoke) did not come up in 60s"
+            cat /tmp/vite-dev-pitch.log
+            exit 1
+          fi
+      - name: Run mouse-pitch smoke
+        run: node ./tools/mouse-pitch-smoke.mjs
+        env:
+          MOUSE_PITCH_SMOKE_URL: http://localhost:5184/
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mouse-pitch-screenshot
+          path: client/mouse-pitch.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev-pitch.pid ]]; then
+            kill "$(cat /tmp/vite-dev-pitch.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
+  # Phase 0 / PR 11.3: pitch wire-format determinism smoke. Verifies
+  # that `encodeInput(s)` and `decodeInput(b)` round-trip pitch
+  # correctly (encode → decode → same pitch, within 1.5 LSB
+  # tolerance). This is the load-bearing regression guard for the
+  # wire-format change (INPUT_SIZE 10 → 12, pitch on bytes 4-5
+  # little-endian uint16). Tests 7 representative pitch values
+  # (0, 0.3, -0.5, π/4, ±π/2, just-under-π/2) to cover the
+  # clamp-arithmetic edge cases + a backward-compat assertion that
+  # a packet with bytes 4-5 = 0 decodes as pitchRadians = 0 (level),
+  # NOT -π/2 (the linear formula's would-be wrong default).
+  #
+  # Why a separate job: catches off-by-one errors in pitchToBits /
+  # decodeInput's byte-shifting + the backward-compat shim. The
+  # lockstep layer can't run this test in CI because headless
+  # Chromium can't establish the ICE connection (TURN unreachable
+  # from the GH runner); the wire-format itself is testable without
+  # WebRTC. The runtime+WebRTC layer is verified by the existing
+  # `client-two-tab-smoke` + manual dev-box playtests.
+  #
+  # Port 5185 so it stays independent of all the other smoke jobs.
+  client-pitch-wire-format-smoke:
+    name: client — pitch wire-format smoke (PR 11.3)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Boot dev server (port 5185)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5185 > /tmp/vite-dev-pitchwire.log 2>&1 &
+          echo $! > /tmp/vite-dev-pitchwire.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5185/ > /dev/null; then
+              echo "Dev server (pitch wire-format smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5185/ > /dev/null; then
+            echo "::error::Dev server (pitch wire-format smoke) did not come up in 60s"
+            cat /tmp/vite-dev-pitchwire.log
+            exit 1
+          fi
+      - name: Run pitch wire-format smoke
+        run: node ./tools/pitch-wire-format-smoke.mjs
+        env:
+          PITCH_SMOKE_URL: http://localhost:5185/
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pitch-wire-format-screenshot
+          path: client/pitch-wire-format.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev-pitchwire.pid ]]; then
+            kill "$(cat /tmp/vite-dev-pitchwire.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   # Phase 0 / PR 11.1: pointer-lock camera-render smoke. Verifies that
   # the chase camera's render path honors the pointer-lock state:
   #   - When pointerLocked, camera.position === character.position + firstPersonOffset
@@ -501,9 +646,16 @@ jobs:
   # regressions like "the chase lerp accidentally runs while locked"
   # (camera would float away from the character).
   #
+  # PR 11.3 additions: the existing 9-state 2-mode V-cycle assertions
+  # were extended with pitch-tilt assertions — verifies that
+  # chaseCameraProbe().pitchRadians is reflected in
+  # camera.rotation.x as `-pitchRadians` (Babylon Y-up sign convention:
+  # positive rotation.x looks DOWN), in both 1st-person (mode 0) and
+  # over-shoulder (mode 1) locked views.
+  #
   # Port 5181 so it stays independent of all the other smoke jobs.
   client-pointer-lock-camera-smoke:
-    name: client — pointer-lock camera smoke (PR 11.1)
+    name: client — pointer-lock camera smoke (PR 11.1, PR 11.3 pitch added)
     runs-on: ubuntu-latest
     defaults:
       run:

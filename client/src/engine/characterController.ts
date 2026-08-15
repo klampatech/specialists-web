@@ -55,6 +55,15 @@ export interface InputState {
    *  "don't touch yaw" (used by single-tab tests + the upgrade window
    *  when bytes 2-3 haven't been wired yet). */
   yawRadians?: number;
+  /** PR 11.3: per-frame pitch in radians ([-π/2, +π/2]). Sourced
+   *  from the wire via `decodeInput` (bytes 4-5). Mirrors `yawRadians`:
+   *  both go on the wire so both clients compute identical look
+   *  directions on the same frame. Used by:
+   *    - chase camera: 1st-person + over-shoulder tilt
+   *    - combat.ts: `forwardFromYawPitch` for tracer raycasts + melee cone
+   *  `undefined` means "don't touch pitch" (used by single-tab tests +
+   *  the pre-PR-11.3 upgrade window when bytes 4-5 haven't been wired). */
+  pitchRadians?: number;
 }
 
 /** Snapshot the controller publishes each frame for the visual + camera. */
@@ -149,6 +158,11 @@ export class CharacterController {
   private readonly up: Vector3 = new Vector3(0, 1, 0);
   private readonly baseDynamicFriction: number = BASE_DYNAMIC_FRICTION;
   private yawRadians: number = 0;
+  /** PR 11.3: pitch state ([-π/2, +π/2]). Read by combat.ts for
+   *  the 3D forward vector + by chase camera for the vertical tilt.
+   *  Updated via setPitch() called from update() when input.pitchRadians
+   *  is defined. */
+  private pitchRadians: number = 0;
   private stunt: "none" | "dive" | "slide" | "wallrun" = "none";
   private stuntEndsAtMs: number = 0;
   /** True for the single update tick after a new stunt becomes active. */
@@ -194,6 +208,8 @@ export class CharacterController {
     this.havok.setPosition(this.startPosition.clone());
     this.havok.setVelocity(new Vector3(0, 0, 0));
     this.yawRadians = 0;
+    // PR 11.3: reset pitch to level alongside yaw.
+    this.pitchRadians = 0;
     this.stunt = "none";
     this.stuntEndsAtMs = 0;
     this.stuntJustEntered = false;
@@ -241,6 +257,8 @@ export class CharacterController {
     this.wasWallrunPressedLast = false;
     this.lastWallrunEndedAtMs = 0;
     this.yawRadians = 0;
+    // PR 11.3: reset pitch to level alongside yaw.
+    this.pitchRadians = 0;
     this.state.rotation.copyFromFloats(0, 0, 0, 1);
     this.havok.dynamicFriction = this.baseDynamicFriction;
     this.havok.staticFriction = 0;
@@ -251,6 +269,23 @@ export class CharacterController {
   public setYaw(radians: number): void {
     this.yawRadians = radians;
     Quaternion.RotationAxisToRef(this.up, radians, this.state.rotation);
+  }
+
+  /**
+   * PR 11.3: store the current pitch (radians, [-π/2, +π/2]).
+   * The controller's `state.rotation` stays yaw-only (a single-axis
+   * Quaternion around Y) — the chase camera and combat code read the
+   * stored `pitchRadians` separately. Clamped to [±π/2] defensively
+   * so float drift at the limits can't leak out.
+   */
+  public setPitch(radians: number): void {
+    const HALF_PI = Math.PI / 2;
+    this.pitchRadians = Math.max(-HALF_PI, Math.min(HALF_PI, radians));
+  }
+
+  /** PR 11.3: current pitch (radians, [-π/2, +π/2]) for read access. */
+  public getPitch(): number {
+    return this.pitchRadians;
   }
 
   /** Drive one frame of controller state. */
@@ -267,6 +302,17 @@ export class CharacterController {
     //     the upgrade window use this.
     if (input.yawRadians !== undefined) {
       this.setYaw(input.yawRadians);
+    }
+
+    // 1a.1 PR 11.3: apply the per-frame pitch (if supplied). Stored on
+    //     the controller for read by the chase camera + combat code.
+    //     Pitch does NOT affect the WASD projection (planar XZ only) —
+    //     it only affects vertical aim (tracer direction + camera tilt).
+    //     Same lockstep argument as yaw above — pitch arrives on bytes
+    //     4-5 of the wire packet, so both clients see the same value on
+    //     the same frame. `undefined` means "leave pitch alone".
+    if (input.pitchRadians !== undefined) {
+      this.setPitch(input.pitchRadians);
     }
 
     // 2. Compute the desired planar velocity in world space from the
