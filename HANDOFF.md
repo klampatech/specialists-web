@@ -4,28 +4,34 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
-## 2026-08-15 — PR 11.2 series: residual ESC-equals-resume flicker tabled as known issue. Awaiting Kyle's merge.
+## 2026-08-15 — PR 11.2 series MERGED on `main` (squash commit `80b2de1`). Pause / loadout menu UI live; ESC-equals-resume flicker tabled as known issue.
 
-**Status**: PR 11.2 + 11.2.1 + 11.2.2 + 11.2.3 stacked on PR #18 (`feat/phase0-pr11.2-pause-menu`), all 11 CI checks green, all 9 smokes green locally. **Awaiting Kyle's merge decision.**
+**Status**: PR #18 (`feat/phase0-pr11.2-pause-menu`) MERGED at https://github.com/klampatech/specialists-web/pull/18 (squash commit `80b2de1`, merged 2026-08-15 13:32 UTC). All 11 CI checks green. Pause / loadout menu UI shipped across four stack commits folded into the single squash: PR 11.2 (initial UI), PR 11.2.1 (over-shoulder sign fix + browser pointer-lock API), PR 11.2.2 (single-handler ESC refactor), PR 11.2.3 (lock-then-unlock debounce + synthetic-mousemove anti auto-release + debug instrumentation).
 
-**Decision (Kyle, 2026-08-15)**: The PR 11.2.3 root-cause narrative — "Bug B = lock-then-unlock race, 64ms after lock" + "Bug A = Chrome 1.5s mouse-inactivity auto-release" — was a *candidate hypothesis* based on the debug-log trace, not a confirmed root cause. Kyle is not convinced the debounce + synthetic-mousemove fixes are addressing the actual cause. **Table this as a known issue.** The Resume button (from the UI) behaves correctly and is the supported UX path; the residual ESC-equals-resume flicker is a UX papercut, not a blocker. Ship the PR.
+**Resume button works correctly** — it's the supported UX path. Routes through `onResume()` → React `<button>` `onClick` → `handle.setPointerLock(true)` → `canvas.requestPointerLock()` synchronously.
 
-**What's in the docs now** (per `docs/SPEC.md`):
-- **Status banner** (`SPEC.md:7`): rewritten to drop the "root cause + fix landed" framing.
-- **PR 11.2 series entry** (`SPEC.md:24`): consolidated four-stack description + cross-reference to "Known issues".
-- **New `## Known issues` section** (`SPEC.md:582`): ESC-equals-resume flicker documented with symptom + workaround (Resume button) + why tabled + severity (UX papercut).
-- **Open Questions section** (`SPEC.md:609`): PR 11.2.3 root-cause bullet removed (it was a question, not an issue); the section now holds only real open questions (game name, mobile, voice chat, account persistence, modding).
-- **Working with this doc** (`SPEC.md:433`): added "Known issues" routing rule (log known defects in the Known Issues section when shipping a workaround-deferred behavior).
+**Residual known issue (tabled per Kyle's 2026-08-15 call)**: pressing ESC while the menu is visible to resume occasionally flickers (menu briefly hides then re-shows). The PR 11.2.3 debounce + synthetic-mousemove are *candidate* fixes for two inferred root causes (lock-then-unlock race + Chrome 1.5s auto-release), not confirmed root-cause fixes. Resume from the UI button works around the issue. Full record in `docs/SPEC.md` §"Known issues" + §"2026-08-14 — PR 11.2 implementation decisions". The 5-site `[PR-11.2.3-DEBUG]` instrumentation remains in place for future investigation.
 
-**Debug instrumentation**: The 5-site `[PR-11.2.3-DEBUG]` instrumentation remains in place (in `onPointerLockChange`, the PauseMenu `useEffect` keydown, `chase.setPointerLock(true|false)`, and `scene.ts`'s `setPointerLock`). Not blocking; if/when this issue is reopened, the logs are already there.
+**Files shipped (cumulative across PR 11.2 + 11.2.1 + 11.2.2 + 11.2.3)**:
+- **New**: 2 (`client/src/ui/PauseMenu.tsx`, `client/tools/pause-menu-smoke.mjs`)
+- **Modified**: 8 (`.github/workflows/ci.yml`, `.gitignore`, `HANDOFF.md`, `docs/SPEC.md`, `client/src/engine/chaseCamera.ts`, `client/src/engine/inputListener.ts`, `client/src/engine/scene.ts`, `client/src/ui/App.tsx`)
+- Bundle: 7,048.62 kB → 7,052.19 kB (+3.57 kB raw / ~+0.5 kB gzip)
+- +1235 / -60 lines (13 files)
 
-**Code changes left on the branch**: unchanged. PR 11.2.3's debounce + synthetic-mousemove are still in `chaseCamera.ts` + `scene.ts`; they may or may not be addressing the actual cause, but they're not actively harmful.
+**Decisions captured in this PR**: PR 11.2.1 over-shoulder sign fix; PR 11.2.2 single-handler ESC architecture (inputListener-side ESC removed); PR 11.2.3 lock-then-unlock debounce + synthetic-mousemove (candidate fixes, root cause unconfirmed); 2026-08-15 table-as-known-issue call.
 
-**Next session** (after Kyle merges PR #18):
-1. Move to **(2) Mouse pitch** (PR 11.3 candidate) — natural follow-up to PR 11.1 yaw.
-2. **(3) Spectator camera** (PR 11.4 candidate) — debug-only, unblocks next two-tab dev session.
-3. **(4) Gap-bridging rollback** (PR 11.5 candidate) — pause-when-too-far-behind cap.
-4. Optional: revisit the ESC flicker if the user signals interest; otherwise leave it tabled.
+**Next session plan** (per `docs/SPEC.md` §"Next"):
+1. **(2) Mouse pitch** (PR 11.3 candidate) — natural follow-up to PR 11.1 yaw. Bytes 4-5 on the wire, ~30 lines in `chaseCamera.ts` + `characterController.ts` + `combat.ts`. No determinism regression because pitch, like yaw, goes on the wire.
+2. **(3) Spectator camera** (PR 11.4 candidate) — debug-only, F2 toggle detaches camera from player (free-fly, orbit with mouse). ~50 lines in `chaseCamera.ts`. Unblocks the next two-tab dev session.
+3. **(4) Gap-bridging rollback** (PR 11.5 candidate) — pause-when-too-far-behind cap in `ggrsRuntime.ts` for WAN testability.
+4. **60s M2 stress test** — no code, ~5 min playtest, formally closes Milestone 2 (last PENDING acceptance row).
+5. Optional: revisit the ESC-equals-resume flicker if Kyle signals interest; otherwise leave it tabled.
+
+**Carry-forwards** (from previous sessions, still open):
+- ESC-equals-resume flicker — tabled as known issue (this PR).
+- Real Loadout UI + Real Settings panel — placeholders only.
+- Fade-in animation on PauseMenu — 5-line follow-up.
+- `inputListener.ts:249` stray debug log — was removed in PR 11.2.x; PR 16 cleanup follow-up closed.
 
 ## 2026-08-14 — PR 11.2.3 debounce + synthetic mousemove landed. **Playtest verification needed.**
 
@@ -142,7 +148,7 @@ Typecheck clean, build clean (1m 57s), bundle delta vs origin/main: small (~+5.6
 - **Fade-in animation** for the menu is a 5-line follow-up if Kyle wants it.
 - **Real Loadout UI**, **Real Settings panel** — placeholders for now.
 - **Mouse pitch** — orthogonal feature, next after this.
-- **Spectator camera** (PR 11.3 candidate) — unblocks the next two-tab dev session.
+- **Spectator camera** (PR 11.4 candidate) — unblocks the next two-tab dev session.
 - **60s M2 stress test closure** — no code, just Kyle's playtest, formally closes Milestone 2.
 
 ### Next-session priority order
@@ -234,7 +240,7 @@ Typecheck clean. Build clean (1m 57s). Bundle 7,048.62 kB → 7,052.19 kB (+3.57
 - **Real Loadout UI** — placeholder for now.
 - **Real Settings panel** — placeholder for now.
 - **Mouse pitch** — orthogonal feature, next after this.
-- **Spectator camera** (PR 11.3 candidate) — unblocks the next two-tab dev session. Per the HANDOFF's recommended order: pause menu → 60s M2 closure → spectator camera → mouse pitch.
+- **Spectator camera** (PR 11.4 candidate) — unblocks the next two-tab dev session. Per the HANDOFF's recommended order: pause menu → 60s M2 closure → spectator camera → mouse pitch.
 - **60s M2 stress test closure** — no code, just Kyle's playtest, formally closes Milestone 2.
 
 ### Next-session priority order
@@ -278,11 +284,13 @@ Typecheck clean. Build clean (1m 57s). Bundle 7,048.62 kB → 7,052.19 kB (+3.57
 | Milestone | PRs | Status |
 | --- | --- | --- |
 | M1 (movement + stunts) | 2, 3, 8, 8.1 | ✅ Closed |
-| M2 (netcode + combat) | 6, 7, 10, 10.1, 10.2, 11.1 | 10/11 acceptance rows landed, last row pending 60s stress test |
+| M2 (netcode + combat) | 6, 7, 10, 10.1, 10.2, 11.1, 11.2 | 10/11 acceptance rows landed, last row pending 60s stress test |
 | M3 (assets + polish) | TBD | Not started |
 | Phase 1 (internet-multiplayer) | TBD | Gating on rollback + server-authoritative damage |
 
-### Next session plan (PR 11.2 candidate)
+### Next session plan *(historical: written 2026-08-14 after PR 11.1 MERGED; PR 11.2 series MERGED 2026-08-15)*
+
+> **Status (2026-08-15):** This section was the planning context for PR 11.2, which is now MERGED. The current "next session plan" is at the top of this HANDOFF (2026-08-15 entry). The notes below are preserved as historical record of how PR 11.2 was originally scoped.
 
 **Recommendation: pause / loadout menu UI** — PR 11.1 added the menu orbit camera + cursor unlock on ESC, but there's no actual menu to interact with yet. The cursor unlocks on ESC, then sits in space doing nothing.
 
