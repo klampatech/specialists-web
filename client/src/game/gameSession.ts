@@ -220,10 +220,30 @@ export function createGameSession(
     // PR 10: cache `nowMs` so `getHealthSnapshot()` can compute the
     // remaining respawn countdown without re-reading the wall clock.
     lastNowMs = nowMs;
+    // PR 11.4.1 fix: when the spectator is active, the local player
+    // (a) shouldn't have any combat events fire (we'd otherwise see
+    //     tracers from the spectator's detached view; observed by Kyle
+    //     2026-08-15 dev-box playtest), and
+    // (b) shouldn't have combat bits encoded on the wire (the peer would
+    //     otherwise see a bullet coming from your detached position —
+    //     non-deterministic in lockstep terms).
+    // Build a sanitized `gameInput` by zeroing combat bits when the
+    // spectator is active. Movement bits are also zeroed defensively
+    // (the controller update is already gated, but this guarantees the
+    // wire packet never contains spurious bits).
+    const gameInput: InputState = spectatorActive
+      ? {
+          ...input,
+          forward: 0,
+          right: 0,
+          fireHeld: false,
+          meleePressed: false,
+        }
+      : input;
     // 1. Encode + submit local input + advance one frame. The runtime uses
     //    the on-wire remote input if it's already arrived, or repeats the
     //    last-known input otherwise.
-    const encodedLocal = encodeInput(input);
+    const encodedLocal = encodeInput(gameInput);
     runtime.submitLocalInput(encodedLocal);
     const advanced = runtime.advanceFrame();
 
@@ -249,10 +269,14 @@ export function createGameSession(
     }
 
     // 5. PR 7: rising-edge combat semantics on the local input.
+    // PR 11.4.1: use `gameInput` (sanitized copy) instead of raw `input`
+    // — when spectator is active, `fireHeld` / `meleePressed` are forced
+    // to false, suppressing both the local tracer fire and the wire
+    // payload that would have told the peer you fired.
     const frameCombatEvents: CombatEvent[] = [];
-    if (input.fireHeld && !wasFiring) {
+    if (gameInput.fireHeld && !wasFiring) {
       const result: DualPistolResult = dualPistolShoot(
-        input,
+        gameInput,
         localController,
         remoteController,
         scene,
@@ -270,9 +294,9 @@ export function createGameSession(
         applyDamage(remoteController, { source: "fire", amount: result.damage }, nowMs);
       }
     }
-    if (input.meleePressed && !wasMelee) {
+    if (gameInput.meleePressed && !wasMelee) {
       const result: MeleeResult = meleeSwing(
-        input,
+        gameInput,
         localController,
         remoteController,
       );
@@ -286,7 +310,7 @@ export function createGameSession(
         applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
       }
     }
-    wasFiring = input.fireHeld;
+    wasFiring = gameInput.fireHeld;
     wasMelee = input.meleePressed;
 
     // PR 10: symmetric damage flow on the REMOTE input. Both clients run

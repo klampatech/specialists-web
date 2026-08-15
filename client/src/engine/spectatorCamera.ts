@@ -10,7 +10,8 @@
 // The toggle is also exposed as a DEV probe path (`__spectatorToggle`)
 // so the smoke can drive the same path headlessly.
 //
-// **Movement**: WASD at `SPECTATOR.moveSpeed` (8 m/s flat). Same WASD keys
+// **Movement**: WASD at `SPECTATOR.moveSpeed` (5 m/s flat — matches
+// the character `walkSpeed: 5`). Same WASD keys
 // as the character controller — the spectator ABSORBS WASD when active
 // (`gameSession.ts` gates `controller.update` on `!spectator.active`).
 // Movement is applied on top of the current camera yaw / pitch. Direction
@@ -76,7 +77,10 @@ export interface SpectatorCameraHandle {
   /** Drives the per-frame WASD pump. Called from `scene.ts`'s render
    *  loop ONLY when `spectator.isActive() === true` — cheaper than
    *  doing the active-check inside the function. */
-  pumpWASD: (input: { forward: number; right: number }) => void;
+  /** Per-frame WASD pump. `deltaSeconds` is the frame time in
+   *  seconds (from `engine.getDeltaTime() / 1000`) — frame-rate-
+   *  independent m/s so the speed feels the same at 30fps or 144fps. */
+  pumpWASD: (input: { forward: number; right: number }, deltaSeconds: number) => void;
   /** Tear down. Detach mouse listeners if attached. */
   dispose: () => void;
 }
@@ -240,9 +244,16 @@ export function createSpectatorCamera(
   // (camera-left XZ), D = right. The forward vector comes from the
   // yaw only (no pitch) so W is always horizontal — this is the
   // Blender / Unity Editor free-fly convention.
-  const pumpWASD = (input: { forward: number; right: number }): void => {
+  const pumpWASD = (input: { forward: number; right: number }, deltaSeconds: number): void => {
     if (!active) return;
     if (input.forward === 0 && input.right === 0) return;
+    // Frame-rate-independent metres-per-second. Earlier PR 11.4 versions
+    // applied `speed` as a per-frame displacement (= 8 m/frame at 60fps ≈
+    // 480 m/s) — felt insane to play. Kyle's 2026-08-15 playtest caught it.
+    // Now: displacement = speed * dtSeconds, so 5 m/s means 5 m/s at any
+    // framerate. The chase camera's lerp is also frame-rate-coupled but
+    // only affects a small delta per frame, not position — switching to
+    // dt-scaled math only here.
     const speed = SPECTATOR.moveSpeed;
     const cy = Math.cos(yawRadians);
     const sy = Math.sin(yawRadians);
@@ -254,12 +265,8 @@ export function createSpectatorCamera(
     //   right=-1 (A)   → move along -world-right.
     // Total: dx = forward*sin(yaw) + right*cos(yaw),
     //        dz = forward*cos(yaw) - right*sin(yaw).
-    const dx = (input.forward * sy + input.right * cy) * speed;
-    const dz = (input.forward * cy - input.right * sy) * speed;
-    // Per-frame WASD applies a per-frame displacement of `speed`
-    // (= 8) units. Frame-rate-coupled motion — the chase camera's
-    // lerp also runs at 1/frame; we accept the same coupling for
-    // PR 11.4 and revisit in a follow-up if it matters. (YAGNI.)
+    const dx = (input.forward * sy + input.right * cy) * speed * deltaSeconds;
+    const dz = (input.forward * cy - input.right * sy) * speed * deltaSeconds;
     camera.position.x += dx;
     camera.position.z += dz;
   };

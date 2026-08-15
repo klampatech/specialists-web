@@ -426,7 +426,12 @@ export async function createScene(
     // Vite strips it from production because `import.meta.env.DEV` is
     // statically replaced with `false` there.
     if (import.meta.env.DEV && spectator !== null && spectator.isActive()) {
-      spectator.pumpWASD({ forward: state.forward, right: state.right });
+      // PR 11.4.1: pass frame delta in seconds so pumpWASD can scale
+      // speed (m/s) by dt instead of treating it as m/frame.
+      spectator.pumpWASD(
+        { forward: state.forward, right: state.right },
+        engine.getDeltaTime() / 1000,
+      );
     }
   });
 

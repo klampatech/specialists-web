@@ -135,10 +135,11 @@ export const MOUSE_LOOK = {
 export const SPECTATOR = {
   /** Flat WASD speed in metres per frame (frame-rate-coupled, see
    *  `spectatorCamera.ts` `pumpWASD` for the rationale — accept the
-   *  same coupling as the chase camera's lerp). Faster than character
-   *  `walkSpeed: 5` so the user can cover ground quickly during
-   *  dev-box inspection. */
-  moveSpeed: 8.0,
+   *  same coupling as the chase camera's lerp). Matches the character
+   *  `walkSpeed: 5` so the user feels like they're walking around the
+   *  world during dev-box inspection (Kyle's 2026-08-15 playtest —
+   *  faster speeds felt jarring). */
+  moveSpeed: 5.0,
   /** Toggle key. Read by `inputListener.ts` to register the F2 handler.
    *  Single source of truth — same convention as the existing
    *  `KEY_CAMERA_TOGGLE` (V) lookup pattern. */

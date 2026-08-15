@@ -152,14 +152,18 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
     // `import.meta.env.DEV` so production bundles contain zero F2
     // handling (Vite statically replaces `import.meta.env.DEV` with
     // `false` in production, and Rollup eliminates the dead branch).
-    // Filtered for `!e.repeat` (no auto-repeat double-toggle). NOT
-    // preventDefault'd — F2 is a dev-only key, no menu / browser
-    // shortcut conflict. The hook is OPTIONAL on InputHooks, so this
-    // also no-ops cleanly when a host doesn't register one.
+    // Filtered for `!e.repeat` (no auto-repeat double-toggle).
+    // **preventDefault()'d** — F2 is grabbed by the Mac browser (opens
+    // the File menu, drops focus, exits pointer-lock, which renders the
+    // pause menu). Calling preventDefault() in the handler stops the
+    // browser action before it fires. The hook is OPTIONAL on
+    // InputHooks, so this also no-ops cleanly when a host doesn't
+    // register one.
     if (import.meta.env.DEV && key === SPECTATOR.toggleKey) {
       if (!e.repeat) {
         hooks.onSpectatorToggle?.();
       }
+      e.preventDefault();
       return;
     }
   };
