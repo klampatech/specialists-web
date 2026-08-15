@@ -53,3 +53,6 @@ client/spectator-camera.png
 .codex-prompt.md
 .codex-last-message*.txt
 .codex-last*.txt
+
+# Hermes agent scratch (plans folder, transient task artifacts)
+.hermes/

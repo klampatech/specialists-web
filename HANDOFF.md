@@ -4,6 +4,44 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-15 — 🎉 MILESTONE 2 CLOSED — Phase 0 fully complete. PR 11.4 merged + 60s two-tab stress test passed.
+
+**Status**: Milestone 2 fully closed. All 11 acceptance rows landed and dev-box verified. Phase 0 is done.
+
+**What landed this session**:
+1. **PR 11.4** (squash `8485ea3`) — dev-box free-fly spectator camera (F2 detach, debug-only). 11 files, +1166/-43. 9-assertion smoke + 15 CI jobs green. Three post-merge follow-ups also landed: F2 `preventDefault()` (Mac File menu hijack), frame-rate-independent WASD speed (5 m/s via `engine.getDeltaTime()/1000` scaling), and spectator-fire suppression (combat bits zeroed on the wire when spectator active — Kyle's observation about tracers leaking from the spectated rig). Bundle: +2.71 kB raw / +0.5 kB gzip, zero spectator code in production.
+2. **CI Playwright fix** — self-hosted runners were hanging 69 minutes on `npx playwright install --with-deps chromium` (apt install waiting for sudo). Dropped `--with-deps`, added `actions/cache@v4` for `~/.cache/ms-playwright/` keyed by `runner.os` + `hashFiles('client/package-lock.json')`. All 15 CI smokes now fly through in <2 min each (was 8-10 min for the spectator smoke, now 30s-1min).
+3. **M2 row 11 closed** (this PR) — Kyle's 60s two-tab drive on http://100.95.111.112:5173/ passed: zero console errors, frame-count delta within the documented no-rollback threshold, HP delta symmetric.
+
+**Files in this PR**:
+- `docs/SPEC.md`: status banner update (M2 closed, Phase 0 done), PR 11.4 entry updated (5 m/s not 8, F2 preventDefault, combat-zeroing), M2 acceptance row 11 flipped from **PENDING** to **LANDED** ✅, Next list re-ranked (PR 11.5 → position 1, PR 11.6 → position 2)
+- `HANDOFF.md`: this top entry
+- 2 files, +15/-13. Docs-only.
+
+**Next session plan** (per `docs/SPEC.md` §"Next"):
+1. **(1) PR 11.5 — Gap-bridging rollback cap** (~50 lines + new smoke in `ggrsRuntime.ts`). Improves WAN testability. Phase 0 cleanup.
+2. **(2) PR 11.6 — Server-authoritative damage** (Phase 1 work, deferred). First step toward a real dedicated server.
+3. **(3) Original PR 11 polish** — Mixamo glTF, kill-marker, hit-marker, death animation. Cosmetic.
+
+**Carry-forwards** (still open):
+- ESC-equals-resume flicker — known issue (PR 11.2 series), tabled
+- Real Loadout UI + Real Settings panel — placeholders only
+- Fade-in animation on PauseMenu — 5-line follow-up
+- Separate pitch sensitivity (`pitchSensitivityRadPerPixel`) — 5-line follow-up
+- Mouse-pitch smoke hardening (assert `cameraRotationX` sign) — 3-line follow-up
+- Smooth interpolation on F2 toggle (currently instant snap) — polish
+- Camera collision in spectator (PhysicsRaycast for floor) — polish
+- Configurable spectator speed (Shift sprint, Space up) — polish
+
+**Lessons** (this session):
+- **WASD in free-fly cameras must be frame-rate-independent.** Codex's initial implementation applied `moveSpeed` as a per-frame displacement (= 300 m/s at 60 fps when configured for 5 m/s). Same convention is fine for chase camera lerp (small per-frame delta) but catastrophic for free-fly position. Always multiply by `engine.getDeltaTime() / 1000` for m/s semantics.
+- **Mac browsers grab F2 → File menu.** Any web game that uses F2 as a shortcut must `preventDefault()` it or the File menu pops up, drops focus, exits pointer-lock, and renders the pause menu. Always preventDefault on F-key handlers.
+- **Self-hosted CI runners can't run `--with-deps`.** `apt install` waits for sudo. Drop `--with-deps` and rely on already-installed system deps; cache `~/.cache/ms-playwright/` between runs. 69-min hang → 30s cache hit.
+- **Don't trust dev-server self-reports.** Vite "ready in 152 ms" doesn't mean the page actually loaded. Always verify with `curl -sf` + a real test.
+- **Codex 0.137 can be killed mid-task by background process lifecycle.** The codex that wrote PR 11.4 was killed mid-`npm run build` without a notification. Always re-run verification gates independently after a codex dispatch; never trust the harness self-report.
+
+---
+
 ## 2026-08-15 — PR 11.4 MERGED — dev-box free-fly spectator camera (F2 detach, debug-only). Unblocks every subsequent two-tab dev session.
 
 **Status**: PR 11.4 ships a debug-only free-fly spectator camera. F2 detaches the camera from the character; WASD flies the spectator around at 8 m/s; held-right-click-drag rotates (yaw wraps mod 2π, pitch clamps ±π/2). F2 again reattaches to the chase camera. WASD absorbed from the character controller while spectator active (gameSession gates `controller.update(input)` on `!spectator.active`). DEV-only via `import.meta.env.DEV` — production bundles contain zero spectator code (verified: zero `__spectator` or `onSpectatorToggle` matches in `dist/assets/index-*.js`).
