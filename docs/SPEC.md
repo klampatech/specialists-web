@@ -4,7 +4,7 @@
 
 **Editing rule**: branch + PR. No direct pushes to `main`. Decisions, operating principles, and acceptance criteria are all version-controlled here. The vault entry is a stub pointer that gets regenerated.
 
-> **Current status (2026-08-14):** Phase 0 / Milestone 2 / PR 17 + PR 11.2.2 MERGED (pending squash-merge).
+> **Current status (2026-08-14 evening):** Phase 0 / Milestone 2 / PR 17 + PR 11.2.3 OPEN on PR #18 (root cause + fix landed; playtest ⚠️ UNVERIFIED).
 > - **PR 1** (tooling baseline + CI + spec lock) — **MERGED** to main.
 > - **PR 2** (Babylon scene + Havok + skydome + static mesh + static ground + Playwright headless smoke) — **MERGED** at https://github.com/klampatech/specialists-web/pull/3 (squash commit `2a12a59`), all 3 CI checks green.
 > - **PR 3** (Havok character controller + WASD + stunts + chase camera + procedural character + WebGPU bootstrap) — **MERGED** at https://github.com/klampatech/specialists-web/pull/5 (squash commit `86feffa`), all 3 CI checks green.

@@ -4,6 +4,26 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-14 — PR 11.2.3 debounce + synthetic mousemove landed. **Playtest verification needed.**
+
+**Status**: PR 11.2.3 (`91aca85`) open on PR #18 (`feat/phase0-pr11.2-pause-menu`). All 11 CI checks green, all 9 smokes green locally. Stack: 6 commits ahead of `2fdda30` (PR 11.2 + 11.2.1 + 11.2.2 + 11.2.3).
+
+**Root-caused from Kyle's debug-log capture** (the log lines he pasted earlier showed the full sequence):
+
+Two distinct bugs in the browser's pointer-lock lifecycle:
+1. **Bug B — lock-then-unlock race**: Chrome fires `pointerlockchange(false)` 64ms after our successful `pointerlockchange(true)` when the user's ESC keydown also queued an exit-pointer-lock command. The browser's hardcoded ESC policy is unstoppable; `e.preventDefault()` doesn't prevent the queued exit. Visual: menu briefly hides (locked=true, menuAngle=0) then immediately re-shows (locked=false, menuAngle incrementing from 0).
+2. **Bug A — Chrome 1.5s mouse-inactivity auto-release**: After clicking Resume, the user waits 1.5s before moving the mouse, Chrome releases pointer-lock autonomously. Visual: lock succeeds → 1.5s of lock → browser auto-unlocks → menu re-shows.
+
+**Fixes** (single commit `91aca85`):
+- `chaseCamera.ts`: `POINTER_LOCK_DEBOUNCE_MS = 150` constant. `setPointerLock(locked)` ignores direction-disagreeing `pointerlockchange` events within 150ms (suppresses Bug B). New `setPointerLockImmediate(locked)` is the same logic without the debounce — DEV probe only.
+- `scene.ts`: dispatch a synthetic `mousemove` (movementX=0, movementY=0) synchronously after `canvas.requestPointerLock()` succeeds. The existing `onMouseMoveLocked` early-returns on `movementX === 0`, so no camera rotation. Refreshes Chrome's "user still engaged" counter, preventing Bug A.
+- `scene.ts` DEV probe `__pointerLockToggle` routes through `setPointerLockImmediate` so the smoke's rapid lock-flips don't hit the production debounce.
+
+**Next session**:
+1. **Kyle playtest on PR 11.2.3**: hard refresh http://100.95.111.112:5173/, reproduce the previous flicker (locked → ESC → menu shows → ESC again → was flickering, should now be clean). Filter DevTools on `[PR-11.2.3-DEBUG]` to confirm the SUPPRESSED log appears for Bug B's race.
+2. **If clean**: squash-merge PR #18 → main as a single commit (or two commits: PR 11.2 + 11.2.3). Remove the debug logs (commit `5ec84e2`'s 5 sites) before merging; the chase camera + scene.ts fixes stay.
+3. **If still flickering**: capture a new [PR-11.2.3-DEBUG] log and we iterate.
+
 ## 2026-08-14 — PR 11.2.2 single-handler ESC shipped but flicker still UNVERIFIED. Next: PR 11.2.3 debug logging.
 
 **Status**: PR 11.2.2 (`070df25`) open on PR #18 (`feat/phase0-pr11.2-pause-menu`). All 11 CI checks green, all 9 smokes green locally. Stack: 5 commits ahead of `2fdda30` (PR 11.2 + 11.2.1 + 11.2.2). Dev server live on http://100.95.111.112:5173/.
