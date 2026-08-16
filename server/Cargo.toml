@@ -1,0 +1,50 @@
+[package]
+name = "specialists-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "specialists_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "specialists-server"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime — single Tokio binary.
+tokio = { version = "1", features = ["full"] }
+# WebTransport primary transport (HTTP/3 + QUIC). Vendored locally — see
+# `vendor/wtransport/PATCHES.md` for the one-line patch that works
+# around the quinn 0.11.9+ `.0` privacy regression. PR 11.6.C should
+# consider upgrading to a current wtransport release and dropping the
+# vendor.
+wtransport = { path = "vendor/wtransport", default-features = false, features = ["self-signed"] }
+# WebSocket fallback transport.
+tokio-tungstenite = "0.24"
+# Byte buffer helpers (BufMut for the wire encoders, Bytes for IO).
+bytes = "1"
+# Error helpers + glue.
+anyhow = "1"
+thiserror = "1"
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Used by `transport::sans_with_defaults` for the merged SAN list.
+futures = "0.3"
+
+[dev-dependencies]
+# Re-declared under dev-dependencies so the integration smoke in
+# `server/tests/session_canary.rs` can drive a WebTransport client AND a
+# WebSocket client against the running server without leaking transport
+# types into the library API.
+tokio-tungstenite = "0.24"
+wtransport = { path = "vendor/wtransport", default-features = false, features = ["self-signed", "dangerous-configuration"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

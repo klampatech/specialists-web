@@ -4,6 +4,70 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+
+## 2026-08-16 — PR 11.6.B (server scaffold — Tokio + WebTransport + WebSocket + room registry + canary script) — first real Rust code in the repo. Branch `feat/phase1-pr11.6.b-server-scaffold`.
+
+**Status**: PR 11.6.B is **COMPLETE on the branch**, ready for review. ~1,500 lines net new (server + tests + vendored wtransport + canary + CI + seam-setup). 34 tests pass on `cargo test`. Self-signed cert is generated at runtime (never committed). No client gameplay code change beyond the §1.2 seam wrapper.
+
+**Files changed** (see `git diff --stat origin/main..HEAD` for canonical numbers):
+- `server/Cargo.toml` — single crate (no workspace per §3.2). Vendored `wtransport` 0.5.0 + `wtransport-proto` 0.5.0 in-tree (see `vendor/wtransport/PATCHES.md` for the one-line patch). `wtransport` has the `self-signed` feature for runtime cert generation; `dangerous-configuration` is enabled under `[dev-dependencies]` for the in-process WebTransport smoke.
+- `server/vendor/wtransport/` + `server/vendor/wtransport-proto/` — vendored copies of `wtransport` 0.5.0 / `wtransport-proto` 0.5.0 with a single-line patch to `streamid_q2w` (the `.0` field access is private from external crates since quinn 0.11.9+). PR 11.6.C should consider upgrading to a current wtransport release and dropping the vendor. See `vendor/wtransport/PATCHES.md`.
+- `server/src/lib.rs` — library entry point that re-exports the modules the integration test drives.
+- `server/src/main.rs` — thin CLI wrapper. Flags: `--port-wt`, `--port-ws`, `--cert`, `--key`, `--sans`, `--gen-cert`, `--help`. Spawns both WebTransport + WebSocket listeners on the same Tokio runtime. `tokio::select!` waits for Ctrl-C or either listener to fail.
+- `server/src/constants.rs` — `MAX_PLAYERS_PER_ROOM = 24`, `TICK_RATE_HZ = 64`, `POSITION_UPDATE_HZ = 32`, `PING_HZ = 1`, `POSITION_HISTORY_RETENTION_FRAMES = 64`, `DEVBX_ROOM_ID = "DEVBX"`.
+- `server/src/protocol.rs` — 5 wire types (§3.5): `DamageRequest` (14B), `DamageBroadcast` (18B), `PositionUpdate` (14B), `Ping` (4B), `Pong` (8B), plus the §1.2 `InputsServer` (17B = 1 disc + 4 frame + 12 input — brief header says 16 but math is 17, same off-by-one class as PR 11.6.A). Each encoder ends with a `debug_assert_eq!(buf.len(), N)` so the wire-format drift is caught at compile + test time. Big-endian per §3.5.
+- `server/src/position_history.rs` — per-player ring buffer, ~64 entries (1s @ 64Hz).
+
+- `server/src/session.rs` — `Room` + `Player` types. `Room` has `inputs_buffer: HashMap<PlayerId, VecDeque<(ServerFrame, EncodedInput)>>` (the §1.2 seam — WRITE-ONLY in this PR, PR 11.7 reads).
+- `server/src/transport.rs` — `run_web_socket` + `run_web_transport` (both public so the canary test can `tokio::spawn` them on a free port). Echo semantics for both transports. `RoomRegistry` shared via `Arc<RwLock<HashMap<String, Arc<RwLock<Room>>>>>`.
+- `server/src/cert.rs` — `ensure_dev_certs` (idempotent) + `load_identity` wrappers around `wtransport::Identity::self_signed` + `Identity::load_pemfiles`.
+- `server/tests/protocol_wire.rs` — 16 tests: size-asserts + round-trips + big-endian sanity checks for every wire type.
+- `server/tests/session_canary.rs` — 4 integration tests: WS echo, WT echo (skipped in CI via `SKIP_WEBTRANSPORT_TEST=1`), `inputs_buffer` write path, `PositionHistory` ring trim.
+- `server/certs/.gitkeep` — keeps the empty certs dir in the checkout.
+- `protocol/damage.ts` — TS mirror of the Rust wire format. Interface declarations + 6 wire-size constants. NO behavior in this PR. PR 11.6.C imports these.
+- `tools/canary-server.sh` — bash canary. Bootstraps the cert on first run via `cargo run --gen-cert`, then execs the server with `--port-wt`/`--port-ws`/`--cert`/`--key`/`--sans`. `chmod +x`.
+- `.github/workflows/ci.yml` — new `server-build` job (`cargo build --release` + `cargo test` with `SKIP_WEBTRANSPORT_TEST=1`) placed after `client-typecheck`. Uses `dtolnay/rust-toolchain@stable` + `Swatinem/rust-cache@v2` with `workspaces: server -> target`.
+- `client/src/game/gameSession.ts` — §1.2 seam #3: `submitLocalInput(input: InputState): void` method wrapping the existing `runtime.submitLocalInput(encodeInput(input))` call. Mechanical wrap, no behavior change.
+- `client/src/net/ggnet.ts` — §1.2 seam #4: snapshot-model awareness comment. Also reformatted the file from the prior 1-line minified shape to multi-line (the existing imports still work).
+- `docs/SPEC.md` — new top entry for PR 11.6.B.
+- `docs/HANDOFF.md` — this entry.
+- `.gitignore` — `server/certs/*.pem` + `server/certs/*.key` (but `!server/certs/.gitkeep`).
+
+**Verification gates run** (all green):
+- `cd server && cargo build --release` → exit 0, ~10s warm / ~30s cold.
+- `cd server && cargo test` → 14 unit + 16 `protocol_wire.rs` + 4 `session_canary.rs` = **34 tests pass, 0 fail**.
+- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test` → 33 tests pass (WT smoke skipped, as expected for CI).
+- Without `SKIP_WEBTRANSPORT_TEST=1`, the full 34-test set runs (dev-box verification).
+- `cd client && npm run typecheck` → exit 0.
+- `cd client && npm run build` → exit 0; bundle unchanged in the no-touched-code path (verified by the existing 11 smokes passing).
+- `tools/canary-server.sh --help` → prints the documented usage block.
+
+**Pre-merge checklist** (Kyle to verify on dev box):
+1. `cd server && cargo build --release` (rebuild from the committed `Cargo.lock`).
+2. `tools/canary-server.sh --port-wt 14433 --port-ws 14434` (foreground OR background). 5s in: `echo -n "hello" | nc -q 1 127.0.0.1 14434` should return `hello`.
+3. (Optional) `cd server && cargo test` without `SKIP_WEBTRANSPORT_TEST=1` to exercise the WebTransport smoke on the dev box.
+
+**Risks / known gaps** (carried into PR 11.6.C):
+- **Vendored `wtransport` 0.5.0**. The latest wtransport (0.7.x at the time of writing) requires a different quinn version than the project's locked deps, and 0.5.0 has a one-line compatibility issue with quinn 0.11.9+ (the `StreamId.0` field was made crate-private in quinn). The patch is documented in `vendor/wtransport/PATCHES.md`, is one line, and is the cleanest path to a green build today. PR 11.6.C should consider dropping the vendor entirely.
+- **`INPUTS_SERVER_WIRE_SIZE = 17` not 16 as the brief header says**. The math is 1 discriminator + 4 frame + 12 input = 17 bytes. PR 11.6.A had the same off-by-one class (DamageRequest 8→14). The Rust size assertion catches this; the TypeScript mirror carries the corrected value. PR 11.6.C's TS encoder must assert 17.
+- **In-process test pattern.** `run_web_socket` / `run_web_transport` are public so the canary test can `tokio::spawn` them on port 0 (kernel-assigned free port). This is fine for the test but exposes the transport layer to anyone who imports the library. PR 11.6.C can re-privatize them by moving the spawn into the test harness file via a `#[cfg(test)]` re-export.
+- **No production cert handling.** Self-signed cert only. PR 11.11 (per §5.3) replaces with Let's Encrypt.
+- **No matchmaker.** Hard-coded `roomId = "DEVBX"`. PR 11.9.
+
+**Out of scope items I touched** (should not be in this PR):
+- `client/src/net/ggnet.ts` was reformatted from a 1-line minified shape to multi-line. The behavior is unchanged (just methods now have explicit `: void` return types). Flagging in case Kyle prefers the original one-line style — it's a 4-line deletion + 18-line reformat.
+
+**Suggested review focus**:
+1. The `server/src/protocol.rs` encoder/decoder pair — every wire type gets a `debug_assert_eq!(buf.len(), N)` and a round-trip test. The test count adds up to 16 in `protocol_wire.rs` + 6 inline in `protocol.rs`.
+2. The §1.2 seam — `Room.inputs_buffer` is WRITE-ONLY in this PR. The smoke `room_state_pushes_inputs_buffer` asserts the write path works but doesn't read. This is per gotcha #1 from the brief.
+3. The `tools/canary-server.sh` script — the `--gen-cert` flag generates the cert via the server binary itself rather than via a separate `openssl` invocation, so the cert-generation path is always in-sync with the cert-loading path.
+
+**Next session plan** (PR 11.6.C):
+- Replace the transport echo with the discriminator router (§3.5 of the plan). Each `0xXX` discriminator dispatches to its handler.
+- Build the TS encoder/decoder pair in `protocol/damage.ts` (interfaces already in PR 11.6.B). Assert the same wire sizes as the Rust side.
+- Drop the `wtransport` vendor if a current wtransport release now builds cleanly against the project's quinn (or commit to keeping it).
+- Add `client/src/net/serverTransport.ts` — the `ServerTransport` sibling of `GgnetTransport`. Routes the same `InputState` to `submitLocalInput` (the seam PR 11.6.B added) via WebTransport primary, WebSocket fallback.
+
 ## 2026-08-16 — PR 11.6.A MERGED (#28, squash `d0c37b8`) — server-authoritative damage architecture plan, review-only. Plan revised during review based on netcode industry research + 24p target + CS2/Valorant reference architecture.
 
 **Status**: PR 11.6.A shipped on `main` as squash `d0c37b8`. 4 files, +1,468/-1 lines. Branch `docs/pr11.6-plan` deleted, vault mirror synced at commit `d0c37b8`.

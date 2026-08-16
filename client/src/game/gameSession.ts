@@ -188,6 +188,16 @@ export interface GameSession {
   readonly totalPausedFrameCount: number;
   /** Per-frame tick. Call from `scene.onBeforeRenderObservable`. */
   tick(input: InputState, deltaSeconds: number, nowMs: number): SessionFrame;
+  /**
+   * PR 11.6.B / §1.2 seam — submit the local input for the next frame.
+   * Wraps `runtime.submitLocalInput(encodeInput(input))` in a method so
+   * PR 11.7 can swap the destination from `ggrsRuntime` (current P2P
+   * lockstep substrate) to `serverTransport` (server-auth) WITHOUT
+   * rewriting the call sites in `tick()` — the only changes PR 11.7
+   * needs are inside this method. No behavior change in PR 11.6.B:
+   * still goes through the lockstep substrate.
+   */
+  submitLocalInput(input: InputState): void;
   /** All combat events ever generated this session (HUD reads `length`). */
   getCombatEvents(): CombatEvent[];
   /** Drain the combat events since the last call; the tracer render uses
@@ -313,8 +323,12 @@ export function createGameSession(
     // 1. Encode + submit local input + advance one frame. The runtime uses
     //    the on-wire remote input if it's already arrived, or repeats the
     //    last-known input otherwise.
-    const encodedLocal = encodeInput(gameInput);
-    runtime.submitLocalInput(encodedLocal);
+    //
+    //    PR 11.6.B / §1.2 seam: the encode + submit is now wrapped in
+    //    `submitLocalInput(input)` below so PR 11.7 can swap the
+    //    destination (ggrsRuntime → serverTransport) without touching
+    //    this call site.
+    submitLocalInput(gameInput);
     const advanced = runtime.advanceFrame();
 
     // PR 11.5: rollback-cap early-return. When the cap fires we return
@@ -454,6 +468,14 @@ export function createGameSession(
     };
   };
 
+  // PR 11.6.B / §1.2 seam — see the interface comment for the rationale.
+  // Today this goes through the lockstep substrate (`ggrsRuntime`).
+  // PR 11.7 retires lockstep and routes the same encoded input to
+  // `serverTransport` instead; only this method changes.
+  const submitLocalInput = (input: InputState): void => {
+    runtime.submitLocalInput(encodeInput(input));
+  };
+
   return {
     localController,
     remoteController,
@@ -469,6 +491,7 @@ export function createGameSession(
     get pausedFrames() { return runtime.pausedFrames; },
     get totalPausedFrameCount() { return runtime.totalPausedFrameCount; },
     tick,
+    submitLocalInput,
     getCombatEvents: () => combatEvents.slice(),
     consumeUnrenderedCombatEvents: () => {
       const drain = combatEvents.slice(lastRenderedIdx);
