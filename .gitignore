@@ -46,6 +46,7 @@ client/mouse-pitch.png
 client/pitch-wire-format.png
 client/pitch-2tab-wire-format.png
 client/spectator-camera.png
+client/lockstep-rollback.png
 
 # Codex delegation scratch (briefs + last-message files live here transiently,
 # alongside the AGENTS.md/handoff docs which are real artifacts).
