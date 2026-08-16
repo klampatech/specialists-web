@@ -4,6 +4,50 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-16 — PR 11.6.A MERGED (#28, squash `d0c37b8`) — server-authoritative damage architecture plan, review-only. Plan revised during review based on netcode industry research + 24p target + CS2/Valorant reference architecture.
+
+**Status**: PR 11.6.A shipped on `main` as squash `d0c37b8`. 4 files, +1,468/-1 lines. Branch `docs/pr11.6-plan` deleted, vault mirror synced at commit `d0c37b8`.
+
+**No code shipped in this PR** — it's still a review-only ADR. First code lands with PR 11.6.B.
+
+**What landed**:
+1. **`docs/PR-11.6-plan.md`** (1,270 lines, was 603 in the original draft) — the architecture decision record, revised 3 times during review:
+   - **Original draft**: WebSocket-first dev path, 5 sub-PRs (11.6.A-E), 4-6 sessions, validation = source≠target + amount + monotonic eventId.
+   - **Rev 1** (FPS netcode industry research, `docs/PR-11.6-netcode-research.md`): added §3.4.1 position history + lag compensation (§30 lines server-side + ported `dualPistolShoot` raycast), §3.4.2 fire-rate validation (10 lines), §3.4.3 RTT measurement (Ping/Pong 4B/8B), §3.5 wire-size assertions, fixed byte-count off-by-one (DamageRequest 8→14, DamageBroadcast 13→18), §3.6 GameTransport interface expanded, §3.9 client-side damage prediction, §3.10 tick rate target (64Hz server / 32Hz PositionUpdate / 1Hz Ping), §3.10.1 bandwidth math at 24p. Flipped §3.3/Q1 from WebSocket-first to **WebTransport-first** + WebSocket fallback (self-signed cert is ~30 min not 1-2 sessions). Removed PR 11.6.E. Net +1 session.
+   - **Rev 2** (Kyle clarified 24-player production target): added §1.1 explaining lockstep P2P caps at ~4 players and gets a sunset date; §3.6 reframed with sunset note; §5.3 added with post-11.6.D Phase 1 roadmap (6 follow-on sub-PRs sketched, ~12-16 sessions). Q5 reframed (paused-tick carry-over becomes moot when lockstep retires).
+   - **Rev 3** (Kyle clarified CS2/Valorant as the 24p reference architecture): added §1.2 with the 7-element CS2/Valorant mapping; added 4 seam-setup changes (~50 lines) so PR 11.7 is additive not a rewrite: wire discriminator 0x06 server-routed inputs (16-byte InputsServer), `Room.inputs_buffer`, `submitLocalInput` abstraction in `gameSession.ts`, snapshot model awareness. PR 11.7 revised to 4-5 sessions + ~500-1000 lines.
+2. **`docs/PR-11.6-netcode-research.md`** (156 lines, NEW) — Q3 2026 FPS netcode industry comparison. Documents the "what shipped / what I'd revisit-now / what I'd revisit-later / what's out of scope" matrix that drove the rev 1 changes. Live transcript at `/home/kyle/.hermes/cache/delegation/deleg_b7c3ecb2/task-0.log`.
+3. **`docs/SPEC.md`** (+4/-1 lines) — Next-list's PR 11.6 paragraph updated: dropped stale `world-factory-ctf` reference (directory doesn't exist), dropped premature "Tokio + Rapier for determinism" framing (PR 11.6 is damage-only), added pointer to the plan file. SPEC.md "2v2 / 4-player free-for-all" framing at line 159 is wrong about the 24p target — flagged for follow-up but NOT auto-fixed (Kyle may want to write that paragraph differently).
+4. **`HANDOFF.md`** — this entry + the pre-merge entry from earlier in the day remains as historical record.
+
+**Locked architecture decisions** (CS2/Valorant parity at 24p):
+- **Server-auth damage + lag comp** (PR 11.6): position-history rewind + fire-rate validation + RTT.
+- **Server-auth movement + client prediction + reconciliation + remote interpolation buffer** (PR 11.7): ~500-1000 lines, retires lockstep P2P substrate.
+- **WebTransport-first** (PR 11.6): primary transport, WebSocket auto-fallback.
+- **24-player rooms** (`MAX_PLAYERS_PER_ROOM = 24` in `protocol/constants.{ts,rs}`): bandwidth math fits comfortably on Hetzner CCX13.
+
+**Sub-PR roll-out** (revised across the 3 reviews):
+- **11.6.B** (~2 sessions, was 1) — server scaffold: Tokio + WebTransport primary + WebSocket fallback + room registry + `tools/canary-server.sh` (self-signed cert) + `server-build` CI job
+- **11.6.C** (~2 sessions, was 1) — wire protocol + transport mux + position_history + hitscan port + PositionUpdate + Ping/Pong wire types + §1.2 seam-setup (discriminator 0x06, `Room.inputs_buffer`, `submitLocalInput` abstraction)
+- **11.6.D** (~1-2 sessions, unchanged) — server-auth damage end-to-end + smoke + dev-box WAN-throttle
+- ~~**11.6.E**~~ — REMOVED (WebTransport folded into 11.6.B)
+
+**Total**: 5-7 sessions (was 4-6 in the original draft). Post-11.6.D roadmap §5.3: ~13-17 more sessions (PRs 11.7-11.12) to first 24p production deploy; ~9-12 months at 1-2 sessions/week.
+
+**Carry-forwards**:
+- PR 11.5's deferred playtest verification still requires real peer + visible character animation state. Carries into PR 11.6.D's verification environment (multi-tab two-tab WAN-throttle).
+- All carry-forwards from PR 11.5's HANDOFF.md entry remain open.
+- SPEC.md line 159 "2v2 / 4-player free-for-all" — wrong target, fix on first SPEC.md edit after 11.6.A merge.
+- PR 11.7's CS2/Valorant architecture (4 seam-setup changes already landed in 11.6.A).
+
+**Budget call** (this session): three review-revision rounds, all in-context (zero codex dispatches). Net budget was reasonable; the FPS netcode research subagent was the only fan-out (~2 min runtime).
+
+**Lessons** (this session):
+- **The "revisit-now" gaps from industry research matter even for a review-only PR.** Catching "server-auth boundary is performative without a world model" + "TCP head-of-line blocking hides bugs" + "trivial-cheat 10000hp/sec exploit" in the plan PR saves weeks of codex-rework after a partial-scaffold merge.
+- **The plan document is the place to think through scope. PR #28 started at 603 lines and ended at 1,270 — the extra 667 lines were scope and architecture decisions, not code.** Worth doing before any implementation PR.
+- **At 24p, lockstep P2P doesn't work.** This was obvious in retrospect but the original plan assumed lockstep continues as the substrate. The CS2/Valorant reference makes the architecture obvious: server-auth everything, client predict, remote interpolate.
+- **Off-by-one in wire format byte counts.** The original plan said DamageRequest = 8 bytes, DamageBroadcast = 13 bytes. Actual: 14, 18. Caught during code verification against the plan's own field layout. **Add wire-size assertions in CI** (now in `server/tests/damage_wire.rs`) so the next off-by-one fails immediately.
+
 ## 2026-08-15 — PR 11.6 plan PR (11.6.A) drafted and opened for review. No code changes; budget-respectful pre-implementation ADR.
 
 **Status**: PR #TBD (`docs/pr11.6-plan`) opened as **REVIEW-ONLY**. No merge until kyle's call on the 5 open architecture questions in §6 of the plan. No codex dispatch, no Rust code, no Vite churn — pure planning work this session.
