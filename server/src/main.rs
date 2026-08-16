@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use specialists_server::transport::{run_web_socket, run_web_transport, RoomRegistry};
+use specialists_server::transport::{run_server, RoomRegistry};
 use specialists_server::cert::DEFAULT_SANS;
 
 #[derive(Debug, Default)]
@@ -174,48 +174,27 @@ async fn main() -> ExitCode {
         "starting specialists-server (PR 11.6.B scaffold)"
     );
 
-    // Spawn both transports. They run forever (until error / Ctrl-C).
-    let wt_handle = tokio::spawn({
-        let rooms = rooms.clone();
-        let cert_path = cert_path.clone();
-        let key_path = key_path.clone();
-        let sans = sans.clone();
-        async move {
-            if let Err(e) = run_web_transport(port_wt, cert_path, key_path, sans, rooms).await {
-                warn!("run_web_transport exited: {e:?}");
-                Err(e)
-            } else {
-                Ok(())
-            }
-        }
-    });
-
-    let ws_handle = tokio::spawn({
-        let rooms = rooms.clone();
-        async move {
-            if let Err(e) = run_web_socket(port_ws, rooms).await {
-                warn!("run_web_socket exited: {e:?}");
-                Err(e)
-            } else {
-                Ok(())
-            }
-        }
-    });
+    // `run_server` owns both listener tasks. The integration canary starts
+    // the individual crate-private listeners by including the transport
+    // module directly, so the normal library surface only exposes this
+    // orchestration seam.
+    let server = run_server(
+        port_wt,
+        port_ws,
+        cert_path,
+        key_path,
+        sans,
+        rooms,
+    );
 
     // Wait for Ctrl-C OR either listener to fail.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("SIGINT received — shutting down");
         }
-        res = wt_handle => match res {
-            Ok(Ok(())) => info!("WebTransport listener returned cleanly"),
-            Ok(Err(e)) => warn!("WebTransport listener errored: {e:?}"),
-            Err(e) => warn!("WebTransport task panicked: {e:?}"),
-        },
-        res = ws_handle => match res {
-            Ok(Ok(())) => info!("WebSocket listener returned cleanly"),
-            Ok(Err(e)) => warn!("WebSocket listener errored: {e:?}"),
-            Err(e) => warn!("WebSocket task panicked: {e:?}"),
+        res = server => match res {
+            Ok(()) => info!("server transports returned cleanly"),
+            Err(e) => warn!("server transports errored: {e:?}"),
         },
     }
 

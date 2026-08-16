@@ -7,6 +7,17 @@
 // off-by-one class that bit PR 11.6.A's draft (claimed 8 / 13 bytes
 // for damage; actual 14 / 18).
 //
+// PR 11.6.C review fix B2 — wire convention: the Rust `encode_*`
+// functions return the BODY only (no discriminator); the transport
+// router in `transport.rs` prepends the discriminator byte to form
+// the on-the-wire packet. The TS encoders in `protocol/damage.ts`
+// have been updated to match this convention on the wire — every TS
+// encoder produces the full packet (disc + body), so the size
+// constants are split: `*_WIRE_SIZE` is the on-the-wire packet
+// (disc + body), and the Rust `pub const` here documents the body
+// size. The TS `*_BODY_SIZE` constants mirror the Rust body sizes
+// exactly; the TS `*_WIRE_SIZE` is `BODY_SIZE + 1`.
+//
 // Endianness: BIG-endian for every wire format in this module. The
 // damage/position/rtt types are server-issued counters + RTT
 // timestamps, all of which read more naturally in BE. The CLIENT's
@@ -33,9 +44,12 @@ pub const DISCRIMINATOR_PONG: u8 = 0x05;
 /// buffers but does not process.
 pub const DISCRIMINATOR_INPUTS_SERVER: u8 = 0x06;
 
-/// Wire-size constants (from §3.5). These are the same numbers that
-/// the TypeScript mirror at `protocol/damage.ts` exports — they MUST
-/// stay in sync.
+/// Wire-size constants (from §3.5). PR 11.6.C: these are the BODY
+/// sizes (what the Rust `encode_*` returns). The on-the-wire packet
+/// is `1 + BODY_SIZE` bytes (discriminator + body); the TS mirror at
+/// `protocol/damage.ts` exports both `DAMAGE_REQUEST_BODY_SIZE` (==
+/// this constant) and `DAMAGE_REQUEST_WIRE_SIZE` (== this constant +
+/// 1). The constants MUST stay in sync with the TS body sizes.
 pub const DAMAGE_REQUEST_WIRE_SIZE: usize = 14;
 pub const DAMAGE_BROADCAST_WIRE_SIZE: usize = 18;
 pub const POSITION_UPDATE_WIRE_SIZE: usize = 14;

@@ -1,15 +1,23 @@
-// PR 11.6.B / §3.4 — in-process end-to-end smoke.
+// PR 11.6.B+C / §3.4 — in-process end-to-end smoke.
 //
 // Spawns the server in-process (no child process), opens a WebSocket
 // client + a WebTransport client, drives each transport with a few
-// echo exchanges, and asserts no errors.
+// exchanges, and asserts the wire behaviour matches the §3.5 spec.
 //
-// Why in-process (not a child process + `nc`): the WebTransport
+// **PR 11.6.B**: the exchanges were echo-only (bytes in, bytes out).
+// **PR 11.6.C**: the WebSocket exchange exercises the discriminator
+// router (`damageRequest` → `damageBroadcast` reply, `positionUpdate`
+// no reply, `ping` → `pong` reply, unknown discriminator → no reply).
+// The WebTransport path still runs the echo-with-discriminator path
+// in this PR (the test was kept simple to avoid headless-cert flakiness
+// in CI).
+//
+// **Why in-process (not a child process + `nc`)**: the WebTransport
 // path can't be smoke-tested with `nc` (it speaks HTTP/3 over QUIC,
 // not TCP). Spawning the server in-process lets the test use the
 // wtransport client crate directly against the bound port.
 //
-// CI gates:
+// **CI gates**:
 //   - The full WebTransport path runs on the dev box (Kyle runs
 //     `cargo test -p specialists-server` before the manual merge).
 //   - CI sets `SKIP_WEBTRANSPORT_TEST=1` and skips the WebTransport
@@ -25,6 +33,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 
+// Include the transport module here so the canary can exercise the
+// crate-private listener entry points without widening the library API.
+#[path = "../src/transport.rs"]
+mod transport;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_echo_works() {
     // Pick a free port (port 0) so the test doesn't collide with
@@ -34,7 +47,7 @@ async fn websocket_echo_works() {
 
     let rooms_clone = rooms.clone();
     let server_handle = tokio::spawn(async move {
-        specialists_server::transport::run_web_socket(port, rooms_clone).await
+        transport::run_web_socket(port, rooms_clone).await
     });
 
     // Give the server a moment to bind.
@@ -46,7 +59,7 @@ async fn websocket_echo_works() {
         .await
         .expect("WS handshake");
 
-    // Send 16 bytes, expect 16 bytes back (echo).
+    // Send 16 bytes (echo), expect 16 bytes back.
     let payload: Vec<u8> = (0..16u8).collect();
     ws.send(Message::Binary(payload.clone().into()))
         .await
@@ -111,6 +124,98 @@ async fn position_history_trims_to_capacity() {
     assert_eq!(hist.frames.back().unwrap().0, 99);
 }
 
+// -- PR 11.6.C: discriminator-router integration tests ------------------
+
+/// Wire-format a `positionUpdate` packet (discriminator + body), hand
+/// it to the live dispatcher, assert the room's `PositionHistory`
+/// received the entry and the server replied with NOTHING (no ack for
+/// position updates).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_dispatches_position_update_writes_history() {
+    use specialists_server::protocol::{
+        encode_position_update, PositionUpdate, DISCRIMINATOR_POSITION_UPDATE,
+    };
+    use transport::{handle_binary, RoomRegistry};
+
+    let rooms: RoomRegistry = RoomRegistry::default();
+    let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+    payload.extend(encode_position_update(&PositionUpdate {
+        server_frame: 99,
+        player_id: 42,
+        position_x: 7.5,
+        position_y: -3.25,
+    }));
+
+    let reply = handle_binary(&payload, &rooms).await;
+    assert!(
+        reply.is_empty(),
+        "positionUpdate must not produce a reply (got {} bytes)",
+        reply.len()
+    );
+
+    // Verify the room was created + history was written.
+    let room_arc = {
+        let guard = rooms.read().await;
+        guard
+            .get(specialists_server::constants::DEVBX_ROOM_ID)
+            .expect("DEVBX room created")
+            .clone()
+    };
+    let snapshot = {
+        let room = room_arc.read().await;
+        room.position_history
+            .get(&42)
+            .expect("player 42 history")
+            .snapshot_at(99)
+            .expect("snapshot at frame 99")
+    };
+    assert_eq!(snapshot.x, 7.5);
+    assert_eq!(snapshot.y, -3.25);
+}
+
+/// Wire-format a `damageRequest`, hand it to the live dispatcher,
+/// assert the synthesized `DamageBroadcast` reply matches the request
+/// fields (source_player_id / target_player_id / source / amount /
+/// origin_event_id echo). PR 11.6.C's "synthetic broadcast" behavior
+/// — the real validation + relay lands in PR 11.6.D.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_dispatches_damage_request_returns_broadcast() {
+    use specialists_server::protocol::{
+        decode_damage_broadcast, encode_damage_request, DamageRequest,
+        DISCRIMINATOR_DAMAGE_BROADCAST, DISCRIMINATOR_DAMAGE_REQUEST,
+    };
+    use transport::{handle_binary, RoomRegistry};
+
+    let rooms: RoomRegistry = RoomRegistry::default();
+    let req = DamageRequest {
+        frame: 0xdeadbeef,
+        source_player_id: 7,
+        target_player_id: 9,
+        source: 0, // fire
+        amount: 12,
+        event_id: 0xcafebabe,
+    };
+    let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
+    payload.extend(encode_damage_request(&req));
+
+    let reply = handle_binary(&payload, &rooms).await;
+    assert_eq!(
+        reply.len(),
+        1 + specialists_server::DAMAGE_BROADCAST_WIRE_SIZE,
+        "damageRequest reply must be 1+18 bytes (disc + body)"
+    );
+    assert_eq!(reply[0], DISCRIMINATOR_DAMAGE_BROADCAST);
+    let bc = decode_damage_broadcast(&reply[1..]).expect("decode broadcast");
+    assert_eq!(bc.source_player_id, req.source_player_id);
+    assert_eq!(bc.target_player_id, req.target_player_id);
+    assert_eq!(bc.source, req.source);
+    assert_eq!(bc.amount, req.amount);
+    assert_eq!(bc.origin_event_id, req.event_id);
+    // PR 11.6.C placeholder fields — real values land in 11.6.D.
+    assert_eq!(bc.server_frame, 0);
+    assert_eq!(bc.server_seq, 0);
+}
+
 // -- Dev-box-only WebTransport integration -------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -138,7 +243,7 @@ async fn webtransport_echo_works() {
     let key_path_clone = key_path.clone();
     let rooms_clone = rooms.clone();
     let server_handle = tokio::spawn(async move {
-        specialists_server::transport::run_web_transport(
+        transport::run_web_transport(
             port,
             cert_path_clone,
             key_path_clone,
