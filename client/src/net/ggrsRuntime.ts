@@ -215,17 +215,24 @@ export class LockstepRuntime {
     // budget.
     //
     // IMPORTANT: use the same `predictionDepth` formula as the getter
-    // (`max(0, localFrame - 1 - highestRemoteFrameSeen)`) rather than raw
-    // `localFrame - highestRemoteFrameSeen`. Without the `-1` and
-    // `max(0, ...)`, the cap would fire on the very first advance before
-    // any peer input arrives (initial state: localFrame=0,
-    // highestRemoteFrameSeen=-1 → raw delta=1, not >= 8 fine — but by
-    // advance #8 raw delta=8 and the cap fires one tick EARLIER than the
-    // getter says we are). Using the predictionDepth formula keeps the
-    // cap and the getter synchronized, and keeps the runtime from
-    // self-pausing during the handshake window.
+    // (`max(0, localFrame - 1 - highestRemoteFrameSeen)`), and apply the
+    // same `Math.max(0, ...)` clamp. Without the clamp, the cap fires on
+    // a SOLO browser with no peer: initial state is
+    // `localFrame=0, highestRemoteFrameSeen=-1`, so `aheadBy = 0 - 1 - (-1) = 0`
+    // on frame 0 (no cap) BUT after 8 frames of solo driving
+    // `localFrame=8, aheadBy = 8 - 1 - (-1) = 8 → CAP FIRES`. A solo
+    // browser has no peer to "fall behind" — `predictionDepth` should
+    // report 0 (we're tied with the nothing-happened condition), and
+    // the cap should never fire. The `Math.max(0, ...)` was supposed
+    // to do this but doesn't because `localFrame - 1 - (-1) = localFrame`
+    // is always non-negative for any localFrame > 0.
+    //
+    // Correct check: gate on `highestRemoteFrameSeen >= 0` (i.e., we've
+    // actually received at least one peer packet — the runtime has a
+    // real notion of "falling behind"). Without a peer, `predictionDepth`
+    // is conceptually 0 and the cap is a no-op.
     const aheadBy = Math.max(0, this.localFrame - 1 - this.highestRemoteFrameSeen);
-    if (aheadBy >= ROLLBACK_CAP_FRAMES) {
+    if (this.highestRemoteFrameSeen >= 0 && aheadBy >= ROLLBACK_CAP_FRAMES) {
       this._pausedFrames++;
       this._totalPausedFrames++;
       // Sentinel: zeroed LOCAL input (the controller MUST NOT be fed this

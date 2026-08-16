@@ -17,25 +17,25 @@
 // What this smoke verifies:
 //   1. ROLLBACK_CAP_FRAMES === 8 (the documented-but-unused constant
 //      became load-bearing; smear test that the re-export compiles).
-//   2. Advance 8 times within the cap → all advance, none paused,
-//      localFrame reaches 8. (The cap fires at aheadBy >= 8 where
-//      aheadBy = max(0, localFrame - 1 - highestRemoteFrameSeen).
-//      With highestRemoteFrameSeen = -1 at startup, the cap fires
-//      when localFrame - 1 - (-1) = localFrame = 8, so all 8
-//      within-cap advances succeed — the 9th advance has localFrame=8
-//      and aheadBy=8, tripping the cap.)
+//   2. Feed 1 peer packet (highestRemoteFrameSeen = 0). Advance 9
+//      times within the cap → all advance, none paused, localFrame
+//      reaches 9. (The cap fires at aheadBy >= 8 where aheadBy = max(0,
+//      localFrame - 1 - highestRemoteFrameSeen). With
+//      highestRemoteFrameSeen = 0, the cap fires when localFrame - 1 ≥ 8
+//      → localFrame = 9 on advance #10 (CHECK is at localFrame=9). So
+//      advances 1..9 succeed, advance #10 is the first over-cap tick.)
 //   3. Advance 5 more times (over the cap) → all return paused=true,
-//      localFrame stays at 8, isPaused=true, pausedFrames grows to 5,
+//      localFrame stays at 9, isPaused=true, pausedFrames grows to 5,
 //      totalPausedFrameCount is 5.
 //   4. Wire encode + submit still happens while paused (peer needs
-//      our packets to catch up). 8 + 5 = 13 sent packets after the
-//      first 13 advanceFrame calls.
-//   5. Feed the runtime 9 zeroed-input peer packets at frames 0..8.
-//      After the feed, highestRemoteFrameSeen = 8. The next
-//      advanceFrame call sees aheadBy = max(0, 8-1-8) = 0 and
+//      our packets to catch up). 9 + 5 = 14 sent packets from the
+//      main loop + 1 caught-up = 15 total.
+//   5. Feed 10 zeroed-input peer packets at frames 0..9.
+//      After the feed, highestRemoteFrameSeen = 9. The next
+//      advanceFrame call sees aheadBy = max(0, 9 - 1 - 9) = 0 and
 //      resumes normally.
 //   6. The caught-up advance returns paused=false, localFrame
-//      increments to 9, pausedFrames resets to 0,
+//      increments to 10, pausedFrames resets to 0,
 //      totalPausedFrameCount stays at 5 (monotonic — never decreases).
 //   7. The new __lockstepProbe DEV probe exposes cap + the paused
 //      counters + the existing frame + repeated + prediction getters.
@@ -50,11 +50,11 @@ import { chromium } from "playwright";
 const URL = process.env.LOCKSTEP_ROLLBACK_SMOKE_URL ?? "http://localhost:5188/";
 const SCREENSHOT = process.env.LOCKSTEP_ROLLBACK_SMOKE_PNG ?? "lockstep-rollback.png";
 const EXPECTED_CAP = 8;
-const WITHIN_CAP_ADVANCES = 8;     // 8 successful advances before the cap fires (see ggrsRuntime.ts cap math)
+const WITHIN_CAP_ADVANCES = 9;     // 9 successful advances after seeding highestRemoteFrameSeen=0 (see ggrsRuntime.ts cap math)
 const OVER_CAP_ADVANCES = 5;       // 5 paused advances (paused counter hits 5)
 const EXPECTED_TOTAL_PAUSED = 5;    // matches OVER_CAP_ADVANCES
-const CATCHUP_FRAMES = 9;           // feed 9 peer packets (frames 0..8) to put highestRemoteFrameSeen = 8
-const EXPECTED_TOTAL_SENT_PACKETS = WITHIN_CAP_ADVANCES + OVER_CAP_ADVANCES + 1; // 14
+const CATCHUP_FRAMES = 10;          // feed 10 peer packets (frames 0..9) to put highestRemoteFrameSeen = 9
+const EXPECTED_TOTAL_SENT_PACKETS = WITHIN_CAP_ADVANCES + OVER_CAP_ADVANCES + 1; // 15
 
 const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
@@ -146,9 +146,15 @@ try {
       return packet;
     };
 
-    // --- Phase A: 8 within-cap advances ---
+    // --- Phase 0: seed one peer packet so highestRemoteFrameSeen = 0 ---
+    // Without this, the cap would NEVER fire (it's gated on
+    // highestRemoteFrameSeen >= 0 — a solo browser has no peer to
+    // "fall behind"). The smoke models the post-handshake state.
+    capturedInboundCallback(makePeerPacket(0));
+
+    // --- Phase A: 9 within-cap advances ---
     const withinCap = [];
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 9; i++) {
       runtime.submitLocalInput(new Uint8Array(INPUT_SIZE));
       const advanced = runtime.advanceFrame();
       withinCap.push({
@@ -179,8 +185,8 @@ try {
     }
     const totalPausedAtEndOfPhaseB = runtime.totalPausedFrameCount;
 
-    // --- Phase C: feed 9 peer packets (catch-up) ---
-    for (let f = 0; f < 9; f++) {
+    // --- Phase C: feed 10 peer packets (catch-up) ---
+    for (let f = 0; f < 10; f++) {
       capturedInboundCallback(makePeerPacket(f));
     }
 
@@ -212,7 +218,7 @@ try {
   }
   console.log(`CAP_OK: ROLLBACK_CAP_FRAMES === ${result.cap}`);
 
-  // (3) Within-cap advances: all 8 succeed, no paused, localFrame 0→8.
+  // (3) Within-cap advances: all 9 succeed, no paused, localFrame 0→9.
   if (result.withinCap.length !== WITHIN_CAP_ADVANCES) {
     throw new Error(`[within-cap-count] expected ${WITHIN_CAP_ADVANCES} advances, got ${result.withinCap.length}`);
   }
@@ -236,7 +242,7 @@ try {
   }
   console.log(`WITHIN_CAP_OK: ${WITHIN_CAP_ADVANCES} advances succeeded, localFrame 0→${result.withinCap[result.withinCap.length - 1].localFrame}`);
 
-  // (4) Over-cap advances: all 5 paused, localFrame stays at 8.
+  // (4) Over-cap advances: all 5 paused, localFrame stays at 9.
   if (result.overCap.length !== OVER_CAP_ADVANCES) {
     throw new Error(`[over-cap-count] expected ${OVER_CAP_ADVANCES} over-cap advances, got ${result.overCap.length}`);
   }
@@ -245,11 +251,11 @@ try {
     if (a.paused !== true) {
       throw new Error(`[over-cap ${i}] expected paused === true, got ${a.paused}`);
     }
-    if (a.frame !== 8) {
-      throw new Error(`[over-cap ${i}] expected frame === 8 (unchanged), got ${a.frame}`);
+    if (a.frame !== 9) {
+      throw new Error(`[over-cap ${i}] expected frame === 9 (unchanged), got ${a.frame}`);
     }
-    if (a.localFrame !== 8) {
-      throw new Error(`[over-cap ${i}] expected localFrame === 8 (unchanged), got ${a.localFrame}`);
+    if (a.localFrame !== 9) {
+      throw new Error(`[over-cap ${i}] expected localFrame === 9 (unchanged), got ${a.localFrame}`);
     }
     if (a.isPaused !== true) {
       throw new Error(`[over-cap ${i}] expected isPaused === true, got ${a.isPaused}`);
@@ -277,16 +283,16 @@ try {
   }
   console.log(`SENT_PACKETS_OK: ${result.sentPacketCount} sent packets (wire encoded every tick, even while paused)`);
 
-  // (6) Caught-up advance: paused=false, localFrame=9, pausedFrames=0,
+  // (6) Caught-up advance: paused=false, localFrame=10, pausedFrames=0,
   // totalPausedFrameCount stays at 5 (monotonic — never decreases).
   if (result.caughtUp.paused !== false) {
     throw new Error(`[caught-up] expected paused === false, got ${result.caughtUp.paused}`);
   }
-  if (result.caughtUp.frame !== 8) {
-    throw new Error(`[caught-up] expected frame === 8, got ${result.caughtUp.frame}`);
+  if (result.caughtUp.frame !== 9) {
+    throw new Error(`[caught-up] expected frame === 9, got ${result.caughtUp.frame}`);
   }
-  if (result.caughtUp.localFrame !== 9) {
-    throw new Error(`[caught-up] expected localFrame === 9, got ${result.caughtUp.localFrame}`);
+  if (result.caughtUp.localFrame !== 10) {
+    throw new Error(`[caught-up] expected localFrame === 10, got ${result.caughtUp.localFrame}`);
   }
   if (result.caughtUp.isPaused !== false) {
     throw new Error(`[caught-up] expected isPaused === false, got ${result.caughtUp.isPaused}`);
