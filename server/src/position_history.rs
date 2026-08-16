@@ -79,6 +79,48 @@ impl PositionHistory {
 mod tests {
     use super::*;
 
+    /// PR 11.6.C — exact-match case: target frame is in the buffer.
+    /// (The lag-comp consumer `validate_and_relay` rewinds to
+    /// `req.frame - rtt/2` and asks for the snapshot at that exact
+    /// frame. This is the happy path.)
+    #[test]
+    fn snapshot_at_exact_match() {
+        let mut h = PositionHistory::new(4);
+        h.record(10, Position { x: 1.0, y: 2.0 });
+        h.record(20, Position { x: 3.0, y: 4.0 });
+        assert_eq!(h.snapshot_at(10), Some(Position { x: 1.0, y: 2.0 }));
+        assert_eq!(h.snapshot_at(20), Some(Position { x: 3.0, y: 4.0 }));
+    }
+
+    /// PR 11.6.C — target frame is between two recorded frames; the
+    /// returned snapshot is the most recent one `<= target`.
+    #[test]
+    fn snapshot_at_largest_below() {
+        let mut h = PositionHistory::new(4);
+        h.record(10, Position { x: 1.0, y: 1.0 });
+        h.record(20, Position { x: 2.0, y: 2.0 });
+        h.record(30, Position { x: 3.0, y: 3.0 });
+        // Target 25: largest <= 25 is 20.
+        assert_eq!(h.snapshot_at(25), Some(Position { x: 2.0, y: 2.0 }));
+        // Target 19: largest <= 19 is 10.
+        assert_eq!(h.snapshot_at(19), Some(Position { x: 1.0, y: 1.0 }));
+        // Target 31: still 30 (largest in buffer).
+        assert_eq!(h.snapshot_at(31), Some(Position { x: 3.0, y: 3.0 }));
+    }
+
+    /// PR 11.6.C — empty buffer returns None for any target. The
+    /// lag-comp validator treats this as "target wasn't moving /
+    /// never reported a position; use the current position instead."
+    /// PR 11.6.D wires the fallback; this PR just pins the API
+    /// contract.
+    #[test]
+    fn snapshot_at_empty() {
+        let h = PositionHistory::new(4);
+        assert_eq!(h.snapshot_at(0), None);
+        assert_eq!(h.snapshot_at(100), None);
+        assert_eq!(h.snapshot_at(u32::MAX), None);
+    }
+
     #[test]
     fn record_then_snapshot_returns_inserted_position() {
         let mut h = PositionHistory::new(4);

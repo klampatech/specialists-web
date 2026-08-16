@@ -17,9 +17,9 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 # WebTransport primary transport (HTTP/3 + QUIC). Vendored locally — see
 # `vendor/wtransport/PATCHES.md` for the one-line patch that works
-# around the quinn 0.11.9+ `.0` privacy regression. PR 11.6.C should
-# consider upgrading to a current wtransport release and dropping the
-# vendor.
+# around the quinn 0.11.9+ `.0` privacy regression. Drop the vendor after
+# PR 11.7 once a compatible current release is verified; keeping it here
+# keeps the dev canary reproducible in the meantime.
 wtransport = { path = "vendor/wtransport", default-features = false, features = ["self-signed"] }
 # WebSocket fallback transport.
 tokio-tungstenite = "0.24"
@@ -33,6 +33,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Used by `transport::sans_with_defaults` for the merged SAN list.
 futures = "0.3"
+# Pure Rust vector math for the server-side lag-comp hit test. This is a
+# direct dependency (rather than relying on a transitive wtransport version)
+# so the hitscan API is stable if the transport implementation changes.
+glam = "0.27"
 
 [dev-dependencies]
 # Re-declared under dev-dependencies so the integration smoke in

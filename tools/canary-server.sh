@@ -33,6 +33,14 @@ PORT_WS="${PORT_WS:-4434}"
 CERT_DIR="${CERT_DIR:-$REPO_ROOT/server/certs}"
 SANS="${SANS:-localhost,127.0.0.1,::1}"
 CARGO_PROFILE="${CARGO_PROFILE:-release}"
+# Build the cargo profile flag. "debug" is the default and doesn't
+# take a flag, so we omit --$CARGO_PROFILE when CARGO_PROFILE=debug
+# (cargo run --debug is a syntax error). For release, we pass --release.
+if [[ "$CARGO_PROFILE" == "debug" ]]; then
+  CARGO_PROFILE_FLAG=""
+else
+  CARGO_PROFILE_FLAG="--$CARGO_PROFILE"
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -69,7 +77,7 @@ cd "$REPO_ROOT"
 if [[ ! -f "$CERT_PATH" ]] || [[ ! -f "$KEY_PATH" ]]; then
   echo "[canary] generating self-signed cert in $CERT_DIR..."
   mkdir -p "$CERT_DIR"
-  cargo run --manifest-path server/Cargo.toml --quiet --$CARGO_PROFILE -- \
+  cargo run --manifest-path server/Cargo.toml --quiet $CARGO_PROFILE_FLAG -- \
     --gen-cert \
     --cert-out "$CERT_PATH" \
     --key-out "$KEY_PATH" \
@@ -82,7 +90,7 @@ echo "[canary] key:  $KEY_PATH"
 echo "[canary] sans: $SANS"
 
 # Hand off to the server. exec so signals (SIGINT) reach it directly.
-exec cargo run --manifest-path server/Cargo.toml --quiet --$CARGO_PROFILE -- \
+exec cargo run --manifest-path server/Cargo.toml --quiet $CARGO_PROFILE_FLAG -- \
   --port-wt "$PORT_WT" \
   --port-ws "$PORT_WS" \
   --cert "$CERT_PATH" \

@@ -48,6 +48,123 @@ jobs:
           # tools/canary-server.sh).
           SKIP_WEBTRANSPORT_TEST: 1
 
+  # Phase 1 / PR 11.6.C — server-transport round-trip smoke.
+  # Boots the canary server (WebTransport + WebSocket) + Vite on port
+  # 5190, opens a single headless tab with the `__forceServerTransport`
+  # DEV probe set, and asserts the wire-format round-trip (ping/pong,
+  # damage request → synthetic broadcast, position update → no reply,
+  # inputs → no error, malformed payload → no crash, wire sizes). The
+  # smoke port is independent of all other client smoke jobs.
+  client-damage-server-smoke:
+    name: client — damage server smoke (PR 11.6.C, port 5190)
+    # PR 11.6.C review fix B4: serialize after server-build so cold
+    # cargo work doesn't race between the two jobs (both write to
+    # `server/target`, which on a cold cache can cause sporadic
+    # `cargo: file lock` errors or stale-binary issues). The canary
+    # binary in this job is the same one that passed server-build.
+    needs: server-build
+    runs-on: ubuntu-latest
+    # No `defaults.run.working-directory` — cargo steps run from repo root
+    # (so `cargo --manifest-path server/Cargo.toml` resolves correctly);
+    # the npm + smoke steps run with explicit `working-directory: client`.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (release)
+        run: cargo build --release --manifest-path server/Cargo.toml
+      - name: Test server (skip WebTransport integration)
+        run: cargo test --manifest-path server/Cargo.toml
+        env:
+          SKIP_WEBTRANSPORT_TEST: 1
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # The key is scoped by the Playwright version + OS so version
+        # bumps pick up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo.
+        # The system deps are already installed on the runner.
+        # The Playwright cache above restores ~/.cache/ms-playwright/
+        # between runs so we don't re-download the browser each time.
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Boot canary server (ports 14433 + 14434)
+        run: |
+          nohup bash tools/canary-server.sh --port-wt 14433 --port-ws 14434             > /tmp/canary-server.log 2>&1 &
+          echo $! > /tmp/canary-server.pid
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+              echo "Canary server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+            echo "::error::Canary server did not become ready in 60s"
+            cat /tmp/canary-server.log
+            exit 1
+          fi
+      - name: Boot Vite dev server (port 5190)
+        working-directory: client
+        run: |
+          nohup npm run dev -- --host 127.0.0.1 --port 5190 --strictPort             > /tmp/vite-5190.log 2>&1 &
+          echo $! > /tmp/vite-5190.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5190/ > /dev/null; then
+              echo "Vite (damage server smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5190/ > /dev/null; then
+            echo "::error::Vite (damage server smoke) did not become ready in 60s"
+            cat /tmp/vite-5190.log
+            exit 1
+          fi
+      - name: Run damage server smoke
+        working-directory: client
+        run: node tools/damage-server-smoke.mjs
+        env:
+          DAMAGE_SERVER_SMOKE_URL: http://localhost:5190/
+          CANARY_SERVER_PORT_WT: 14433
+          CANARY_SERVER_PORT_WS: 14434
+          SMOKE_PNG: client/tools/damage-server-smoke.png
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: damage-server-smoke-screenshot
+          path: client/tools/damage-server-smoke.png
+          if-no-files-found: warn
+      - name: Tear down canary + Vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server.pid ]]; then kill "$(cat /tmp/canary-server.pid)" || true; fi
+          if [[ -f /tmp/vite-5190.pid ]]; then kill "$(cat /tmp/vite-5190.pid)" || true; fi
+          # Belt-and-suspenders: kill any stragglers on the known ports.
+          pkill -f canary-server.sh || true
+          pkill -f 'vite.*5190' || true
+          for port in 5190 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   # Phase 0 / PR 2: headless smoke test of the Babylon scene.
   # Boots `npm run dev`, waits for the ready banner to disappear, captures a
   # screenshot, fails on any console error, and uploads the screenshot as a

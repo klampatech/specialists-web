@@ -1,7 +1,8 @@
 // PR 11.6.B — server scaffold library entry point.
 //
-// Re-exports the modules that `main.rs` and the integration test in
-// `tests/session_canary.rs` need. Keeping `main.rs` thin + pushing
+// Re-exports the modules that the binary + integration harness need.
+// `transport.rs` is included directly by `tests/session_canary.rs` so its
+// individual listener entry points can stay crate-private. Keeping `main.rs` thin + pushing
 // orchestration into `run()` is what makes the in-process canary test
 // possible: the test calls `run(...)` with a tempdir + ports 0 (so the
 // kernel assigns free ports), drives both transports, and tears down
@@ -9,14 +10,25 @@
 
 #![allow(clippy::needless_return)]
 
+// Alias the package for modules included directly by the integration canary.
+// That lets `#[path]` include `transport.rs` without leaking listener
+// entry points through the public library surface.
+extern crate self as specialists_server;
+
 pub mod cert;
 pub mod constants;
+pub mod hitscan;
 pub mod position_history;
 pub mod protocol;
 pub mod session;
 pub mod transport;
 
 pub use constants::{MAX_PLAYERS_PER_ROOM, PING_HZ, POSITION_UPDATE_HZ, TICK_RATE_HZ};
+pub use glam::Vec3;
+pub use hitscan::{
+    chest_position, dual_pistol_damage, dual_pistol_hit, forward_from_yaw_pitch,
+    DEFAULT_TARGET_RADIUS, DUAL_PISTOL_DAMAGE, DUAL_PISTOL_MAX_RANGE_METERS,
+};
 pub use position_history::{Position, PositionHistory};
 pub use protocol::{
     decode_damage_broadcast, decode_damage_request, decode_inputs_server, decode_ping,

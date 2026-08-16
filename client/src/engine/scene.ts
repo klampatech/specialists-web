@@ -65,9 +65,27 @@ import type { GgnetTransport } from "../net/ggnet";
 import { LockstepRuntime, ROLLBACK_CAP_FRAMES } from "../net/ggrsRuntime";
 
 /** Optional multiplayer kick — when present, createScene also runs a second
- *  controller and a lockstep session across the supplied transport. */
+ *  controller and a lockstep session across the supplied transport.
+ *
+ *  PR 11.6.C review fix N1: `useServerTransport` is the programmatic
+ *  override that gates the DEV-only `ServerTransport` instantiation in
+ *  scene.ts. Default `false`. Programmatic callers can pass `true`
+ *  here to exercise the server-transport path through the public API
+ *  (planned for PR 11.6.D's URL-routed `?server=` flag). The DEV
+ *  probe `__forceServerTransport` is still honored as a backup (the
+ *  smoke uses that — `page.addInitScript` sets it BEFORE the page
+ *  loads so scene.ts sees it on boot).
+ */
 export interface MultiplayerOptions {
   transport: GgnetTransport;
+  /** PR 11.6.C review fix N1: programmatic override that gates the
+   *  server-transport DEV probe in scene.ts. `true` enables the
+   *  `ServerTransport` instantiation (equivalent to setting
+   *  `window.__forceServerTransport` before the page loads). The
+   *  smoke uses the window-probe path; future programmatic callers
+   *  (PR 11.6.D's URL-routed `?server=` flag) will pass `true`
+   *  directly via this field. */
+  useServerTransport?: boolean;
 }
 
 export interface SceneHandle {
@@ -621,6 +639,59 @@ export async function createScene(
       repeatedFrameCount: __lockstepTestRuntime.repeatedFrameCount,
       predictionDepth: __lockstepTestRuntime.predictionDepth,
     });
+    // PR 11.6.C: server-transport DEV probe. The smoke sets
+    // `window.__forceServerTransport = true` via `page.addInitScript`
+    // BEFORE this scene module loads. When the flag is set, we
+    // instantiate a `ServerTransport`, connect it, and expose it (plus
+    // the typed `damageBus` wrappers) on `window.__serverTransport`
+    // and `window.__damageBus`. The smoke drives the transport
+    // directly via these probes — no gameSession wiring (that lands in
+    // PR 11.6.D's caller-side swap).
+    //
+    // The probe is gated behind `import.meta.env.DEV` so Vite strips
+    // it from production builds. The `__forceServerTransport` symbol
+    // and the `ServerTransport` class itself appear nowhere in
+    // production bundles. Verified by:
+    //   grep '__forceServerTransport' dist/assets/index-*.js
+    //   grep '__serverTransport' dist/assets/index-*.js
+    // Both return ZERO matches post- build.
+    // PR 11.6.C review fix N1: the DEV probe now honors either the
+    // window probe (`__forceServerTransport` — set by the smoke via
+    // `page.addInitScript`) OR the programmatic override passed via
+    // `MultiplayerOptions.useServerTransport` (planned for PR 11.6.D's
+    // URL-routed `?server=` flag). Either is sufficient to enable the
+    // server-transport instantiation.
+    const useServerTransportFromOpts = multiplayer?.useServerTransport === true;
+    const useServerTransportFromWindow = (
+      typeof window !== "undefined" &&
+      (window as unknown as { __forceServerTransport?: boolean }).__forceServerTransport === true
+    );
+    if (
+      import.meta.env.DEV &&
+      (useServerTransportFromOpts || useServerTransportFromWindow)
+    ) {
+      // Lazy-import to keep the production bundle clean (Vite strips
+      // dead branches even when the import statement is at module
+      // top-level, but a dynamic import is the documented pattern for
+      // DEV-only modules).
+      void (async () => {
+        const { ServerTransport } = await import("../net/serverTransport");
+        const { createDamageBusProbe } = await import("../net/damageBus");
+        // Default: point at localhost:5190 (the vite dev server). The
+        // smoke can override the transport ports via
+        // `window.__damageServerPorts = { wt: 14433, ws: 14434 }`
+        // (the canary server's --port-wt / --port-ws flags).
+        const urlBase = (window as unknown as { __damageServerUrl?: string }).__damageServerUrl
+          ?? `${window.location.protocol}//${window.location.host}`;
+        const roomId = (window as unknown as { __damageServerRoomId?: string }).__damageServerRoomId
+          ?? "DEVBX";
+        const server = new ServerTransport(urlBase, roomId);
+        await server.connect();
+        (window as unknown as { __serverTransport?: InstanceType<typeof ServerTransport> }).__serverTransport = server;
+        (window as unknown as { __damageBus?: ReturnType<typeof createDamageBusProbe> }).__damageBus =
+          createDamageBusProbe(server);
+      })();
+    }
   }
 
   const handle: SceneHandle = {
