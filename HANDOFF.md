@@ -4,6 +4,45 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-15 — PR 11.6 plan PR (11.6.A) drafted and opened for review. No code changes; budget-respectful pre-implementation ADR.
+
+**Status**: PR #TBD (`docs/pr11.6-plan`) opened as **REVIEW-ONLY**. No merge until kyle's call on the 5 open architecture questions in §6 of the plan. No codex dispatch, no Rust code, no Vite churn — pure planning work this session.
+
+**Why this is the deliverable**: PR 11.6 is "~2-4 sessions" per the spec, but a survey of the codebase showed it's actually more like 4-6 sessions because (a) `server/` and `protocol/` are empty `.gitkeep` placeholders (no Rust scaffolding exists), (b) the closest referenced Rust scaffold `~/Development/world-factory-ctf` does not exist (memory/SPEC drift — flagging explicitly; SPEC text also fixed in this PR), (c) the existing 14 smokes need a backward-compat path so they keep passing while server-auth damage is added. The plan breaks PR 11.6 into 5 sub-PRs (11.6.A through 11.6.E), each independently mergeable, with progressively bigger orchestration budget per PR.
+
+**What this session shipped**:
+1. **`docs/PR-11.6-plan.md`** (603 lines) — the architecture decision record. Covers: why PR 11.6 is the next thing post-M2; current-vs-new damage flow with sequence diagrams; wire protocol byte layouts (no codegen, hand-translated `protocol/damage.{ts,rs}`); the new `GameTransport` 4-channel interface (`inputs`/`state`/`damageRequests`/`damageBroadcasts`); per-sub-PR file scope; 3-tier verification strategy; 5 open architecture questions for your call.
+2. **`docs/SPEC.md`** — Next-list's PR 11.6 paragraph updated to drop the incorrect `world-factory-ctf` reference (directory doesn't exist) and to point at the plan file. No status flips (nothing shipped yet).
+3. **`HANDOFF.md`** — this entry.
+4. **Branch + PR opened**. Ready for kyle's review.
+
+**Sub-PR roll-out sequence** (each independently mergeable, no in-progress branch extensions):
+- **11.6.A** (this PR) — plan + ADR
+- **11.6.B** (~1 session) — server scaffold: Tokio + WebSocket + room registry + `tools/canary-server.sh` + `server-build` CI job
+- **11.6.C** (~1 session) — wire protocol + transport mux: `GameTransport` interface + `ServerGgnetTransport` impl + `P2PGgnetTransport` backward-compat + protocol/damage encode/decode
+- **11.6.D** (~1-2 sessions) — server-auth damage end-to-end: `damageBus.queue(...)` in `gameSession.tick`, server's `damage_relay.rs`, `client-damage-server-smoke.mjs` on port 5190, dev-box two-tab convergence verification
+- **11.6.E** (~1 session) — WebTransport layer: replace WebSocket with WebTransport + cert handling. The deferral here is the call that needs kyle's signoff (Q1).
+
+**5 open questions** (full text in `docs/PR-11.6-plan.md` §6):
+1. **WebSocket-first or WebTransport-first** — my recommendation: WebSocket-first (faster canary + smoke; matches the spec's "WebSocket fallback for restricted networks" framing by treating it as the dev path; WebTransport as production-hardening later).
+2. **Matchmaker or hard-coded "DEVBX" room for the dev-box smoke** — my recommendation: hard-coded `roomId = "DEVBX"`, matchmaker is a separate PR.
+3. **Server-frame clock source** — my recommendation: `tokio::time::Instant` monotonic from server startup. Confirms "tick-driven" spec framing.
+4. **Bidirectional eventId dedupe** (tab's `eventId` echoed back as `originEventId`) — my recommendation: yes, cheap insurance for future anti-cheat work.
+5. **Ship with the `paused`-tick-input-loss carry-over** (PR 11.5 honest limitation; symmetric input drop on paused frames) — my recommendation: yes, document + table the fix as a follow-up.
+
+**Review checklist** (full in plan §8) — 8 items, mostly Q1-Q5. No code changes proposed; decisions only.
+
+**Carry-forwards** (unchanged from prior session):
+- PR 11.5's deferred playtest verification still requires real peer + visible character animation state. Carries into PR 11.6's verification environment, where the multi-tab two-tab WAN-throttle becomes the natural test surface for both PR 11.5 (cap behavior) AND PR 11.6 (server-auth damage). This stays in scope for PR 11.6.E.
+- All carry-forwards from PR 11.5's HANDOFF.md entry remain open (ESC-equals-resume flicker tabled; real Loadout + Settings UI placeholder; fade-in animation, separate pitch sensitivity, mouse-pitch smoke hardening, smooth interpolation on F2 toggle, camera collision in spectator, configurable spectator speed, paused-tick combat rising-edge loss).
+
+**Budget call** (this session): kyle was at 38% with 4h to reset. Burned zero orchestrate-dispatches. Pure in-context planning. Right grain for the budget window.
+
+**Lessons** (this session):
+- **The spec was wrong about `world-factory-ctf`** — referenced as the "Rust scaffold to crib from" but the directory does not exist (closest Rust repos are `~/Development/world-factory` and `~/Development/orca-rust`). Caught while surveying the codebase for PR 11.6's planning. Fixed in this PR's SPEC.md patch. Don't blindly trust architectural references — `ls` the path before assuming it exists.
+- **PR 11.6 is bigger than the spec claimed.** The "~2-4 sessions" estimate in `docs/SPEC.md` §"Next" assumed a Rust scaffold to crib from. None exists → design from scratch → add ~2 sessions. Revised honest estimate is 4-6 sessions. Update the SPEC to match once 11.6.B ships (real data point on actual session count).
+- **`prxx.0/discussion/PR-N-plan` PR for non-trivial work is the right discipline.** Same shape as the documentation-PR pattern that every prior PR has used. The plan lands in `docs/PR-11.6-plan.md`, gets reviewed once, then the 5 sub-PRs converge on a single validated target. Spends ~30 minutes of in-context time today to save hours of codex-rework after a partial-scaffold merge.
+
 ## 2026-08-15 — PR 11.5 MERGED (#27, squash `6e064e84`) — gap-bridging rollback cap in LockstepRuntime. Playtest verification DEFERRED to PR 11.6 — meaningful two-tab WAN test requires either a real server or notable rig animation, neither available today.
 
 **Status**: PR 11.5 shipped on `main` as squash `6e064e84`. All 16 CI smokes green on the final push. Branch `feat/phase0-pr11.5-rollback-cap` deleted, worktree removed, vault mirror synced at commit `6e064e8`.
