@@ -24,6 +24,30 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
+  server-build:
+    name: server — build + test (Rust, PR 11.6.B)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build (release)
+        run: cargo build --release
+      - name: Test
+        run: cargo test
+        env:
+          # The WebTransport integration smoke in tests/session_canary.rs
+          # is gated on this env var being unset. CI sets it because the
+          # mTLS dance for self-signed certs is flaky in the sandboxed
+          # GitHub runner. The dev box runs without it (see
+          # tools/canary-server.sh).
+          SKIP_WEBTRANSPORT_TEST: 1
+
   # Phase 0 / PR 2: headless smoke test of the Babylon scene.
   # Boots `npm run dev`, waits for the ready banner to disappear, captures a
   # screenshot, fails on any console error, and uploads the screenshot as a

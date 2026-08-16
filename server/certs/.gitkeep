@@ -1,0 +1,4 @@
+# PR 11.6.B — server/certs/ holds the dev self-signed cert + key.
+# Generated at runtime by `tools/canary-server.sh` on first boot. Not
+# committed (see .gitignore `server/certs/*.pem` + `server/certs/*.key`).
+# This file just keeps the directory in the checkout.

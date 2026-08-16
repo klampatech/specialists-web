@@ -57,3 +57,11 @@ client/lockstep-rollback.png
 
 # Hermes agent scratch (plans folder, transient task artifacts)
 .hermes/
+
+# PR 11.6.B — server self-signed cert (generated at runtime, never committed).
+# `tools/canary-server.sh` regenerates these on first boot. The `dev.pem` +
+# `dev.key` paths are referenced by `server/certs/.gitkeep` so the directory
+# exists in the checkout.
+server/certs/*.pem
+server/certs/*.key
+!server/certs/.gitkeep

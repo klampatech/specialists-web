@@ -1,6 +1,0 @@
-# Rust dedicated game server (Phase 1)
-
-Phase 1 will scaffold this with:
-- Tokio + Rapier (deterministic mode)
-- WebTransport server (`wtransport` crate)
-- Direct-connect (no matchmaker yet — share a URL)
