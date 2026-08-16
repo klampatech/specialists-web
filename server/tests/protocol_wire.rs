@@ -174,7 +174,7 @@ fn pong_roundtrip() {
 // -- InputsServer (NEW §1.2) -----------------------------------------
 
 #[test]
-fn inputs_server_is_16_bytes() {
+fn inputs_server_is_17_bytes() {
     let payload = InputsServer {
         frame: 0xdeadbeef,
         encoded_input: vec![0u8; 12],

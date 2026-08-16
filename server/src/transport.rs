@@ -119,18 +119,11 @@ async fn handle_websocket_connection(
 
     // Drop the player's room membership on disconnect. PR 11.9+
     // will replace with reconnection-aware logic; for now the room is
-    // immortal so leaving it has no observable effect on tests.
-    let rooms = rooms.write().await;
-    if let Some(room_lock) = rooms.get(DEVBX_ROOM_ID) {
-        let room = room_lock.write().await;
-        // Find the player id (we don't track per-connection ids in 11.6.B
-        // because the canary doesn't assign them — `add_player` is
-        // called on demand by the future 11.6.D damage path). For
-        // 11.6.B this is a no-op.
-        let _ = room;
-    }
-    drop(rooms);
-
+    // immortal so the WS handler skips room writes entirely. The
+    // `let _ = room;` and outer `rooms.write().await` lock acquisitions
+    // are intentionally omitted — issuing them here is a no-op that
+    // would block the executor for no benefit (per PR 11.6.B's
+    // cross-vendor review on this code path).
     info!(%peer, echo_count, "WebSocket connection closed");
     Ok(())
 }
