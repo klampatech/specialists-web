@@ -57,6 +57,16 @@
 // receives whatever the peer's `LockstepRuntime` has for that frame. Both
 // characters are visible from frame 0; the remote stays at its spawn until
 // the peer actually sends inputs.
+//
+// **PR 11.5 — pause-and-wait gate**: when the `LockstepRuntime` cap fires
+// (local frame more than `MAX_PREDICTION_FRAMES` ahead of the peer), the
+// runtime returns a sentinel `{paused: true, ...}` frame. We short-circuit
+// out of the tick before updating either controller, running combat, or
+// ticking respawn timers. The wire encoder already ran (submitLocalInput
+// fires before advanceFrame), so the peer keeps receiving our packets and
+// will eventually catch up. Once the runtime unpauses, both clients
+// resume from the same frame on the same tick — guaranteed-deterministic
+// resume. See `docs/SPEC.md` PR 11.5 decisions log for the full rationale.
 
 import { type Scene, Vector3 } from "@babylonjs/core";
 
@@ -105,6 +115,45 @@ export interface SessionFrame {
   combatEvents: CombatEvent[];
 }
 
+/**
+ * PR 11.5: a zeroed `InputState`. Used to build the empty `SessionFrame`
+ * returned on a paused tick — the controllers DON'T see this input (the
+ * tick early-returns), but the returned SessionFrame needs the fields
+ * to satisfy the type contract. `decodeInput` of a zeroed `Uint8Array`
+ * would also work; this is just more explicit.
+ */
+function makeEmptyInputState(): InputState {
+  return {
+    forward: 0,
+    right: 0,
+    jumpPressed: false,
+    divePressed: false,
+    slideHeld: false,
+    wallrunPressed: false,
+    cameraTogglePressed: false,
+    fireHeld: false,
+    meleePressed: false,
+    bulletTimeHeld: false,
+    yawRadians: 0,
+    pitchRadians: 0,
+  };
+}
+
+/**
+ * PR 11.5: an empty `SessionFrame` for a paused tick. `remoteConfirmed`
+ * is `true` because we explicitly paused (no prediction). `combatEvents`
+ * is empty because rising-edge combat checks are skipped.
+ */
+function makeEmptyFrame(frame: number): SessionFrame {
+  return {
+    frame,
+    localInput: makeEmptyInputState(),
+    remoteInput: makeEmptyInputState(),
+    remoteConfirmed: true,
+    combatEvents: [],
+  };
+}
+
 /** Handle returned by `createGameSession`. */
 export interface GameSession {
   /** The Havok controller driving the local player's capsule. */
@@ -123,6 +172,20 @@ export interface GameSession {
   readonly latestConfirmedFrame: number;
   /** Frames we had to repeat (informational; surfaces in the HUD). */
   readonly repeatedFrameCount: number;
+  /**
+   * PR 11.5: consecutive-tick paused-frame counter. Resets to 0 the
+   * moment we successfully advance. Surfaced for the future
+   * `paused-frames` HUD chip and the smoke catch-up assertions.
+   * Out of scope for this PR's HUD wiring — exposed here so the
+   * chip can be added as a follow-up without touching the runtime.
+   */
+  readonly pausedFrames: number;
+  /**
+   * PR 11.5: total paused-frame count across the session. Monotonic —
+   * never decreases. Surfaces for the future HUD's "paused N frames
+   * total" diagnostic.
+   */
+  readonly totalPausedFrameCount: number;
   /** Per-frame tick. Call from `scene.onBeforeRenderObservable`. */
   tick(input: InputState, deltaSeconds: number, nowMs: number): SessionFrame;
   /** All combat events ever generated this session (HUD reads `length`). */
@@ -211,6 +274,13 @@ export function createGameSession(
    * One tick: encode local input → submit → advance → apply decoded inputs to
    * both controllers → run combat semantics on the local input → update rig
    * poses (stunt visual lean/squash).
+   *
+   * PR 11.5: when `advanceFrame()` returns `{paused: true, ...}` (the
+   * rollback cap fired), we short-circuit BEFORE updating either
+   * controller / running combat / ticking respawn. Wire encode + submit
+   * still happens (submitLocalInput runs before advanceFrame), so the
+   * peer can catch up. Returns a minimal `makeEmptyFrame` so the
+   * caller's `SessionFrame` contract is preserved.
    */
   const tick: GameSession["tick"] = (
     input: InputState,
@@ -246,6 +316,19 @@ export function createGameSession(
     const encodedLocal = encodeInput(gameInput);
     runtime.submitLocalInput(encodedLocal);
     const advanced = runtime.advanceFrame();
+
+    // PR 11.5: rollback-cap early-return. When the cap fires we return
+    // a minimal SessionFrame WITHOUT stepping either controller, running
+    // combat, or ticking respawn. The wire packet is already on the wire
+    // (submitLocalInput ran above), so the peer can keep catching up.
+    // The `wasFiring` / `wasMelee` / etc. rising-edge trackers are NOT
+    // updated on a paused tick — the next non-paused tick will see the
+    // same input state we already saw, so the rising-edge semantics
+    // remain correct (a key pressed before pause and held through it
+    // still hits the rising edge on the first non-paused tick).
+    if (advanced.paused) {
+      return makeEmptyFrame(advanced.frame);
+    }
 
     // 2. Decode both inputs for the controllers.
     const localDecoded: InputState = decodeInput(advanced.local);
@@ -380,6 +463,11 @@ export function createGameSession(
     get frame() { return runtime.frame; },
     get latestConfirmedFrame() { return runtime.latestConfirmedFrame; },
     get repeatedFrameCount() { return runtime.repeatedFrameCount; },
+    // PR 11.5: pass-through the runtime's pause counters. The HUD chip
+    // wiring is a follow-up PR — exposed here so the chip can be added
+    // without touching the runtime or the session handle shape.
+    get pausedFrames() { return runtime.pausedFrames; },
+    get totalPausedFrameCount() { return runtime.totalPausedFrameCount; },
     tick,
     getCombatEvents: () => combatEvents.slice(),
     consumeUnrenderedCombatEvents: () => {

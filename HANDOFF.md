@@ -4,6 +4,63 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
+## 2026-08-15 — PR 11.5 STAGED — gap-bridging rollback cap in LockstepRuntime. Awaiting Evo adjudication + dev-box playtest before squash-merge.
+
+**Status**: PR 11.5 staged on `feat/phase0-pr11.5-rollback-cap`. All four Evo re-verification gates green (typecheck, production build, production-bundle grep zero, smoke 7/7). Pause-when-too-far-behind cap in place: when local frame is ≥ `MAX_PREDICTION_FRAMES = 8` (~133ms @ 60Hz) ahead of the peer, `LockstepRuntime.advanceFrame()` returns a sentinel `{paused: true, ...}` frame; `gameSession.tick()` early-returns without stepping either controller or running combat; wire encode + submit still fires every tick so the peer can catch up. Both clients see the same paused frames (lockstep) — no de-sync.
+
+**What landed this session**:
+1. **`client/src/net/ggrsRuntime.ts`** — added `ROLLBACK_CAP_FRAMES` re-export, `paused` flag on `AdvancedFrame`, cap check in `advanceFrame()` using the `predictionDepth` formula (`max(0, localFrame - 1 - highestRemoteFrameSeen)`), `_pausedFrames` + `_totalPausedFrames` counters, `isPaused`/`pausedFrames`/`totalPausedFrameCount` public getters, counter-clear in `dispose()`. ~160 lines added. **Bug caught during Evo's re-verification**: original codex draft used raw `localFrame - highestRemoteFrameSeen` (off by one at handshake + fires one tick too early); fixed to the predictionDepth formula, smoke constants re-tuned from `7 within-cap + 8 catchup` to `8 within-cap + 9 catchup`.
+2. **`client/src/game/gameSession.ts`** — caller-side early-return on `advanced.paused` BEFORE controller update + combat + bullet-time block. Added `makeEmptyInputState()` + `makeEmptyFrame()` helpers and two new getters on `GameSession` (`pausedFrames`, `totalPausedFrameCount`). ~88 lines added. Rising-edge trackers (`wasFiring`/`wasMelee`) NOT updated on a paused tick — both clients see the same input on the same frame in lockstep, so the rising-edge semantics remain correct after resume.
+3. **`client/src/engine/scene.ts`** — DEV-only `__lockstepProbe` accessor (24 lines). Tree-shaken in production (verified: `grep '__lockstep\|ROLLBACK_CAP_FRAMES' dist/assets/index-*.js` returns ZERO matches). Mirror of the existing `__spectator*` probe pattern.
+4. **`client/tools/lockstep-rollback-smoke.mjs`** — new smoke on port 5188, 7 assertions: probe sanity, cap constant value, 8 within-cap advances (localFrame 0→8), 5 over-cap pauses (localFrame stays at 8), wire packets count during pause (14 sent), caught-up resume (localFrame=9, pausedFrames resets), monotonic totalPausedFrameCount. Single-context smoke with synthetic transport stub (headless can't reach TURN — mirrors the yaw/pitch wire-format smokes).
+5. **`.github/workflows/ci.yml`** — new `client-lockstep-rollback-smoke` job on port 5188, copy of `client-spectator-camera-smoke` (same PR 11.4.1 cache recipe).
+6. **`docs/SPEC.md`** — status banner updated (PR 11.4 entry → PR 11.5 entry), Next-list re-ranked (PR 11.5 → position 1, PR 11.6 → position 1 Phase 1, PR 11.X HUD chip → position 2), new "2026-08-15 — PR 11.5 implementation decisions" log entry appended (10 bullets covering cap math, encoding contract, rising-edge correctness, codex partial-completion pattern, one-shot codex fallback on hosts where interactive codex TTY fails).
+
+**Verification gates (all re-run by Evo after codex was killed mid-task)**:
+- ✅ Typecheck: `cd client && npx tsc -b --noEmit` exit 0
+- ✅ Production build: 2m 7s, exit 0
+- ✅ Production bundle grep: ZERO `__lockstep` matches, ZERO `ROLLBACK_CAP_FRAMES` matches (the DEV probe + the alias name are tree-shaken out; `isPaused`/`pausedFrames`/`totalPausedFrameCount` names DO appear because the runtime class is shipped — that's correct, the cap path may fire in production on WAN drop).
+- ✅ Lockstep rollback smoke: 7/7 assertions pass. Output: `lockstep-rollback.png` (110 kB).
+- ✅ Regression smoke batch (scene 5173, yaw-wire 5182, pitch-wire 5185, lockstep-rollback 5188): all 4 green on re-verify.
+
+**Process notes (this session)**:
+- **Codex partial completion**: codex was dispatched with a 25KB brief (~280 lines of locked contract + 9 critical gotchas + verification gates). Code edited `ggrsRuntime.ts` + `gameSession.ts` + `scene.ts` and wrote the smoke cleanly across ~10 minutes, then was killed mid-task (pane exit code 0) without running the verification gates or writing the CI job / docs. Per the "don't trust the harness self-report" rule, Evo re-verified everything from the worktree state. The smoke's 1-tick-off cap math bug was caught during re-verification and fixed before any push.
+- **Interactive codex TTY failure on this host**: the combined workspace-create + agent-start + `codex --yolo` (interactive REPL) recipe failed with `Error: stdin is not a terminal`. Switched mid-session to `codex --yolo exec -o <file>` (one-shot print mode) — worked cleanly. Same herdr workspace+agent recipe, only the wrapper's `exec` line changed. **The `coding-task-routing` skill should add a pitfall about this host's herdr TTY provision so future sessions don't repeat the dance.**
+- **Smoke regression discipline (the burn-trace documented in the skill fired)**: the smoke's expected values had to match the EXACT cap formula in code (`predictionDepth = max(0, localFrame - 1 - highestRemoteFrameSeen)`), not the conceptual model. Re-tracing the math during re-verification caught the 1-tick off-by-one before pushing. The skill's "smoke-logic bugs codex writes — pre-merge self-verify checklist" rule (delta-too-small trap, smoke-local constants not in `page.evaluate` context) is load-bearing; both codex's smoke and the corrected version are correct because the assertions reference exact values, not fuzzy tolerances.
+
+**Playtest status** ⚠️ UNVERIFIED — smoke only. Kyle needs to playtest the WAN-style scenario on the dev box at http://100.95.111.112:5173/:
+1. Two tabs, both connect; drive normally for ~5s.
+2. Throttle one tab's outbound (Chrome DevTools "Network: Slow 3G" or `tc qdisc add dev tailscale0 root netem delay 200ms`) so it falls behind by >8 frames.
+3. The fast tab should observe its character FREEZE in place (no input response, no tracer fire) for the duration of the throttling.
+4. Console on the fast tab should not throw any errors — the silent early-return path in `tick()` is a no-op on the surface.
+5. Both tabs' `frame` HUD field should stay in lockstep (both pause-or-resume symmetrically because the cap fires at the same `predictionDepth` threshold on both ends).
+6. After the throttling clears, both tabs should resume advancing within ~8 frames of when the slow tab catches up.
+7. No phantom firing, no controller state corruption, no console errors.
+
+**Awaiting**: Kyle's dev-box two-tab playtest after Evo opens the PR. Once green, squash-merge + branch-delete + sync `docs/SPEC.md → ~/Obsidian/mem/projects/specialists-web.md` + wipe the worktree.
+
+**Next session plan** (per `docs/SPEC.md` §"Next"):
+1. **(1) PR 11.6 — Server-authoritative damage** (Phase 1 work, deferred). Move damage application from `gameSession.tick` (per-client local) to a server-broadcast packet handler. First step toward a real dedicated server.
+2. **(2) PR 11.X — HUD paused-frames chip** (cosmetic). Wire `runtime.pausedFrames` + `totalPausedFrameCount` into a small HUD chip in `App.tsx` + `BulletHud.tsx`. ~30 lines + 1-assertion smoke. Helps observe WAN behavior in Phase 1 playtests.
+3. **(3) Original PR 11 polish** — Mixamo glTF, kill-marker, hit-marker, death animation, real wall-detection via `PhysicsRaycast`.
+
+**Carry-forwards** (from previous sessions, still open):
+- ESC-equals-resume flicker — tabled as known issue (PR 11.2 series)
+- Real Loadout UI + Real Settings panel — placeholders only
+- Fade-in animation on PauseMenu — 5-line follow-up
+- Separate pitch sensitivity (`pitchSensitivityRadPerPixel`) — 5-line follow-up if Kyle wants it
+- Mouse-pitch smoke hardening (assert `cameraRotationX` sign) — 3-line follow-up
+- Smooth interpolation on F2 toggle — polish
+- Camera collision in spectator — polish
+- Configurable spectator speed — polish
+- PR 11.5 honest limitation: a combat rising edge that lands EXACTLY on a paused frame is lost (both clients skip it symmetrically — no de-sync, but the input is dropped). Documented in PR 11.5's decisions log; real rollback would catch this via re-simulation but the cap design explicitly doesn't. Tabled; HUD chip + observability will surface when it occurs.
+
+**Lessons** (this session):
+- **Codex 0.137 can be killed mid-task without writing the `-o` file.** The `codex --yolo exec -o <file>` recipe BUFFERS the final message until exit; if herdr's outer pane lifecycle eats codex before exit, the file is never written. Always re-run verification gates from the worktree state — never trust the harness self-report (Pitfall #9 in coding-task-routing, plus the PR 11.4 burn-trace in `~/.hermes/skills/projects/specialists-web/SKILL.md`).
+- **`codex --yolo` (interactive REPL) needs a real TTY on this host.** herdr's pane terminal doesn't satisfy `isatty(STDIN)` for the interactive codex TUI. Symptom: `Error: stdin is not a terminal`, codex exits after 12s. Fix: use `codex --yolo exec -o /tmp/last-msg.txt` (one-shot print mode) for codex dispatches on this host. The herdr workspace+agent+wrapper recipe is otherwise identical (workspace create, agent start, full-path wrapper, HERDR_* env vars). The pane transcript still appears in the JSONL session log; observability is preserved.
+- **The smoke's expected values must match the EXACT cap formula, not the conceptual model.** The cap uses `predictionDepth = max(0, localFrame - 1 - highestRemoteFrameSeen)` — the `- 1` matters, the `max(0, ...)` matters. Hand-tracing during re-verification caught the 1-tick off-by-one in the smoke's "8 within-cap advances should succeed" assertion. When the cap math is non-obvious, write the trace as a comment in the smoke so the next session doesn't re-tread.
+- **Production-bundle grep uses distinctive names, not shared substrings.** `__lockstep` and `ROLLBACK_CAP_FRAMES` (the alias) are distinctive to this PR — both return zero matches. `isPaused` / `pausedFrames` / `totalPausedFrameCount` ARE in the production bundle because the runtime class itself ships; the cap can fire on WAN drop in production. Don't flag the runtime getter names as a leak — they're correct to be there.
+
 ## 2026-08-15 — 🎉 MILESTONE 2 CLOSED — Phase 0 fully complete. PR 11.4 merged + 60s two-tab stress test passed.
 
 **Status**: Milestone 2 fully closed. All 11 acceptance rows landed and dev-box verified. Phase 0 is done.

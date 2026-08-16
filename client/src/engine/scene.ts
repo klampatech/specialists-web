@@ -62,6 +62,7 @@ import { createInputListener, type InputListener } from "./inputListener";
 import { createGameSession, type GameSession } from "../game/gameSession";
 import { renderTracer } from "../game/combat";
 import type { GgnetTransport } from "../net/ggnet";
+import { LockstepRuntime, ROLLBACK_CAP_FRAMES } from "../net/ggrsRuntime";
 
 /** Optional multiplayer kick — when present, createScene also runs a second
  *  controller and a lockstep session across the supplied transport. */
@@ -597,6 +598,29 @@ export async function createScene(
       (deltaRadians: number) => spectator!.applyYawDelta(deltaRadians);
     (window as unknown as { __spectatorPitchDelta?: (deltaRadians: number) => void }).__spectatorPitchDelta =
       (deltaRadians: number) => spectator!.applyPitchDelta(deltaRadians);
+    // PR 11.5: dev-only probe for the lockstep-rollback smoke. Wraps a
+    // throwaway LockstepRuntime with a no-op transport so the smoke can
+    // verify ROLLBACK_CAP_FRAMES is loaded + the public getters return
+    // sane defaults (no .paused / .pausedFrames access on a real session
+    // because the smoke creates its OWN runtime programmatically; this
+    // probe is just a sanity check + the signature smoke the rest of
+    // the suite uses to detect "module loaded"). Stripped from
+    // production by Vite (import.meta.env.DEV → false). The probe
+    // matches the convention of the existing __spectator* / __chaseCamera*
+    // probes — same shape, same DEV-only gate, same tree-shaking story.
+    const __lockstepTestRuntime = new LockstepRuntime({
+      onPacket: () => {},
+      send: () => {},
+    } as unknown as GgnetTransport);
+    (window as unknown as { __lockstepProbe?: () => unknown }).__lockstepProbe = () => ({
+      cap: ROLLBACK_CAP_FRAMES,
+      isPaused: __lockstepTestRuntime.isPaused,
+      pausedFrames: __lockstepTestRuntime.pausedFrames,
+      totalPausedFrames: __lockstepTestRuntime.totalPausedFrameCount,
+      frame: __lockstepTestRuntime.frame,
+      repeatedFrameCount: __lockstepTestRuntime.repeatedFrameCount,
+      predictionDepth: __lockstepTestRuntime.predictionDepth,
+    });
   }
 
   const handle: SceneHandle = {

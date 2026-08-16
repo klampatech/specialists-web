@@ -1112,6 +1112,69 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  client-lockstep-rollback-smoke:
+    name: client — lockstep rollback cap smoke (PR 11.5, pause-when-too-far-behind)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Cache Playwright browsers
+        # PR 11.4.1: cache the Playwright browser binary across runs.
+        # ~/.cache/ms-playwright is the standard Playwright cache location.
+        # The key is scoped by the Playwright version + OS so a version
+        # bump picks up a fresh download automatically.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Boot dev server (port 5188)
+        run: |
+          nohup npm run dev -- --host 0.0.0.0 --port 5188 > /tmp/vite-dev11.log 2>&1 &
+          echo $! > /tmp/vite-dev11.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5188/ > /dev/null; then
+              echo "Dev server (lockstep rollback smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5188/ > /dev/null; then
+            echo "::error::Dev server (lockstep rollback smoke) did not come up in 60s"
+            cat /tmp/vite-dev11.log
+            exit 1
+          fi
+      - name: Run lockstep rollback smoke
+        run: node ./tools/lockstep-rollback-smoke.mjs
+        env:
+          LOCKSTEP_ROLLBACK_SMOKE_URL: http://localhost:5188/
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lockstep-rollback-screenshot
+          path: client/lockstep-rollback.png
+          if-no-files-found: warn
+      - name: Tear down dev server
+        if: always()
+        run: |
+          if [[ -f /tmp/vite-dev11.pid ]]; then
+            kill "$(cat /tmp/vite-dev11.pid)" || true
+          fi
+          pkill -f 'vite' || true
+
   spec-canonical:
     name: spec layout — canonical at docs/SPEC.md
     runs-on: ubuntu-latest
