@@ -90,6 +90,48 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Manual test**: open two browser tabs to `http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX&__forceServerTransport=true` and watch them shoot each other. Real-time gameplay works fine. The 12-HP gap is a smoke-specific over-time artifact (it only manifests after 100-fire spam + 1.5s sweep wait); you won't see it in normal play.
 
+**CI test coverage (current state, honest audit)**:
+
+✅ **In CI** (verifies in `.github/workflows/ci.yml`):
+1. `client-typecheck` job — `npm run typecheck` + `npm run build` (the new test file + new code paths get typechecked/built but the tests don't RUN).
+2. `server-build` job — `cargo test` (all 8 server validation gates + lag-comp + fire-rate + ammo + eventId monotonicity).
+3. `client-damage-server-smoke` (port 5190) — single-tab wire-format end-to-end. **PASSES** in CI today.
+4. `client-damage-server-hp-convergence-smoke` (port 5191) — two-tab end-to-end. **FAILS in CI today** (12-HP gap — same as local). Will keep failing main until fix5 lands.
+
+❌ **NOT in CI (gaps to address)**:
+1. **Vitest (`npm test`) is NOT run in CI.** The 5 boundary tests (Tests A/B/C/D from fix3 + Test E for actualDelta from fix4) verify unit-level invariants but only run locally. **Concrete action item** — add a `client-vitest` job to `.github/workflows/ci.yml`:
+   ```yaml
+   client-vitest:
+     name: client — vitest boundary tests (PR 11.6.D fix3+fix4)
+     runs-on: ubuntu-latest
+     defaults:
+       run:
+         working-directory: client
+     steps:
+       - uses: actions/checkout@v4
+       - uses: actions/setup-node@v4
+         with:
+           node-version: "22"
+           cache: npm
+           cache-dependency-path: client/package-lock.json
+       - run: npm ci
+       - run: npm test
+   ```
+2. **No regression test for the StrictMode race fix (Bug A from fix4).** The race-safe sync guard is verified by the smoke's handler-count metric (14 → 7), but there's no unit test that pins the "synchronous IIFE claims the slot before await" invariant. Should be a vitest test against `makeBroadcastHandler` + a mock `window` that simulates the StrictMode double-mount sequence.
+3. **No regression test for the drop-branch markSettled (Bug B from fix4).** Test B (late-broadcast ignored) covers the "broadcast arrives after settling" path, but the specific "dropped entry's broadcast returns ignored after the entry was deleted by overflow" path isn't explicitly tested.
+4. **No regression test for the clamped-confirm-convergence path (Bug C from fix4).** Test E covers the sweep's actualDelta usage, but not the `applyBroadcast` confirm path's `if (pending.actualAppliedDelta < bc.amount) applyDamage(remaining)` branch.
+5. **No regression test for the TS-side DamageReject (0x07) round-trip.** `protocol/damage.ts` `encodeDamageReject` + `decodeDamageReject` need a round-trip test (`encode → decode → assert equal`, plus size-assert tests like the rest of the protocol).
+
+**Recommended fix5/fix6 scope expansion** (in addition to closing the 12-HP gap):
+1. Add the `client-vitest` job to CI (one file edit).
+2. Add 2-3 vitest tests:
+   - StrictMode race: synchronous `__serverTransport = "INIT_INFLIGHT"` happens before the first `await`.
+   - Clamped confirm convergence: when `actualDelta < bc.amount`, confirm path applies the missing damage.
+   - DamageReject round-trip: encode + decode symmetric, body size 5, wire size 6.
+3. Verify the new CI job runs green on a push.
+
+**Why this matters for closing 11.6.D**: the 5191 smoke is the only automated test for the cross-tab damage path, and it's currently failing. Vitest tests at the unit level would catch 80%+ of the actualDelta / markSettled / DamageReject regressions before they reach the smoke. Right now if someone breaks the actualDelta invariant in a follow-up PR, only the 5191 smoke (which itself is broken) would catch it.
+
 
 
 ---
