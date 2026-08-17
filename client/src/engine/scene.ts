@@ -179,8 +179,15 @@ function makeBroadcastHandler(
       playerId === localPlayerId ? local : remote,
     );
     if (typeof window !== "undefined") {
-      const w = window as unknown as {__lastBroadcastResult?: string};
+      const w = window as unknown as {__lastBroadcastResult?: string; __broadcastResultCounts?: Record<string, number>; __broadcastTimestamps?: Array<{at: number, result: string, pendingCountAfter: number, hpRemote?: number, hpLocal?: number}>};
       w.__lastBroadcastResult = result;
+      w.__broadcastResultCounts = w.__broadcastResultCounts ?? {};
+      w.__broadcastResultCounts[result] = (w.__broadcastResultCounts[result] ?? 0) + 1;
+      w.__broadcastTimestamps = w.__broadcastTimestamps ?? [];
+      const session = (window as any).__gameSession;
+      const hpR = session?.remoteController?.state?.hp;
+      const hpL = session?.localController?.state?.hp;
+      w.__broadcastTimestamps.push({at: performance.now(), result, pendingCountAfter: (window as any).__damageBus?.pendingApplyCount() ?? -1, hpRemote: hpR, hpLocal: hpL});
     }
   };
 }

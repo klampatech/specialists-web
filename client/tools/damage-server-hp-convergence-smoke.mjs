@@ -471,6 +471,15 @@ async function runSmoke() {
     });
     const dmgApplied = hpBeforeSpamB - hpAfterSpamB;
     log(`Spam done: HP dropped by ${dmgApplied} (from ${hpBeforeSpamB} to ${hpAfterSpamB})`);
+    // Post-spam debug: Tab A's broadcast handler count + last result
+    const handlerCountA_post = await pageA.evaluate(() => (window).__broadcastHandlerCount ?? 0);
+    const lastResultA_post = await pageA.evaluate(() => (window).__lastBroadcastResult ?? null);
+    const resultCountsA_post = await pageA.evaluate(() => (window).__broadcastResultCounts ?? {});
+    const pendingCountA_post = await pageA.evaluate(() => (window).__damageBus ? (window).__damageBus.pendingApplyCount() : -1);
+    log(`Post-spam: Tab A broadcast handler count=${handlerCountA_post}, lastResult=${lastResultA_post}, resultCounts=${JSON.stringify(resultCountsA_post)}, pendingCount=${pendingCountA_post}.`);
+    const timestampsA = await pageA.evaluate(() => (window).__broadcastTimestamps ?? []);
+    log(`Tab A broadcast timestamps (all ${timestampsA.length}):`);
+    for (const t of timestampsA) log(`  ${t.at.toFixed(0)}ms result=${t.result} pending=${t.pendingCountAfter} hpRemote=${t.hpRemote} hpLocal=${t.hpLocal}`);
     // 120ms cooldown = ~9 hits/sec, each does 12 dmg = 108 dmg max
     // (with 1100ms spam window). Allow generous upper bound (12 hits
     // for clock-skew tolerance) and lower bound (≥6 hits to verify

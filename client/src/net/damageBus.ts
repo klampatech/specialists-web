@@ -121,6 +121,60 @@ function pendingKey(sourcePlayerId: number, eventId: number): PendingKey {
 const pendingApplies = new Map<PendingKey, PendingOptimisticApply>();
 const MAX_PENDING_APPLIES = 64;
 
+// PR 11.6.D fix3: bounded `recentlySettled` map. When a pending entry
+// is handled (confirmed via broadcast, reverted via mismatch,
+// rejected via DamageReject, OR swept by the timeout sweep), we
+// record the (sourcePlayerId, eventId) here for
+// `RECENTLY_SETTLED_TTL_MS` so a late-arriving broadcast for the
+// same key can be recognized as already-handled and ignored (don't
+// double-apply). Without this map, `applyBroadcast`'s "no pending ->
+// apply directly" branch would re-apply damage on re-delivered frames
+// (WebSocket retries / GC stalls / late-arriving broadcasts after a
+// timeout sweep).
+//
+// The SWEEP path marks settled because the sweep is the SAFETY-NET
+// timeout fallback: if the server's broadcast or reject hasn't
+// arrived within PENDING_REJECT_TIMEOUT_MS, the client has effectively
+// given up on the server's view and reverted locally. Any broadcast
+// arriving after the sweep is treated as "too late" — the entry
+// is marked handled and the broadcast is ignored. This deterministic
+// interpretation is what fixes the round-2 verifier's flaky smoke
+// (FAIL-A / FAIL-B divergence from the sweep+re-apply interleaving).
+//
+// The queue-overflow DROP path does NOT mark settled. The drop evicts
+// an entry that may have been ACCEPTED by the server but whose
+// broadcast hasn't arrived yet — the broadcast arriving later MUST
+// re-apply the damage so the client's HP converges with the server's
+// view. Marking overflow-drops as settled would silently lose those
+// accepted fires in the spam scenario.
+const recentlySettled = new Map<PendingKey, number>();
+/** TTL for the recentlySettled map: 2 * PENDING_REJECT_TIMEOUT_MS.
+ *  Generous so a late broadcast (e.g., re-ordered WebSocket frame, GC
+ *  stall) still gets ignored, but bounded so the map can't grow
+ *  unboundedly. Pruned each `sweepExpiredPending` call (every 50ms
+ *  in the smoke). */
+const RECENTLY_SETTLED_TTL_MS = 1000;
+
+function markSettled(key: PendingKey, nowMs: number): void {
+  recentlySettled.set(key, nowMs);
+}
+
+/** PR 11.6.D fix3: track an optimistic apply. If the queue is at
+ *  capacity, drop the OLDEST entry - but FIRST revert its optimistic
+ *  apply (Bug 1) so its HP subtraction doesn't stay stuck forever.
+ *  The revert uses the same `applyDamage(target, {source: "correction",
+ *  amount: -pending.optimisticallyAppliedAmount}, nowMs)` pattern the
+ *  sweep / applyReject paths use, plus a tracer flash for HUD
+ *  visibility (the spam phase makes the tracer HUD useful for
+ *  verification).
+ *
+ *  NOTE: we do NOT mark the dropped entry as recentlySettled. The
+ *  broadcast handler must re-apply the damage if the server accepted
+ *  the request before the local queue overflowed (Bug 2 - see commit
+ *  body for the full discussion). Marking swept/dropped entries as
+ *  settled caused accepted fires to be silently lost in the spam
+ *  scenario, leaving Tab A's remote HP diverged from Tab B's local.
+ */
 function trackOptimisticApply(p: PendingOptimisticApply): PendingOptimisticApply | null {
   let dropped: PendingOptimisticApply | null = null;
   if (pendingApplies.size >= MAX_PENDING_APPLIES) {
@@ -134,7 +188,29 @@ function trackOptimisticApply(p: PendingOptimisticApply): PendingOptimisticApply
     }
     if (oldestKey !== null) {
       dropped = pendingApplies.get(oldestKey) ?? null;
-      pendingApplies.delete(oldestKey);
+      if (dropped) {
+        // Bug 1 fix: revert the dropped entry's optimistic apply BEFORE
+        // removing from the map. Without this, the -amount stays
+        // stuck on HP forever (the entry was dropped from the queue
+        // but its HP decrement was already committed via
+        // applyDamage at send time). On the spam path this leaks
+        // ~N*amount HP per queue-overflow cycle.
+        applyDamage(
+          dropped.targetController,
+          {source: "correction", amount: -dropped.optimisticallyAppliedAmount},
+          p.appliedAtMs,
+        );
+        emitTracerFlash({
+          type: "rejection",
+          targetPlayerId: dropped.targetPlayerId,
+          sourcePlayerId: dropped.sourcePlayerId,
+          eventId: dropped.eventId,
+          appliedAmount: dropped.optimisticallyAppliedAmount,
+          broadcastAmount: 0, // dropped - no broadcast amount
+          atMs: p.appliedAtMs,
+        });
+        pendingApplies.delete(oldestKey);
+      }
     }
   }
   pendingApplies.set(pendingKey(p.sourcePlayerId, p.eventId), p);
@@ -284,6 +360,18 @@ export function applyBroadcast(
   // FIX 3: use (sourcePlayerId, eventId) for the lookup — NOT
   // eventId alone. Tab A's own fire (source=1, event=1) and Tab B's
   // fire (source=2, event=1) are DIFFERENT pending entries.
+  const bcKey = pendingKey(bc.sourcePlayerId, bc.originEventId);
+  // PR 11.6.D fix3 (Bug 2): check `recentlySettled` BEFORE the
+  // `forgetOptimisticApply` lookup. If this (source, eventId) was
+  // already handled (confirm, revert, OR sweep within the last
+  // RECENTLY_SETTLED_TTL_MS), the broadcast is a late arrival for
+  // an already-settled entry — return "ignored" so the "no pending
+  // -> apply directly" branch below doesn't re-apply damage. This
+  // is the root cause of the round-2 verifier's flaky smoke.
+  const settledAt = recentlySettled.get(bcKey);
+  if (settledAt !== undefined && nowMs - settledAt < RECENTLY_SETTLED_TTL_MS) {
+    return "ignored";
+  }
   const pending = forgetOptimisticApply(bc.sourcePlayerId, bc.originEventId);
   if (pending) {
     if (bc.amount === pending.optimisticallyAppliedAmount) {
@@ -296,6 +384,10 @@ export function applyBroadcast(
         broadcastAmount: bc.amount,
         atMs: nowMs,
       });
+
+      // re-delivered broadcast (e.g., WebSocket retry, broadcast
+      // arriving after a successful sweep) doesn't double-apply.
+      markSettled(bcKey, nowMs);
       return "confirm";
     }
     // Mismatch → revert the optimistic apply.
@@ -313,6 +405,8 @@ export function applyBroadcast(
       broadcastAmount: bc.amount,
       atMs: nowMs,
     });
+    // Bug 2 fix: record this (source, eventId) as settled.
+    markSettled(bcKey, nowMs);
     return "revert";
   }
   const target = resolveTarget?.(bc.targetPlayerId) ?? null;
@@ -358,6 +452,9 @@ export function applyReject(
     broadcastAmount: 0, // rejected — no broadcast amount
     atMs: nowMs,
   });
+  // Bug 2 fix: record this (source, eventId) as settled so a
+  // late broadcast for the same key returns "ignored".
+  markSettled(pendingKey(sourcePlayerId, eventId), nowMs);
   return "revert";
 }
 
@@ -390,8 +487,34 @@ export function sweepExpiredPending(nowMs: number): number {
         broadcastAmount: 0,
         atMs: nowMs,
       });
+      // Remove the entry from the pending map. Without this, the
+      // entry stays in the map forever, so a late broadcast for the
+      // same key finds it via forgetOptimisticApply, hits the
+      // "confirm" path (since we did revert + mark settled would
+      // catch the next one), and HP stays stuck at the reverted
+      // value. This is the canonical round-2 verifier FAIL-A
+      // symptom: Tab A's HP = 100 (everything reverted, nothing
+      // re-applied), Tab B's HP = 4 (7 accepted broadcasts applied).
       pendingApplies.delete(key);
+      // PR 11.6.D fix3 (Bug 2 — sweep marks settled): record this
+      // (source, eventId) as settled so a late broadcast for the
+      // same key returns "ignored" via the recentlySettled TTL
+      // check in applyBroadcast. The sweep is the SAFETY-NET
+      // timeout fallback — once the entry is reverted by the sweep,
+      // the client has committed to that view and any subsequent
+      // broadcast is treated as "too late" (no double-apply).
+      markSettled(key, nowMs);
       swept++;
+    }
+  }
+  // PR 11.6.D fix3 (Bug 2 maintenance): prune recentlySettled entries
+  // older than TTL. Runs every 50ms in the smoke so the map can't
+  // grow unboundedly even with sustained damage traffic.
+  if (recentlySettled.size > 0) {
+    for (const [k, ts] of recentlySettled) {
+      if (nowMs - ts >= RECENTLY_SETTLED_TTL_MS) {
+        recentlySettled.delete(k);
+      }
     }
   }
   return swept;
