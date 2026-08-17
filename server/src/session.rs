@@ -38,6 +38,18 @@ pub struct Player {
     /// `Some(t)` if the player has fired since joining; `None` for a
     /// fresh player. PR 11.6.D's fire-rate validator reads this.
     pub last_fire_at: Option<Instant>,
+    /// PR 11.6.D FIX 1: when the server last received a `Ping` from
+    /// this player's connection. The validator uses this to compute
+    /// a smoothed RTT for lag-comp rewind:
+    /// `rtt_ms = (now - last_ping_received_at) * 2 + heartbeat_bonus`
+    /// (the "* 2" approximates the round-trip from the server's
+    /// perspective; the heartbeat_bonus accounts for time since the
+    /// last ping landed). Pure client timestamp-based RTT requires
+    /// the server to remember the client's `clientTimestamp` on the
+    /// inbound ping then compare with the outbound pong's
+    /// `server_timestamp` — PR 11.7 wires that; for now we use the
+    /// proxy below.
+    pub last_ping_received_at: Option<Instant>,
 }
 
 impl Player {
@@ -47,6 +59,7 @@ impl Player {
             hp: 100,
             ammo: 0,
             last_fire_at: None,
+            last_ping_received_at: None,
         }
     }
 }

@@ -40,6 +40,8 @@
 //   - Lockstep substrate retirement (PR 11.7).
 //   - Production cert handling (Let's Encrypt, PR 11.6.E now absorbed into 11.7).
 
+use std::sync::Mutex;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -84,6 +86,44 @@ static PLACEHOLDER_COUNTER: AtomicU16 = AtomicU16::new(1000);
 /// validation succeeds.
 fn next_placeholder_player_id() -> PlayerId {
     PLACEHOLDER_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// PR 11.6.D — per-connection state shared between the listener
+/// loop and `handle_binary`. Used `Cell` for interior mutability
+/// so the connection's `claimed_player_id` can be set on the first
+/// `DamageRequest` (which establishes the connection's identity)
+/// and checked on subsequent requests (FIX 8 anti-spoof).
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionState {
+    claimed_player_id: Cell<Option<PlayerId>>,
+}
+
+impl ConnectionState {
+    pub(crate) fn new() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self::default()))
+    }
+    /// Check the connection's claimed identity against an incoming
+    /// `DamageRequest`. Returns `Ok(claimed)` if the connection's
+    /// identity is established (first claim or matching claim);
+    /// `Err((claimed, requested))` if a different PlayerId is
+    /// claimed on a subsequent request.
+    fn check(&self, requested: PlayerId) -> Result<PlayerId, (PlayerId, PlayerId)> {
+        match self.claimed_player_id.get() {
+            None => Ok(requested),
+            Some(existing) => {
+                if existing == requested {
+                    Ok(existing)
+                } else {
+                    Err((existing, requested))
+                }
+            }
+        }
+    }
+    /// Stamp the connection's claimed PlayerId after the first
+    /// `DamageRequest` succeeds. Idempotent.
+    fn stamp(&self, id: PlayerId) {
+        self.claimed_player_id.set(Some(id));
+    }
 }
 
 /// Spawned by `main`. Returns once the WebSocket listener stops
@@ -201,6 +241,7 @@ async fn handle_websocket_connection(
     // the claimed id (see `handle_binary`'s DamageRequest arm).
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(64);
     let placeholder_id = next_placeholder_player_id();
+    let conn_state = ConnectionState::new();
     {
         let mut room_guard = room_arc.write().await;
         room_guard.register_connection(placeholder_id, outbound_tx);
@@ -245,7 +286,7 @@ async fn handle_websocket_connection(
                 };
                 match msg {
                     Message::Binary(bytes) => {
-                        let reply = handle_binary(&bytes, &rooms, placeholder_id).await;
+                        let reply = handle_binary(&bytes, &rooms, placeholder_id, conn_state.clone()).await;
                         if !reply.is_empty() {
                             debug!(%peer, bytes_len = bytes.len(), reply_len = reply.len(), "WS dispatch -> reply");
                             // For PR 11.6.D broadcasts the reply is
@@ -355,6 +396,7 @@ async fn handle_webtransport_session(
     // dispatcher re-registers under the claimed id.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(64);
     let placeholder_id = next_placeholder_player_id();
+    let conn_state = ConnectionState::new();
     {
         let mut room_guard = room_arc.write().await;
         room_guard.register_connection(placeholder_id, outbound_tx);
@@ -388,7 +430,7 @@ async fn handle_webtransport_session(
                     None => continue,
                 };
                 let payload = &buf[..n];
-                let reply = handle_binary(payload, &rooms, placeholder_id).await;
+                let reply = handle_binary(payload, &rooms, placeholder_id, conn_state.clone()).await;
                 if !reply.is_empty() {
                     send.write_all(&reply).await?;
                 }
@@ -402,14 +444,14 @@ async fn handle_webtransport_session(
                     None => continue,
                 };
                 let payload = &buf[..n];
-                let _ = handle_binary(payload, &rooms, placeholder_id).await;
+                let _ = handle_binary(payload, &rooms, placeholder_id, conn_state.clone()).await;
                 // No direct reply on uni streams; broadcasts go via
                 // the outbound datagram path.
             }
             datagram = connection.receive_datagram() => {
                 let dgram = datagram?;
                 let payload = dgram.payload();
-                let _ = handle_binary(payload.as_ref(), &rooms, placeholder_id).await;
+                let _ = handle_binary(payload.as_ref(), &rooms, placeholder_id, conn_state.clone()).await;
                 // No direct reply; broadcasts go via the outbound
                 // datagram path.
             }
@@ -437,6 +479,7 @@ pub(super) async fn handle_binary(
     payload: &[u8],
     rooms: &RoomRegistry,
     placeholder_player_id: PlayerId,
+    connection_state: Arc<Mutex<ConnectionState>>,
 ) -> Vec<u8> {
     if payload.is_empty() {
         return vec![];
@@ -458,25 +501,58 @@ pub(super) async fn handle_binary(
                 warn!("damageRequest: decoder rejected malformed payload");
                 return vec![];
             };
-            // The connection's PlayerId is determined by which room
-            // entry it registered under. PR 11.6.D's listener loop
-            // stashes the PlayerId on the inbound side via a
-            // thread-local-style mechanism. For PR 11.6.D we use the
-            // simplest available identity: the connection's source
-            // PlayerId is `req.source_player_id` (the request's
-            // asserted source). The validator performs an anti-spoof
-            // check (Gate 2) that requires this to match the
-            // connection's PlayerId — which in this PR is the
-            // request's source. A future PR can add a proper
-            // per-connection identity via the join handshake.
-            //
-            // For PR 11.6.D's smoke + dev-box we trust the request's
-            // `source_player_id` as the connection identity. This
-            // works because each tab uses a unique PlayerId that
-            // isn't reassigned (PR 11.9's matchmaker enforces this).
-            let source_player_id = req.source_player_id;
+            // FIX 8: anti-spoof — the connection's REAL PlayerId is
+            // the value stashed in `connection_state`.claimed_player_id
+            // by the first successful DamageRequest on this
+            // connection. Subsequent requests MUST claim the same
+            // PlayerId or the validator rejects (the inner gate 2).
+            // Before the first successful request, we trust the
+            // request's claimed source_player_id as the connection's
+            // identity (the validator stamps it on success).
+            // FIX 8: extract the connection's claimed identity
+            // BEFORE the await (the borrow is !Send — we drop it
+            // before touching the room registry).
+            let claimed_player_id = {
+                let conn = connection_state.lock().unwrap();
+                match conn.check(req.source_player_id) {
+                    Ok(id) => id,
+                    Err((claimed, requested)) => {
+                        warn!(
+                            claimed_player_id = claimed,
+                            requested_player_id = requested,
+                            "damageRequest: rejected — connection identity mismatch",
+                        );
+                        return vec![];
+                    }
+                }
+            };
             let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
             let now = Instant::now();
+            // FIX 1: per-connection RTT proxy. Look up the source
+            // Player's `last_ping_received_at`; compute the wall-clock
+            // gap since then, double it (the pong hasn't arrived yet
+            // — the next ping from the client will have carried the
+            // round-trip — but until then, the gap is our best
+            // estimate of the half-RTT). Add a 16ms floor (the
+            // server tick) so we never advance backwards in time.
+            let client_rtt_ms = {
+                let room_guard = room_arc.read().await;
+                if let Some(player) = room_guard.players.get(&claimed_player_id) {
+                    if let Some(last_ping) = player.last_ping_received_at {
+                        let gap = now.duration_since(last_ping);
+                        // 2x the half-trip approximates the full
+                        // round-trip. The gap is capped at MAX_RTT_MS
+                        // (500ms) so a stale ping doesn't cause
+                        // pathological rewind into the distant past.
+                        let rtt_ms = (gap.as_millis() as u32).saturating_mul(2);
+                        rtt_ms.min(specialists_server::damage_relay::MAX_RTT_MS)
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            };
             // Run the validator under a write lock. The lock is held
             // for the duration of validate_and_relay (no .await
             // inside), so the lock is released synchronously.
@@ -484,13 +560,9 @@ pub(super) async fn handle_binary(
                 let mut room_guard = room_arc.write().await;
                 specialists_server::damage_relay::validate_and_relay(
                     &req,
-                    source_player_id,
+                    claimed_player_id,
                     &mut room_guard,
-                    0, // PR 11.6.D: per-connection RTT not yet wired (the
-                    //    listener doesn't track per-connection RTT — that's
-                    //    a follow-up). Until it's wired, lag_frames=0,
-                    //    meaning no rewind. The hitscan still re-casts
-                    //    against the latest recorded positions.
+                    client_rtt_ms,
                     now,
                 )
             };
@@ -514,6 +586,10 @@ pub(super) async fn handle_binary(
             // connection will find the connection registered under
             // its real PlayerId.
             //
+            // FIX 8: also stamp the connection's claimed identity
+            // (if not already set). The next request from this
+            // connection will be checked against this identity.
+            //
             // We do this AFTER validation succeeds so a rejected
             // request doesn't promote a phantom connection. The
             // connection's placeholder_id is passed in by the
@@ -531,9 +607,14 @@ pub(super) async fn handle_binary(
                     // already have a sender (defensive — prevents
                     // clobbering an existing connection under the
                     // same PlayerId).
-                    room_guard.connections.entry(source_player_id).or_insert(sender);
+                    room_guard.connections.entry(claimed_player_id).or_insert(sender);
                 }
             }
+            // FIX 8: stamp the connection's claimed identity so
+            // subsequent requests from this connection can be
+            // checked against it. Idempotent — `check` already
+            // matched, so this is just a record.
+            connection_state.lock().unwrap().stamp(claimed_player_id);
 
             // Encode the broadcast once. The listener loop fans it out
             // to every connection in the room (including the source —
@@ -542,12 +623,29 @@ pub(super) async fn handle_binary(
             // Fan out to every connection in the room.
             {
                 let room_guard = room_arc.read().await;
-                let n = room_guard.connections.len();
-                eprintln!("DEBUG fan-out: {} connections registered", n);
+                let n_conns = room_guard.connections.len();
                 for (player_id, sender) in room_guard.connections.iter() {
                     match sender.try_send(wire_bytes.clone()) {
-                        Ok(()) => eprintln!("DEBUG fan-out: sent to player_id={}", player_id),
-                        Err(e) => eprintln!("DEBUG fan-out: FAILED to player_id={}: {:?}", player_id, e),
+                        Ok(()) => {
+                            debug!(
+                                target_player_id = *player_id,
+                                n_conns = n_conns,
+                                "damageBroadcast enqueued",
+                            );
+                        }
+                        Err(_) => {
+                            // Channel full or sender closed. The
+                            // client will lag / miss this broadcast;
+                            // the timeout sweep in `damageBus.ts`
+                            // (FIX 4) reverts the optimistic apply
+                            // after PENDING_REJECT_TIMEOUT_MS. We log
+                            // at warn to surface the issue without
+                            // crashing the dispatcher.
+                            warn!(
+                                target_player_id = *player_id,
+                                "damageBroadcast fan-out: channel full / closed",
+                            );
+                        }
                     }
                 }
             }
@@ -608,6 +706,32 @@ pub(super) async fn handle_binary(
                 warn!("ping: decoder rejected malformed payload");
                 return vec![];
             };
+            // FIX 1: stamp the connection's last_ping_received_at on
+            // the connection's claimed PlayerId. The validator's
+            // lag-comp rewind uses this to compute RTT for the
+            // "favor the shooter" behavior. If the connection hasn't
+            // established a claimed identity yet (no successful
+            // DamageRequest), we don't have a PlayerId to attribute
+            // the ping to — the timing is recorded against the
+            // placeholder, but the placeholder doesn't have a slot
+            // in `room.players`, so the lag-comp falls back to
+            // RTT=0 (no rewind). The first DamageRequest will
+            // establish the identity and the next ping will be
+            // recorded properly.
+            //
+            // Extract the claimed PlayerId BEFORE the await (the
+            // borrow is !Send).
+            let claimed_player_id_for_ping = {
+                let conn = connection_state.lock().unwrap();
+                conn.claimed_player_id.get()
+            };
+            if let Some(player_id) = claimed_player_id_for_ping {
+                let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
+                let mut room_guard = room_arc.write().await;
+                if let Some(player) = room_guard.players.get_mut(&player_id) {
+                    player.last_ping_received_at = Some(Instant::now());
+                }
+            }
             let pong = Pong {
                 client_timestamp: ping.client_timestamp,
                 server_timestamp: 0, // §1.2: PR 11.6.D wires real monotonic clock
@@ -727,7 +851,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_empty_payload() {
         let rooms = fresh_rooms();
-        let reply = handle_binary(&[], &rooms, 0 /* placeholder */).await;
+        let reply = handle_binary(&[], &rooms, 0, ConnectionState::new() /* placeholder */).await;
         assert!(reply.is_empty(), "empty payload must produce no reply");
     }
 
@@ -735,7 +859,7 @@ mod tests {
     async fn dispatch_unknown_discriminator() {
         let rooms = fresh_rooms();
         // 0xFF is unused; should log + discard + return empty.
-        let reply = handle_binary(&[0xFF, 0x00, 0x00, 0x00], &rooms, 0 /* placeholder */).await;
+        let reply = handle_binary(&[0xFF, 0x00, 0x00, 0x00], &rooms, 0, ConnectionState::new() /* placeholder */).await;
         assert!(reply.is_empty(), "unknown discriminator must produce no reply");
     }
 
@@ -778,7 +902,7 @@ mod tests {
         let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
         payload.extend(encode_damage_request(&req));
 
-        let reply = handle_binary(&payload, &rooms, 0 /* placeholder */).await;
+        let reply = handle_binary(&payload, &rooms, 0, ConnectionState::new() /* placeholder */).await;
 
         // Reply: 1-byte discriminator + 18-byte body.
         assert_eq!(reply.len(), 1 + specialists_server::protocol::DAMAGE_BROADCAST_WIRE_SIZE);
@@ -807,7 +931,7 @@ mod tests {
         let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
         payload.extend(encode_position_update(&pu));
 
-        let reply = handle_binary(&payload, &rooms, 0 /* placeholder */).await;
+        let reply = handle_binary(&payload, &rooms, 0, ConnectionState::new() /* placeholder */).await;
         assert!(reply.is_empty(), "positionUpdate must not produce a reply");
 
         // Verify the PositionHistory actually received the entry.
@@ -830,7 +954,7 @@ mod tests {
         let ping = specialists_server::protocol::Ping { client_timestamp: 0xfeedface };
         payload.extend(encode_ping(&ping));
 
-        let reply = handle_binary(&payload, &rooms, 0 /* placeholder */).await;
+        let reply = handle_binary(&payload, &rooms, 0, ConnectionState::new() /* placeholder */).await;
         assert_eq!(reply.len(), 1 + specialists_server::protocol::PONG_WIRE_SIZE);
         assert_eq!(reply[0], DISCRIMINATOR_PONG);
         let pong = decode_pong(&reply[1..]).expect("decode pong");

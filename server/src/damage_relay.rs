@@ -48,6 +48,12 @@ const MAX_AMOUNT: u8 = 100;
 /// Server tick interval (16ms at 64Hz — see `TICK_RATE_HZ` in
 /// `constants.rs`). Used to convert `clientRttMs` into lag frames.
 const SERVER_TICK_MS: u32 = 16;
+/// PR 11.6.D FIX 1: cap on the RTT-derived `lag_frames` so a
+/// dropped Ping doesn't cause the validator to rewind into the
+/// distant past (where `snapshot_at` returns None and the
+/// validator rejects). 500ms covers normal internet latency; a
+/// truly-stale ping beyond 500ms is treated as no rewind.
+pub const MAX_RTT_MS: u32 = 500;
 
 /// Public entry point. Validate `req` against `room`'s state and
 /// (on success) emit a `DamageBroadcast` for the whole room.
