@@ -201,6 +201,19 @@ export interface GameSession {
    * still goes through the lockstep substrate.
    */
   submitLocalInput(input: InputState): void;
+  /**
+   * PR 11.6.D FIX 2 — this tab's local player ID. Used as
+   * `sourcePlayerId` on outbound DamageRequests. Defaults to 1.
+   * The smoke drives this via `window.__localPlayerId` and asserts
+   * it via `__gameSession.localPlayerId`.
+   */
+  readonly localPlayerId: number;
+  /**
+   * PR 11.6.D FIX 2 — the peer's player ID. Used as `targetPlayerId`
+   * on outbound DamageRequests. Defaults to 2. The smoke drives this
+   * via `window.__peerPlayerId`.
+   */
+  readonly peerPlayerId: number;
   /** All combat events ever generated this session (HUD reads `length`). */
   getCombatEvents(): CombatEvent[];
   /** Drain the combat events since the last call; the tracer render uses
@@ -603,6 +616,12 @@ export function createGameSession(
     get totalPausedFrameCount() { return runtime.totalPausedFrameCount; },
     tick,
     submitLocalInput,
+    // PR 11.6.D FIX 2: expose the local + peer player ids on the
+    // returned handle. The smoke uses these to assert the right tab
+    // is sending fire events to the right target. Both are
+    // immutable for the session's lifetime.
+    localPlayerId,
+    peerPlayerId,
     // PR 11.6.D: late-bind server-auth transport. Defaults to the
     // constructor option (may be `null` for P2P smokes).
     setServerTransport: (t) => {
