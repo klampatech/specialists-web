@@ -5,6 +5,29 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
 
+## ⚡ TL;DR for the next session (read this first)
+
+**You are here**: PR 11.6.D, branch `feat/phase1-pr11.6.d-validate-and-relay`, **20 commits ahead of main**, last commit `a765ccc` (2026-08-17 evening). PR is **NOT YET PUSHED** — local-only. Worktree clean. Servers can be left running OR killed; check `ps -p 3599169,3599938`.
+
+**Where we landed**:
+- **fix3** (`c682a03`): recentlySettled map, drop-without-revert, vitest installed.
+- **fix4** (`929f3d6`): Bug A (StrictMode race) + Bug B (drop-branch markSettled) + Bug C (sweep over-restoration via actualDelta) + TS-side 0x07 DamageReject mirror + smoke-side fix. **All 4 verifier gates green** (cargo 13/13, tsc clean, build 7,058.04 kB, vitest 5/5 then 10/10 after fix5).
+- **fix5** (`1d88ac3`): client-vitest CI job added + 5 new vitest tests (Tests F/G/H for fix4 invariants). ci.yml now has 20 jobs. **All 4 verifier gates still green**.
+- **fix6 (NOT YET DISPATCHED)**: the 12-HP gap. Smoking-gun diagnostic captured: `before=100, afterImmediate=88, afterBroadcast=100` — the optimistic apply works synchronously but something reverts the -12 between the immediate read and the broadcast arrival. Most likely cause: the broadcast handler's `resolveTarget` returns controllers from the LATEST `__gameSession` (which may be a different instance than the cached one the smoke/probe reads), so the broadcast's `applyDamage` decrements the LATEST controller while the smoke/probe reads the FIRST. Recommended fix6 approach: add `__broadcastAppliedTo` instrumentation to confirm, then either (a) use FIRST-session controllers in the broadcast handler, (b) invalidate stale `__gameSession` refs on StrictMode re-mount, or (c) drop optimistic-apply entirely (cleanest, +1 RTT per fire).
+
+**Verifier state** (run 2026-08-17 evening): cargo test 13/13, tsc clean, npm run build clean, **vitest 10/10 PASS**, 5190 smoke PASS, 5191 smoke **0/3 deterministic-FAIL with 12-HP gap** (the fix6 work).
+
+**Servers**: canary (pid 3599169) on Tailscale IP `100.95.111.112:14433/14434` + Vite (pid 3599938) on `100.95.111.112:5191`. URL for 2-tab test: `http://100.95.111.112:5191/?server=ws%3A%2F%2F100.95.111.112%3A14434%2Frooms%2FDEVBX` (URL routing at PeerOverlay.tsx:38-65 auto-sets `__forceServerTransport` — no DevTools setup needed).
+
+**Memory**: pre-fix4 state still in MEMORY.md (the codex 3-for-3 burn-trace + PR 11.6.D status). The post-fix4 + fix5 + smoking-gun state is **NOT in memory** (the memory budget was full and consolidation failed). Read `HANDOFF.md` + `docs/SPEC.md` for the canonical current state.
+
+**Codex 4-for-4 burn-trace**: codex has stalled at the 90-min wall-clock mark on every fix round (fix1+fix2+fix3+fix4). fix4 hit 402 Payment Required. Recovery pattern: parse JSONL, re-run verifier gates, write the commit yourself. **~10-15 min overhead per round**. Plan for codex to stall; don't expect a final-message file.
+
+**`/tmp` backups preserved**: `.codex-fix3-prompt-pr11.6.d.md` (14KB), `.codex-fix4-prompt-pr11.6.d.md` (13.6KB), smoke result logs.
+
+**The next move**: dispatch fix6 with a focused 5-10 min brief targeting the LATEST-gameSession resolver. See the "fix6 scope" section below for the full outline.
+
+
 ## 2026-08-17 — PR 11.6.D fix4 LANDED. Bug A (StrictMode race) + Bug B (drop-branch markSettled) + Bug C (sweep over-restoration) all closed. Smoke still 0/10 deterministic-FAIL with NEW failure mode (12-HP gap). Branch `feat/phase1-pr11.6.d-validate-and-relay`.
 
 **Status**: Commit `929f3d6` lands Bug A + Bug B + Bug C + a wire-format-completion (TS-side mirror of server's already-existing 0x07 `DamageReject` — see codex session archaeology below). The StrictMode race is **fully resolved** (handler count went from 14 → 7, no more duplicate firings). Bug B + Bug C closed by `markSettled` in the drop branch + the new `actualAppliedDelta` field. Vitest 5/5 PASS (4 from fix3 + new Test E for actualDelta). 5190 smoke PASS. 5191 smoke 0/3 (or 0/10 over longer runs) PASS — still failing, but with a different consistent failure mode: a 12-HP gap exactly one broadcast's worth.
@@ -36,22 +59,20 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - The "codex shipped but never ran its own verification" pattern hit again at 4-for-4 on this PR cycle. Recovery pattern: parse JSONL, re-verify, write the commit myself. ~10-15 min per round.
 - The 402 exit is **purely a budget-exhaustion signal** — codex's last activity was a `cat client/src/game/health.ts` to investigate the fire-rate regression. It had code in the worktree but no commit.
 
-**What fix4 did NOT fix (carries to fix5)**:
-- The 12-HP gap. Across multiple smoke runs, one of the 6-8 server-accepted broadcasts per spam does NOT decrement Tab A's remote OR Tab B's local, leaving a 12-HP delta. The failure direction varies (sometimes Tab A is short, sometimes Tab B is short), suggesting the issue is timing-dependent on which tab's `__gameSession` resolves first during the spam. Possible causes:
-  1. The "no pending → apply" path on Tab B (or Tab A's confirm path) is hitting a controller that's been swapped to a disposed session's instance under StrictMode. The `__gameSession` resolver might be returning a different session at broadcast time than at applyBroadcast's `target` resolution time.
-  2. The smoke's `__spamSent` counter doesn't match the actual accepted-broadcast count (e.g., the smoke fires 100 but only 6 reach the server's fire-rate gate, and the broadcasts don't all decrement both tabs' HP).
-  3. A timing race in the `sweepExpiredPending` interval (50ms cadence) vs the broadcast arrival (60-150ms latency). The sweep may revert entries that the broadcast is about to confirm.
+**What fix4 did NOT fix (carries to fix6)**:
+- The 12-HP gap. Across multiple smoke runs, one of the 6-8 server-accepted broadcasts per spam does NOT decrement Tab A's remote OR Tab B's local, leaving a 12-HP delta. The failure direction varies (sometimes Tab A is short, sometimes Tab B is short), suggesting the issue is timing-dependent on which tab's `__gameSession` resolves first during the spam. Confirmed by Kyle's 2026-08-17 evening devtools probe (see "Smoking-gun diagnostic" below) — the bug is the LATEST-gameSession resolver in `scene.ts:823-851` routing the broadcast's `applyDamage` to a different controller instance than the one the smoke/probe reads.
 - **This is a TAB-agnostic issue** — the asymmetric 12-HP gap (sometimes Tab A is short, sometimes Tab B) suggests the bug is NOT a specific tab's handler, but a fundamental question of which session/controller the broadcast is targeting at any given microsecond.
 
-**Investigation path for fix5** (recommended next dispatch):
-1. Add `__broadcastAppliedTo` debug instrumentation: log the EXACT controller instance (`controller.id` or a unique ref) that each broadcast decremented. Compare across Tab A and Tab B for the same broadcast. If they differ, the LATEST-gameSession resolver is mis-routing the apply.
+**Investigation path for fix6** (recommended next dispatch):
+1. Add `__broadcastAppliedTo` debug instrumentation: log the EXACT controller instance (`controller.id` or a unique ref) that each broadcast decremented. Compare across Tab A and Tab B for the same broadcast. If they differ, the LATEST-gameSession resolver is mis-routing the apply. The smoking-gun diagnostic in the "Smoking-gun diagnostic" section below strongly suggests this is the cause.
 2. Add `__pendingSnapshot` debug instrumentation: log the `pendingApplies` map size and a sample of keys at the moment each broadcast arrives. If a broadcast arrives with `pending=0` but the confirm path returns `"confirm"` (without applying HP), it means the pending was there during the optimistic apply but not during the broadcast handler — different code path, different session.
 3. **OR**: skip the optimistic-apply feature for the smoke's POST-SPAM phase. Reset the broadcast handler to use captured `gameSession` (not LATEST) and see if the smoke passes. If it does, the LATEST-resolver is the problem; if not, the issue is elsewhere.
 4. **OR**: add an `applyBroadcast` mode that always uses captured-`gameSession` and a mode that always uses LATEST-`__gameSession`; let the smoke select which to use. Use captured-mode for tests that want determinism; use LATEST-mode for production where StrictMode re-renders can happen.
+5. **OR (recommended)**: drop the optimistic-apply feature entirely. Clients send-and-wait; server is the sole source of truth; +1 RTT per fire but the entire race/sweep/recentlySettled/max-pending/order-vs-arrival surface collapses. The bug catalog will need a new Class 8 entry for any future session that wants optimistic-apply back.
 
-**If fix5 lands + smoke is 10/10 PASS**: the PR is closeable. Squash + push + `gh pr create --body-file`. The 13 commits ahead of main all stay.
+**If fix6 lands + smoke is 10/10 PASS**: the PR is closeable. Squash + push + `gh pr create --body-file`. The 20 commits ahead of main all stay.
 
-**If fix5 doesn't land**: open question = the smoke's setup may be testing an impossible invariant (cross-tab deterministic HP convergence under React StrictMode + optimistic-apply + queue-overflow + sweep + per-tab individual fire-rate accept/decline + WebSocket latency). The user's actual gameplay (a single browser tab seeing 2 remote players) is a different topology than the smoke's 2 separate browser tabs both running scene() with their own StrictMode lifecycle. The smoke may be too aggressive for what production can guarantee.
+**If fix6 doesn't land**: open question = the smoke's setup may be testing an impossible invariant (cross-tab deterministic HP convergence under React StrictMode + optimistic-apply + queue-overflow + sweep + per-tab individual fire-rate accept/decline + WebSocket latency). The user's actual gameplay (a single browser tab seeing 2 remote players) is a different topology than the smoke's 2 separate browser tabs both running scene() with their own StrictMode lifecycle. The smoke may be too aggressive for what production can guarantee.
 
 **Files changed in commit `929f3d6`** (8 files, +476/-38):
 - `client/src/engine/scene.ts` (+154): race-safe sync guard + dynamic `__gameSession` resolver + `DamageReject` listener wiring.
@@ -236,6 +257,73 @@ Then in 2 browser tabs (or 2 browser windows, or 2 computers on the Tailscale ne
 - Fire ~10 times in a row from Tab A: Tab B's HP should hit 0 (each fire = 12 dmg, 10 fires = 120 dmg clamped at 0), then Tab B respawns after 3s with HP=100
 
 **What you'd see if the 12-HP gap is reproducing in real play**: Tab A's local view of Tab B's HP could lag by 12 HP (one broadcast's worth) for ~1.5s after a fire-rate spam. In real play this is a transient visual desync — the other tab sees the correct HP, the next broadcast self-corrects. You should NOT see it in normal (non-spam) play; you'd need to fire 100+ shots in 1.1s to trigger it.
+
+
+---
+
+## 🚀 fix6 brief (ready to dispatch — copy/paste into the next codex call)
+
+The next session can dispatch fix6 with this exact 5-10 min brief. Don't rewrite it; the diagnostic context is captured below.
+
+**Repo**: specialists-web, branch `feat/phase1-pr11.6.d-validate-and-relay` (do NOT change)
+**Worktree**: `/home/kyle/Development/specialists-web-pr11.6.d` (clean as of 2026-08-17)
+**Previous state**: fix5 (`1d88ac3`) landed client-vitest CI job + Tests F/G/H. All 4 verifier gates green. 5191 smoke still 0/3 FAIL with 12-HP gap.
+
+**Smoke evidence** (the bug is real and reproducible):
+- 5191 smoke 10×: 0/10 PASS, deterministic-FAIL with 12-HP gap (one broadcast's worth) in either direction. Run-by-run: Tab A=4/Tab B=100; Tab A=16/Tab B=4; Tab A=28/Tab B=16. Asymmetric direction.
+- Devtools probe (single fire): `before=100, afterImmediate=88, afterBroadcast=100` — the optimistic apply works synchronously but something reverts the -12 between the immediate read and the broadcast arrival.
+
+**Likely root cause** (confirmed by the devtools probe):
+- `client/src/engine/scene.ts:823-851` has the broadcast handler closure that resolves `window.__gameSession` DYNAMICALLY per call. Under React StrictMode, `__gameSession` may be set to a SECOND scene() mount's GameSession. The first mount's GameSession is disposed (its controllers go null) but its controllers may still be in the devtools probe's `session` reference.
+- The broadcast's `applyDamage` decrements the LATEST controllers; the devtools probe reads the FIRST controllers → 12-HP gap.
+
+**Target**: close the 12-HP gap so the 5191 smoke is 10/10 PASS.
+
+**Specific files to touch** (in order):
+1. `client/src/engine/scene.ts:823-851` (broadcast handler closure) — the `__gameSession` resolver.
+2. `client/src/net/scene.ts:32-40` (where StrictMode first sets `__gameSession` to scene1's, then scene2 overrides).
+3. Possibly `client/src/ui/App.tsx:69-130` (where `WebRTCPeer` is created + `GgnetTransport` wraps it — the multiplayer-on path).
+
+**Approach options** (pick one based on the diagnostic, do not change all three):
+- **Option A (most surgical)**: replace the `__gameSession` resolver with a static reference to the first scene()'s gameSession (captured at IIFE entry). The broadcast always uses the first; StrictMode's second mount's session is allowed to do its own thing but doesn't override the broadcast's target. ~10 lines.
+- **Option B (defensive)**: in the broadcast handler, log the controller instance it targeted. Add a vitest test that runs the smoke and asserts the broadcast targets the same controller the smoke reads.
+- **Option C (simplest)**: drop the optimistic-apply feature. Clients send-and-wait; +1 RTT per fire. The entire race/sweep/recentlySettled/max-pending/order-vs-arrival surface collapses. This is what I'd recommend if Option A doesn't pan out.
+
+**Verification gates (run yourself before reporting done)**:
+```bash
+cd /home/kyle/Development/specialists-web-pr11.6.d
+cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release 2>&1 | tail -5   # 13/13 PASS
+cd ../client
+npx tsc -b --noEmit 2>&1 | tail -3                                              # clean
+npm run build 2>&1 | tail -5                                                   # clean
+npm test 2>&1 | tail -8                                                        # 10/10 PASS (5 existing + 5 new)
+# Smoke 5191: 10 runs in a row
+for i in {1..10}; do
+  echo "=== Run $i ==="
+  node tools/damage-server-hp-convergence-smoke.mjs 2>&1 | grep -E 'FAIL|^OK ' | head -3
+done
+# 5190 smoke: must still PASS
+node tools/damage-server-smoke.mjs 2>&1 | tail -3
+```
+
+**Vitest test to add** (Test I — pins the fix6 invariant):
+- If Option A: a test that creates two mock GameSession instances (simulating StrictMode double-mount), registers the broadcast handler with the first, fires a broadcast, asserts the broadcast decremented the FIRST session's controllers (not the second).
+- If Option C: a test that pins the new "send-and-wait" behavior (no optimistic apply; HP only decrements when the broadcast arrives).
+
+**DO NOT**: change the wire format. DO NOT add new dependencies. DO NOT push to origin. DO NOT open a PR. DO NOT skip the 10× smoke loop.
+
+**Brief to write yourself** (paste into `/tmp/.codex-fix6-prompt-pr11.6.d.md`):
+```
+[Use the structure above, paste verbatim. Reference the smoking-gun diagnostic in the "Smoking-gun diagnostic" section of HANDOFF.md. Reference Test I (new vitest) as the regression gate. Reference the existing Test F (clamped confirm convergence) to confirm the actualDelta invariant isn't broken by fix6.]
+```
+
+**Servers for verification** (already up):
+- canary: pid 3599169 on Tailscale `100.95.111.112:14433/14434`
+- vite: pid 3599938 on Tailscale `100.95.111.112:5191`
+- 2-tab URL: `http://100.95.111.112:5191/?server=ws%3A%2F%2F100.95.111.112%3A14434%2Frooms%2FDEVBX`
+
+
+## 🔬 Smoking-gun diagnostic (Kyle's 2026-08-17 evening devtools probe)
 
 
 
