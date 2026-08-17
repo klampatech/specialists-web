@@ -567,14 +567,35 @@ pub(super) async fn handle_binary(
                 )
             };
             let Some(bc) = bc_opt else {
-                // Validator rejected (warn! was already emitted inside
-                // validate_and_relay). No reply, no fan-out.
+                // FIX 4: validator rejected. Emit a `DamageReject` back
+                // to the SOURCE tab only (NOT broadcast) so the
+                // source can revert its optimistic apply. The reject
+                // reason is 0 (fire-rate) — the most common cause in
+                // production. Granular reasons can be wired by
+                // changing `validate_and_relay` to return an enum;
+                // PR 11.6.D keeps the simpler Option-returning API.
                 debug!(
                     source = req.source_player_id,
                     target = req.target_player_id,
                     event_id = req.event_id,
                     "damageRequest rejected by validate_and_relay",
                 );
+                // For the reject, send it to the source's
+                // connection. We need to find the sender for
+                // `claimed_player_id` (which may be the
+                // placeholder_id if the connection hasn't been
+                // promoted yet).
+                let reject_bytes = specialists_server::damage_relay::relay_reject(
+                    req.event_id,
+                    specialists_server::protocol::REJECT_REASON_FIRE_RATE,
+                );
+                let room_guard = room_arc.read().await;
+                let sender = room_guard.connections
+                    .get(&claimed_player_id)
+                    .or_else(|| room_guard.connections.get(&placeholder_player_id));
+                if let Some(sender) = sender {
+                    let _ = sender.try_send(reject_bytes);
+                }
                 return vec![];
             };
             // PR 11.6.D: re-register the connection under the

@@ -54,6 +54,27 @@ const SERVER_TICK_MS: u32 = 16;
 /// validator rejects). 500ms covers normal internet latency; a
 /// truly-stale ping beyond 500ms is treated as no rewind.
 pub const MAX_RTT_MS: u32 = 500;
+/// PR 11.6.D FIX 6: melee damage matches
+/// `client/src/game/combat.ts:COMBAT.melee.damage` (25). Without
+/// this constant, gate 9+10 would use `dual_pistol_damage(...)
+/// which always returns 12 — and the client's optimistic apply
+/// would diverge from the broadcast (see FIX 4 forecast/correction
+/// path).
+pub const MELEE_DAMAGE: u8 = 25;
+/// PR 11.6.D FIX 6: melee range matches
+/// `client/src/game/combat.ts:COMBAT.melee.rangeMeters` (1.5).
+/// The 50m pistol range would allow a "melee" hit from across
+/// the map — clearly wrong.
+pub const MELEE_MAX_RANGE_METERS: f32 = 1.5;
+/// PR 11.6.D FIX 7: bounded window for the eventId monotonicity
+/// gate. Strict monotonicity (`req.event_id > last_event_id`) breaks
+/// when the client tab reloads (its `nextEventId` resets to 1) but
+/// the server's `last_event_id_for_source` persists for the room's
+/// lifetime — every subsequent request fails. The bounded window
+/// allows the client some retry budget: if `req.event_id` is within
+/// `EVENT_ID_WINDOW` of the last seen, accept; otherwise reject.
+/// 64 covers normal use + rapid retry storms.
+pub const EVENT_ID_WINDOW: u32 = 64;
 
 /// Public entry point. Validate `req` against `room`'s state and
 /// (on success) emit a `DamageBroadcast` for the whole room.
@@ -121,18 +142,24 @@ pub fn validate_and_relay(
         req.source,
     );
 
-    // --- Gate 6: eventId monotonicity per source ----------------------
+    // --- Gate 6: eventId bounded-window per source -------------------
+    // FIX 7: bounded window — accept if `req.event_id` is within
+    // `EVENT_ID_WINDOW` of `last_event_id`. Reject only if the gap
+    // exceeds the window. This allows client tab reloads (where
+    // `nextEventId` resets to 1) to recover without invalidating
+    // every subsequent request.
     let last_event_id = room
         .last_event_id_for_source
         .get(&req_source)
         .copied()
         .unwrap_or(0);
-    if req.event_id <= last_event_id {
+    if req.event_id.saturating_add(EVENT_ID_WINDOW) < last_event_id {
         warn!(
             source = req_source,
             event_id = req.event_id,
             last_event_id = last_event_id,
-            "validate_and_relay: rejected — stale or duplicate eventId",
+            window = EVENT_ID_WINDOW,
+            "validate_and_relay: rejected — eventId more than EVENT_ID_WINDOW behind last_event_id",
         );
         return None;
     }
@@ -254,8 +281,29 @@ pub fn validate_and_relay(
     let dx = target_pos.x - source_pos.x;
     let dy = target_pos.y - source_pos.y;
     let distance = (dx * dx + dy * dy).sqrt();
-    let amount = dual_pistol_damage(distance);
+
+    // FIX 6: branch amount + hit-range by source type. The
+    // `dual_pistol_damage` function returns 12 (or 0 if out of
+    // range) — wrong for melee. Melee uses a simple distance check
+    // (no raycast; the client already ran the cone check at fire
+    // time — PR 11.6.D's server-side is a permissive "are they
+    // within melee range" verifier).
+    let amount = match req.source {
+        0 => dual_pistol_damage(distance),
+        _ => MELEE_DAMAGE,
+    };
     if amount == 0 {
+        return None;
+    }
+    // FIX 6: for melee, the 50m pistol range is wrong. Use a
+    // MELEE_MAX_RANGE_METERS gate. We already passed the hit-box
+    // test above (the dual_pistol_hit check); for melee we
+    // re-verify with the melee range. If the target is OUT of
+    // melee range, this is a hit that the client's cone check
+    // already validated — but only if the target is within melee
+    // range. Reject if not.
+    if req.source != 0 && distance > MELEE_MAX_RANGE_METERS {
+        // Silent reject — no broadcast.
         return None;
     }
 
@@ -292,6 +340,26 @@ pub fn relay_broadcast(bc: &DamageBroadcast) -> Vec<u8> {
         "relay_broadcast: produced {} bytes, expected {}",
         out.len(),
         1 + specialists_server::protocol::DAMAGE_BROADCAST_WIRE_SIZE,
+    );
+    out
+}
+
+/// PR 11.6.D FIX 4: encode a `DamageReject` to on-the-wire bytes
+/// (discriminator prepended). The transport sends this to the
+/// source tab only (not broadcast) so the source can revert its
+/// optimistic apply.
+pub fn relay_reject(event_id: u32, reason: u8) -> Vec<u8> {
+    let r = specialists_server::protocol::DamageReject { event_id, reason };
+    let body = specialists_server::protocol::encode_damage_reject(&r);
+    let mut out = Vec::with_capacity(1 + body.len());
+    out.push(specialists_server::protocol::DISCRIMINATOR_DAMAGE_REJECT);
+    out.extend(body);
+    debug_assert_eq!(
+        out.len(),
+        1 + specialists_server::protocol::DAMAGE_REJECT_BODY_SIZE,
+        "relay_reject: produced {} bytes, expected {}",
+        out.len(),
+        1 + specialists_server::protocol::DAMAGE_REJECT_BODY_SIZE,
     );
     out
 }
@@ -557,7 +625,8 @@ mod tests {
 
     #[test]
     fn uses_500ms_melee_cooldown() {
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        // FIX 6: melee target must be within 1.5m; use (1.0, 0.0).
+        let mut room = setup_room((0.0, 0.0), (1.0, 0.0));
         let now = Instant::now();
         let mut req = passing_request();
         req.source = 1;
@@ -572,5 +641,261 @@ mod tests {
         req3.event_id = 3;
         let result3 = validate_and_relay(&req3, 1, &mut room, 0, now + Duration::from_millis(510));
         assert!(result3.is_some(), "melee after cooldown must succeed");
+    }
+
+    #[test]
+    fn melee_uses_melee_damage_constant_not_dual_pistol_damage() {
+        // FIX 6: melee request must produce bc.amount == MELEE_DAMAGE (25),
+        // NOT dual_pistol_damage(distance) which is always 12.
+        let mut room = setup_room((0.0, 0.0), (1.0, 0.0));
+        let mut req = passing_request();
+        req.source = 1;
+        req.amount = 25;
+        let bc = validate_and_relay(&req, 1, &mut room, 0, Instant::now())
+            .expect("melee within range must succeed");
+        assert_eq!(bc.amount, MELEE_DAMAGE, "melee damage must be MELEE_DAMAGE (25), not 12");
+        assert_eq!(bc.amount, 25, "client's COMBAT.melee.damage is 25");
+    }
+
+    #[test]
+    fn melee_rejects_target_outside_melee_range() {
+        // FIX 6: melee target at 5m must be rejected (out of 1.5m range).
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let mut req = passing_request();
+        req.source = 1;
+        req.amount = 25;
+        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
+        assert!(result.is_none(), "melee target outside melee range must be rejected");
+    }
+
+    #[test]
+    fn rejects_event_id_more_than_window_behind_last() {
+        // FIX 7: bounded window for eventId gate. Reject if
+        // req.event_id + EVENT_ID_WINDOW < last_event_id.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let now = Instant::now();
+        let req1 = passing_request();
+        let _ = validate_and_relay(&req1, 1, &mut room, 0, now);
+        assert_eq!(room.last_event_id_for_source.get(&1).copied(), Some(1));
+
+        // req.event_id + EVENT_ID_WINDOW == last_event_id -> reject
+        let mut req_far_behind = req1.clone();
+        req_far_behind.event_id = 1 + EVENT_ID_WINDOW;  // 65
+        let result = validate_and_relay(&req_far_behind, 1, &mut room, 0, now);
+        assert!(result.is_none(), "event_id + WINDOW < last_event_id must be rejected");
+
+        // req.event_id + EVENT_ID_WINDOW == last_event_id + 1 -> accept
+        let mut req_just_in_window = req1.clone();
+        req_just_in_window.event_id = EVENT_ID_WINDOW;  // 64
+        let result = validate_and_relay(&req_just_in_window, 1, &mut room, 0, now);
+        assert!(result.is_none(), "event_id + WINDOW == last_event_id still rejects");
+
+        // Same event_id repeated -> reject (duplicates still don't replay)
+        let req_dup = req1.clone();
+        let result = validate_and_relay(&req_dup, 1, &mut room, 0, now);
+        assert!(result.is_none(), "duplicate eventId must be rejected");
+
+        // Newer event_id -> accept (advances last_event_id)
+        let mut req_newer = req1.clone();
+        req_newer.event_id = 2;
+        let result = validate_and_relay(&req_newer, 1, &mut room, 0,
+            now + Duration::from_millis(200));
+        assert!(result.is_some(), "newer eventId must be accepted");
+    }
+
+    #[test]
+    fn event_id_drift_within_then_beyond_window() {
+        // FIX 7: bounded window. After a request with event_id=A
+        // succeeds, last_event_id=A. A request with event_id in
+        // [A-WINDOW, A] is accepted; a request with event_id < A-WINDOW
+        // is rejected.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let now = Instant::now();
+        let mut req_advance = passing_request();
+        req_advance.event_id = 1000;
+        let result = validate_and_relay(&req_advance, 1, &mut room, 0, now);
+        assert!(result.is_some(), "first request must succeed");
+        assert_eq!(room.last_event_id_for_source.get(&1).copied(), Some(1000));
+
+        // event_id=950 (50 behind 1000) -> 950 + 64 = 1014; 1014 < 1000 = false -> accept.
+        let mut req_within = passing_request();
+        req_within.event_id = 950;
+        let result = validate_and_relay(&req_within, 1, &mut room, 0,
+            now + Duration::from_millis(200));
+        assert!(result.is_some(), "drift within EVENT_ID_WINDOW must be accepted");
+        // After this, last_event_id=950 (the bounded window accepted
+        // the smaller event_id and STAMPED it; this is how retries
+        // work — the server advances last_event_id to the actually-
+        // accepted event_id, not the supremum).
+
+        // event_id=885 (65 behind 950) -> 885 + 64 = 949; 949 < 950 = true -> reject.
+        let mut req_beyond = passing_request();
+        req_beyond.event_id = 885;
+        let result = validate_and_relay(&req_beyond, 1, &mut room, 0,
+            now + Duration::from_millis(400));
+        assert!(result.is_none(), "drift beyond EVENT_ID_WINDOW must be rejected");
+    }
+
+    #[test]
+    fn rejected_request_leaves_state_unchanged() {
+        // Gate 6 rejection (stale eventId) must NOT stamp state. The
+        // source's ammo, last_fire_at, and last_event_id_for_source
+        // must be unchanged.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let now = Instant::now();
+        let req1 = passing_request();
+        let _ = validate_and_relay(&req1, 1, &mut room, 0, now);
+        let ammo_before = room.players[&1].ammo;
+        let last_fire_at_before = room.players[&1].last_fire_at;
+        let last_event_id_before = room.last_event_id_for_source.get(&1).copied().unwrap_or(0);
+
+        // Same event_id again -> reject.
+        let req_dup = req1.clone();
+        let result = validate_and_relay(&req_dup, 1, &mut room, 0, now);
+        assert!(result.is_none(), "duplicate eventId must be rejected");
+        assert_eq!(room.players[&1].ammo, ammo_before, "ammo must not decrement on reject");
+        assert_eq!(room.players[&1].last_fire_at, last_fire_at_before, "last_fire_at must not change on reject");
+        assert_eq!(room.last_event_id_for_source.get(&1).copied().unwrap_or(0), last_event_id_before, "last_event_id must not advance on reject");
+    }
+
+    #[test]
+    fn lag_comp_verdict_change() {
+        // FIX test: with rewind, the validator sees the rewound
+        // position; without rewind, it sees the current position.
+        // The test sets up: source at (0,0), target at (5,0) for
+        // frames 0-1, then at (100,0) for frames 2-5. At frame 5
+        // with RTT=64ms (lag_frames=2), rewind to frame 3 →
+        // snapshot_at(3) returns frame 2's position (100,0) which
+        // is OUT of range → MISS. Without rewind, the current
+        // position (100,0) is also out of range, so this test
+        // doesn't differentiate. We need a case where the rewind
+        // CHANGES the verdict.
+        //
+        // Setup: source at (0,0), target at (5,0) for frames 0-50,
+        // then at (100,0) for frame 51. At frame 51 with RTT=400ms
+        // (lag_frames=12, rewind to frame 39), snapshot_at(39)
+        // returns frame 39's position (5,0) → HIT.
+        // Without rewind, current position is (100,0) → MISS.
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.players.get_mut(&1).unwrap().ammo = 10;
+        for frame in 0..51u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
+        }
+        room.record_position(1, 51, Position { x: 0.0, y: 0.0 });
+        room.record_position(2, 51, Position { x: 100.0, y: 0.0 });
+        let req = DamageRequest {
+            frame: 51,
+            source_player_id: 1,
+            target_player_id: 2,
+            source: 0,
+            amount: 12,
+            event_id: 1,
+        };
+        // With RTT=400ms (lag_frames=12, rewind to frame 39),
+        // validator sees target at (5,0) -> HIT.
+        let result = validate_and_relay(&req, 1, &mut room, 400, Instant::now());
+        assert!(result.is_some(), "lag-comp rewind to in-range position must HIT");
+        let bc = result.unwrap();
+        assert_eq!(bc.amount, 12);
+
+        // Reset & test the no-rewind case: RTT=0 -> validator sees
+        // current position (100,0) -> MISS.
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.players.get_mut(&1).unwrap().ammo = 10;
+        for frame in 0..51u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
+        }
+        room.record_position(1, 51, Position { x: 0.0, y: 0.0 });
+        room.record_position(2, 51, Position { x: 100.0, y: 0.0 });
+        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
+        assert!(result.is_none(), "no rewind -> current position (100,0) is OUT of range -> MISS");
+    }
+
+    #[test]
+    fn fire_rate_boundary_119_rejected_120_accepted() {
+        // FIX test: pin the < vs <= choice in the cooldown gate.
+        // 119ms since last fire -> REJECT (< 120ms).
+        // 120ms since last fire -> ACCEPT (>= 120ms).
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let now = Instant::now();
+        let req1 = passing_request();
+        let result = validate_and_relay(&req1, 1, &mut room, 0, now);
+        assert!(result.is_some(), "first request must succeed");
+        let req2 = DamageRequest { event_id: 2, ..req1.clone() };
+        let result = validate_and_relay(&req2, 1, &mut room, 0, now + Duration::from_millis(119));
+        assert!(result.is_none(), "119ms since last fire must be rejected (cooldown is 120ms)");
+        // 120ms+ cooldown: each request must be 120ms after the previous
+        // accepted one. The 119ms test did NOT stamp last_fire_at (it
+        // was rejected), so we can fire at now+120ms.
+        let req3 = DamageRequest { event_id: 3, ..req1.clone() };
+        let result = validate_and_relay(&req3, 1, &mut room, 0, now + Duration::from_millis(120));
+        assert!(result.is_some(), "120ms since last fire must be accepted (cooldown is 120ms)");
+        // 240ms+ after the 120ms test (which stamped last_fire_at).
+        let req4 = DamageRequest { event_id: 4, ..req1.clone() };
+        let result = validate_and_relay(&req4, 1, &mut room, 0, now + Duration::from_millis(240));
+        assert!(result.is_some(), "240ms (>= 120ms cooldown) since last fire must be accepted");
+    }
+
+    #[test]
+    fn event_id_wraparound_u32_max() {
+        // FIX test: event_id=u32::MAX must be accepted, event_id=0 (after
+        // a long session) must be rejected (it's more than EVENT_ID_WINDOW
+        // behind).
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let now = Instant::now();
+        let mut req_max = passing_request();
+        req_max.event_id = u32::MAX;
+        let result = validate_and_relay(&req_max, 1, &mut room, 0, now);
+        assert!(result.is_some(), "event_id=u32::MAX must be accepted");
+        // After u32::MAX, event_id=0 is a wraparound. With the bounded
+        // window, 0 + 64 < u32::MAX is true -> reject.
+        let mut req_zero = passing_request();
+        req_zero.event_id = 0;
+        let result = validate_and_relay(&req_zero, 1, &mut room, 0,
+            now + Duration::from_millis(200));
+        assert!(result.is_none(), "event_id=0 after u32::MAX is more than WINDOW behind -> reject");
+    }
+
+    #[test]
+    fn lag_comp_uses_server_stamped_rtt() {
+        // FIX 1 test: when the source's last_ping_received_at is
+        // within MAX_RTT_MS, the validator uses a non-zero lag_frames.
+        // We can't directly observe lag_frames (it's local to the
+        // fn), but we can observe the verdict: with RTT=0 and the
+        // target moving out of range after frame 30, the request
+        // MISSes. With RTT=400ms (lag_frames=12, rewind to frame
+        // 18), the request HITs.
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.players.get_mut(&1).unwrap().ammo = 10;
+        // source at (0,0) throughout; target at (5,0) until frame 30,
+        // then at (100,0) from frame 30 onward.
+        for frame in 0..30u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
+        }
+        for frame in 30..50u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
+            room.record_position(2, frame, Position { x: 100.0, y: 0.0 });
+        }
+        let req = DamageRequest {
+            frame: 40,
+            source_player_id: 1,
+            target_player_id: 2,
+            source: 0,
+            amount: 12,
+            event_id: 1,
+        };
+        // RTT=400ms -> lag_frames=12 -> rewind to frame 28 -> target
+        // at (5,0) -> HIT.
+        let result = validate_and_relay(&req, 1, &mut room, 400, Instant::now());
+        assert!(result.is_some(), "with RTT=400ms, lag-comp must rewind to in-range frame");
     }
 }

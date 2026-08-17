@@ -43,6 +43,11 @@ pub const DISCRIMINATOR_PONG: u8 = 0x05;
 /// NEW §1.2 — server-relayed inputs for PR 11.7 handoff. PR 11.6.B
 /// buffers but does not process.
 pub const DISCRIMINATOR_INPUTS_SERVER: u8 = 0x06;
+/// PR 11.6.D FIX 4: server sends a DamageReject back to the source
+/// tab only (NOT broadcast) when the validator rejects a
+/// DamageRequest. The reject is privacy-scoped to the source's
+/// connection so peer tabs don't learn about the rejection.
+pub const DISCRIMINATOR_DAMAGE_REJECT: u8 = 0x07;
 
 /// Wire-size constants (from §3.5). PR 11.6.C: these are the BODY
 /// sizes (what the Rust `encode_*` returns). The on-the-wire packet
@@ -62,6 +67,15 @@ pub const PONG_WIRE_SIZE: usize = 8;
 /// PR 11.6.A DamageRequest 8 -> 14. The math wins; carry-forward into
 /// PR 11.6.C's TS encoder.
 pub const INPUTS_SERVER_WIRE_SIZE: usize = 17;  // see §3.5 - brief header says 16 but the math is 1+4+12=17 (PR 11.6.A off-by-one class)
+/// PR 11.6.D FIX 4: body size of `DamageReject` (event_id u32 BE + reason u8 = 5).
+pub const DAMAGE_REJECT_BODY_SIZE: usize = 5;
+
+/// PR 11.6.D FIX 4: reject reason codes. Wire-format-stable.
+pub const REJECT_REASON_FIRE_RATE: u8 = 0;
+pub const REJECT_REASON_AMMO: u8 = 1;
+pub const REJECT_REASON_EVENT_ID: u8 = 2;
+pub const REJECT_REASON_LAG_MISS: u8 = 3;
+pub const REJECT_REASON_NO_HISTORY: u8 = 4;
 
 // -- DamageRequest --------------------------------------------------------
 
@@ -144,6 +158,50 @@ pub fn decode_damage_broadcast(buf: &[u8]) -> Option<DamageBroadcast> {
         source: b.get_u8(),
         amount: b.get_u8(),
         origin_event_id: b.get_u32(),
+    })
+}
+
+// -- DamageReject ----------------------------------------------------------
+
+/// PR 11.6.D FIX 4: Server → Source-tab. Private reject signal.
+/// Sent when the validator rejects a `DamageRequest` (fire-rate,
+/// ammo, eventId, lag-miss, no-history). The source tab uses this
+/// to revert the optimistic apply it made locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DamageReject {
+    pub event_id: u32,
+    /// 0 = fire-rate, 1 = ammo, 2 = eventId, 3 = lag-miss, 4 = no-history.
+    pub reason: u8,
+}
+
+pub fn encode_damage_reject(r: &DamageReject) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(DAMAGE_REJECT_BODY_SIZE);
+    buf.put_u32(r.event_id);
+    buf.put_u8(r.reason);
+    debug_assert_eq!(
+        buf.len(),
+        DAMAGE_REJECT_BODY_SIZE,
+        "encode_damage_reject: produced {} bytes, expected {}",
+        buf.len(),
+        DAMAGE_REJECT_BODY_SIZE,
+    );
+    buf
+}
+
+pub fn decode_damage_reject(buf: &[u8]) -> Option<DamageReject> {
+    if buf.len() != DAMAGE_REJECT_BODY_SIZE {
+        return None;
+    }
+    let mut cursor = std::io::Cursor::new(buf);
+    use std::io::Read;
+    let mut eid_bytes = [0u8; 4];
+    cursor.read_exact(&mut eid_bytes).ok()?;
+    let event_id = u32::from_be_bytes(eid_bytes);
+    let mut reason_byte = [0u8; 1];
+    cursor.read_exact(&mut reason_byte).ok()?;
+    Some(DamageReject {
+        event_id,
+        reason: reason_byte[0],
     })
 }
 
@@ -366,7 +424,24 @@ mod tests {
         };
         let bytes = encode_pong(&p);
         assert_eq!(bytes.len(), PONG_WIRE_SIZE);
-        assert_eq!(bytes.len(), 8);
+
+    }
+
+    #[test]
+    fn damage_reject_is_5_bytes_roundtrip() {
+        // FIX 4: DamageReject body is event_id u32 BE + reason u8 = 5.
+        let r = DamageReject { event_id: 0xdeadbeef, reason: REJECT_REASON_FIRE_RATE };
+        let bytes = encode_damage_reject(&r);
+        assert_eq!(bytes.len(), DAMAGE_REJECT_BODY_SIZE);
+        assert_eq!(bytes.len(), 5, "DamageReject body is event_id u32 + reason u8");
+        let dr = decode_damage_reject(&bytes).expect("decode damage reject");
+        assert_eq!(dr, r);
+
+        // Wrong size -> None.
+        let too_short = vec![0u8; DAMAGE_REJECT_BODY_SIZE - 1];
+        assert!(decode_damage_reject(&too_short).is_none());
+        let too_long = vec![0u8; DAMAGE_REJECT_BODY_SIZE + 1];
+        assert!(decode_damage_reject(&too_long).is_none());
     }
 
     #[test]

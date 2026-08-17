@@ -289,15 +289,29 @@ async fn integration_fire_rate_cooldown_enforced() {
         .expect("msg1");
 
     // Second request with a fresh eventId but no time elapsed —
-    // inside the 120ms cooldown, so validator rejects (no reply).
+    // inside the 120ms cooldown, so validator rejects.
     let req2 = specialists_server::protocol::DamageRequest {
         event_id: 2,
         ..req1.clone()
     };
     ws.send(Message::Binary(encode_damage_request(&req2).into())).await.expect("send2");
-    // Expect NO broadcast within 500ms.
+    // FIX 4: the validator now sends a DamageReject back to the source
+    // (not a DamageBroadcast). We expect a non-broadcast message —
+    // specifically a 0x07 discriminator.
+    let reject_msg = tokio::time::timeout(Duration::from_millis(500), ws.next())
+        .await
+        .expect("timeout waiting for reject")
+        .expect("stream ok")
+        .expect("msg ok");
+    if let Message::Binary(b) = reject_msg {
+        assert_eq!(b[0], specialists_server::protocol::DISCRIMINATOR_DAMAGE_REJECT,
+            "validator must send a DamageReject (0x07), not a DamageBroadcast");
+    } else {
+        panic!("expected Binary message");
+    }
+    // No further messages should arrive.
     let no_bc = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
-    assert!(no_bc.is_err(), "second request within cooldown must produce no broadcast");
+    assert!(no_bc.is_err(), "no further messages should arrive after reject");
 
     ws.send(Message::Close(None)).await.ok();
     server_handle.abort();
