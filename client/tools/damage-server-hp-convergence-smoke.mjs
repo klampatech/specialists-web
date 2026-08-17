@@ -207,6 +207,38 @@ async function runSmoke() {
     if (!connectedB) throw new Error("Tab B ServerTransport did not connect");
     log("Both ServerTransports connected.");
 
+    // PR 11.6.D FIX 2: assert each tab uses the correct player id
+    // (Tab A=1, Tab B=2). The page init script sets
+    // window.__localPlayerId and window.__peerPlayerId; the scene
+    // passes these to createGameSession via opts.
+    const idsA = await pageA.evaluate(() => {
+      const session = (window).__gameSession;
+      return {
+        local: session ? session.localPlayerId : null,
+        peer: session ? session.peerPlayerId : null,
+        windowLocal: window.__localPlayerId ?? null,
+        windowPeer: window.__peerPlayerId ?? null,
+      };
+    });
+    const idsB = await pageB.evaluate(() => {
+      const session = (window).__gameSession;
+      return {
+        local: session ? session.localPlayerId : null,
+        peer: session ? session.peerPlayerId : null,
+        windowLocal: window.__localPlayerId ?? null,
+        windowPeer: window.__peerPlayerId ?? null,
+      };
+    });
+    log(`Tab A: ${JSON.stringify(idsA)}`);
+    log(`Tab B: ${JSON.stringify(idsB)}`);
+    if (idsA.local !== 1 || idsA.peer !== 2) {
+      throw new Error(`Tab A: expected local=1, peer=2, got ${JSON.stringify(idsA)}`);
+    }
+    if (idsB.local !== 2 || idsB.peer !== 1) {
+      throw new Error(`Tab B: expected local=2, peer=1, got ${JSON.stringify(idsB)}`);
+    }
+    log("Assertion (FIX 2) PASS: both tabs use correct player ids (A=1→2, B=2→1).");
+
     // Install broadcast listeners on both tabs so we can detect when
     // the broadcast arrives (via __lastBroadcast + the typed probe).
     await pageA.evaluate(() => {
@@ -318,7 +350,7 @@ async function runSmoke() {
         source: 0, // fire
         amount,
         eventId,
-      }, targetController, performance.now());
+      }, targetController, performance.now(), 1, targetId);
       // Poll the targetController's HP for change (max 500ms).
       const start = Date.now();
       while (Date.now() - start < timeoutMs) {
@@ -421,7 +453,7 @@ async function runSmoke() {
             source: 0,
             amount: 12,
             eventId,
-          }, targetController, performance.now());
+          }, targetController, performance.now(), 1, 2);
         } catch {
           // ignore — too many in flight
         }
@@ -450,6 +482,40 @@ async function runSmoke() {
       throw new Error(`Fire-rate cooldown NOT enforcing: ${dmgApplied / 12} hits landed (expected ≤ 12 with 120ms cooldown).`);
     }
     log(`Assertion 6 PASS: fire-rate cooldown enforced (${dmgApplied / 12} hits in ~1s).`);
+
+    // PR 11.6.D FIX 4: after the spam phase, the server's
+    // DamageReject + the client's timeout sweep must restore HP
+    // convergence. Tab A optimistically applied ~all spam requests
+    // locally; the server only accepted the cooldown-bounded
+    // subset. Wait for the timeout sweep (PENDING_REJECT_TIMEOUT_MS
+    // = 500ms) to revert the rejected optimistic applies, then
+    // assert both tabs' HP match again.
+    log("Waiting 1.5s for timeout sweep to revert rejected optimistic applies...");
+    await sleep(1500);
+    // Also explicitly trigger the sweep on Tab A (in case the
+    // gameSession's tick loop doesn't drive it).
+    await pageA.evaluate(() => {
+      const mod = (window).__damageBus;
+      if (mod && mod.sweepExpiredPending) {
+        mod.sweepExpiredPending(performance.now());
+      }
+    });
+    const hpA_post = await pageA.evaluate(() => {
+      const session = (window).__gameSession;
+      return session ? session.remoteController.state.hp : null;
+    });
+    const hpB_post = await pageB.evaluate(() => {
+      const session = (window).__gameSession;
+      return session ? session.localController.state.hp : null;
+    });
+    log(`Post-spam: Tab A remote hp=${hpA_post}, Tab B local hp=${hpB_post}`);
+    if (hpA_post !== hpB_post) {
+      throw new Error(
+        `Post-spam HP convergence failed: Tab A remote=${hpA_post} vs Tab B local=${hpB_post}. ` +
+        `Timeout sweep didn't restore convergence (FIX 4 part C).`,
+      );
+    }
+    log(`Assertion (FIX 4) PASS: post-spam HP convergence restored (both at ${hpA_post}).`);
 
     // ---- 7. Capture screenshot ----
     // Take Tab A's screenshot (the shooter). It will show the
@@ -497,16 +563,25 @@ async function waitForProbe(page, timeoutMs) {
 
 (async () => {
   let success = false;
+  const skipBoot = process.env.SMOKE_NO_BOOT === "1";
   try {
-    await bootCanary();
-    await bootVite();
-    await sleep(500);
+    if (!skipBoot) {
+      await bootCanary();
+      await bootVite();
+      await sleep(500);
+    } else {
+      log("SMOKE_NO_BOOT=1: skipping canary + vite boot (pre-booted by caller)");
+    }
     success = await runSmoke();
   } catch (err) {
     fail("Boot error:", err.message);
     success = false;
   } finally {
-    await teardown();
+    if (!skipBoot) {
+      await teardown();
+    } else {
+      log("SMOKE_NO_BOOT=1: skipping teardown (caller owns the pre-booted processes)");
+    }
   }
   process.exit(success ? 0 : 1);
 })();

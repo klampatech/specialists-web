@@ -254,6 +254,9 @@ jobs:
           HP_CONV_WT_PORT: 14433
           HP_CONV_WS_PORT: 14434
           SMOKE_PNG: client/tools/damage-server-hp-convergence-smoke.png
+          # PR 11.6.D FIX 9: the canary + Vite are already booted
+          # by the steps above; the smoke just connects to them.
+          SMOKE_NO_BOOT: "1"
       - name: Upload screenshot
         if: always()
         uses: actions/upload-artifact@v4

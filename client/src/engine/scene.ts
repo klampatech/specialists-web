@@ -353,7 +353,19 @@ export async function createScene(
   // Single-player path: build the local rig + controller directly (PR 3).
   // Multiplayer path: the GameSession owns BOTH rigs + both controllers +
   // the LockstepRuntime; the render loop just calls `gameSession.tick()`.
-  const gameSession = multiplayer ? createGameSession(scene, multiplayer.transport) : null;
+  // PR 11.6.D FIX 2: pass localPlayerId + peerPlayerId from
+  // window flags (set by the smoke init script). Defaults to 1
+  // and 2 for the legacy 2-player demo.
+  const initLocalPlayerId =
+    (window as unknown as { __localPlayerId?: number }).__localPlayerId ?? 1;
+  const initPeerPlayerId =
+    (window as unknown as { __peerPlayerId?: number }).__peerPlayerId ?? 2;
+  const gameSession = multiplayer
+    ? createGameSession(scene, multiplayer.transport, {
+        localPlayerId: initLocalPlayerId,
+        peerPlayerId: initPeerPlayerId,
+      })
+    : null;
 
   let character: CharacterController;
   let applyPose: () => void = () => {};

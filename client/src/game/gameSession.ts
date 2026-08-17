@@ -255,6 +255,10 @@ export interface CreateGameSessionOpts {
    *  connections; the smoke drives this directly via the page
    *  init script (window.__localPlayerId). */
   localPlayerId?: number;
+  /** PR 11.6.D FIX 2 — the peer's player ID. Used as `targetPlayerId`
+   *  on outgoing DamageRequests. Defaults to 2 for the legacy 2-player
+   *  demo. The 5191 smoke drives this via `window.__peerPlayerId`. */
+  peerPlayerId?: number;
 }
 
 export function createGameSession(
@@ -312,6 +316,11 @@ export function createGameSession(
    *  via `window.__localPlayerId` and the page init script — see
    *  `tools/damage-server-hp-convergence-smoke.mjs`). */
   const localPlayerId: number = opts.localPlayerId ?? 1;
+  /** PR 11.6.D FIX 2 — the peer's player ID. Used as `targetPlayerId`
+   *  on outgoing DamageRequests. Defaults to 2 (the demo's 2-player
+   *  layout). The smoke drives this via `window.__peerPlayerId` so
+   *  Tab A targets player 2 and Tab B targets player 1. */
+  const peerPlayerId: number = opts.peerPlayerId ?? 2;
   /** PR 11.6.D — monotonic eventId counter for outbound DamageRequests.
    *  The server rejects stale eventIds (PR 11.6.D §3.4.1 gate 6).
    *  Start at 1 (0 is a sentinel — never used on the wire). */
@@ -442,12 +451,12 @@ export function createGameSession(
           const req: DamageRequest = {
             frame: advanced.frame,
             sourcePlayerId: localPlayerId,
-            targetPlayerId: 2, // remote is always player 2 in this 2-player demo
+            targetPlayerId: peerPlayerId,
             source: 0, // fire
             amount: result.damage,
             eventId,
           };
-          dbSendDamageRequest(serverTransport, req, remoteController, nowMs);
+          dbSendDamageRequest(serverTransport, req, remoteController, nowMs, localPlayerId, peerPlayerId);
         } else {
           applyDamage(remoteController, { source: "fire", amount: result.damage }, nowMs);
         }
@@ -473,12 +482,12 @@ export function createGameSession(
           const req: DamageRequest = {
             frame: advanced.frame,
             sourcePlayerId: localPlayerId,
-            targetPlayerId: 2,
+            targetPlayerId: peerPlayerId,
             source: 1, // melee
             amount: result.damage,
             eventId,
           };
-          dbSendDamageRequest(serverTransport, req, remoteController, nowMs);
+          dbSendDamageRequest(serverTransport, req, remoteController, nowMs, localPlayerId, peerPlayerId);
         } else {
           applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
         }
