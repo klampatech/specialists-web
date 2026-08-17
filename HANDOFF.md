@@ -132,6 +132,58 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Why this matters for closing 11.6.D**: the 5191 smoke is the only automated test for the cross-tab damage path, and it's currently failing. Vitest tests at the unit level would catch 80%+ of the actualDelta / markSettled / DamageReject regressions before they reach the smoke. Right now if someone breaks the actualDelta invariant in a follow-up PR, only the 5191 smoke (which itself is broken) would catch it.
 
+**Ad-hoc decision (2026-08-17 evening, Kyle's call)**: shoring up CI first, then the 12-HP debug next session. Rationale: (a) the vitest tests we'd add are the RIGHT tests to write regardless of how fix5 lands; (b) the `client-vitest` job is required to merge 11.6.D anyway (the 5191 smoke will be marked "expected to fail" with a TODO, but vitest passing in CI is the only honest green signal on the fix3+fix4 invariants); (c) the 12-HP investigation is bounded by what scene.ts instrumentation can tell us, not by vitest surface area — they're independent work tracks. Kyle's exact ask: "update the spec / handoff with our next steps and ad-hoc decisions. Add it to the current PR. I'll review."
+
+**Concrete next-session action items (in order)**:
+
+1. **Add `client-vitest` job to `.github/workflows/ci.yml`** (5 lines of YAML — exact snippet in the "NOT in CI" section above). Required so the 5 existing boundary tests (Tests A/B/C/D + Test E) actually run in CI.
+2. **Add 2-3 more vitest tests pinning the fix4 invariants**:
+   - **Test F — StrictMode race**: a vitest test that simulates the StrictMode double-mount sequence (two `createScene` calls in succession, with the synchronous IIFE claiming `__serverTransport` before the first await) and asserts only one ServerTransport is instantiated. Pins the "synchronous IIFE claims the slot before await" invariant from `scene.ts:744-826`. Without this test, someone could revert the sync-guard optimization in a future PR and only the 5191 smoke (which is itself broken) would catch it.
+   - **Test G — Clamped confirm convergence**: when `pending.actualAppliedDelta < bc.amount`, the `applyBroadcast` confirm path should `applyDamage(remaining)` to the target controller. Specifically, fire 3 shots at an HP=2 target (last one is a clamped no-op, actualDelta=0), then send a broadcast with `bc.amount=12` and `pending.actualAppliedDelta=0` — assert the confirm path applies -12 to close the gap.
+   - **Test H — DamageReject (0x07) round-trip**: `encodeDamageReject({eventId, reason})` + `decodeDamageReject(buf)` should be symmetric, and both encoder + decoder should size-assert (`DAMAGE_REJECT_BODY_SIZE = 5`, `DAMAGE_REJECT_WIRE_SIZE = 6`). Mirrors the existing `encodeDamageRequest` / `encodeDamageBroadcast` round-trip tests in the protocol test suite.
+3. **Run `npm test` locally to confirm 8/8 (5 existing + 3 new) PASS**, then push the `client-vitest` CI job + the new tests as a single commit (`fix5(phase1-pr11.6.d): add client-vitest CI job + Tests F/G/H for fix4 invariants`).
+4. **Verify the new CI job runs green on push** (check the Actions tab on the PR).
+5. **Then dispatch fix6** (the 12-HP gap investigation) — recommend `__broadcastAppliedTo` instrumentation in `scene.ts` first, then a codex dispatch with the constraint that it must do the 10× smoke loop before reporting done.
+
+**Function-test repro (Kyle's manual 2-tab test)**:
+
+After the `client-vitest` job + Tests F/G/H land and CI is green, the dev-box side has:
+- Cargo canary server on ports 14433 (WebTransport) + 14434 (WebSocket)
+- Vite dev server on port 5191 with the new `?server=` URL routing
+- All the fix3+fix4 invariants verified by the new vitest tests
+- 5190 smoke (single-tab wire-format) PASSES
+- 5191 smoke (two-tab) parts 1-5 PASS (cross-tab identity, broadcast fan-out, optimistic apply, HP convergence at first shot, fire-rate enforcement in 6-8 hit range); part 7 (post-spam HP convergence) FAILS with 12-HP gap (the fix6 work).
+
+**2-tab repro steps** (Kyle can run this on the dev box with 2 browser tabs):
+
+```bash
+# Terminal 1: start the canary server
+cd ~/Development/specialists-web-pr11.6.d
+bash tools/canary-server.sh --port-wt 14433 --port-ws 14434
+
+# Terminal 2: start Vite on port 5191
+cd ~/Development/specialists-web-pr11.6.d/client
+npm run dev -- --host 0.0.0.0 --port 5191
+```
+
+Then in 2 browser tabs (or 2 browser windows, or 2 computers on the Tailscale network):
+- Tab A: `http://100.95.111.112:5191/?server=ws%3A%2F%2F100.95.111.112%3A14434%2Frooms%2FDEVBX&__forceServerTransport=true`
+- Tab B: `http://100.95.111.112:5191/?server=ws%3A%2F%2F100.95.111.112%3A14434%2Frooms%2FDEVBX&__forceServerTransport=true`
+
+(Replace `100.95.111.112` with the dev box's actual Tailscale IP if different. The `?server=...` query param is the new PR 11.6.D `?server=` URL routing; the `__forceServerTransport=true` param is the DEV probe that bypasses the URL-allowlist gate in `scene.ts:744`. Both tabs point at the same `DEVBX` room so they're matched into the same server-side fan-out group.)
+
+**What you should observe**:
+- Both tabs connect to the server within ~1s
+- Tab A's local rig is player 1, peer rig is player 2 (visible in the HUD's `__gameSession` probe: open devtools console, `JSON.stringify({local: window.__gameSession.localPlayerId, peer: window.__gameSession.peerPlayerId})` should show `{local: 1, peer: 2}` on Tab A and `{local: 2, peer: 1}` on Tab B)
+- Click on Tab A's canvas to lock pointer, then LMB to fire at Tab B's rig
+- Tab A: tracer fires, Tab B's HP bar drops (this is the optimistic apply — Tab A's local view of Tab B)
+- Tab B: receives the broadcast, decrements Tab B's own HP bar (the "no pending → apply" path)
+- Both tabs' HP bars should match within 1 RTT (60-150ms on localhost; expect them to be in lockstep on each fire)
+- The RTT shows up in the `__serverTransport.getStats()` probe: `JSON.stringify(window.__serverTransport.getStats())` should show `{rttMs: 60-150, transport: "websocket", connected: true}`
+- Fire ~10 times in a row from Tab A: Tab B's HP should hit 0 (each fire = 12 dmg, 10 fires = 120 dmg clamped at 0), then Tab B respawns after 3s with HP=100
+
+**What you'd see if the 12-HP gap is reproducing in real play**: Tab A's local view of Tab B's HP could lag by 12 HP (one broadcast's worth) for ~1.5s after a fire-rate spam. In real play this is a transient visual desync — the other tab sees the correct HP, the next broadcast self-corrects. You should NOT see it in normal (non-spam) play; you'd need to fire 100+ shots in 1.1s to trigger it.
+
 
 
 ---

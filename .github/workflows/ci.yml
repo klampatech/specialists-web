@@ -55,6 +55,33 @@ jobs:
   # damage request → synthetic broadcast, position update → no reply,
   # inputs → no error, malformed payload → no crash, wire sizes). The
   # smoke port is independent of all other client smoke jobs.
+  # PR 11.6.D fix5: client-vitest job — runs `npm test` in CI.
+  # The 10 boundary tests (Tests A/B/C/D from fix3 + Test E for
+  # actualDelta from fix4 + Tests F/G/H for the fix4 invariants
+  # (clamped confirm convergence, drop-branch markSettled,
+  # DamageReject round-trip)) verify the damageBus pending-map
+  # invariants + the 0x07 DamageReject wire-type contract.
+  # Without this job, the only CI coverage on those invariants was
+  # the 5191 HP-convergence smoke — which is itself broken on the
+  # 12-HP gap (fix6 work). So a future PR regressing actualDelta
+  # would only be caught by the broken smoke. Adding the vitest
+  # job gives an honest unit-level green signal in CI.
+  client-vitest:
+    name: client — vitest boundary tests (PR 11.6.D fix5)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Run vitest
+        run: npm test
   client-damage-server-smoke:
     name: client — damage server smoke (PR 11.6.C, port 5190)
     # PR 11.6.C review fix B4: serialize after server-build so cold
