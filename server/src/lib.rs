@@ -16,6 +16,7 @@
 extern crate self as specialists_server;
 
 pub mod cert;
+pub mod damage_relay;
 pub mod constants;
 pub mod hitscan;
 pub mod position_history;

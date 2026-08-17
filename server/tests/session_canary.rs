@@ -146,7 +146,7 @@ async fn router_dispatches_position_update_writes_history() {
         position_y: -3.25,
     }));
 
-    let reply = handle_binary(&payload, &rooms).await;
+    let reply = handle_binary(&payload, &rooms, 0 /* placeholder */).await;
     assert!(
         reply.is_empty(),
         "positionUpdate must not produce a reply (got {} bytes)",
@@ -173,11 +173,11 @@ async fn router_dispatches_position_update_writes_history() {
     assert_eq!(snapshot.y, -3.25);
 }
 
-/// Wire-format a `damageRequest`, hand it to the live dispatcher,
-/// assert the synthesized `DamageBroadcast` reply matches the request
-/// fields (source_player_id / target_player_id / source / amount /
-/// origin_event_id echo). PR 11.6.C's "synthetic broadcast" behavior
-/// — the real validation + relay lands in PR 11.6.D.
+/// PR 11.6.D: wire-format a `damageRequest`, hand it to the live
+/// dispatcher, assert that `damage_relay::validate_and_relay` accepts
+/// the request and produces a `DamageBroadcast` reply matching the
+/// request fields. The validator requires players + ammo + position
+/// history — seeded below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_dispatches_damage_request_returns_broadcast() {
     use specialists_server::protocol::{
@@ -187,8 +187,9 @@ async fn router_dispatches_damage_request_returns_broadcast() {
     use transport::{handle_binary, RoomRegistry};
 
     let rooms: RoomRegistry = RoomRegistry::default();
+    seed_room_for_validator(&rooms, 7, Some(9), (0.0, 0.0), Some((5.0, 0.0))).await;
     let req = DamageRequest {
-        frame: 0xdeadbeef,
+        frame: 1, // any frame 0..3 has a snapshot
         source_player_id: 7,
         target_player_id: 9,
         source: 0, // fire
@@ -198,7 +199,7 @@ async fn router_dispatches_damage_request_returns_broadcast() {
     let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
     payload.extend(encode_damage_request(&req));
 
-    let reply = handle_binary(&payload, &rooms).await;
+    let reply = handle_binary(&payload, &rooms, 0 /* placeholder */).await;
     assert_eq!(
         reply.len(),
         1 + specialists_server::DAMAGE_BROADCAST_WIRE_SIZE,
@@ -211,9 +212,127 @@ async fn router_dispatches_damage_request_returns_broadcast() {
     assert_eq!(bc.source, req.source);
     assert_eq!(bc.amount, req.amount);
     assert_eq!(bc.origin_event_id, req.event_id);
-    // PR 11.6.C placeholder fields — real values land in 11.6.D.
+    // PR 11.6.D: server_frame + server_seq are now real values from
+    // Room (both start at 0).
     assert_eq!(bc.server_frame, 0);
     assert_eq!(bc.server_seq, 0);
+}
+
+// -- PR 11.6.D: validator integration tests -------------------------
+
+/// Helper: trigger `ensure_room` (via a PositionUpdate packet so the
+/// dispatcher creates the DEVBX room + writes a sample position),
+/// then add the players + ammo + a recorded position so the validator
+/// has everything it needs.
+async fn seed_room_for_validator(
+    rooms: &transport::RoomRegistry,
+    source_id: u16,
+    target_id: Option<u16>,
+    source_xy: (f32, f32),
+    target_xy: Option<(f32, f32)>,
+) {
+    use specialists_server::protocol::{
+        encode_position_update, PositionUpdate, DISCRIMINATOR_POSITION_UPDATE,
+    };
+    // Trigger ensure_room by sending a PositionUpdate packet.
+    let pu = PositionUpdate {
+        server_frame: 0,
+        player_id: source_id,
+        position_x: source_xy.0,
+        position_y: source_xy.1,
+    };
+    let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+    payload.extend(encode_position_update(&pu));
+    let _ = transport::handle_binary(&payload, rooms, 0 /* placeholder */).await;
+
+    // Now grab the room + populate it.
+    let room_arc = rooms.read().await.get(specialists_server::constants::DEVBX_ROOM_ID).unwrap().clone();
+    let mut room_guard = room_arc.write().await;
+    room_guard.add_player(source_id);
+    if let Some(t) = target_id {
+        room_guard.add_player(t);
+    }
+    room_guard.players.get_mut(&source_id).unwrap().ammo = 10;
+    // Record positions at frames 0,1 so the lag-comp snapshot succeeds.
+    for frame in 0..3u32 {
+        room_guard.record_position(
+            source_id,
+            frame,
+            specialists_server::Position { x: source_xy.0, y: source_xy.1 },
+        );
+        if let (Some(t), Some(txy)) = (target_id, target_xy) {
+            room_guard.record_position(
+                t,
+                frame,
+                specialists_server::Position { x: txy.0, y: txy.1 },
+            );
+        }
+    }
+}
+
+/// Validator rejects self-damage when both endpoints are the same
+/// player. The dispatcher sees the reject (no reply bytes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validator_rejects_self_damage_in_room() {
+    use specialists_server::protocol::{
+        encode_damage_request, DamageRequest, DISCRIMINATOR_DAMAGE_REQUEST,
+    };
+    use transport::{handle_binary, RoomRegistry};
+
+    let rooms: RoomRegistry = RoomRegistry::default();
+    seed_room_for_validator(&rooms, 7, Some(7), (0.0, 0.0), Some((0.0, 0.0))).await;
+    let req = DamageRequest {
+        frame: 1,
+        source_player_id: 7,
+        target_player_id: 7, // self-damage!
+        source: 0,
+        amount: 12,
+        event_id: 1,
+    };
+    let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
+    payload.extend(encode_damage_request(&req));
+    let reply = handle_binary(&payload, &rooms, 0 /* placeholder */).await;
+    assert!(reply.is_empty(), "self-damage must produce no broadcast reply");
+}
+
+/// Validator rejects requests that violate the fire-rate cooldown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validator_rejects_fire_rate_violation_in_room() {
+    use specialists_server::protocol::{
+        encode_damage_request, DamageRequest, DISCRIMINATOR_DAMAGE_REQUEST,
+    };
+    use transport::{handle_binary, RoomRegistry};
+
+    let rooms: RoomRegistry = RoomRegistry::default();
+    seed_room_for_validator(&rooms, 7, Some(9), (0.0, 0.0), Some((5.0, 0.0))).await;
+    // First request succeeds.
+    let req1 = DamageRequest {
+        frame: 1,
+        source_player_id: 7,
+        target_player_id: 9,
+        source: 0,
+        amount: 12,
+        event_id: 1,
+    };
+    let mut payload1 = vec![DISCRIMINATOR_DAMAGE_REQUEST];
+    payload1.extend(encode_damage_request(&req1));
+    let reply1 = handle_binary(&payload1, &rooms, 0 /* placeholder */).await;
+    assert!(!reply1.is_empty(), "first request must produce a broadcast");
+
+    // Second request with a fresh eventId but no time elapsed —
+    // inside the 120ms cooldown.
+    let req2 = DamageRequest {
+        frame: 1,
+        source_player_id: 7,
+        target_player_id: 9,
+        source: 0,
+        amount: 12,
+        event_id: 2,
+    };
+    let mut payload2 = vec![DISCRIMINATOR_DAMAGE_REQUEST];
+    payload2.extend(encode_damage_request(&req2));
+    let reply2 = handle_binary(&payload2, &rooms, 0 /* placeholder */).await;
+    assert!(reply2.is_empty(), "second request within cooldown must produce no broadcast");
 }
 
 // -- Dev-box-only WebTransport integration -------------------------

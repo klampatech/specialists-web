@@ -184,10 +184,37 @@ async fn main() -> ExitCode {
         cert_path,
         key_path,
         sans,
-        rooms,
+        rooms.clone(),
     );
 
-    // Wait for Ctrl-C OR either listener to fail.
+    // PR 11.6.D: 64Hz tick task that increments the global server
+    // frame counter on every room. The server frame is the
+    // `server_frame` field on `DamageBroadcast`. Currently there is
+    // exactly one room (`DEVBX`); the matchmaker in PR 11.9 will
+    // iterate over all rooms.
+    let tick_handle = tokio::spawn({
+        let rooms = rooms.clone();
+        async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_millis(16), // ~64Hz (1_000 / 64 ≈ 15.6ms)
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let room_arc = {
+                    let guard = rooms.read().await;
+                    guard.get(specialists_server::constants::DEVBX_ROOM_ID).cloned()
+                };
+                if let Some(room_arc) = room_arc {
+                    let mut room_guard = room_arc.write().await;
+                    room_guard.tick_server_frame();
+                }
+            }
+        }
+    });
+
+    // Wait for Ctrl-C OR either listener to fail OR the tick task to
+    // panic (it never returns Ok in normal operation).
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("SIGINT received — shutting down");
@@ -196,6 +223,9 @@ async fn main() -> ExitCode {
             Ok(()) => info!("server transports returned cleanly"),
             Err(e) => warn!("server transports errored: {e:?}"),
         },
+        _ = tick_handle => {
+            warn!("server tick task exited unexpectedly");
+        }
     }
 
     info!("server exiting");
