@@ -153,13 +153,11 @@ type ControllerResolver = () => {
   remote: CharacterController;
 };
 /**
- * PR 11.6.D — broadcast handler. Calls the probe's `applyBroadcast`
- * (so the pendingApplies map is shared between Tab A's optimistic
- * apply and Tab B's broadcast handling). The probe is created
- * OUTSIDE this function and passed in; using it avoids the
- * Vite-dev double-instance problem (a fresh
- * `import("../net/damageBus")` would resolve to a different module
- * instance with its own pendingApplies map, breaking confirm/revert).
+ * PR 11.6.D — broadcast handler. The probe (created once, in the
+ * DEV probe block below) is passed in explicitly so the broadcast
+ * handler + the optimistic-apply paths share one `pendingApplies`
+ * map. Vite deduplicates modules in dev, but an explicit dependency
+ * is cleaner than relying on the bundler's cache behavior.
  */
 function makeBroadcastHandler(
   localPlayerId: number,
@@ -776,15 +774,13 @@ export async function createScene(
         // BEFORE in the smoke (since the smoke awaits the probe
         // BEFORE running its assertions). Either way the getter
         // returns the live controllers on every broadcast.
-        // PR 11.6.D — register the broadcast handler. The probe
-        // owns the `applyBroadcast` function (which has the live
-        // pendingApplies map). Calling the probe's method keeps both
-        // paths (Tab A's optimistic apply + Tab B's revert/apply on
-        // broadcast) on the same module instance — Vite serves the
-        // dev-module from the `?import=` URL, so a separate
-        // `import("../net/damageBus")` would resolve to a DIFFERENT
-        // module instance with its own pendingApplies map, breaking
-        // the confirm/revert path.
+        // PR 11.6.D — create the damage-bus probe. The probe owns
+        // the `pendingApplies` map; both the broadcast handler
+        // (registered below) and the gameSession's outbound send
+        // path share this single probe so optimistic applies and
+        // broadcast confirmations resolve to the same map entry.
+        // Vite deduplicates module instances in dev, but threading
+        // the probe through explicitly makes the dependency clear.
         const probe = createDamageBusProbe(server);
         const broadcastHandler = makeBroadcastHandler(
           localPlayerId,
@@ -806,6 +802,19 @@ export async function createScene(
         if (gameSession) {
           gameSession.setServerTransport?.(server);
         }
+        // PR 11.6.D FIX 4 part C — periodic sweep of expired pending
+        // applies. The server's `DamageReject` packet may be dropped
+        // (channel full, network blip). If a pending apply hasn't seen
+        // a broadcast OR reject within `PENDING_REJECT_TIMEOUT_MS`
+        // (500ms), revert it. Without this sweep, the optimistic HP
+        // stays decremented even after the server has authoritative-
+        // state information that no damage happened. The 20Hz rate
+        // (50ms) is a balance between timely reversion and CPU cost.
+        // The interval is cleared on dispose (see handle.dispose()).
+        const sweepInterval = setInterval(() => {
+          probe.sweepExpiredPending(performance.now());
+        }, 50);
+        (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval = sweepInterval;
       })();
     }
   }
@@ -815,6 +824,12 @@ export async function createScene(
     scene,
     dispose: () => {
       window.removeEventListener("resize", onResize);
+      // PR 11.6.D FIX 4 part C — clear the periodic sweep interval.
+      const sweepInterval = (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval;
+      if (sweepInterval !== undefined) {
+        clearInterval(sweepInterval);
+        (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval = undefined;
+      }
       input.dispose();
       chase.dispose();
       spectator?.dispose();
