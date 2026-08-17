@@ -253,7 +253,12 @@ async function runSmoke() {
       throw new Error(`RTT invalid: ${statsAfterPing.rttMs}`);
     }
 
-    // ---- 3. DamageRequest → DamageBroadcast (synthetic, PR 11.6.C) ----
+    // ---- 3. DamageRequest → DamageBroadcast (PR 11.6.D / §3.4 server-auth) ----
+    // PR 11.6.D: the server now VALIDATES the request (gates: source +
+    // target in room, amount<=100, fire-rate cooldown, ammo gate,
+    // eventId monotonicity, lag-comp hit re-validation). The smoke
+    // must seed the room (send a PositionUpdate FIRST so source 7 is
+    // in the room) before the DamageRequest will pass validation.
     const damageReq = {
       frame: 0xdeadbeef,
       sourcePlayerId: 7,
@@ -262,6 +267,16 @@ async function runSmoke() {
       amount: 12,
       eventId: 0xcafef00d,
     };
+    // Seed: send PositionUpdate for source 7 + target 9 at frame 0
+    // so they're registered in the room + have position history.
+    await page.evaluate(() => {
+      const t = (window).__serverTransport;
+      t.sendPositionUpdate({serverFrame: 0, playerId: 7, positionX: 0.0, positionY: 0.0});
+      t.sendPositionUpdate({serverFrame: 0, playerId: 9, positionX: 5.0, positionY: 0.0});
+    });
+    // Small delay so the server's writer applies both before our
+    // DamageRequest arrives.
+    await sleep(50);
     const bcResult = await page.evaluate(async ({ req, timeoutMs }) => {
       const t = (window).__serverTransport;
       const bus = (window).__damageBus;

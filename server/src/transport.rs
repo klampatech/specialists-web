@@ -577,6 +577,19 @@ pub(super) async fn handle_binary(
             let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
             {
                 let mut room_guard = room_arc.write().await;
+                // PR 11.6.D: a PositionUpdate also auto-registers the
+                // player in the room. Anyone reporting position IS a
+                // player — this aligns with §3.4.1 and unblocks the
+                // validator's `source in room` gate (gate 2). The
+                // ammo defaults to a sensible starting pool (PR
+                // 11.7's matchmaker will configure per-match ammo;
+                // for the dev-box 10 is plenty).
+                room_guard.add_player(pu.player_id);
+                if let Some(p) = room_guard.players.get_mut(&pu.player_id) {
+                    if p.ammo == 0 {
+                        p.ammo = 10;
+                    }
+                }
                 room_guard.record_position(
                     pu.player_id,
                     pu.server_frame,

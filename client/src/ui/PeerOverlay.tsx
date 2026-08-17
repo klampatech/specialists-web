@@ -20,6 +20,50 @@ interface PeerOverlayProps {
   onStatusChange?: (status: "offline" | "waiting-ice" | "connected" | "disconnected") => void;
 }
 
+/**
+ * PR 11.6.D / §3.6 — read the `?server=` URL parameter on module
+ * load. When present (e.g. `?server=ws://localhost:14434/rooms/DEVBX`
+ * or `https://localhost:14433/rooms/DEVBX`), sets the
+ * `__forceServerTransport` DEV probe so scene.ts wires the
+ * server-auth transport on boot. Default (no `?server=`) keeps the
+ * existing P2P substrate for the 14 legacy smokes.
+ *
+ * Side-effect runs at module evaluation time (BEFORE React renders,
+ * BEFORE scene.ts's `useEffect` runs), so scene.ts sees the flag.
+ *
+ * Gated behind `import.meta.env.DEV` so production bundles strip
+ * this block entirely (verified by `grep '__forceServerTransport'
+ * dist/assets/index-*.js` → ZERO matches in production builds).
+ */
+if (
+  import.meta.env.DEV &&
+  typeof window !== "undefined" &&
+  typeof window.location !== "undefined"
+) {
+  const url = new URL(window.location.href);
+  const serverParam = url.searchParams.get("server");
+  if (serverParam && serverParam.length > 0) {
+    (window as unknown as {__forceServerTransport?: boolean}).__forceServerTransport = true;
+    try {
+      const u = new URL(serverParam);
+      (window as unknown as {__damageServerUrl?: string}).__damageServerUrl = u.origin;
+      const roomParam = url.searchParams.get("room");
+      if (roomParam) {
+        (window as unknown as {__damageServerRoomId?: string}).__damageServerRoomId = roomParam;
+      }
+      const localIdParam = url.searchParams.get("localId");
+      if (localIdParam) {
+        const n = Number(localIdParam);
+        if (Number.isFinite(n) && n > 0) {
+          (window as unknown as {__localPlayerId?: number}).__localPlayerId = n;
+        }
+      }
+    } catch {
+      // Malformed server URL — ignore, fall back to default path.
+    }
+  }
+}
+
 /** Tracks whether the last-created blob was an offer or an answer, so the
  *  `data-testid` is unambiguous regardless of SDP body content. */
 type BlobKind = "offer" | "answer";

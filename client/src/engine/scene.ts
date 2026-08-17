@@ -136,6 +136,57 @@ export interface SceneHandle {
   setPointerLock?: (locked: boolean) => void;
 }
 
+/**
+ * PR 11.6.D / §3.9 — decode an inbound DamageBroadcast body and route
+ * it through `damageBus.applyBroadcast`. The default controller
+ * resolver maps `targetPlayerId` 2 → local controller (we're player
+ * `localPlayerId`, peer is player 2 — see smoke flow).
+ */
+/**
+ * PR 11.6.D / §3.9 — broadcast handler installed in the DEV probe.
+ * The handler closure captures `localPlayerId` (set by the page init
+ * script) + a getter pair for the controllers (set once `gameSession`
+ * is created — see the late-binding call inside the DEV probe IIFE).
+ */
+type ControllerResolver = () => {
+  local: CharacterController;
+  remote: CharacterController;
+};
+/**
+ * PR 11.6.D — broadcast handler. Calls the probe's `applyBroadcast`
+ * (so the pendingApplies map is shared between Tab A's optimistic
+ * apply and Tab B's broadcast handling). The probe is created
+ * OUTSIDE this function and passed in; using it avoids the
+ * Vite-dev double-instance problem (a fresh
+ * `import("../net/damageBus")` would resolve to a different module
+ * instance with its own pendingApplies map, breaking confirm/revert).
+ */
+function makeBroadcastHandler(
+  localPlayerId: number,
+  getControllers: ControllerResolver,
+  probe: ReturnType<typeof import("../net/damageBus").createDamageBusProbe>,
+): (body: Uint8Array) => void {
+  return (body: Uint8Array) => {
+    if (typeof window !== "undefined") {
+      const w = window as unknown as {__broadcastHandlerCount?: number};
+      w.__broadcastHandlerCount = (w.__broadcastHandlerCount ?? 0) + 1;
+      (window as unknown as {__lastBroadcastHandlerAt?: number}).__lastBroadcastHandlerAt = performance.now();
+    }
+    // The probe's applyBroadcast handles decoding + the resolver
+    // closure. No async needed.
+    const bc = probe.decodeDamageBroadcast(body);
+    if (!bc) return;
+    const { local, remote } = getControllers();
+    const result = probe.applyBroadcast(bc, performance.now(), (playerId) =>
+      playerId === localPlayerId ? local : remote,
+    );
+    if (typeof window !== "undefined") {
+      const w = window as unknown as {__lastBroadcastResult?: string};
+      w.__lastBroadcastResult = result;
+    }
+  };
+}
+
 /** Try WebGPU first; fall back to WebGL2 if anything throws during init. */
 async function createEngine(
   canvas: HTMLCanvasElement,
@@ -505,6 +556,13 @@ export async function createScene(
     // lock-then-unlock debounce window.
     (window as unknown as { __pointerLockToggle?: (locked: boolean) => void }).__pointerLockToggle =
       (locked: boolean) => chase.setPointerLockImmediate(locked);
+    // PR 11.6.D: smoke-only gameSession probe. Exposes the live
+    // GameSession (and via it the local/remote controllers) so the
+    // damage-server-hp-convergence smoke can drive fire events and
+    // read HP values directly. DEV-only — stripped in production.
+    if (gameSession) {
+      (window as unknown as {__gameSession?: GameSession}).__gameSession = gameSession;
+    }
     // PR 11.1.1: chase-camera toggle probe. Calls chase.toggle() so the
     // smoke can advance the viewMode state machine without dispatching
     // a synthetic V key event. Same DEV-only gate.
@@ -668,7 +726,16 @@ export async function createScene(
     );
     if (
       import.meta.env.DEV &&
-      (useServerTransportFromOpts || useServerTransportFromWindow)
+      (useServerTransportFromOpts || useServerTransportFromWindow) &&
+      // PR 11.6.D - React StrictMode double-mount guard. Skip the DEV
+      // probe entirely if a previous scene() call already installed a
+      // ServerTransport on the window. Without this, StrictMode fires
+      // createScene twice in dev, each mount creates a new
+      // ServerTransport + WS connection, and the broadcast handler
+      // fires twice per server-emit (Tab B HP drops 2x, breaking the
+      // convergence smoke).
+      !(typeof window !== "undefined" &&
+        (window as unknown as {__serverTransport?: unknown}).__serverTransport)
     ) {
       // Lazy-import to keep the production bundle clean (Vite strips
       // dead branches even when the import statement is at module
@@ -685,11 +752,48 @@ export async function createScene(
           ?? `${window.location.protocol}//${window.location.host}`;
         const roomId = (window as unknown as { __damageServerRoomId?: string }).__damageServerRoomId
           ?? "DEVBX";
+        // PR 11.6.D — read the local player ID from the page init
+        // script (smoke sets this via `window.__localPlayerId`). Defaults
+        // to 1 (matches the smoke's first tab; the smoke uses 2 for tab B).
+        const localPlayerId = (window as unknown as { __localPlayerId?: number }).__localPlayerId ?? 1;
         const server = new ServerTransport(urlBase, roomId);
         await server.connect();
+        // PR 11.6.D / §3.9 — register the broadcast handler. The
+        // controller getter is late-binding: gameSession is created
+        // AFTER `await connect()` resolves in real browser flow but
+        // BEFORE in the smoke (since the smoke awaits the probe
+        // BEFORE running its assertions). Either way the getter
+        // returns the live controllers on every broadcast.
+        // PR 11.6.D — register the broadcast handler. The probe
+        // owns the `applyBroadcast` function (which has the live
+        // pendingApplies map). Calling the probe's method keeps both
+        // paths (Tab A's optimistic apply + Tab B's revert/apply on
+        // broadcast) on the same module instance — Vite serves the
+        // dev-module from the `?import=` URL, so a separate
+        // `import("../net/damageBus")` would resolve to a DIFFERENT
+        // module instance with its own pendingApplies map, breaking
+        // the confirm/revert path.
+        const probe = createDamageBusProbe(server);
+        const broadcastHandler = makeBroadcastHandler(
+          localPlayerId,
+          () => gameSession
+            ? {local: gameSession.localController, remote: gameSession.remoteController}
+            : {local: character, remote: character},
+          probe,
+        );
+        server.onDamageBroadcast(broadcastHandler);
+        if (typeof window !== "undefined") {
+          (window as unknown as {__broadcastHandlerRegistered?: boolean}).__broadcastHandlerRegistered = true;
+        }
         (window as unknown as { __serverTransport?: InstanceType<typeof ServerTransport> }).__serverTransport = server;
-        (window as unknown as { __damageBus?: ReturnType<typeof createDamageBusProbe> }).__damageBus =
-          createDamageBusProbe(server);
+        (window as unknown as { __damageBus?: ReturnType<typeof createDamageBusProbe> }).__damageBus = probe;
+        // PR 11.6.D — late-bind the server transport onto the
+        // GameSession so tick() routes damage through it. The smoke
+        // passes the localPlayerId explicitly so both tabs know which
+        // player ID they own.
+        if (gameSession) {
+          gameSession.setServerTransport?.(server);
+        }
       })();
     }
   }

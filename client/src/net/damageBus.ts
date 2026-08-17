@@ -1,17 +1,23 @@
-// PR 11.6.C / §3.5 + §3.6 — typed wrappers over the wire codecs +
-// outbound queue for damage requests.
+// PR 11.6.D / §3.5 + §3.6 + §3.9 — typed wrappers over the wire codecs +
+// outbound queue + **client-side damage prediction**.
 //
-// **PR 11.6.C scope**: this file defines the typed wrappers
-// (`sendDamageRequest`, `sendPositionUpdate`, `sendPing`) and re-exports
-// the decoders. It does NOT wire into `gameSession.tick()` (that's PR
-// 11.6.D's caller-side swap). PR 11.6.C's smoke drives these directly
-// via `window.__damageBus` (DEV probe set up by `scene.ts`).
+// **PR 11.6.D scope (over PR 11.6.C)**:
+//   - `pendingApplies` map (§3.9). Every fire event queues an
+//     optimistic apply locally; when the server's broadcast arrives,
+//     the map is consulted for confirm / revert.
+//   - `applyBroadcast(bc, nowMs, resolveTarget?)` — the three-path
+//     confirm / revert / apply-directly handler.
+//   - `sendDamageRequest(t, req, targetController, nowMs)` — the new
+//     unified entry point that sends + applies locally.
+//   - `sendPositionUpdateThrottled(t, frame, playerId, x, y)` —
+//     32Hz PositionUpdate sender (§3.10).
 //
-// **Why a queue**: PR 11.6.D adds client-side damage prediction (§3.9).
-// Outbound damage requests queue up so the predictor can see the
-// request that just fired AND any retries that arrive within the same
-// frame. The queue is FIFO and bounded (capacity = 16 — far more than
-// any per-frame firing rate could produce).
+// **Why a queue + a pending map**: PR 11.6.C added the bounded
+// `DamageRequestQueue` for outbound FIFO + retry tracking. PR 11.6.D
+// adds the per-eventId pending map so the broadcast handler can
+// confirm / revert the optimistic apply. Both are needed: the queue
+// is about *what was sent*, the pending map is about *what was
+// optimistically applied*.
 //
 // **DEV probe**: PR 11.6.C surfaces the typed wrappers on
 // `window.__damageBus` so the headless smoke can call them without
@@ -40,6 +46,8 @@ import type {
   PositionUpdate,
 } from "../../../protocol/damage";
 import type {ServerTransport} from "./serverTransport";
+import { applyDamage } from "../game/health";
+import type { CharacterController } from "../engine/characterController";
 
 // Keep the codec surface available from the typed bus as well as from the
 // protocol module. PR 11.6.C review fix B2: the TS encoders now
@@ -73,17 +81,123 @@ export {
 
 /** Maximum outbound damage requests queued before oldest are dropped. */
 const MAX_QUEUED = 16;
+/** Position-update throttle (§3.10). 32Hz = every other tick at 64Hz. */
+const POSITION_UPDATE_SEND_EVERY_N_TICKS = 2;
+
+// -- Pending optimistic applies map (§3.9) --------------------------------
+
+interface PendingOptimisticApply {
+  eventId: number;
+  targetController: CharacterController;
+  source: "fire" | "melee";
+  amount: number;
+  appliedAtMs: number;
+  /** How many HP the optimistic apply actually subtracted. Used by
+   *  the revert path to undo the exact amount (the broadcast may
+   *  arrive with a different amount if the server clamped it). */
+  optimisticallyAppliedAmount: number;
+}
+
+/** Per-eventId map of optimistic applies awaiting broadcast confirmation. */
+const pendingApplies = new Map<number, PendingOptimisticApply>();
+const MAX_PENDING_APPLIES = 64;
+
+function trackOptimisticApply(p: PendingOptimisticApply): PendingOptimisticApply | null {
+  let dropped: PendingOptimisticApply | null = null;
+  if (pendingApplies.size >= MAX_PENDING_APPLIES) {
+    let oldestKey: number | null = null;
+    let oldestAt = Number.POSITIVE_INFINITY;
+    for (const [k, v] of pendingApplies) {
+      if (v.appliedAtMs < oldestAt) {
+        oldestAt = v.appliedAtMs;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey !== null) {
+      dropped = pendingApplies.get(oldestKey) ?? null;
+      pendingApplies.delete(oldestKey);
+    }
+  }
+  pendingApplies.set(p.eventId, p);
+  return dropped;
+}
+
+function forgetOptimisticApply(eventId: number): PendingOptimisticApply | null {
+  const v = pendingApplies.get(eventId);
+  if (v !== undefined) pendingApplies.delete(eventId);
+  return v ?? null;
+}
+
+export function peekPendingApply(eventId: number): PendingOptimisticApply | null {
+  return pendingApplies.get(eventId) ?? null;
+}
+
+export function pendingApplyCount(): number {
+  return pendingApplies.size;
+}
 
 // -- Typed send wrappers --------------------------------------------------
 
-/** Send a typed `DamageRequest` over the transport. */
-export function sendDamageRequest(t: ServerTransport, req: DamageRequest): void {
+/**
+ * PR 11.6.D / §3.9 — client-side damage prediction entry point.
+ * Sends the request to the server AND applies the damage locally
+ * optimistically, tracking the apply by `req.eventId` so the
+ * upcoming broadcast can confirm or revert it.
+ *
+ * If the server's broadcast arrives with a DIFFERENT amount (e.g.
+ * lag comp rewound and missed, or the fire was out of range, or the
+ * server clamped the amount), `applyBroadcast` will revert with the
+ * negative-amount correction path (see `health.ts`).
+ *
+ * Returns the eventId for caller-side chaining.
+ */
+export function sendDamageRequest(
+  t: ServerTransport,
+  req: DamageRequest,
+  targetController: CharacterController,
+  nowMs: number,
+): number {
+  const sourceKind: "fire" | "melee" = req.source === 0 ? "fire" : "melee";
+  // 1. Apply locally first (the optimistic apply).
+  applyDamage(targetController, {source: sourceKind, amount: req.amount}, nowMs);
+  trackOptimisticApply({
+    eventId: req.eventId,
+    targetController,
+    source: sourceKind,
+    amount: req.amount,
+    appliedAtMs: nowMs,
+    optimisticallyAppliedAmount: req.amount,
+  });
+  // 2. Send the wire packet to the server.
   t.sendDamageRequest(req);
+  return req.eventId;
 }
 
 /** Send a typed `PositionUpdate` over the transport. */
 export function sendPositionUpdate(t: ServerTransport, pu: PositionUpdate): void {
   t.sendPositionUpdate(pu);
+}
+
+/**
+ * PR 11.6.D / §3.10 — 32Hz PositionUpdate sender. The caller invokes
+ * this every tick; the helper throttles to every other tick at 64Hz.
+ * Returns `true` if the packet was sent.
+ */
+export function sendPositionUpdateThrottled(
+  t: ServerTransport,
+  frameCounter: number,
+  playerId: number,
+  positionX: number,
+  positionY: number,
+): boolean {
+  if (frameCounter % POSITION_UPDATE_SEND_EVERY_N_TICKS !== 0) return false;
+  t.sendPositionUpdate({
+    serverFrame: frameCounter,
+    playerId,
+    positionX,
+    positionY,
+  });
+  return true;
 }
 
 /** Send a typed `Ping` over the transport. */
@@ -95,6 +209,86 @@ export function sendPing(t: ServerTransport, p: Ping): void {
  *  directly in PR 11.6.C). */
 export function sendInputsServer(t: ServerTransport, i: InputsServer): void {
   t.sendInputs(i);
+}
+
+// -- Broadcast handler (§3.9) --------------------------------------------
+
+export type BroadcastResult = "confirm" | "revert" | "applied" | "ignored";
+
+interface TracerFlashEvent {
+  type: "rejection" | "confirm";
+  targetPlayerId: number;
+  sourcePlayerId: number;
+  eventId: number;
+  appliedAmount: number;
+  broadcastAmount: number;
+  atMs: number;
+}
+type TracerFlashListener = (ev: TracerFlashEvent) => void;
+const tracerFlashListeners: TracerFlashListener[] = [];
+let lastTracerFlash: TracerFlashEvent | null = null;
+export function onTracerFlash(f: TracerFlashListener): void {
+  tracerFlashListeners.push(f);
+}
+export function getLastTracerFlash(): TracerFlashEvent | null {
+  return lastTracerFlash;
+}
+function emitTracerFlash(ev: TracerFlashEvent): void {
+  lastTracerFlash = ev;
+  for (const f of tracerFlashListeners) f(ev);
+}
+
+/**
+ * PR 11.6.D / §3.9 — invoked by `ServerTransport.onDamageBroadcast`
+ * (wired in `scene.ts`'s DEV probe block). Implements three paths:
+ *   1. Optimistic match (broadcast amount === applied amount) → confirm.
+ *   2. Optimistic mismatch (broadcast amount differs) → REVERT + emit
+ *      HUD tracer flash event.
+ *   3. No matching pending apply → apply directly (someone else's fire).
+ */
+export function applyBroadcast(
+  bc: DamageBroadcast,
+  nowMs: number,
+  resolveTarget?: (playerId: number) => CharacterController | null,
+): BroadcastResult {
+  const pending = forgetOptimisticApply(bc.originEventId);
+  if (pending) {
+    if (bc.amount === pending.optimisticallyAppliedAmount) {
+      emitTracerFlash({
+        type: "confirm",
+        targetPlayerId: bc.targetPlayerId,
+        sourcePlayerId: bc.sourcePlayerId,
+        eventId: bc.originEventId,
+        appliedAmount: pending.optimisticallyAppliedAmount,
+        broadcastAmount: bc.amount,
+        atMs: nowMs,
+      });
+      return "confirm";
+    }
+    // Mismatch → revert the optimistic apply.
+    applyDamage(
+      pending.targetController,
+      {source: "correction", amount: -pending.optimisticallyAppliedAmount},
+      nowMs,
+    );
+    emitTracerFlash({
+      type: "rejection",
+      targetPlayerId: bc.targetPlayerId,
+      sourcePlayerId: bc.sourcePlayerId,
+      eventId: bc.originEventId,
+      appliedAmount: pending.optimisticallyAppliedAmount,
+      broadcastAmount: bc.amount,
+      atMs: nowMs,
+    });
+    return "revert";
+  }
+  const target = resolveTarget?.(bc.targetPlayerId) ?? null;
+  if (!target) {
+    return "ignored";
+  }
+  const sourceKind: "fire" | "melee" = bc.source === 0 ? "fire" : "melee";
+  applyDamage(target, {source: sourceKind, amount: bc.amount}, nowMs);
+  return "applied";
 }
 
 // -- Typed decode helpers -------------------------------------------------
@@ -182,10 +376,21 @@ export class DamageRequestQueue {
  * should use the typed wrappers directly via the transport.
  */
 export interface DamageBusProbe {
-  /** Send a typed `DamageRequest` through the live transport. */
-  sendDamageRequest: (req: DamageRequest) => void;
+  /** PR 11.6.D / §3.9: send a damage request AND apply locally optimistically. */
+  sendDamageRequest: (
+    req: DamageRequest,
+    targetController: CharacterController,
+    nowMs: number,
+  ) => number;
   /** Send a typed `PositionUpdate` through the live transport. */
   sendPositionUpdate: (pu: PositionUpdate) => void;
+  /** PR 11.6.D / §3.10: throttled PositionUpdate sender. */
+  sendPositionUpdateThrottled: (
+    frameCounter: number,
+    playerId: number,
+    positionX: number,
+    positionY: number,
+  ) => boolean;
   /** Send a typed `Ping` through the live transport. */
   sendPing: (p: Ping) => void;
   /** Register an inbound `DamageBroadcast` listener. */
@@ -196,6 +401,19 @@ export interface DamageBusProbe {
   getStats: () => {rttMs: number; transport?: string; connected: boolean};
   /** Get (or create) the outbound damage request queue. */
   getQueue: () => DamageRequestQueue;
+  /** Register a tracer-flash listener (PR 11.6.D HUD integration). */
+  onTracerFlash: (f: (ev: TracerFlashEvent) => void) => void;
+  /** Get the most recent tracer-flash event (smoke / debug). */
+  getLastTracerFlash: () => TracerFlashEvent | null;
+  /** Snapshot the pending optimistic apply count (smoke / debug). */
+  pendingApplyCount: () => number;
+  /** Invoke `applyBroadcast` directly with a custom controller resolver
+   *  (smoke / debug — production wires the default resolver). */
+  applyBroadcast: (
+    bc: DamageBroadcast,
+    nowMs: number,
+    resolveTarget?: (playerId: number) => CharacterController | null,
+  ) => BroadcastResult;
   /** Re-export the typed encoder/decoder functions so the smoke can
    *  inspect wire bytes without re-importing `protocol/damage`. */
   encodeDamageRequest: typeof encodeDamageRequest;
@@ -212,11 +430,27 @@ export interface DamageBusProbe {
 export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
   const queue = new DamageRequestQueue();
   return {
-    sendDamageRequest: (req) => {
+    sendDamageRequest: ((req: DamageRequest, targetController?: CharacterController, nowMs?: number) => {
       queue.push(req);
-      sendDamageRequest(t, req);
+      // PR 11.6.D / §3.9 — when both `targetController` and `nowMs`
+      // are supplied, apply optimistically + track in pendingApplies
+      // (the new PR 11.6.D flow). Otherwise, just send the wire
+      // packet (PR 11.6.C smoke path — no optimistic apply, no
+      // pending tracking).
+      if (targetController !== undefined && nowMs !== undefined) {
+        return sendDamageRequest(t, req, targetController, nowMs);
+      }
+      t.sendDamageRequest(req);
+      return req.eventId;
+    }) as {
+      // PR 11.6.D overload (with optimistic apply)
+      (req: DamageRequest, targetController: CharacterController, nowMs: number): number;
+      // PR 11.6.C overload (send only — used by the 5190 smoke)
+      (req: DamageRequest): number;
     },
     sendPositionUpdate: (pu) => sendPositionUpdate(t, pu),
+    sendPositionUpdateThrottled: (frameCounter, playerId, positionX, positionY) =>
+      sendPositionUpdateThrottled(t, frameCounter, playerId, positionX, positionY),
     sendPing: (p) => sendPing(t, p),
     onDamageBroadcast: (f) => {
       t.onDamageBroadcast((body) => {
@@ -232,6 +466,10 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
     },
     getStats: () => t.getStats(),
     getQueue: () => queue,
+    onTracerFlash,
+    getLastTracerFlash,
+    pendingApplyCount,
+    applyBroadcast,
     encodeDamageRequest,
     encodePositionUpdate,
     encodePing,
