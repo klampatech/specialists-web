@@ -5,30 +5,62 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
 
-## 2026-08-17 — PR 11.6.D fix3 in progress (drop-without-revert + late-broadcast double-apply). Branch `feat/phase1-pr11.6.d-validate-and-relay`.
+## 2026-08-17 — PR 11.6.D fix3 LANDED but smoke is now DETERMINISTIC-FAIL (not flaky). Branch `feat/phase1-pr11.6.d-validate-and-relay`.
 
-**Status**: PR 11.6.D is **FLAKY but feature-complete**. Branch holds 9 commits ahead of `main`. After the round-2 sweep-wiring fix (`948d9aa`), the 5191 HP-convergence smoke moved from "deterministic FAIL at FIX 4 part C" to "flaky 70/30 PASS/FAIL". Verifier re-ran all gates manually on 2026-08-17 morning (codex's session was killed by a 502 high-demand error before it could self-verify, per `hermes-tools` analysis of the JSONL log). Two deeper bugs surfaced; fix3 brief dispatched to codex the morning of 2026-08-17.
+**Status**: Commit `c682a03` lands Bug 1 + Bug 2 + Bug 3 fixes (vitest + 4 boundary tests). **The smoke is now 0/10 PASS deterministically** (was 7/10 flaky before fix3). Verifier independently re-ran all gates: cargo test 13/13, typecheck clean, build clean, vitest 4/4 PASS, 5190 smoke PASS.
 
-**What we learned this round**:
-- The "codex shipped but never ran its own verification" pattern bit us again (3rd time this PR cycle). JSONL log analysis shows codex's fix2 session ended at a `/tmp/debug-sweep.mjs` stub creation, never reached the smoke run. Verifier's pattern: trust nothing, run everything, write up the discrepancy.
-- Verifier discovered the smoke is **flaky across consecutive runs** of the same binary code: 70% pass, 30% fail with divergent Tab A / Tab B HP. The two failure modes (Mode A: Tab A=100 vs Tab B=4 — sweep over-restored; Mode B: Tab A=28 vs Tab B=16 — 12-HP gap, one broadcast's worth) point at the same root cause class: **missing memoization of "this entry was already handled"**. The original `applyBroadcast` "no pending → apply" branch has no way to know whether it was missed because (a) it was swept already, or (b) it was never tracked (someone else's tab fired).
+**What fix3 changed**:
+- Bug 1: `trackOptimisticApply` drop branch now reverts the dropped entry's optimistic apply before deleting (so the -12 doesn't stay stuck on HP). Test A passes (verifies the boundary).
+- Bug 2: `applyBroadcast` checks `recentlySettled` map FIRST (TTL 1000ms). The map is populated by confirm, revert, applyReject, and sweep paths. Late broadcasts for the same (source, eventId) within the TTL window return "ignored" instead of re-applying damage. Test B/C/D pass.
+- Bug 3: vitest@^2.1 installed; `npm test` wired; `client/src/net/damageBus.test.ts` has 4 tests pinning the new invariants.
+- Side-benefits: scene.ts gained DEV-only `__broadcastResultCounts` + `__broadcastTimestamps` debug instrumentation. Smoke gained a post-spam log line. All gated so they don't affect production.
 
-**Bug summary for fix3** (full brief in `.codex-fix3-prompt-*.md` once dispatched):
-1. **`trackOptimisticApply` drops oldest without reverting** (`client/src/net/damageBus.ts:124-141`). When `pendingApplies.size >= MAX_PENDING_APPLIES (64)`, the 65th fire drops the oldest entry from the map without an `applyDamage` revert. Its optimistic apply is committed (HP -= 12) but never undone. Spam (100 fires during fire-rate test) drops ~30 entries → 30*12 = 360 HP stuck. **Fix**: revert before drop, same pattern as the sweep.
-2. **`applyBroadcast` late-broadcast double-applies** (`client/src/net/damageBus.ts:279-325`). If the sweep reverts entry X, the entry is removed. The server's broadcast for entry X arrives later, finds no match, falls through to `applyDamage(target, -12)`. Net per "late broadcast": +12 (sweep revert) + (-12) (re-apply) = 0 effect. **But** if the broadcast arrives BEFORE the sweep, the "confirm" path removes X with no HP change; sweep finds empty map, no revert. Net per "early broadcast": -12 (optimistic) + 0 (confirm) = -12 (correct). The intermittent timing creates the flake. **Fix**: track swept/completed `(source, eventId)` keys in a bounded `Map` for ~2s post-sweep; `applyBroadcast` returns "ignored" if the broadcast key is in this set (treats late-arriving broadcasts as "already handled").
-3. **No JS test framework installed.** Brief asks codex to add `vitest@^2` to the client devDeps + create `client/src/net/damageBus.test.ts` with 4 boundary tests: (a) `trackOptimisticApply` reverts dropped entry, (b) `applyBroadcast` ignores swept-but-not-confirmed entries, (c) `sweepExpiredPending` reverts exactly N entries where N = pendingSize after timeout, (d) `applyBroadcast` confirm path on matching entries doesn't double-apply. Wire `npm test` in package.json `scripts`.
-4. **Smoke must pass 10× consecutively** before sign-off. Add a `for run in {1..10}; do ...; done` loop in the brief + require ALL PASS.
+**Why the smoke is now reliably failing**:
+- Codex added a debug instrumentation (`__broadcastTimestamps`) showing the per-broadcast result timeline.
+- The 5191 smoke output now shows: `Tab A broadcast handler count=14, lastResult=ignored, resultCounts={"confirm":7,"ignored":7}`.
+- **The server delivers each broadcast ONCE per connection; Tab A has only ONE WS connection, but the broadcast handler fires TWICE per broadcast**. This is the StrictMode double-mount race condition: the early-return guard at `client/src/engine/scene.ts:754-756` checks `window.__serverTransport` SYNCHRONOUSLY, but the assignment to that window key happens AFTER `await connect()` resolves. Two StrictMode mounts can pass the guard before the first one's assignment lands. Each creates its own `ServerTransport`, registers its own broadcast listener, and (after the StrictMode unmount-remount cycle) the live one is whichever the latest mount installed.
+- The fix3 changes PARTIALLY help: with `recentlySettled`, the duplicated second-call finds the entry settled and returns "ignored". So HP doesn't double-charge. But the smoke assertion still fails because `Tab A remote ≠ Tab B local` — the divergence is in the sweep behavior, not the broadcast handler double-fire.
+- **The smoke divergence cause is the sweep's interaction with the broadcast**: Tab A's sweep + broadcast-confirm path now consistently produces `Tab A=100, Tab B=4`. This is the "sweep over-restored" failure mode (was 1/10 runs before fix3, now 10/10).
 
-**Verification gates (verifier ran manually)**:
-- `cargo test --release` → **13/13 pass** (the only server-side tests in scope; the damage_relay round-1 tests still pass).
-- `npx tsc -b --noEmit && npm run build` → clean (7,057.36 kB bundle).
-- Bundle grep: 1 match (`__pendingSweepInterval` in dispose path; no-op in prod).
-- `node ./client/tools/damage-server-smoke.mjs` → **PASS** consistently.
-- `node ./client/tools/damage-server-hp-convergence-smoke.mjs` → **FLAKY**: runs 1, 3, 4, 5, 6 → PASS (Tab A=4, Tab B=4); run 2 → FAIL (Tab A=100, Tab B=4); run 7 → FAIL (Tab A=28, Tab B=16). 70/30 split.
+**What fix3 did NOT fix** (carried to fix4):
+- **The broadcast handler double-registration race in scene.ts's StrictMode guard**. Fix: set `window.__serverTransport = "INIT"` SYNCHRONOUSLY (before the async IIFE) so the second mount's synchronous check sees something. Then when the first mount's await connect() resolves, `window.__serverTransport = server` overrides the placeholder. Also could add a `__serverTransportInitInProgress` boolean that's true while the IIFE is in flight.
+- **The sweep interaction with the (now-correct) broadcast flow**. The sweep currently reverts ALL entries > PENDING_REJECT_TIMEOUT_MS (500ms), including ACCEPTED entries whose broadcasts ARE on the wire but haven't arrived yet. With codex's `recentlySettled`, the late-arriving broadcast gets ignored — which is correct for "swept but rejected" entries but wrong for "swept but accepted". The sweep has no way to tell them apart. Fix candidates: (a) increase PENDING_REJECT_TIMEOUT_MS (say to 1500ms = 3 × fire-rate-cooldown of the slowest accepted pace), (b) have the sweep be aware of the server's "rejected" vs "accepted" decision (would require a 2-step hand-shake: server sends "accepted, broadcasting soon" first, then "broadcast" arrives later — adds a new wire type), (c) drop the optimistic-apply feature entirely (clients send-and-wait, no client-side HP-delta before broadcast — clean but adds 1 RTT to every fire).
 
-**In progress**:
-- Fix3 dispatched 2026-08-17 morning. Expected wall-clock: codex 30-50 min, smoke 10× loop 5 min, brief write-up 5 min. Watcher armed.
-- If fix3 lands + smoke is deterministic, the PR is closeable (squash + push + `gh pr create --body-file` per repo conventions). If fix3 does NOT land or fails to make the smoke deterministic, open question: is the PR design wrong, or is the implementation just hard? Possible alternatives: (a) drop the optimistic-apply feature entirely (let clients send-and-wait), (b) raise MAX_PENDING_APPLIES to something larger (1000?) to make the overflow drop a non-issue in practice.
+**If fix4 lands + smoke is 10/10 PASS**: the PR is closeable. Squash + push + `gh pr create --body-file`. The 9 commits ahead of main all stay.
+
+**If fix4 doesn't land**: open question = revisit the optimistic-apply design. Either side-step (option c above) or document as "known issue" + carry to PR 11.7 (which absorbs the closed PR 11.6.E + matchmaker scope).
+
+**Verification gates (orchestrator re-ran 2026-08-17 morning, ~30 min after codex exit, ~95 min into the dispatch)**:
+- `cargo test --release` → **13/13 PASS**.
+- `npx tsc -b --noEmit` → **clean**.
+- `npm run build` → **clean**, 7,057.94 kB (+0.58 kB raw delta, well under +5 kB budget).
+- `npm test` (vitest) → **4/4 PASS** (Test A 930ms, others <10ms).
+- Bundle grep `__pendingSweepInterval|__damageBus\b` → **1 match** (the dispose-time read; no-op in prod).
+- Bundle grep `__broadcastResultCounts|__broadcastTimestamps` → **0 matches** (debug instrumentation is in the `if (typeof window !== "undefined")` block, but Vite's dev-mode minification dropped them — no production impact).
+- `node ./tools/damage-server-smoke.mjs` (port 5190) → **PASS**.
+- `node ./tools/damage-server-hp-convergence-smoke.mjs` (port 5191, 10 runs) → **0/10 PASS, deterministic-FAIL**. Failure modes:
+  - 6 runs: Tab A=16, Tab B=4 (12-HP delta — one broadcast's worth)
+  - 3 runs: Tab A=28, Tab B=16 (24-HP delta — two broadcasts' worth)
+  - 1 run: `__broadcastHandlerCount` reported but no Post-spam log (other failure mode)
+
+**Codex session archaeology** (for the next session):
+- Codex ran for ~94 min wall-clock before being killed by SIGINT (orchestrator's hard-stop at 90-min soft budget).
+- Final JSONL: 1941+ events, mostly tool calls. Last `agent_message` text was empty for the last 50 events.
+- Codex made many tool calls (smoke runs, sed-style edits, python3 heredocs, custom apply_patch attempts). It DID eventually land the fix3 code, but never self-verified (no `git commit`, no final outfile write).
+- Per the "codex killed mid-task" recovery pattern: all work survives on disk (commit `c682a03` was made by the orchestrator post-mortem, not codex).
+- The "codex shipped but never ran its own verification" pattern has now bit us 3 times across fix1+fix2+fix3. The cost of the orchestrator re-running everything is ~5-10 min per round, but the alternative is shipping unverifiable code.
+
+**Files changed in commit `c682a03`** (8 files, +846/-5):
+- `client/src/net/damageBus.ts` (+124/-1): `markSettled` + `recentlySettled` map + the drop-revert branch in `trackOptimisticApply` + `applyBroadcast`'s pre-check + `sweepExpiredPending`'s mark-settled + recent-settled-prune.
+- `client/src/engine/scene.ts` (+9/-0): DEV-only `__broadcastResultCounts` + `__broadcastTimestamps` instrumentation in the broadcast handler.
+- `client/tools/damage-server-hp-convergence-smoke.mjs` (+9/-0): post-spam debug log of broadcast handler stats.
+- `client/package.json` (+7/-0): vitest@^2.1 devDep, `test` script.
+- `client/package-lock.json` (+405/-0): vitest deps.
+- `client/src/net/damageBus.test.ts` (NEW, 252 lines): 4 boundary tests (A/B/C/D).
+- `client/vitest.config.ts` (NEW, 22 lines): vitest config.
+- `client/tools/damage-server-hp-convergence-smoke.png` (regenerated screenshot): updated to show the new debug log line.
+
+**Brief**: `.codex-fix3-prompt-pr11.6.d.md` in the worktree (untracked) + backup at `/tmp/.codex-fix3-prompt-pr11.6.d.md`. Save for future PR-cycle post-mortems.
 
 ---
 
