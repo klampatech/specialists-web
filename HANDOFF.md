@@ -186,6 +186,50 @@ Then in 2 browser tabs (or 2 browser windows, or 2 computers on the Tailscale ne
 
 
 
+
+**Function-test verification (2026-08-17 21:40 CT, Kyle's manual 2-tab test on Tailscale)**:
+
+Vibe-tested on Vivaldi (Chromium-based) over Tailscale (100.79.235.118 ↔ dev box 100.95.111.112):
+
+✅ **Working in real browser**:
+- ServerTransport connected via WebSocket (RTT 150ms — slightly higher than the 80-100ms localhost baseline, but well under the smoke's 150ms assertion).
+- Broadcast handler registered (`window.__broadcastHandlerRegistered = true`).
+- DamageBus initialized (`window.__damageBus` set).
+- Reject handler registered (`window.__rejectHandlerRegistered = true`).
+- Both rigs visible (red local + cyan peer) in the 3D scene.
+- HP me / HP them both at 100 initially; frame counter ticks correctly.
+- Render path: WebGPU not supported by Vivaldi → cleanly fell back to WebGL2 (`renderer: webgl2` in the HUD).
+- Canary log shows multiple successful WebSocket handshakes from 100.79.235.118; room DEVBX created each time.
+
+⚠ **Harmless warnings (expected)**:
+- `[ServerTransport] WebTransport failed, falling back to WebSocket: ReferenceError: WebTransport is not defined` — Vivaldi doesn't ship WebTransport (it's not in the Chromium mainline; only Chrome/Edge do). The fallback kicks in cleanly. The `https://100.95.111.112:14433/rooms/DEVBX` URL was attempted first; on failure the code switches to `ws://100.95.111.112:14434/rooms/DEVBX`.
+- `WebGPU is not supported by your browser` — same root cause. Babylon.js handles the fallback automatically.
+- Parallel shader compilation messages — Babylon.js's normal startup chatter, not a real error.
+
+❌ **Misleading HUD**:
+- The HUD's "Offline (idle)" status refers to the **WebRTC peer**, NOT the ServerTransport. The WebRTC peer really is offline (no signaling server in this test) — but the damage path doesn't touch the WebRTC peer. The "PeerOverlay" React component shows the "Create Room / Join / Paste offer / Paste answer" UI — this is all noise for the server-auth damage test. Ignore it.
+- The bottom-left HUD's HP me / HP them values DO reflect the GameSession's localController and remoteController, which is what the ServerTransport decrements via the broadcast handler. If you fire and the ServerTransport is connected, those values decrement.
+
+🧪 **Recommended diagnostic for damage flow** (faster than pointer-lock + LMB):
+```js
+const session = window.__gameSession;
+const bus = window.__damageBus;
+bus.sendDamageRequest(
+  { frame: 0, sourcePlayerId: 1, targetPlayerId: 2, source: 0, amount: 12, eventId: Date.now() & 0x7fffffff },
+  session.remoteController,
+  performance.now(), 1, 2,
+);
+await new Promise(r => setTimeout(r, 500));
+JSON.stringify({ remoteHp: session.remoteController.state.hp, localHp: session.localController.state.hp });
+// Expected: {"remoteHp": 88, "localHp": 100}
+// If localHp also decremented, the LATEST-gameSession resolver or the
+// broadcast handler is mis-routing (carries to fix6).
+```
+
+**Open questions**:
+- Will need a second tab on a different browser instance to test the 2-tab damage cross-flow. The single-tab fire via devtools can confirm the bus pipeline but doesn't exercise the cross-tab broadcast fan-out.
+- Vivaldi doesn't support WebTransport; Chrome / Edge would use the HTTPS path on port 14433 instead. The fallback to WebSocket is correct in either case.
+
 ---
 
 ## 2026-08-16 — PR 11.6.D (server-side damage validation + lag-comp rewind + fire-rate cooldown + ammo gate + client-side prediction + `?server=` URL routing + 2-tab HP-convergence smoke). Branch `feat/phase1-pr11.6.d-validate-and-relay`.
