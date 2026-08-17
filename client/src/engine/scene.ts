@@ -744,21 +744,44 @@ export async function createScene(
     if (
       import.meta.env.DEV &&
       (useServerTransportFromOpts || useServerTransportFromWindow) &&
-      // PR 11.6.D - React StrictMode double-mount guard. Skip the DEV
-      // probe entirely if a previous scene() call already installed a
-      // ServerTransport on the window. Without this, StrictMode fires
-      // createScene twice in dev, each mount creates a new
-      // ServerTransport + WS connection, and the broadcast handler
-      // fires twice per server-emit (Tab B HP drops 2x, breaking the
-      // convergence smoke).
-      !(typeof window !== "undefined" &&
-        (window as unknown as {__serverTransport?: unknown}).__serverTransport)
+      // PR 11.6.D fix4 (Bug A — race-safe sync guard): the check
+      // must be both read AND written SYNCHRONOUSLY (no awaits in
+      // between). StrictMode fires `createScene` twice in dev; both
+      // mounts entered the outer guard before either assigned
+      // `window.__serverTransport` (the original assignment lived
+      // inside the async IIFE, AFTER `await server.connect()` —
+      // too late, the second mount's sync check still saw
+      // `undefined`). We now claim the slot synchronously here, so
+      // the second mount's sync check bails out before spinning up
+      // a duplicate ServerTransport + WS + broadcast handler. The
+      // async body rechecks the slot once the connect resolves and
+      // closes its own transport if a sibling won the race (defense
+      // in depth — the outer sync guard usually catches it, but a
+      // microtask-ordered double-tap could still leak).
+      ((): boolean => {
+        if (typeof window === "undefined") return false;
+        const w = window as unknown as {__serverTransport?: unknown};
+        if (w.__serverTransport !== undefined) return false;
+        w.__serverTransport = "INIT_INFLIGHT";
+        return true;
+      })()
     ) {
       // Lazy-import to keep the production bundle clean (Vite strips
       // dead branches even when the import statement is at module
       // top-level, but a dynamic import is the documented pattern for
       // DEV-only modules).
       void (async () => {
+        // Local alias for the typed window slot. Captured at IIFE
+        // start so every re-read inside the async body sees the
+        // same target object (a subsequent scene() call writes to
+        // the same `window`).
+        const winSlot = window as unknown as {
+          __serverTransport?: unknown;
+          __damageBus?: unknown;
+          __broadcastHandlerRegistered?: boolean;
+          __pendingSweepInterval?: ReturnType<typeof setInterval>;
+        };
+        try {
         const { ServerTransport } = await import("../net/serverTransport");
         const { createDamageBusProbe } = await import("../net/damageBus");
         // Default: point at localhost:5190 (the vite dev server). The
@@ -775,6 +798,24 @@ export async function createScene(
         const localPlayerId = (window as unknown as { __localPlayerId?: number }).__localPlayerId ?? 1;
         const server = new ServerTransport(urlBase, roomId);
         await server.connect();
+        // PR 11.6.D fix4 (Bug A — race resolution): after the
+        // connect resolves, check whether a sibling mount already
+        // wrote a real (non-sentinel) ServerTransport into the slot.
+        // If so, this mount lost the race — discard the freshly-
+        // connected transport (close to release the WS) and bail.
+        // The outer sync guard normally prevents this branch from
+        // firing, but GC / microtask reordering can still race two
+        // in-flight `connect()` calls; close() prevents a leaked
+        // socket + a duplicate broadcast handler.
+        if (winSlot.__serverTransport !== "INIT_INFLIGHT" &&
+            winSlot.__serverTransport !== undefined) {
+          try {
+            server.close();
+          } catch {
+            // ignore — best-effort cleanup
+          }
+          return;
+        }
         // PR 11.6.D / §3.9 — register the broadcast handler. The
         // controller getter is late-binding: gameSession is created
         // AFTER `await connect()` resolves in real browser flow but
@@ -789,19 +830,85 @@ export async function createScene(
         // Vite deduplicates module instances in dev, but threading
         // the probe through explicitly makes the dependency clear.
         const probe = createDamageBusProbe(server);
+        // PR 11.6.D fix4 (Bug A — latest-gameSession resolver):
+        // the broadcast handler closure would otherwise capture
+        // this scene() call's `gameSession` reference, which under
+        // React StrictMode is the FIRST call's session — but
+        // `window.__gameSession` ends up holding the SECOND
+        // call's session (the assignment runs on every scene()
+        // — see line ~581) and the smoke reads the LATEST session.
+        // Resolving via the window slot ensures the handler
+        // applies damage to the live GameSession, not the
+        // disposed one from the first mount.
         const broadcastHandler = makeBroadcastHandler(
           localPlayerId,
-          () => gameSession
-            ? {local: gameSession.localController, remote: gameSession.remoteController}
-            : {local: character, remote: character},
+          () => {
+            const liveSession: GameSession | null = (
+              typeof window !== "undefined"
+                ? (window as unknown as { __gameSession?: GameSession }).__gameSession ?? null
+                : null
+            );
+            const target = liveSession ?? gameSession;
+            return target
+              ? {local: target.localController, remote: target.remoteController}
+              : {local: character, remote: character};
+          },
           probe,
         );
         server.onDamageBroadcast(broadcastHandler);
         if (typeof window !== "undefined") {
-          (window as unknown as {__broadcastHandlerRegistered?: boolean}).__broadcastHandlerRegistered = true;
+          const w = window as unknown as {__broadcastHandlerRegistered?: boolean; __broadcastHandlerRegisteredAt?: number};
+          w.__broadcastHandlerRegistered = true;
+          w.__broadcastHandlerRegisteredAt = performance.now();
         }
-        (window as unknown as { __serverTransport?: InstanceType<typeof ServerTransport> }).__serverTransport = server;
-        (window as unknown as { __damageBus?: ReturnType<typeof createDamageBusProbe> }).__damageBus = probe;
+        // PR 11.6.D FIX 4: wire the server-private DamageReject
+        // listener so the source tab reverts each rejected
+        // `DamageRequest` IMMEDIATELY rather than waiting for the
+        // 500ms timeout sweep. Without this wiring, the sweep is
+        // the only revert path on the source tab and the spam
+        // phase over-reverts (each pending entry actualDelta gets
+        // re-added, clamped at maxHp — see fix4 commit body for
+        // the convergence failure mode). Wire-format stable since
+        // PR 11.6.D server `ca9f177` (discriminator 0x07);
+        // pre-fix4 the client treated it as an unknown discriminator.
+        probe.onDamageReject((r) => {
+          if (typeof window !== "undefined") {
+            const w = window as unknown as {__rejectHandlerCount?: number; __rejectHandlerResultCounts?: Record<string, number>; __rejectTimestamps?: Array<{at: number, eventId: number, result: string, hpRemote?: number, hpLocal?: number}>};
+            w.__rejectHandlerCount = (w.__rejectHandlerCount ?? 0) + 1;
+          }
+          const result = probe.applyReject(localPlayerId, r.eventId, performance.now());
+          if (typeof window !== "undefined") {
+            const w = window as unknown as {__lastRejectResult?: string; __rejectHandlerResultCounts?: Record<string, number>; __rejectTimestamps?: Array<{at: number, eventId: number, result: string, hpRemote?: number, hpLocal?: number}>};
+            w.__lastRejectResult = result;
+            w.__rejectHandlerResultCounts = w.__rejectHandlerResultCounts ?? {};
+            w.__rejectHandlerResultCounts[result] = (w.__rejectHandlerResultCounts[result] ?? 0) + 1;
+            w.__rejectTimestamps = w.__rejectTimestamps ?? [];
+            const session = (window as any).__gameSession;
+            const hpR = session?.remoteController?.state?.hp;
+            const hpL = session?.localController?.state?.hp;
+            w.__rejectTimestamps.push({at: performance.now(), eventId: r.eventId, result, hpRemote: hpR, hpLocal: hpL});
+          }
+        });
+        if (typeof window !== "undefined") {
+          (window as unknown as {__rejectHandlerRegistered?: boolean}).__rejectHandlerRegistered = true;
+        }
+        // PR 11.6.D fix4 (Bug A — handler-publish race): before
+        // replacing the sentinel with the real ServerTransport,
+        // re-check the slot. If a sibling mount somehow sneaked a
+        // real ServerTransport into the slot between connect()
+        // resolving and here, that sibling is the authority — drop
+        // ours (close + return) to avoid duplicate broadcast
+        // handlers / probe maps.
+        if (winSlot.__serverTransport !== "INIT_INFLIGHT") {
+          try {
+            server.close();
+          } catch {
+            // ignore — best-effort cleanup
+          }
+          return;
+        }
+        winSlot.__serverTransport = server;
+        winSlot.__damageBus = probe;
         // PR 11.6.D — late-bind the server transport onto the
         // GameSession so tick() routes damage through it. The smoke
         // passes the localPlayerId explicitly so both tabs know which
@@ -822,6 +929,23 @@ export async function createScene(
           probe.sweepExpiredPending(performance.now());
         }, 50);
         (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval = sweepInterval;
+        } catch (e) {
+          // PR 11.6.D fix4 (Bug A — failure cleanup): if any step
+          // in the async body throws (dynamic import failed, WS
+          // connect failed, etc.), reset the sentinel so a future
+          // scene() mount can retry. Without this, a thrown init
+          // would leave `window.__serverTransport = "INIT_INFLIGHT"`
+          // and permanently disable the DEV probe.
+          try {
+            const w = window as unknown as {__serverTransport?: unknown};
+            if (w.__serverTransport === "INIT_INFLIGHT") {
+              w.__serverTransport = undefined;
+            }
+          } catch {
+            // ignore — nothing useful to do on a cleanup failure
+          }
+          throw e;
+        }
       })();
     }
   }

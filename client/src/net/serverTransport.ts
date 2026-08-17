@@ -47,6 +47,7 @@
 
 import {
   DISCRIMINATOR_DAMAGE_BROADCAST,
+  DISCRIMINATOR_DAMAGE_REJECT,
   DISCRIMINATOR_DAMAGE_REQUEST,
   DISCRIMINATOR_INPUTS,
   DISCRIMINATOR_INPUTS_SERVER,
@@ -82,12 +83,16 @@ export interface ServerTransportStats {
 type ListenerMap = {
   inputs: Array<(p: Uint8Array) => void>;
   damageBroadcast: Array<(p: Uint8Array) => void>;
+  /** PR 11.6.D FIX 4: private server-to-source-tab reject signals.
+   *  Wire-format stable since PR 11.6.D (server `ca9f177`); the
+   *  client just didn't dispatch them before fix4. */
+  damageReject: Array<(p: Uint8Array) => void>;
   pong: Array<(p: Uint8Array) => void>;
   disconnect: Array<() => void>;
 };
 
 function emptyListeners(): ListenerMap {
-  return {inputs: [], damageBroadcast: [], pong: [], disconnect: []};
+  return {inputs: [], damageBroadcast: [], damageReject: [], pong: [], disconnect: []};
 }
 
 /** Window of recent RTT samples (ms). */
@@ -196,6 +201,25 @@ export class ServerTransport {
   /** Register an `onDamageBroadcast` listener. */
   onDamageBroadcast(f: (p: Uint8Array) => void): void {
     this.listeners.damageBroadcast.push(f);
+  }
+
+  /**
+   * PR 11.6.D FIX 4: register an `onDamageReject` listener. The
+   * body is the raw 5-byte DamageReject body (discriminator 0x07
+   * already stripped by `handleInbound`). The listener is
+   * responsible for decoding — typically `decodeDamageReject`
+   * from `protocol/damage.ts`. PR 11.6.D smoke wires this to
+   * `damageBus.applyReject(localPlayerId, r.eventId, now)` so
+   * the source tab reverts the optimistic apply when the
+   * validator rejects a `DamageRequest` (fire-rate, ammo,
+   * eventId, lag-miss, no-history). Without this, the source tab
+   * would have to wait for the 500ms timeout sweep to roll back
+   * the rejected applies — and the sweep over-reverts in the
+   * spam phase (each pending entry's actualDelta gets re-added,
+   * clamped at maxHp).
+   */
+  onDamageReject(f: (p: Uint8Array) => void): void {
+    this.listeners.damageReject.push(f);
   }
 
   /** Send a PositionUpdate. */
@@ -537,6 +561,13 @@ export class ServerTransport {
         return;
       case DISCRIMINATOR_DAMAGE_BROADCAST:
         for (const f of this.listeners.damageBroadcast) f(body);
+        return;
+      case DISCRIMINATOR_DAMAGE_REJECT:
+        // PR 11.6.D FIX 4: dispatch private server-to-source-tab
+        // reject signals. Wire-format stable since PR 11.6.D —
+        // pre-fix4 this branch fell through to the default
+        // unknown-discriminator warning and the body was dropped.
+        for (const f of this.listeners.damageReject) f(body);
         return;
       case DISCRIMINATOR_POSITION_UPDATE:
         // PositionUpdate is client → server; ignore if it arrives inbound.

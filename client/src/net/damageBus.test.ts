@@ -262,4 +262,77 @@ describe("damageBus PR 11.6.D fix3 — pending-map invariants", () => {
     expect(result).toBe("confirm");
     expect(target.state.hp).toBe(99); // no double-apply
   });
+
+  // PR 11.6.D fix4 — Test E: the sweep uses `actualAppliedDelta`
+  // (post-apply HP sample), NOT the requested `optimisticallyAppliedAmount`,
+  // so a clamped no-op apply contributes 0 HP delta and the
+  // sweep's revert is also a 0-HP no-op. This is what fixes the
+  // 5191 smoke's post-spam HP convergence assertion: a 65-fire
+  // spam against a 100-HP target (clamped to 0 after 9 fires)
+  // should NOT push HP back up past the accepted-broadcasts
+  // delta when the sweep runs. Without Test E's invariant the
+  // sweep reverts 65 phantom 12-damage losses and HP reverts to
+  // maxHp, breaking convergence.
+  it("Test E: sweepExpiredPending uses actualAppliedDelta (clamped no-op applies contribute 0)", async () => {
+    const { sendDamageRequest, sweepExpiredPending, peekPendingApply, pendingApplyCount } = await loadDamageBus();
+    // Setup per fix4 (Bug C): track 3 fires against HP=2 (just enough
+    // for the first 2 to decrement, the 3rd is a clamped no-op).
+    // This bypasses MAX_PENDING_APPLIES overflow (3 < 64) and gives
+    // us a clean invariant:
+    //
+    //   fire 1: HP=2→1, actualDelta=1
+    //   fire 2: HP=1→0, actualDelta=1
+    //   fire 3: HP=0, clamped no-op, actualDelta=0
+    //
+    // All 3 entries remain in pendingApplies (we used nowMs that
+    // grows monotonically). After the sweep:
+    //   entry 1 (actualDelta=1): revert +1 → HP=0→1
+    //   entry 2 (actualDelta=1): revert +1 → HP=1→2
+    //   entry 3 (actualDelta=0): revert amount=-0 → no change
+    //
+    // Final HP=2. Without the actualDelta distinction (i.e.,
+    // using `optimisticallyAppliedAmount` for the revert),
+    // entry 3's revert would push HP from 2→3→...→maxHp.
+    const target = makeMockTarget();
+    target.state.hp = 2;
+    const transport = makeMockTransport();
+    const sourcePlayerId = 1;
+    const targetPlayerId = 2;
+
+    sendDamageRequest(asTransport(transport), {
+      frame: 0, sourcePlayerId, targetPlayerId, source: 0, amount: 1, eventId: 1,
+    }, asTarget(target), /* nowMs */ 0, sourcePlayerId, targetPlayerId);
+    expect(target.state.hp).toBe(1); // -1 from optimistic apply (actualDelta=1)
+
+    sendDamageRequest(asTransport(transport), {
+      frame: 1, sourcePlayerId, targetPlayerId, source: 0, amount: 1, eventId: 2,
+    }, asTarget(target), /* nowMs */ 1, sourcePlayerId, targetPlayerId);
+    expect(target.state.hp).toBe(0); // -1 from optimistic apply (actualDelta=1)
+
+    sendDamageRequest(asTransport(transport), {
+      frame: 2, sourcePlayerId, targetPlayerId, source: 0, amount: 1, eventId: 3,
+    }, asTarget(target), /* nowMs */ 2, sourcePlayerId, targetPlayerId);
+    // HP stays at 0 — applyDamage returns early for `state.hp <= 0 && ev.amount > 0`
+    // (no respawn timer arming because the target just hit HP=0 via fire 2).
+    // Actually the prior fire armed respawningUntilMs. Let me restart
+    // carefully — use a fresh target for fire 3 OR clear respawn state.
+    expect(target.state.respawningUntilMs).toBeGreaterThan(0);
+    // Reset respawn so fire 3 reaches the `state.hp = Math.max(0, ...) -> 0` clamp
+    // properly without being gated by the `state.hp <= 0 && ev.amount > 0`
+    // early-return... actually that branch returns early ANYWAY because
+    // hp is 0 and amount is 1. Either way, HP stays at 0 and actualDelta=0.
+
+    expect(pendingApplyCount()).toBe(3);
+    expect(peekPendingApply(1, 1)?.actualAppliedDelta).toBe(1);
+    expect(peekPendingApply(1, 2)?.actualAppliedDelta).toBe(1);
+    expect(peekPendingApply(1, 3)?.actualAppliedDelta).toBe(0);
+
+    // Sweep past timeout. Reverts:
+    //   entry 1 (delta=1): +1 → HP=0→1
+    //   entry 2 (delta=1): +1 → HP=1→2
+    //   entry 3 (delta=0): no change
+    const swept = sweepExpiredPending(2000);
+    expect(swept).toBe(3);
+    expect(target.state.hp).toBe(2); // 2 entries with actualDelta=1 (2 reverts), 1 entry with actualDelta=0 (no revert). Final HP=2.
+  });
 });

@@ -28,6 +28,7 @@
 
 import {
   decodeDamageBroadcast,
+  decodeDamageReject,
   decodePing,
   decodePong,
   decodePositionUpdate,
@@ -39,6 +40,7 @@ import {
 } from "../../../protocol/damage";
 import type {
   DamageBroadcast,
+  DamageReject,
   DamageRequest,
   InputsServer,
   Ping,
@@ -56,6 +58,7 @@ import type { CharacterController } from "../engine/characterController";
 // take the buffer after `handleInbound` has stripped the discriminator.
 export {
   decodeDamageBroadcast,
+  decodeDamageReject,
   decodePing,
   decodePong,
   decodePositionUpdate,
@@ -65,6 +68,7 @@ export {
   encodePing,
   encodePositionUpdate,
   DISCRIMINATOR_DAMAGE_BROADCAST,
+  DISCRIMINATOR_DAMAGE_REJECT,
   DISCRIMINATOR_DAMAGE_REQUEST,
   DISCRIMINATOR_INPUTS,
   DISCRIMINATOR_INPUTS_SERVER,
@@ -72,11 +76,17 @@ export {
   DISCRIMINATOR_PONG,
   DISCRIMINATOR_POSITION_UPDATE,
   DAMAGE_BROADCAST_WIRE_SIZE,
+  DAMAGE_REJECT_WIRE_SIZE,
   DAMAGE_REQUEST_WIRE_SIZE,
   INPUTS_SERVER_WIRE_SIZE,
   PING_WIRE_SIZE,
   PONG_WIRE_SIZE,
   POSITION_UPDATE_WIRE_SIZE,
+  REJECT_REASON_AMMO,
+  REJECT_REASON_EVENT_ID,
+  REJECT_REASON_FIRE_RATE,
+  REJECT_REASON_LAG_MISS,
+  REJECT_REASON_NO_HISTORY,
 } from "../../../protocol/damage";
 
 /** Maximum outbound damage requests queued before oldest are dropped. */
@@ -102,6 +112,22 @@ interface PendingOptimisticApply {
    *  the revert path to undo the exact amount (the broadcast may
    *  arrive with a different amount if the server clamped it). */
   optimisticallyAppliedAmount: number;
+  /** PR 11.6.D fix4 (Bug C — sweep over-revert): the actual HP
+   *  delta the optimistic apply contributed, computed from
+   *  `state.hp` before/after the apply. Differs from
+   *  `optimisticallyAppliedAmount` when the target was already at
+   *  HP=0 (clamped no-op) — `applyDamage` returns early without
+   *  changing HP, so the actual delta is 0 even though the
+   *  request asked for `optimisticallyAppliedAmount` damage.
+   *
+   *  The sweep's revert uses THIS field, not the requested
+   *  amount: a 12-damage request that hit a dead target
+   *  contributed 0 HP loss and should revert 0 HP, not 12. Without
+   *  this, the sweep reverts push HP all the way back to maxHp
+   *  (90+ phantom reverts clobbering the 7 actually-accepted
+   *  broadcasts' optimistic applies), breaking the post-spam HP
+   *  convergence assertion on the 5191 smoke. */
+  actualAppliedDelta: number;
 }
 
 /** PR 11.6.D FIX 3: pending-map key is `${sourcePlayerId}:${eventId}`.
@@ -195,9 +221,18 @@ function trackOptimisticApply(p: PendingOptimisticApply): PendingOptimisticApply
         // but its HP decrement was already committed via
         // applyDamage at send time). On the spam path this leaks
         // ~N*amount HP per queue-overflow cycle.
+        // PR 11.6.D fix4 (Bug C — actualDelta revert): revert
+        // only the actual HP delta, not the requested amount.
+        // When the optimistic apply was a clamped no-op (target
+        // already at HP=0) the actual delta is 0 and the revert
+        // is a +0 = no-op, preserving the post-spam HP convergence
+        // invariant (without this the 65th fire at HP=0 would
+        // still drop a queue entry that "lost 1 HP" and the
+        // revert would silently un-clamp back to 1 HP under some
+        // edge cases).
         applyDamage(
           dropped.targetController,
-          {source: "correction", amount: -dropped.optimisticallyAppliedAmount},
+          {source: "correction", amount: -dropped.actualAppliedDelta},
           p.appliedAtMs,
         );
         emitTracerFlash({
@@ -205,10 +240,25 @@ function trackOptimisticApply(p: PendingOptimisticApply): PendingOptimisticApply
           targetPlayerId: dropped.targetPlayerId,
           sourcePlayerId: dropped.sourcePlayerId,
           eventId: dropped.eventId,
-          appliedAmount: dropped.optimisticallyAppliedAmount,
+          appliedAmount: dropped.actualAppliedDelta,
           broadcastAmount: 0, // dropped - no broadcast amount
           atMs: p.appliedAtMs,
         });
+        // PR 11.6.D fix4 (Bug B — re-apply on dropped entry):
+        // mark the dropped entry as recentlySettled BEFORE deleting
+        // it from the pending map. Without this, a broadcast for
+        // the dropped (source, eventId) arriving after the drop
+        // finds no pending entry via `forgetOptimisticApply`,
+        // falls through to the "no pending -> apply directly"
+        // branch in `applyBroadcast`, and re-applies the damage —
+        // exactly what we just reverted. With the settled-mark,
+        // the same late broadcast is treated as "already handled"
+        // and returns "ignored" (RECENTLY_SETTLED_TTL_MS window).
+        // This closes the round-2 verifier's Mode X regression
+        // where the spam phase under-counted because dropped
+        // entries were silently re-acknowledged by their own late
+        // broadcast.
+        markSettled(oldestKey, p.appliedAtMs);
         pendingApplies.delete(oldestKey);
       }
     }
@@ -263,7 +313,18 @@ export function sendDamageRequest(
 ): number {
   const sourceKind: "fire" | "melee" = req.source === 0 ? "fire" : "melee";
   // 1. Apply locally first (the optimistic apply).
+  // PR 11.6.D fix4 (Bug C — actualDelta capture): sample the
+  // target's HP before/after the apply so the sweep's revert
+  // path knows the TRUE HP delta. If the target was already at
+  // HP=0 (clamped no-op) the actual delta is 0 even though
+  // `optimisticallyAppliedAmount` is the full request amount;
+  // without this distinction the sweep reverts phantom losses
+  // and the post-spam HP converges to maxHp instead of the
+  // server's broadcast-bounded value.
+  const hpBefore = targetController.state.hp;
   applyDamage(targetController, {source: sourceKind, amount: req.amount}, nowMs);
+  const hpAfter = targetController.state.hp;
+  const actualAppliedDelta = hpBefore - hpAfter;
   trackOptimisticApply({
     sourcePlayerId,
     eventId: req.eventId,
@@ -273,6 +334,7 @@ export function sendDamageRequest(
     amount: req.amount,
     appliedAtMs: nowMs,
     optimisticallyAppliedAmount: req.amount,
+    actualAppliedDelta,
   });
   // 2. Send the wire packet to the server.
   t.sendDamageRequest(req);
@@ -375,25 +437,65 @@ export function applyBroadcast(
   const pending = forgetOptimisticApply(bc.sourcePlayerId, bc.originEventId);
   if (pending) {
     if (bc.amount === pending.optimisticallyAppliedAmount) {
-      emitTracerFlash({
-        type: "confirm",
-        targetPlayerId: bc.targetPlayerId,
-        sourcePlayerId: bc.sourcePlayerId,
-        eventId: bc.originEventId,
-        appliedAmount: pending.optimisticallyAppliedAmount,
-        broadcastAmount: bc.amount,
-        atMs: nowMs,
-      });
+      // PR 11.6.D fix4 (Bug C — clamped confirm convergence):
+      // if the optimistic apply was clamped at HP=0 (actualDelta
+      // < bc.amount), the source tab's local HP didn't decrement
+      // for this fire. The target tab (which receives the same
+      // broadcast via the "no pending -> apply" path below)
+      // DOES decrement by bc.amount, leaving the source 12 HP
+      // too high per affected fire. Close the gap by applying
+      // the remaining damage now so the source's HP converges
+      // with the target's. Without this, the post-spam
+      // convergence assertion fails (Tab A remote=16 vs Tab B
+      // local=4 — the 12 HP difference is exactly one clamped
+      // accepted fire that didn't propagate).
+      //
+      // NOTE: applyDamage clamps at HP=0, so this fix only
+      // helps when the source's HP is still > 0 at the time
+      // the broadcast arrives (the spam scenario in the 5191
+      // smoke has HP oscillating due to interleaved reverts, so
+      // this is generally true for the LAST accepted fire).
+      if (pending.actualAppliedDelta < bc.amount) {
+        const remainingDamage = bc.amount - pending.actualAppliedDelta;
+        const sourceKind: "fire" | "melee" = bc.source === 0 ? "fire" : "melee";
+        applyDamage(
+          pending.targetController,
+          {source: sourceKind, amount: remainingDamage},
+          nowMs,
+        );
+        emitTracerFlash({
+          type: "confirm",
+          targetPlayerId: bc.targetPlayerId,
+          sourcePlayerId: bc.sourcePlayerId,
+          eventId: bc.originEventId,
+          appliedAmount: pending.actualAppliedDelta + remainingDamage,
+          broadcastAmount: bc.amount,
+          atMs: nowMs,
+        });
+      } else {
+        emitTracerFlash({
+          type: "confirm",
+          targetPlayerId: bc.targetPlayerId,
+          sourcePlayerId: bc.sourcePlayerId,
+          eventId: bc.originEventId,
+          appliedAmount: pending.optimisticallyAppliedAmount,
+          broadcastAmount: bc.amount,
+          atMs: nowMs,
+        });
+      }
 
       // re-delivered broadcast (e.g., WebSocket retry, broadcast
       // arriving after a successful sweep) doesn't double-apply.
       markSettled(bcKey, nowMs);
       return "confirm";
     }
-    // Mismatch → revert the optimistic apply.
+    // Mismatch → revert the optimistic apply. PR 11.6.D fix4
+    // (Bug C — actualDelta): use the actual HP delta not the
+    // requested amount (a clamped no-op apply contributes 0
+    // and should revert 0).
     applyDamage(
       pending.targetController,
-      {source: "correction", amount: -pending.optimisticallyAppliedAmount},
+      {source: "correction", amount: -pending.actualAppliedDelta},
       nowMs,
     );
     emitTracerFlash({
@@ -401,7 +503,7 @@ export function applyBroadcast(
       targetPlayerId: bc.targetPlayerId,
       sourcePlayerId: bc.sourcePlayerId,
       eventId: bc.originEventId,
-      appliedAmount: pending.optimisticallyAppliedAmount,
+      appliedAmount: pending.actualAppliedDelta,
       broadcastAmount: bc.amount,
       atMs: nowMs,
     });
@@ -437,10 +539,13 @@ export function applyReject(
   if (!pending) {
     return "ignored";
   }
-  // Revert via the negative-amount correction path.
+  // Revert via the negative-amount correction path. PR 11.6.D
+  // fix4 (Bug C — actualDelta): use the actual HP delta so the
+  // revert is a no-op when the original optimistic apply was
+  // clamped (HP already at 0).
   applyDamage(
     pending.targetController,
-    {source: "correction", amount: -pending.optimisticallyAppliedAmount},
+    {source: "correction", amount: -pending.actualAppliedDelta},
     nowMs,
   );
   emitTracerFlash({
@@ -448,7 +553,7 @@ export function applyReject(
     targetPlayerId: pending.targetPlayerId,
     sourcePlayerId,
     eventId,
-    appliedAmount: pending.optimisticallyAppliedAmount,
+    appliedAmount: pending.actualAppliedDelta,
     broadcastAmount: 0, // rejected — no broadcast amount
     atMs: nowMs,
   });
@@ -472,10 +577,18 @@ export function sweepExpiredPending(nowMs: number): number {
   let swept = 0;
   for (const [key, pending] of pendingApplies) {
     if (nowMs - pending.appliedAtMs > PENDING_REJECT_TIMEOUT_MS) {
-      // Revert the optimistic apply.
+      // Revert the optimistic apply. PR 11.6.D fix4 (Bug C —
+      // actualDelta revert): use the actual HP delta, not the
+      // requested amount. A 12-damage request that hit an already-
+      // dead target (applyDamage clamped no-op) should revert 0
+      // HP, not 12. This prevents the post-spam sweep from
+      // undoing HP damage that was never actually applied
+      // (phantom reverts that would otherwise push HP all the
+      // way back to maxHp, breaking the post-spam convergence
+      // assertion on the 5191 smoke).
       applyDamage(
         pending.targetController,
-        {source: "correction", amount: -pending.optimisticallyAppliedAmount},
+        {source: "correction", amount: -pending.actualAppliedDelta},
         nowMs,
       );
       emitTracerFlash({
@@ -483,7 +596,7 @@ export function sweepExpiredPending(nowMs: number): number {
         targetPlayerId: pending.targetPlayerId,
         sourcePlayerId: pending.sourcePlayerId,
         eventId: pending.eventId,
-        appliedAmount: pending.optimisticallyAppliedAmount,
+        appliedAmount: pending.actualAppliedDelta,
         broadcastAmount: 0,
         atMs: nowMs,
       });
@@ -629,6 +742,11 @@ export interface DamageBusProbe {
   sendPing: (p: Ping) => void;
   /** Register an inbound `DamageBroadcast` listener. */
   onDamageBroadcast: (f: (bc: DamageBroadcast) => void) => void;
+  /** PR 11.6.D FIX 4: register a DamageReject listener. The
+   *  probe wraps the server transports listener to decode the
+   *  body and pass a typed DamageReject to the callback.
+   *  Typically wired to applyReject(localPlayerId, r.eventId, now). */
+  onDamageReject: (f: (r: DamageReject) => void) => void;
   /** Register an inbound `Pong` listener. */
   onPong: (f: (p: Pong) => void) => void;
   /** Get a snapshot of the live transport stats. */
@@ -713,6 +831,12 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
       t.onDamageBroadcast((body) => {
         const bc = decodeDamageBroadcast(body);
         if (bc) f(bc);
+      });
+    },
+    onDamageReject: (f) => {
+      t.onDamageReject((body) => {
+        const r = decodeDamageReject(body);
+        if (r) f(r);
       });
     },
     onPong: (f) => {

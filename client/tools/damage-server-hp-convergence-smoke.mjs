@@ -433,11 +433,23 @@ async function runSmoke() {
     const hpBeforeSpamB = hpB;
     await pageA.evaluate(async ({timeoutMs, cooldownMs, baseEventId}) => {
       const bus = (window).__damageBus;
-      const session = (window).__gameSession;
-      const targetController = session.remoteController;
       const start = Date.now();
       let sent = 0;
       while (Date.now() - start < timeoutMs) {
+        // PR 11.6.D fix4 (smoke-side): re-resolve the target
+        // controller on every iteration. The broadcast handler
+        // resolves the LATEST `__gameSession` on every call
+        // (under React StrictMode the first scene() call's
+        // gameSession may be disposed and replaced by a
+        // second-mount's gameSession mid-spam — see
+        // `makeBroadcastHandler` in scene.ts). Caching
+        // `targetController` outside the loop would point at
+        // the disposed session and the spam's optimistic
+        // applies would land on a controller the broadcasts
+        // never touch, breaking the post-spam HP convergence
+        // assertion with a 12-HP (one broadcast's worth) gap.
+        const session = (window).__gameSession;
+        const targetController = session.remoteController;
         // PR 11.6.D / §3.4.2 — eventId MUST be strictly monotonic
         // per source. Random IDs are rejected by the server as
         // stale; the smoke therefore bumps a local counter starting
@@ -477,6 +489,9 @@ async function runSmoke() {
     const resultCountsA_post = await pageA.evaluate(() => (window).__broadcastResultCounts ?? {});
     const pendingCountA_post = await pageA.evaluate(() => (window).__damageBus ? (window).__damageBus.pendingApplyCount() : -1);
     log(`Post-spam: Tab A broadcast handler count=${handlerCountA_post}, lastResult=${lastResultA_post}, resultCounts=${JSON.stringify(resultCountsA_post)}, pendingCount=${pendingCountA_post}.`);
+    const handlerCountB_post = await pageB.evaluate(() => (window).__broadcastHandlerCount ?? 0);
+    const resultCountsB_post = await pageB.evaluate(() => (window).__broadcastResultCounts ?? {});
+    log(`Post-spam: Tab B broadcast handler count=${handlerCountB_post}, resultCounts=${JSON.stringify(resultCountsB_post)}.`);
     const timestampsA = await pageA.evaluate(() => (window).__broadcastTimestamps ?? []);
     log(`Tab A broadcast timestamps (all ${timestampsA.length}):`);
     for (const t of timestampsA) log(`  ${t.at.toFixed(0)}ms result=${t.result} pending=${t.pendingCountAfter} hpRemote=${t.hpRemote} hpLocal=${t.hpLocal}`);

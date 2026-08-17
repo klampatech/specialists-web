@@ -50,6 +50,7 @@ export const DISCRIMINATOR_PONG = 0x05;
 /** NEW §1.2 — server-routed inputs for PR 11.7 handoff. PR 11.6.B
  *  buffers but does not process. */
 export const DISCRIMINATOR_INPUTS_SERVER = 0x06;
+export const DISCRIMINATOR_DAMAGE_REJECT = 0x07;
 
 // -- Body-size constants (mirror of server/src/protocol.rs) ----------------
 //
@@ -62,6 +63,18 @@ export const DAMAGE_BROADCAST_BODY_SIZE = 18;
 export const POSITION_UPDATE_BODY_SIZE = 14;
 export const PING_BODY_SIZE = 4;
 export const PONG_BODY_SIZE = 8;
+/** PR 11.6.D FIX 4: body size of `DamageReject` (event_id u32 BE +
+ *  reason u8 = 5 bytes). Wire-format stable — server `ca9f177`. */
+export const DAMAGE_REJECT_BODY_SIZE = 5;
+/** PR 11.6.D FIX 4: reject reason codes. Wire-format stable —
+ *  mirror of `server/src/protocol.rs::REJECT_REASON_*`. New codes
+ *  may be added without breaking older clients (they just log
+ *  "unknown reason" and proceed). */
+export const REJECT_REASON_FIRE_RATE = 0;
+export const REJECT_REASON_AMMO = 1;
+export const REJECT_REASON_EVENT_ID = 2;
+export const REJECT_REASON_LAG_MISS = 3;
+export const REJECT_REASON_NO_HISTORY = 4;
 
 // -- Wire-size constants (disc + body — the full on-the-wire packet) ------
 //
@@ -75,6 +88,9 @@ export const PONG_WIRE_SIZE = PONG_BODY_SIZE + 1;
 /** `0x06` discriminator + u32 frame BE + 12-byte input blob = 17 bytes.
  *  `INPUT_SIZE = 12` comes from `client/src/net/inputBitmask.ts`. */
 export const INPUTS_SERVER_WIRE_SIZE = 17;
+/** PR 11.6.D FIX 4: `0x07` discriminator + u32 event_id BE +
+ *  reason u8 = 6 bytes total. */
+export const DAMAGE_REJECT_WIRE_SIZE = DAMAGE_REJECT_BODY_SIZE + 1;
 
 // -- Wire-format interfaces (mirror of server/src/protocol.rs) ------------
 
@@ -188,6 +204,24 @@ export interface InputsServer {
   /** 12-byte input blob. Matches `INPUT_SIZE` in
    *  `client/src/net/inputBitmask.ts`. */
   encodedInput: Uint8Array;
+}
+
+/**
+ * PR 11.6.D FIX 4: Server → Source-tab. Private reject signal
+ * (sent on the source tab's connection only — NOT broadcast to
+ * peer tabs so they can't infer the source's rate-limit / ammo /
+ * eventId / lag-miss state).
+ *
+ * Wire layout (6 bytes — see `DAMAGE_REJECT_WIRE_SIZE`):
+ *   byte 0       discriminator 0x07
+ *   byte 1..4    event_id (u32 BE — matches the `eventId` field of
+ *                the rejected `DamageRequest`)
+ *   byte 5       reason (u8 — see `REJECT_REASON_*` constants)
+ */
+export interface DamageReject {
+  eventId: number;
+  /** 0 = fire-rate, 1 = ammo, 2 = eventId, 3 = lag-miss, 4 = no-history. */
+  reason: number;
 }
 
 // -- Encoder / decoder pair ----------------------------------------------
@@ -422,4 +456,41 @@ export function decodeInputsServer(buf: Uint8Array): InputsServer | null {
   const input = new Uint8Array(12);
   input.set(buf.subarray(5, 17));
   return { frame, encodedInput: input };
+}
+
+
+/**
+ * PR 11.6.D FIX 4: encode a `DamageReject` payload to a 6-byte
+ * wire-format `Uint8Array` (discriminator 0x07 + 4-byte event_id
+ * BE + 1-byte reason). The reverse direction (server → client) is
+ * the only one in active use — the client doesn't send rejects.
+ * Symmetric encoder kept for protocol-test symmetry with the Rust
+ * `encode_damage_reject`.
+ */
+export function encodeDamageReject(r: DamageReject): Uint8Array {
+  const eventIdBytes = u32BE(r.eventId);
+  const out = concatBytes([
+    new Uint8Array([DISCRIMINATOR_DAMAGE_REJECT]),
+    eventIdBytes,
+    new Uint8Array([r.reason & 0xff]),
+  ]);
+  console.assert(
+    out.length === DAMAGE_REJECT_WIRE_SIZE,
+    `encodeDamageReject: expected ${DAMAGE_REJECT_WIRE_SIZE} bytes, got ${out.length}`,
+  );
+  return out;
+}
+
+/**
+ * PR 11.6.D FIX 4: decode a 5-byte body buffer (discriminator
+ * already stripped) to a `DamageReject`. Returns null on size
+ * mismatch. Mirrors the Rust `decode_damage_reject` exactly.
+ */
+export function decodeDamageReject(buf: Uint8Array): DamageReject | null {
+  if (buf.length !== DAMAGE_REJECT_BODY_SIZE) return null;
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  return {
+    eventId: dv.getUint32(0, false),
+    reason: dv.getUint8(4),
+  };
 }
