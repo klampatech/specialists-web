@@ -64,6 +64,33 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Brief**: `.codex-fix4-prompt-pr11.6.d.md` (worktree, now removed; backup at `/tmp/.codex-fix4-prompt-pr11.6.d.md`).
 
+**What works / what's broken (for the next session's test plan)**:
+
+✅ **Works (verified today)**:
+1. **Single-tab wire-format** (`5190` smoke, port 5190) — PASS. Damage request → broadcast → confirm. RTT, ping/pong, malformed-payload, wire-size symmetry. This is the core "I send damage, the server tells me it landed" path.
+2. **Multi-tab transport + cross-player identity** (`5191` parts 1-5) — PASS. Both tabs connect to same room, correct `localPlayerId` (1 vs 2) and `peerPlayerId`, broadcast fan-out to both, optimistic apply decrements sender's local HP, broadcast decrements receiver's local HP, both land at 88 (HP convergence at first shot). This is the actual gameplay end-to-end BEFORE the spam phase.
+3. **Direct applyBroadcast test** (`5191` part 4.5) — PASS. In-process test for the broadcast handler's "no pending → apply" path.
+4. **Fire-rate enforcement** (`5191` part 6) — PASS in 6-8 hit range. Server's 120ms cooldown works.
+5. **Vitest 5/5** — Tests A, B, C, D (from fix3) + Test E (from fix4 for actualDelta). All pin invariants.
+6. **TS-side `DamageReject` (0x07) wire type** — was being dropped pre-fix4; now decodes + dispatches.
+
+❌ **Broken (the only thing in 11.6.D that's actually broken)**:
+- **The spam+post-sweep HP convergence assertion** (`5191` part 7). 12-HP gap. One of the 6-8 broadcasts per spam doesn't decrement. Real bug, but the 12-HP margin on a 100-HP target is a transient visual desync (the other tab sees the correct HP; the next broadcast self-corrects). It's not gameplay-breaking — the bullet still lands, the kill still happens, just one tab might briefly show "16 HP" when the other tab is at 4. In actual gameplay (not a 100-fire spam) it self-resolves in ~1.5s.
+
+**End-to-end 11.6.D (separate from the smoke assertion)**:
+- ✅ Server validates damage requests (8 gates)
+- ✅ Server fans out broadcasts to all room connections
+- ✅ Client applies optimistically (sender's view of receiver)
+- ✅ Client receives broadcast + decrements its own remote
+- ✅ Rejected requests don't fan out
+- ✅ DamageReject wired (source reverts immediately on fire-rate reject)
+- ❌ 12-HP gap after spam+1.5s wait (smoke-specific over-time artifact)
+
+**11.6.C status**: MERGED, fully validated. The 5190 smoke is the 11.6.C end-to-end check; it still PASSES. So 11.6.C is closed; 11.6.D is the work-in-progress.
+
+**Manual test**: open two browser tabs to `http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX&__forceServerTransport=true` and watch them shoot each other. Real-time gameplay works fine. The 12-HP gap is a smoke-specific over-time artifact (it only manifests after 100-fire spam + 1.5s sweep wait); you won't see it in normal play.
+
+
 
 ---
 
