@@ -132,6 +132,59 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Why this matters for closing 11.6.D**: the 5191 smoke is the only automated test for the cross-tab damage path, and it's currently failing. Vitest tests at the unit level would catch 80%+ of the actualDelta / markSettled / DamageReject regressions before they reach the smoke. Right now if someone breaks the actualDelta invariant in a follow-up PR, only the 5191 smoke (which itself is broken) would catch it.
 
+**Smoking-gun diagnostic (2026-08-17 21:48 CT, Kyle's Path B probe)**:
+
+Single-fire probe via devtools (`bus.sendDamageRequest(...)` directly):
+
+```js
+const before = window.__gameSession?.remoteController?.state?.hp;  // 100
+const bus = window.__damageBus;
+const session = window.__gameSession;
+bus.sendDamageRequest(
+  { frame: 0, sourcePlayerId: 1, targetPlayerId: 2, source: 0, amount: 12,
+    eventId: Date.now() & 0x7fffffff },
+  session.remoteController, performance.now(), 1, 2,
+);
+const afterImmediate = window.__gameSession?.remoteController?.state?.hp;  // 88 (synchronous optimistic apply works!)
+await new Promise(r => setTimeout(r, 500));
+const afterBroadcast = window.__gameSession?.remoteController?.state?.hp;  // 100 (reverted!)
+JSON.stringify({ before, afterImmediate, afterBroadcast });
+// → {"before":100,"afterImmediate":88,"afterBroadcast":100}
+```
+
+**Interpretation**:
+- `before: 100` — initial state correct.
+- `afterImmediate: 88` — `sendDamageRequest`'s synchronous `applyDamage(targetController, -12)` DID decrement the cached `session.remoteController.state.hp` from 100→88. **The optimistic-apply path is wired correctly to the cached controller.**
+- `afterBroadcast: 100` — after 500ms (broadcast round-trip), HP went BACK UP to 100. Something reverted the -12.
+
+**What reverted the -12?** The optimistic apply is synchronous (immediate), but the broadcast arrives ~60-150ms later. By the time the broadcast's `applyBroadcast` runs, the pending entry exists. The match path (bc.amount === optimisticallyAppliedAmount) is a no-op for HP — so the broadcast's `applyBroadcast` did NOT revert the HP directly.
+
+The two candidates for the revert:
+1. **The sweep** (`sweepExpiredPending` at 50ms cadence, PENDING_REJECT_TIMEOUT_MS=500): the entry is at the 500ms boundary; sweep ran ~500ms after send, saw `nowMs - appliedAtMs > 500`, reverted via `applyDamage(targetController, {source: "correction", amount: -actualDelta}, nowMs)`. For actualDelta=12 this would add +12 HP → 100.
+2. **The broadcast's "no pending → apply" path**: if the sweep ran first AND the broadcast arrived just after (and the pending entry was already deleted by the sweep), `forgetOptimisticApply` returns null, falls through to `applyDamage(target, {source: sourceKind, amount: bc.amount}, nowMs)` which decrements -12 → HP 100→88.
+
+But we observe HP=100 (not 88), so the broadcast's "no pending → apply" branch either:
+   (a) Was NOT taken (sweep ran second, after the broadcast's confirm-no-op).
+   (b) WAS taken but the `resolveTarget` returned null (controller instance was disposed/swapped under StrictMode — LATEST-gameSession resolver hypothesis).
+   (c) Was taken but applied to a DIFFERENT controller instance than the one the probe is reading.
+
+**Most likely diagnosis (hypothesis c)**: the broadcast's `resolveTarget` callback resolves to controllers from the LATEST `__gameSession`, which may be a DIFFERENT instance than the cached `session.remoteController` we sampled. The broadcast's `applyDamage` decrements the LATEST controller's HP; the probe's read returns the FIRST controller's HP (still 100). This is the LATEST-gameSession resolver hypothesis from earlier diagnosis, confirmed by this single-fire evidence.
+
+**Fix6 scope confirmed**: the 12-HP gap is the LATEST-gameSession resolver routing broadcasts to a different controller instance than what the probe reads. The fix needs to either (a) make the broadcast handler always target the SAME controller the spam sent damage to (single source of truth for "which session owns this broadcast"), OR (b) invalidate all stale GameSession references when StrictMode re-mounts, OR (c) drop the optimistic-apply feature entirely (clients send-and-wait; no cache to go stale).
+
+**Recommended fix6 brief outline**:
+1. Add `__broadcastAppliedTo` instrumentation: log the EXACT controller instance (via a unique ref) that each broadcast decremented. Compare across runs to confirm whether broadcasts hit the same controller the probe reads.
+2. Either fix the LATEST-gameSession resolver to use the FIRST session's controllers (not LATEST), OR invalidate stale references on StrictMode re-mount.
+3. Re-run Path B diagnostic after fix: `afterImmediate === 88`, `afterBroadcast === 88` (or `76` if broadcasts also decrement).
+
+**Test plan for fix6 verification**:
+- vitest 10/10 still PASS (no regression on the existing invariants)
+- 5191 smoke 10× must PASS (the bug the smoke catches)
+- Path B diagnostic must show `{"before":100,"afterImmediate":88,"afterBroadcast":88}` (no revert)
+
+**Servers are kept up** until the next session. Kyle can re-test fix6 by reloading the URL after pushing.
+
+
 **Ad-hoc decision (2026-08-17 evening, Kyle's call)**: shoring up CI first, then the 12-HP debug next session. Rationale: (a) the vitest tests we'd add are the RIGHT tests to write regardless of how fix5 lands; (b) the `client-vitest` job is required to merge 11.6.D anyway (the 5191 smoke will be marked "expected to fail" with a TODO, but vitest passing in CI is the only honest green signal on the fix3+fix4 invariants); (c) the 12-HP investigation is bounded by what scene.ts instrumentation can tell us, not by vitest surface area — they're independent work tracks. Kyle's exact ask: "update the spec / handoff with our next steps and ad-hoc decisions. Add it to the current PR. I'll review."
 
 **Concrete next-session action items (in order)**:
