@@ -5,6 +5,35 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
 
+## 2026-08-18 — SESSION END NOTE: PR 11.7.B codex dispatch landed (2 commits, 27 files, +4597/-110 lines). Branch `feat/phase1-pr11.7.b-server-snapshot` PUSHED to origin awaiting review.
+
+**This session** (2026-08-18, ~2.5 hours, follow-on from the 11.7.A plan + parity additions):
+1. **PR 11.7.B codex dispatch landed clean** — 38m 51s wall time, no SIGINT budget overrun this time. Branch `feat/phase1-pr11.7.b-server-snapshot @ e708d58` pushed to origin. All 10 verifier gates green per Evo's independent re-run (cargo 168/168, tsc clean, build 7,058.04 kB identical hash, vitest 10/10, 5191 smoke HP=88 PASS, bundle grep clean, Havok reference JSONs exist, snapshot determinism test PASS).
+2. **5 documented deviations**, all accepted by verifier:
+   - Rapier 0.12 → 0.18 (0.12 has 112 E0223 errors on Rust 1.95)
+   - No `World` struct in 0.18 — manual composition + `PhysicsWorld` newtype wrapper
+   - `KinematicCharacterController::move_shape().grounded` for grounded detection (canonical Rapier API)
+   - `MoveBits.JUMP = 16` (bit 4), not bit 6 as brief stated (brief typo; codex read `inputBitmask.ts` correctly)
+   - Discriminator bump: `DamageReject` 0x07 → 0x0C to free 0x07 for Snapshot (plan §3.5 had contradictory "0x07 reserved" + "DamageReject at 0x07" — codex resolved it correctly; documented as dual breaking change with the deferred `0x06 InputSeq` trailer)
+3. **Plan amendments on `docs/pr11.7-plan` branch** (pushed earlier this session):
+   - §3.5: discriminator table rewritten to reflect post-implementation organization + new "Discriminator reorganization" callout documenting the dual breaking change
+   - Appendix A: new "PR 11.7.B implementation findings" entry listing all 5 deviations + verifier acceptance
+4. **Watcher bug noted** — `herdr wait agent-status --status done` did NOT fire the notify on completion; codex sat idle for an hour before user flagged. Need to fix the wait recipe for future dispatches (likely a `--timeout` parsing issue or a missing `wait` flag).
+5. **Claude cross-vendor review in flight** — spawned in pane `wGQ:p2` in print mode (~10 min estimated). Will adjudicate findings when it returns.
+
+**Files pushed to origin this session**:
+- `feat/phase1-pr11.7.b-server-snapshot @ e708d58` (27 files, 2 commits)
+- `docs/pr11.7-plan @ 1f4e022` (docs-only, +176 lines from session-2 parity work)
+
+**Honest framing for the next session**:
+- PR 11.7.B is **ready to open as a PR** (no claude blockers expected, but awaiting review findings). Next step after claude: `gh pr create --repo klampatech/specialists-web --head feat/phase1-pr11.7.b-server-snapshot --title "feat(phase1-pr11.7.b): server physics + snapshot generator (Rapier + 64Hz tick + Snapshot 0x07 + coyote-time parity)" --body-file <generated>`.
+- **Fix the herdr wait recipe** before the next codex dispatch — the silent-wait bug bit us. Likely cause: the `notify_on_complete=true` parameter on `terminal(background=true, notify_on_complete=true)` doesn't propagate to a child process whose stdout is piped to `tee`. Alternative: poll `herdr pane get <pane_id>` every 30s with a deadline.
+- **Servers**: down (clean state). Restart per the handoff's "Servers" section.
+- **Watcher fix skill**: worth saving as a skill — `herdr-coder-wait-recipe` covering the correct notify pattern for long-running codex dispatches.
+
+**Servers**: down (unchanged).
+
+
 ## 2026-08-18 — SESSION END NOTE: PR 11.7.A Q1 call (Rapier) + plan additions for Rapier↔Havok parity. Branch `docs/pr11.7-plan` (not pushed, 2 commits ahead of origin/main).
 
 **This session** (2026-08-18, ~45 min plan-revision, follow-on from the 11.7.A plan delivery):
