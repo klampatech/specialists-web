@@ -5,27 +5,59 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
 
+## 2026-08-18 — PR 11.7.A OPENED (plan PR). PR 11.7 server-authoritative movement (CS2/Valorant shape). Branch `docs/pr11.7-plan`.
+
+**Status**: PR 11.7.A is **OPENED**, branch `docs/pr11.7-plan`, branched from `origin/main` at `e9ac169` (PR 11.6.D merge). No Rust code, no codex dispatch, no Vite churn — docs-only. PR description: "Server-authoritative movement (CS2/Valorant shape) — Plan. See `docs/PR-11.7-plan.md` for the architecture decision record. 6 sub-PRs, ~7-9 sessions estimated."
+
+**What got done in this session** (2026-08-18, single session):
+1. **docs/PR-11.7-plan.md** written (~68KB, ~1200 lines): the architecture decision record for PR 11.7. Mirrors PR-11.6-plan.md's structure with the following PR 11.7-specific sections:
+   - §1 (Why this PR is the next thing post-PR 11.6.D) — driver is the 24p ceiling; lockstep caps at ~4 players.
+   - §1.2 (CS2/Valorant reference architecture) — items 2/3/4/6 are PR 11.7's work; items 1/5/7 already done in PR 11.6.D.
+   - §1.3 (PR 11.6 seams audit) — 3/4 seams delivered as designed; 1 (snapshot model awareness) carried forward into 11.7.B as the Snapshot wire type at discriminator byte `0x07`.
+   - §3.1 (Server physics authority — the BIG open question) — Rapier WASM (native Rust crate) recommended over Havok port; bit-equivalence NOT required because server is source of truth + client reconciles on snapshot drift.
+   - §3.3 (Sub-PR roll-out — the dependency chain) — 6 sub-PRs: 11.7.A → 11.7.B (server physics + snapshot) → 11.7.C (client predictor + interpolator + reconciliation) → 11.7.D (lockstep retirement + smoke rewrites) → 11.7.E (reload mechanics) → 11.7.F (production cert handling).
+   - §3.5 (Wire protocol additions) — Snapshot (0x07), StateAck (0x08), InputSeq trailer on 0x06 (BREAKING CHANGE for PR 11.6.D clients → PR 11.7.B servers, one-PR migration window), ReloadRequest (0x0A, 11.7.E), StateResyncRequest (0x0B).
+   - §3.8 (Client-side prediction, ~400 lines) — predictor.ts architecture sketch: tick() runs Havok forward for local player; onSnapshot() compares predicted ↔ snapshot, reconciles on drift > `RECONCILIATION_THRESHOLD_M = 0.1m`, hard clamps rubber-band snap distance at `MAX_RECONCILIATION_SNAP_DISTANCE_M = 2m`.
+   - §3.9 (Remote-player interpolation buffer, ~120 lines) — interpolator.ts with 8-snapshot ring buffer + render-time lerp at `INTERPOLATION_DELAY_MS = 100`.
+   - §4.4 (The 12-HP gap from PR 11.6.D closes as a side-effect) — server is sole source of truth for damage timing; client's applyBroadcast fires from snapshot's damage_log entry, not a separate broadcast. Optimistic-apply UX persists, but reconciles against snapshot not broadcast.
+   - §5.2 (7 hard questions for codex dispatches) — preempt the surprises the dispatches WILL hit (Rapier deterministic feature flag, position history trim cadence, StrictMode race for predictor/initializer, vitest pinning for reconciliation, smoke rewrite-not-delete, server-authoritative reload from day one, DNS-01 vs HTTP-01 for Let's Encrypt).
+   - §6 (Open questions Q1-Q6) — 6 calls only Kyle can make: physics authority (Q1, recommended Rapier), snapshot rate (Q2, recommended 20Hz), lockstep retirement approach (Q3, recommended hard delete), reload as separate PR (Q4), cert handling as separate PR (Q5), bidirectional eventId dedupe (Q6, recommended StateAck only).
+2. **docs/SPEC.md banner updated** — top status entry now reads "PR 11.6.D MERGED at squash `e9ac169` (PR #32, 2026-08-18). PR 11.7.A OPENED at squash `docs/pr11.7-plan` (in review); see `docs/PR-11.7-plan.md` (6 sub-PRs, ~7-9 sessions)."
+
+**What this PR (11.7.A) does NOT ship** (carried forward into the implementation PRs):
+- No `Cargo.toml` changes.
+- No new dependencies (no `rapier3d`, no `rustls-acme`).
+- No CI jobs.
+- No smoke updates.
+- No client code changes.
+- No server code changes.
+
+**The next session's work** (post-merge of 11.7.A):
+- Pick up PR 11.7.B (server physics + snapshot generator). Rapier integration + physics tick loop + Snapshot wire type at discriminator 0x07 + cutover plan from per-player PositionUpdate.
+- The 5191 smoke (HP convergence, port 5191) is unchanged and must continue to PASS — 11.7.B is server-side architecture work invisible to the client.
+- All 4 verifier gates must be green before opening the implementation PRs: cargo test (existing 126/126 + new snapshot integration tests), typecheck clean, build clean (7,058.04 kB baseline; +~30 kB for new code), vitest unchanged (no client changes yet).
+- Codex dispatch for 11.7.B should explicitly call out: Rapier's `deterministic` feature flag, position history trim cadence, the wire-format breaking change for 0x06 InputsServer (one-PR migration window). See plan §5.2 for the full preempt list.
+
+**Ad-hoc decisions made this session**:
+1. **6 sub-PRs, not 4** — original PR 11.6 §5.3 sketch was 4 sub-PRs. After reviewing surface area, reload (11.7.E) + cert handling (11.7.F) got split out from lockstep retirement (11.7.D) to keep each PR under ~700 lines (§5.1 roll-out discipline). The total session estimate goes from 4-5 to 7-9 — net +3-4 sessions but with smaller review cost per PR.
+2. **Server-side position history cutover is gradual, not big-bang** — PR 11.7.B ships physics-fed `PositionHistory` but keeps the per-player `PositionUpdate` inbound path as deprecated (logs warning, still accepts). PR 11.7.D removes the client-side `sendPositionUpdate` call site entirely + server-side handler becomes a no-op. Same pattern as PR 11.6.D's `__forceServerTransport` flag — shadow the new path, cut over when client matches.
+3. **Rapier WASM (native Rust crate) recommended over Havok port** — 1-2 sessions vs 3-4 sessions; low divergence risk vs high; bit-equivalence NOT required because server is the source of truth and the client reconciles on snapshot drift. Pending Kyle's call (Q1).
+
+**Servers**: down since PR 11.6.D merge cleanup. Restart with `cd ~/Development/specialists-web-pr11.6.d && bash tools/canary-server.sh --port-wt 14433 --port-ws 14434` + `cd client && npm run dev -- --host 0.0.0.0 --port 5191 --strictPort`. Not needed for 11.7.A (docs-only PR).
+
 ## ⚡ TL;DR for the next session (read this first)
 
-**You are here**: PR 11.6.D, branch `feat/phase1-pr11.6.d-validate-and-relay`, **20 commits ahead of main**, last commit `a765ccc` (2026-08-17 evening). PR is **NOT YET PUSHED** — local-only. Worktree clean. Servers can be left running OR killed; check `ps -p 3599169,3599938`.
+**You are here**: PR 11.7.A OPENED (plan PR), branch `docs/pr11.7-plan`, branched from `origin/main` at `e9ac169` (PR 11.6.D merge). Docs-only — no code changes. See `docs/PR-11.7-plan.md` for the architecture decision record (~1200 lines, 6 sub-PRs, ~7-9 sessions estimated).
 
-**Where we landed**:
-- **fix3** (`c682a03`): recentlySettled map, drop-without-revert, vitest installed.
-- **fix4** (`929f3d6`): Bug A (StrictMode race) + Bug B (drop-branch markSettled) + Bug C (sweep over-restoration via actualDelta) + TS-side 0x07 DamageReject mirror + smoke-side fix. **All 4 verifier gates green** (cargo 13/13, tsc clean, build 7,058.04 kB, vitest 5/5 then 10/10 after fix5).
-- **fix5** (`1d88ac3`): client-vitest CI job added + 5 new vitest tests (Tests F/G/H for fix4 invariants). ci.yml now has 20 jobs. **All 4 verifier gates still green**.
-- **fix6 (NOT YET DISPATCHED)**: the 12-HP gap. Smoking-gun diagnostic captured: `before=100, afterImmediate=88, afterBroadcast=100` — the optimistic apply works synchronously but something reverts the -12 between the immediate read and the broadcast arrival. Most likely cause: the broadcast handler's `resolveTarget` returns controllers from the LATEST `__gameSession` (which may be a different instance than the cached one the smoke/probe reads), so the broadcast's `applyDamage` decrements the LATEST controller while the smoke/probe reads the FIRST. Recommended fix6 approach: add `__broadcastAppliedTo` instrumentation to confirm, then either (a) use FIRST-session controllers in the broadcast handler, (b) invalidate stale `__gameSession` refs on StrictMode re-mount, or (c) drop optimistic-apply entirely (cleanest, +1 RTT per fire).
+**What's pending review**: 6 open questions for Kyle in plan §6 — physics authority (Q1: Rapier WASM recommended), snapshot rate (Q2: 20Hz recommended), lockstep retirement approach (Q3: hard delete recommended), reload as separate PR (Q4: yes recommended), cert handling as separate PR (Q5: yes recommended), bidirectional eventId dedupe (Q6: StateAck only recommended). The §5.2 preempts for codex dispatches also need Kyle's read.
 
-**Verifier state** (run 2026-08-17 evening): cargo test 13/13, tsc clean, npm run build clean, **vitest 10/10 PASS**, 5190 smoke PASS, 5191 smoke **0/3 deterministic-FAIL with 12-HP gap** (the fix6 work).
+**What this PR (11.7.A) does NOT touch**: no Rust code, no client code, no CI jobs, no smoke updates, no dependencies. Pure docs.
 
-**Servers**: canary (pid 3599169) on Tailscale IP `100.95.111.112:14433/14434` + Vite (pid 3599938) on `100.95.111.112:5191`. URL for 2-tab test: `http://100.95.111.112:5191/?server=ws%3A%2F%2F100.95.111.112%3A14434%2Frooms%2FDEVBX` (URL routing at PeerOverlay.tsx:38-65 auto-sets `__forceServerTransport` — no DevTools setup needed).
+**Next session's work** (after 11.7.A merges): pick up PR 11.7.B (server physics + snapshot generator). Branch `feat/phase1-pr11.7.b-server-snapshot` off main. The 5191 smoke must continue to PASS — 11.7.B is server-side architecture work invisible to the client. All 4 verifier gates must be green before opening the implementation PR.
 
-**Memory**: pre-fix4 state still in MEMORY.md (the codex 3-for-3 burn-trace + PR 11.6.D status). The post-fix4 + fix5 + smoking-gun state is **NOT in memory** (the memory budget was full and consolidation failed). Read `HANDOFF.md` + `docs/SPEC.md` for the canonical current state.
+**Servers**: down. Restart with `cd ~/Development/specialists-web-pr11.6.d && bash tools/canary-server.sh --port-wt 14433 --port-ws 14434` + `cd client && npm run dev -- --host 0.0.0.0 --port 5191 --strictPort`. Not needed for 11.7.A.
 
-**Codex 4-for-4 burn-trace**: codex has stalled at the 90-min wall-clock mark on every fix round (fix1+fix2+fix3+fix4). fix4 hit 402 Payment Required. Recovery pattern: parse JSONL, re-run verifier gates, write the commit yourself. **~10-15 min overhead per round**. Plan for codex to stall; don't expect a final-message file.
-
-**`/tmp` backups preserved**: `.codex-fix3-prompt-pr11.6.d.md` (14KB), `.codex-fix4-prompt-pr11.6.d.md` (13.6KB), smoke result logs.
-
-**The next move**: dispatch fix6 with a focused 5-10 min brief targeting the LATEST-gameSession resolver. See the "fix6 scope" section below for the full outline.
+**Memory**: pre-PR-11.6.D state in MEMORY.md is stale (the codex 3-for-3 burn-trace + PR 11.6.D status). The PR 11.6.D-MERGED + PR 11.7.A-OPENED state is the canonical current state. Read `HANDOFF.md` + `docs/SPEC.md` for the canonical current state.
 
 
 ## 2026-08-17 — PR 11.6.D fix4 LANDED. Bug A (StrictMode race) + Bug B (drop-branch markSettled) + Bug C (sweep over-restoration) all closed. Smoke still 0/10 deterministic-FAIL with NEW failure mode (12-HP gap). Branch `feat/phase1-pr11.6.d-validate-and-relay`.
