@@ -113,12 +113,6 @@ pub struct Room {
     /// Constructor initializes with no bodies — `add_player`
     /// (called on first DamageRequest) seeds the body.
     pub physics: crate::physics::PhysicsWorld,
-    /// PR 11.7.B / §3.13 — per-player last-grounded frame counter
-    /// for coyote-time jump grants. Updated by the physics tick
-    /// when the capsule is detected grounded by the character
-    /// controller; consumed by `apply_jump` to grant jumps
-    /// within `COYOTE_FRAMES` of the last grounded frame.
-    pub last_grounded_frame: HashMap<PlayerId, u64>,
     /// PR 11.7.B — scratch space for the per-tick drained inputs.
     /// `drain_inputs_for_tick` clears this map and repopulates it
     /// with the most-recent input per player (the inputs_buffer is
@@ -140,7 +134,6 @@ impl Room {
             connections: HashMap::new(),
             next_server_frame: 0,
             physics: crate::physics::PhysicsWorld::new(),
-            last_grounded_frame: HashMap::new(),
             drained_inputs_this_tick: HashMap::new(),
         }
     }

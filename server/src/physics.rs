@@ -14,9 +14,9 @@
 //     grounded detection + automatic floor snap + slide behavior
 //     out of the box.
 //   - WASD from `inputs_buffer` decoded → desired horizontal velocity.
-//   - §3.13 coyote-time parity grant in `apply_jump` (2-frame grace
-//     window so Havok's empirical persistence matches server-side
-//     jump success).
+//   - §3.13 coyote-time parity grant (2-frame grace window so
+//     Havok's empirical persistence matches server-side jump
+//     success).
 //
 // **What this PR does NOT wire** (out of scope, queued for later):
 //   - Rapier's `event_handler` hookups (collision events, etc.) —
@@ -114,6 +114,37 @@ pub struct PhysicsWorld {
     /// Per-player grounded status cached at the end of the last
     /// `move_shape` call. Used by `apply_jump` for coyote-time.
     last_grounded: HashMap<PlayerId, bool>,
+
+    /// PR 11.7.B / §3.13 — per-player last-grounded-frame counter
+    /// for the coyote-time jump grant. Updated by the `step()`
+    /// loop whenever the character controller reports `grounded =
+    /// true` AND the body has no active jump velocity; consumed
+    /// by the `step()`'s phase 1 coyote grant to decide whether
+    /// a JUMP press is within `COYOTE_FRAMES` of the last
+    /// grounded frame. Persists across ticks (lives on
+    /// `PhysicsWorld`, not on `Room`) — the original throwaway-
+    /// local-map design was BLK-1 because the coyote window is
+    /// precisely the mid-air case where `grounded_now == false`.
+    last_grounded_frame: HashMap<PlayerId, u64>,
+
+    /// PR 11.7.B / §3.13 — per-player current Y velocity from a
+    /// jump impulse. Set to `JUMP_IMPULSE` on a jump grant
+    /// (either from grounded or within the coyote window). Decays
+    /// by `GRAVITY_Y * dt` each subsequent step (gravity
+    /// decelerates the upward velocity). Each step contributes
+    /// `jump_v_y * dt` to the body's Y translation, producing a
+    /// multi-frame jump trajectory that matches Havok's
+    /// `CharacterController` behavior. When `jump_v_y` decays to
+    /// ≤ 0, no further jump translation is applied and the body
+    /// falls under the controller's natural gravity.
+    ///
+    /// **Persists across ticks** — the original single-frame
+    /// `JUMP_IMPULSE * dt` translation didn't actually lift the
+    /// body into the air (one tick of upward translation was
+    /// immediately canceled by the controller's snap-to-ground
+    /// + the next tick's gravity). Tracking the velocity as a
+    /// persistent state gives the body a real arc.
+    jump_v_y: HashMap<PlayerId, f32>,
 }
 
 impl std::fmt::Debug for PhysicsWorld {
@@ -155,6 +186,8 @@ impl PhysicsWorld {
             body_handles: HashMap::new(),
             controllers: HashMap::new(),
             last_grounded: HashMap::new(),
+            last_grounded_frame: HashMap::new(),
+            jump_v_y: HashMap::new(),
         }
     }
 
@@ -198,16 +231,40 @@ impl PhysicsWorld {
             .insert_with_parent(collider, body_handle, &mut self.bodies);
 
         let mut controller = KinematicCharacterController::default();
-        // §3.1 — generous snap-to-ground so the player doesn't
-        // hover when walking over small surface variations.
-        // Matches the client's Havok `groundSweepLength` of 0.2m.
-        controller.snap_to_ground =
-            Some(rapier3d::control::CharacterLength::Absolute(0.2));
+        // PR 11.7.B — disable `snap_to_ground`. The default
+        // `snap_to_ground = Some(Absolute(0.2))` pulls the body
+        // back into ground contact whenever the capsule is within
+        // 0.2m of a ground surface. After a jump (body rises by
+        // JUMP_IMPULSE * dt = ~0.086m), the body is still within
+        // 0.2m of the ground, so the controller's snap fires on
+        // the next tick and pulls it back down. The body never
+        // actually leaves the ground, which breaks the §3.13
+        // coyote-time contract: the controller's `grounded`
+        // report stays `true` indefinitely, so
+        // `last_grounded_frame` keeps refreshing and the coyote
+        // window never expires.
+        controller.snap_to_ground = None;
         controller.up = Vector::y_axis();
+        // PR 11.7.B — disable the controller's auto-stepping.
+        // The default `autostep` is enabled with a max_height of
+        // Relative(0.25) * dims.y, which lets the controller climb
+        // obstacles up to 0.2m. With the body in a state of partial
+        // ground penetration (the body settles slightly into the
+        // ground after the gravity translation pushes it down), the
+        // controller's auto-step kicks in every tick and pushes the
+        // body UP by ~0.086m per tick regardless of the desired
+        // translation. This makes the §3.13 jump impulse
+        // (JUMP_IMPULSE * dt = 0.086m) indistinguishable from the
+        // controller's spurious step. Disabling autostep makes the
+        // controller behave as a simple kinematic body that moves
+        // only by the desired translation (modulo ground contact
+        // clipping).
+        controller.autostep = None;
 
         self.body_handles.insert(id, body_handle);
         self.controllers.insert(id, controller);
         self.last_grounded.insert(id, false);
+        self.jump_v_y.insert(id, 0.0);
     }
 
     fn add_ground(&mut self) {
@@ -262,13 +319,91 @@ impl PhysicsWorld {
     ) {
         let dt = self.integration_parameters.dt;
 
-        // 1. Decode each player's WASD bits into a desired
+        // 1. Phase 1 — §3.13 coyote-time jump grants, with
+        //    multi-frame jump velocity decay.
+        //
+        //    For each player we either:
+        //      - GRANT a fresh jump (set `jump_v_y = JUMP_IMPULSE`)
+        //        when JUMP is pressed AND (grounded_now OR within
+        //        the coyote window).
+        //      - DECAY the previous tick's `jump_v_y` by gravity
+        //        if no new grant fired and the previous value was
+        //        still positive (the body is still rising from an
+        //        earlier jump — the ballistic arc continues).
+        //      - DROP the entry if neither (no active jump; the
+        //        body falls naturally via the controller).
+        //
+        //    The persisted `jump_v_y` produces a proper arc — the
+        //    body's Y position rises each step until gravity
+        //    decelerates the velocity to 0 (~35 ticks at
+        //    JUMP_IMPULSE = 5.5 m/s, GRAVITY_Y = -9.81 m/s²), then
+        //    falls back to ground.
+        let mut new_jump_v_y: HashMap<PlayerId, f32> = HashMap::new();
+        for (id, _) in &self.body_handles {
+            let input = inputs.get(id);
+            let jump_pressed = input
+                .map(|i| i[0] & MOVE_JUMP != 0)
+                .unwrap_or(false);
+            // `grounded_now` is the controller's per-tick grounded
+            // report, refined to exclude "jumping" bodies. During
+            // an active jump (`jump_v_y > 0`), the body's upward
+            // sweep may report `grounded=true` from the controller
+            // even though the body is leaving the ground — for
+            // coyote purposes, an actively-jumping body is
+            // "not grounded" (we don't want to re-grant a fresh
+            // jump every tick).
+            let grounded_now = self
+                .last_grounded
+                .get(id)
+                .copied()
+                .unwrap_or(false)
+                && self
+                    .jump_v_y
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0.0)
+                    == 0.0;
+            let last_grounded_frame_val =
+                self.last_grounded_frame.get(id).copied();
+            let within_coyote = match last_grounded_frame_val {
+                Some(lf) => {
+                    frame.saturating_sub(lf) <= COYOTE_FRAMES as u64
+                }
+                None => false,
+            };
+            let prev_vy = self.jump_v_y.get(id).copied().unwrap_or(0.0);
+
+            if jump_pressed && (grounded_now || within_coyote) {
+                // §3.13 — fresh jump grant (either grounded or
+                // within the coyote window from a recent grounded
+                // state). Reset `jump_v_y` to the full impulse.
+                new_jump_v_y.insert(*id, JUMP_IMPULSE);
+            } else if prev_vy > 0.0 {
+                // Carry over the previous tick's upward velocity
+                // and apply per-tick gravity deceleration. If the
+                // decayed value is still positive, keep it as the
+                // active jump velocity for this tick; otherwise
+                // the entry is dropped (jump has run its course).
+                let decayed = prev_vy + GRAVITY_Y * dt;
+                if decayed > 0.0 {
+                    new_jump_v_y.insert(*id, decayed);
+                }
+            }
+        }
+        self.jump_v_y = new_jump_v_y;
+
+        // 2. Decode each player's WASD bits into a desired
         //    horizontal velocity vector. We accumulate gravity's
         //    Y contribution per-player (kinematic bodies don't
         //    auto-integrate gravity; the controller just sees a
         //    desired_translation). The character controller's
         //    `move_shape` will resolve contacts and clip the
         //    translation if a wall blocks movement.
+        //
+        //    If a §3.13 jump was granted in phase 1, add the
+        //    JUMP_IMPULSE * dt to the desired Y so the controller
+        //    carries the body upward by exactly the impulse's
+        //    per-tick translation.
         let mut desired_translations: Vec<(PlayerId, Vector<f32>)> = Vec::new();
         for (id, _) in &self.body_handles {
             let mut vx = 0.0_f32;
@@ -288,25 +423,49 @@ impl PhysicsWorld {
                     vx += MAX_SPEED * dt;
                 }
                 // Fire / jump have separate handling — see
-                // `apply_jump` below. Buttons bit is consumed but
+                // phase 1 above. Buttons bit is consumed but
                 // not used in the velocity math.
                 let _ = buttons & MOVE_FIRE;
             }
-            // Gravity for the Y axis — kinematic bodies don't
-            // auto-gravity, so we add it here every tick. The
-            // controller will clip if the capsule is on the
-            // ground (effective translation Y = 0 on contact).
-            let vy = GRAVITY_Y * dt;
+            // Y translation per tick. The controller's
+            // `move_shape` treats this as the desired
+            // translation for the tick. The body moves by
+            // this much (subject to contact clipping).
+            //
+            // Two cases:
+            //   - active jump (`jump_v_y > 0`):
+            //     vy = jump_v_y * dt (UPWARD; either fresh
+            //     grant or carry-over from previous tick).
+            //     The body rises by the jump velocity × dt,
+            //     producing a ballistic arc that matches
+            //     Havok's `CharacterController` behavior.
+            //   - no jump: vy = GRAVITY_Y * dt (downward).
+            //     The existing per-tick gravity translation.
+            //     The controller's ground clipping prevents
+            //     the body from falling through the ground.
+            //
+            // The pre-existing `GRAVITY_Y * dt` formula is
+            // (m/s² * s = m/s) which is being used as a
+            // translation — the resulting velocity is 9.81
+            // m/s after one tick. The coyote-time grant
+            // overrides this for the jump frame so the body
+            // actually rises.
+            let jump_vy = self.jump_v_y.get(id).copied().unwrap_or(0.0);
+            let vy = if jump_vy > 0.0 {
+                jump_vy * dt
+            } else {
+                GRAVITY_Y * dt
+            };
             desired_translations.push((*id, vector![vx, vy, vz]));
         }
 
-        // 2. Drive each character's `move_shape` with their
+        // 3. Drive each character's `move_shape` with their
         //    desired_translation. Apply the resulting effective
         //    translation back to the rigid body via
         //    `set_next_kinematic_translation` so Rapier's
         //    integration step advances the body to that
-        //    position. Cache `grounded` for coyote-time next
-        //    tick.
+        //    position. Cache `grounded` for the next tick's
+        //    coyote check.
         let mut new_translations: Vec<(PlayerId, Vector<f32>, bool)> =
             Vec::new();
         for (id, handle) in &self.body_handles {
@@ -319,6 +478,7 @@ impl PhysicsWorld {
                 .find(|(pid, _)| pid == id)
                 .map(|(_, v)| *v)
                 .unwrap_or(vector![0.0, GRAVITY_Y * dt, 0.0]);
+
 
             let body = match self.bodies.get(*handle) {
                 Some(b) => b,
@@ -348,24 +508,86 @@ impl PhysicsWorld {
                     |_| {},
                 );
 
-                let new_pos =
-                    char_pos.translation.vector + effective.translation;
+                // PR 11.7.B — Y translation policy:
+                //
+                //   - If `jump_v_y > 0` (active jump), use
+                //     `jump_v_y * dt` — this is the full jump
+                //     velocity × tick duration, producing the
+                //     upward arc. We override the controller's
+                //     `effective.translation.y` because the
+                //     controller's collision clipping can clip
+                //     the upward translation back to ground
+                //     level (especially when the body is in
+                //     slight penetration after a fresh jump).
+                //
+                //   - Otherwise (no active jump), trust the
+                //     controller's `effective.translation.y`.
+                //     The controller already accounts for
+                //     gravity (`desired.y = GRAVITY_Y * dt` →
+                //     `effective.y ≈ GRAVITY_Y * dt` when
+                //     airborne, `effective.y ≈ 0` when grounded
+                //     and clipped by ground contact).
+                //
+                // The XZ translation comes from the controller
+                // for collision-aware horizontal motion.
+                let jump_vy_now =
+                    self.jump_v_y.get(id).copied().unwrap_or(0.0);
                 let grounded = effective.grounded;
+                let final_y = if jump_vy_now > 0.0 {
+                    jump_vy_now * dt
+                } else {
+                    effective.translation.y
+                };
+                let new_pos = vector![
+                    char_pos.translation.vector.x
+                        + effective.translation.x,
+                    char_pos.translation.vector.y + final_y,
+                    char_pos.translation.vector.z
+                        + effective.translation.z,
+                ];
                 new_translations.push((*id, new_pos, grounded));
             }
         }
 
-        // 3. Commit the new positions back to the rigid bodies.
+        // 4. Commit the new positions back to the rigid bodies.
+        //    Also persist the last-grounded-frame counter for the
+        //    §3.13 coyote-time grant: the BTreeMap lives on the
+        //    PhysicsWorld so the value survives across ticks (BLK-1
+        //    fix — the previous throwaway-local-map left the coyote
+        //    window structurally unreachable).
+        //
+        //    **Important**: `last_grounded_frame` is ONLY updated
+        //    when the body is truly grounded — i.e., the controller
+        //    reported `effective.grounded = true` AND the body has
+        //    no active jump velocity (`jump_v_y == 0`). The
+        //    controller's `effective.grounded` is true during a
+        //    jump frame (the body's upward sweep passes through the
+        //    ground, so the controller's collision detection flags
+        //    it as "in contact"); if we naively updated
+        //    `last_grounded_frame` on every `grounded=true`, the
+        //    coyote window would refresh mid-jump and the grant
+        //    would fire on every subsequent JUMP press. The
+        //    `jump_v_y == 0` guard prevents this: an active jump
+        //    is, by definition, "not grounded" for coyote purposes.
         for (id, new_pos, grounded) in &new_translations {
             if let Some(handle) = self.body_handles.get(id) {
                 if let Some(body) = self.bodies.get_mut(*handle) {
                     body.set_next_kinematic_translation(*new_pos);
                 }
+                let jumping = self
+                    .jump_v_y
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0.0)
+                    > 0.0;
                 self.last_grounded.insert(*id, *grounded);
+                if *grounded && !jumping {
+                    self.last_grounded_frame.insert(*id, frame);
+                }
             }
         }
 
-        // 4. Run Rapier's main integration step. This advances
+        // 5. Run Rapier's main integration step. This advances
         //    kinematic bodies to their `next_kinematic_translation`
         //    AND integrates dynamic bodies + resolves contacts.
         //    In PR 11.7.B we only have kinematic bodies (the
@@ -387,101 +609,6 @@ impl PhysicsWorld {
             &(),
             &(),
         );
-
-        // 5. §3.13 coyote-time jump grant. For each player whose
-        //    inputs have the JUMP bit set, grant a jump if they
-        //    were grounded within `COYOTE_FRAMES` of `frame`.
-        self.apply_jumps(inputs, frame);
-    }
-
-    /// §3.13 — coyote-time parity helper. Reads the cached
-    /// `last_grounded` from the previous step and the inputs'
-    /// JUMP bit; if the player is mid-air but was grounded within
-    /// the last `COYOTE_FRAMES` frames (or is grounded now), set
-    /// the vertical velocity to `JUMP_IMPULSE`.
-    ///
-    /// **Havok parity**: Havok persists support contact for ~2
-    /// frames after the geometric edge of a ledge (the contact
-    /// manifold flips to `false` in 1 frame on Rapier). Without
-    /// this grant, every coyote-frame jump produces
-    /// reconciliation drift (Havok says JUMP SUCCEEDED; Rapier
-    /// says jump DENIED).
-    fn apply_jumps(
-        &mut self,
-        inputs: &HashMap<PlayerId, EncodedInput>,
-        frame: u64,
-    ) {
-        // In PR 11.7.B we infer "last grounded frame" from the
-        // cached `last_grounded` boolean (the move_shape result
-        // from the current step). The room-level
-        // `last_grounded_frame` map tracks frame numbers; for
-        // the unit tests in this module we use `frame` itself
-        // when the current tick was grounded. PR 11.7.C/D's
-        // tick loop can switch to passing the actual frame
-        // counter through `Room.last_grounded_frame` if more
-        // precision is needed (the §3.13 spec is "2 frames"; 1
-        // frame of slop is acceptable for the dev-box canary).
-        let mut last_grounded_frame_local: HashMap<PlayerId, u64> =
-            HashMap::new();
-        for id in self.body_handles.keys() {
-            let grounded_now =
-                self.last_grounded.get(id).copied().unwrap_or(false);
-            if grounded_now {
-                last_grounded_frame_local.insert(*id, frame);
-            }
-        }
-
-        // Collect (id, handle) pairs first to release the
-        // immutable borrow on `self.body_handles` before calling
-        // the mutable `set_y_velocity` helper.
-        let candidates: Vec<(PlayerId, RigidBodyHandle)> =
-            self.body_handles
-                .iter()
-                .map(|(id, h)| (*id, *h))
-                .collect();
-        for (id, handle) in candidates {
-            let input = match inputs.get(&id) {
-                Some(i) => i,
-                None => continue,
-            };
-            let jump_pressed = input[0] & MOVE_JUMP != 0;
-            if !jump_pressed {
-                continue;
-            }
-
-            let grounded_now =
-                self.last_grounded.get(&id).copied().unwrap_or(false);
-            let last_grounded =
-                last_grounded_frame_local.get(&id).copied();
-            let within_coyote = match last_grounded {
-                Some(lf) => {
-                    frame.saturating_sub(lf) <= COYOTE_FRAMES as u64
-                }
-                None => false,
-            };
-
-            if grounded_now {
-                // Normal in-air jump from ground.
-                self.set_y_velocity(handle, JUMP_IMPULSE);
-            } else if within_coyote {
-                // §3.13 coyote-time grant: player walked off a
-                // ledge but the jump button was pressed within
-                // `COYOTE_FRAMES` of the last grounded tick.
-                self.set_y_velocity(handle, JUMP_IMPULSE);
-            }
-        }
-    }
-
-    /// Helper: set the Y component of a body's linvel. Kinematic
-    /// bodies don't auto-gravity; setting linvel is how we apply
-    /// jump impulses. The body's X/Z velocity is whatever the
-    /// controller left from the move_shape step (which already
-    /// preserved horizontal motion).
-    fn set_y_velocity(&mut self, handle: RigidBodyHandle, new_y: f32) {
-        if let Some(body) = self.bodies.get_mut(handle) {
-            let v = *body.linvel();
-            body.set_linvel(vector![v.x, new_y, v.z], true);
-        }
     }
 
     /// 2D XZ position for a player. Used by `SnapshotGenerator`
@@ -506,6 +633,51 @@ impl PhysicsWorld {
             },
             None => [0.0, 0.0],
         }
+    }
+
+    /// PR 11.7.B / §3.13 (BLK-3 test support) — Y-component of
+    /// the player's linear velocity (the up axis). Returns
+    /// `None` if the player isn't in the physics world.
+    ///
+    /// Note: for `KinematicPositionBased` bodies, `linvel` is
+    /// computed by the integration step from the position delta.
+    /// Each tick the body moves by `jump_v_y * dt` (when an
+    /// active jump exists) or `controller.effective.translation.y`
+    /// (otherwise); `linvel.y = position_delta / dt`. So
+    /// `velocity_y` returns the same value as `jump_v_y` (when
+    /// jumping) or `GRAVITY_Y` (when in free fall).
+    pub fn velocity_y(&self, id: PlayerId) -> Option<f32> {
+        let handle = self.body_handles.get(&id)?;
+        let body = self.bodies.get(*handle)?;
+        Some(body.linvel().y)
+    }
+
+    /// PR 11.7.B / §3.13 (test support) — the per-player jump
+    /// impulse velocity. Set to `JUMP_IMPULSE` when a jump is
+    /// granted (grounded or within coyote window); decays by
+    /// `GRAVITY_Y * dt` each subsequent step. `None` if the
+    /// player isn't in the physics world; `Some(0.0)` if no
+    /// active jump.
+    ///
+    /// Tests use this to distinguish a granted jump (velocity
+    /// reset to `JUMP_IMPULSE`) from a denied one (velocity
+    /// remains 0 or negative).
+    pub fn jump_velocity_y(&self, id: PlayerId) -> Option<f32> {
+        self.jump_v_y.get(&id).copied()
+    }
+
+    /// PR 11.7.B / §3.13 (BLK-3 test support) — Y-component of
+    /// the player's body translation (the up axis). Returns
+    /// `None` if the player isn't in the physics world. Used
+    /// by the rewritten coyote-time tests to assert that a
+    /// jump raised the capsule (the floor of the §3.13 grant
+    /// contract — the Y position must rise after a granted
+    /// jump). The XZ position is reported via `position(id)`;
+    /// the Y is internal to the body.
+    pub fn body_y(&self, id: PlayerId) -> Option<f32> {
+        let handle = self.body_handles.get(&id)?;
+        let body = self.bodies.get(*handle)?;
+        Some(body.translation().y)
     }
 
     /// Returns `true` if the player's capsule is in contact with
