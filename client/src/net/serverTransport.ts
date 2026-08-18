@@ -205,7 +205,7 @@ export class ServerTransport {
 
   /**
    * PR 11.6.D FIX 4: register an `onDamageReject` listener. The
-   * body is the raw 5-byte DamageReject body (discriminator 0x07
+   * body is the raw 5-byte DamageReject body (discriminator 0x0C
    * already stripped by `handleInbound`). The listener is
    * responsible for decoding — typically `decodeDamageReject`
    * from `protocol/damage.ts`. PR 11.6.D smoke wires this to

@@ -869,7 +869,7 @@ export async function createScene(
         // phase over-reverts (each pending entry actualDelta gets
         // re-added, clamped at maxHp — see fix4 commit body for
         // the convergence failure mode). Wire-format stable since
-        // PR 11.6.D server `ca9f177` (discriminator 0x07);
+        // PR 11.6.D server `ca9f177` (discriminator 0x07; PR 11.7.B bumped to 0x0C);
         // pre-fix4 the client treated it as an unknown discriminator.
         probe.onDamageReject((r) => {
           if (typeof window !== "undefined") {

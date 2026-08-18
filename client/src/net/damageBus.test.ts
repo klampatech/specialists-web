@@ -340,7 +340,7 @@ describe("damageBus PR 11.6.D fix3 — pending-map invariants", () => {
 // =====================================================================
 // PR 11.6.D fix4 — boundary tests for the new invariants introduced
 // in commit 929f3d6 (the actualDelta refactor + drop-branch markSettled
-// + clamped confirm convergence + 0x07 DamageReject wire type). These
+// + clamped confirm convergence + 0x0C DamageReject wire type). These
 // pin the behaviors that the verifier identified in the post-fix3
 // smoke analysis. Without these unit tests, the only coverage on the
 // fix4 invariants was the 5191 smoke (which itself is broken on the
@@ -508,16 +508,16 @@ describe("damageBus PR 11.6.D fix4 — actualDelta + drop-branch markSettled + D
 
 // =====================================================================
 // PR 11.6.D fix4 — protocol-level round-trip test for the DamageReject
-// (0x07) wire type. Mirrors the existing Rust `protocol_wire.rs`
+// (0x0C) wire type. Mirrors the existing Rust `protocol_wire.rs`
 // round-trip pattern: encode → decode → assert equal, plus size
-// asserts. The server has been emitting 0x07 since commit `ca9f177`;
+// asserts. The server has been emitting 0x0C since PR 11.7.B (was 0x07 in PR 11.6.D since commit `ca9f177`);
 // the client was dropping the body pre-fix4. After fix4 the client
-// decodes + dispatches 0x07. This test pins that the encode/decode
+// decodes + dispatches 0x0C. This test pins that the encode/decode
 // round-trip is symmetric so a future encoder or decoder change
 // doesn't break the cross-language wire contract.
 // =====================================================================
 
-describe("protocol PR 11.6.D fix4 — DamageReject (0x07) round-trip", () => {
+describe("protocol PR 11.6.D fix4 — DamageReject (0x0C) round-trip (was 0x07 before PR 11.7.B)", () => {
   it("encodeDamageReject + decodeDamageReject round-trip is symmetric for every REJECT_REASON_*", async () => {
     const {
       encodeDamageReject,

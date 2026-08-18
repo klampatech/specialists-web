@@ -42,7 +42,8 @@ export class GgnetTransport {
 /**
  * PR 11.6.B / §1.2 seam #4 — snapshot-model awareness.
  *
- * Snapshot message — discriminator 0x07, introduces in PR 11.7.
+ * Snapshot message — discriminator 0x07, introduced in PR 11.7.B.
+ * (NOTE: PR 11.7.B bumped DamageReject from 0x07 to 0x0C to free this slot.)
  * PR 11.7 replaces per-player PositionUpdate with a single
  * `Snapshot { frame, [Position × N] }` message. ServerTransport will
  * dispatch this; P2PGgnetTransport will NOT (lockstep substrate retires

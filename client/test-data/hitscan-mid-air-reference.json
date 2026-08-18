@@ -1,0 +1,498 @@
+{
+  "scenario": "mid-air hitscan trajectory (Havok reference, pre-11.7.B)",
+  "capturedAt": "2026-08-18T20:27:06.321Z",
+  "captureFrames": 60,
+  "frameIntervalMs": 16,
+  "startPosition": {
+    "x": 0,
+    "y": 1,
+    "z": 0
+  },
+  "jumpImpulseY": 5.5,
+  "apexFrame": 8,
+  "apexY": 3.08666051821239,
+  "hpAtApex": 100,
+  "notes": "Captures the Y trajectory of a player jumping straight up from y=1 with JUMP_IMPULSE=5.5 m/s + gravity=9.81. The apex is when vy crosses zero. The post-11.7.B parity smoke verifies the server's lag-comp rewinds through Rapier's PositionHistory for the mid-air target — the trajectory itself is what differs from the ground case.",
+  "frames": [
+    {
+      "frame": 0,
+      "elapsedMs": 0,
+      "y": 1.4383500015735626,
+      "supported": true,
+      "isApex": true,
+      "vy": 5.34304
+    },
+    {
+      "frame": 1,
+      "elapsedMs": 95,
+      "y": 1.9673625658013438,
+      "supported": false,
+      "isApex": true,
+      "vy": 4.706371003742219
+    },
+    {
+      "frame": 2,
+      "elapsedMs": 186,
+      "y": 2.4022030385580453,
+      "supported": false,
+      "isApex": true,
+      "vy": 3.679264000935555
+    },
+    {
+      "frame": 3,
+      "elapsedMs": 264,
+      "y": 2.7320108572723343,
+      "supported": false,
+      "isApex": true,
+      "vy": 2.641366003742218
+    },
+    {
+      "frame": 4,
+      "elapsedMs": 304,
+      "y": 2.85722776073601,
+      "supported": false,
+      "isApex": true,
+      "vy": 2.128303001871109
+    },
+    {
+      "frame": 5,
+      "elapsedMs": 346,
+      "y": 2.9604476360974195,
+      "supported": false,
+      "isApex": true,
+      "vy": 1.5809049999999998
+    },
+    {
+      "frame": 6,
+      "elapsedMs": 386,
+      "y": 3.034683520479756,
+      "supported": false,
+      "isApex": true,
+      "vy": 1.0138870028066633
+    },
+    {
+      "frame": 7,
+      "elapsedMs": 424,
+      "y": 3.0756955837033133,
+      "supported": false,
+      "isApex": true,
+      "vy": 0.46746999999999983
+    },
+    {
+      "frame": 8,
+      "elapsedMs": 462,
+      "y": 3.08666051821239,
+      "supported": false,
+      "isApex": true,
+      "vy": -0.06619399625778219
+    },
+    {
+      "frame": 9,
+      "elapsedMs": 497,
+      "y": 3.0685120729163406,
+      "supported": false,
+      "isApex": false,
+      "vy": -0.6008389962577821
+    },
+    {
+      "frame": 10,
+      "elapsedMs": 538,
+      "y": 3.0266210257832817,
+      "supported": false,
+      "isApex": false,
+      "vy": -1.0952629971933368
+    },
+    {
+      "frame": 11,
+      "elapsedMs": 576,
+      "y": 2.947510358724897,
+      "supported": false,
+      "isApex": false,
+      "vy": -1.6554139962577823
+    },
+    {
+      "frame": 12,
+      "elapsedMs": 615,
+      "y": 2.844192361997815,
+      "supported": false,
+      "isApex": false,
+      "vy": -2.184172997193337
+    },
+    {
+      "frame": 13,
+      "elapsedMs": 652,
+      "y": 2.7094366740708153,
+      "supported": false,
+      "isApex": false,
+      "vy": -2.7227419981288916
+    },
+    {
+      "frame": 14,
+      "elapsedMs": 691,
+      "y": 2.552046227941092,
+      "supported": false,
+      "isApex": false,
+      "vy": -3.2416909990644465
+    },
+    {
+      "frame": 15,
+      "elapsedMs": 772,
+      "y": 2.2021222572483943,
+      "supported": false,
+      "isApex": false,
+      "vy": -4.164811998128892
+    },
+    {
+      "frame": 16,
+      "elapsedMs": 819,
+      "y": 1.942260159509589,
+      "supported": false,
+      "isApex": false,
+      "vy": -4.735753996257783
+    },
+    {
+      "frame": 17,
+      "elapsedMs": 863,
+      "y": 1.6244989535885304,
+      "supported": false,
+      "isApex": false,
+      "vy": -5.3498600000000005
+    },
+    {
+      "frame": 18,
+      "elapsedMs": 907,
+      "y": 1.2801611898762122,
+      "supported": false,
+      "isApex": false,
+      "vy": -5.945326998128891
+    },
+    {
+      "frame": 19,
+      "elapsedMs": 956,
+      "y": 0.9064911104854335,
+      "supported": false,
+      "isApex": false,
+      "vy": -6.530983996257782
+    },
+    {
+      "frame": 20,
+      "elapsedMs": 1004,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 21,
+      "elapsedMs": 1048,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 22,
+      "elapsedMs": 1137,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 23,
+      "elapsedMs": 1235,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 24,
+      "elapsedMs": 1279,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 25,
+      "elapsedMs": 1328,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 26,
+      "elapsedMs": 1379,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 27,
+      "elapsedMs": 1427,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 28,
+      "elapsedMs": 1475,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 29,
+      "elapsedMs": 1518,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 30,
+      "elapsedMs": 1565,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 31,
+      "elapsedMs": 1607,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 32,
+      "elapsedMs": 1649,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 33,
+      "elapsedMs": 1692,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 34,
+      "elapsedMs": 1739,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 35,
+      "elapsedMs": 1786,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 36,
+      "elapsedMs": 1830,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 37,
+      "elapsedMs": 1918,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 38,
+      "elapsedMs": 1960,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 39,
+      "elapsedMs": 2003,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 40,
+      "elapsedMs": 2045,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 41,
+      "elapsedMs": 2144,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 42,
+      "elapsedMs": 2236,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 43,
+      "elapsedMs": 2279,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 44,
+      "elapsedMs": 2326,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 45,
+      "elapsedMs": 2411,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 46,
+      "elapsedMs": 2457,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 47,
+      "elapsedMs": 2552,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 48,
+      "elapsedMs": 2643,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 49,
+      "elapsedMs": 2691,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 50,
+      "elapsedMs": 2736,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 51,
+      "elapsedMs": 2780,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 52,
+      "elapsedMs": 2828,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 53,
+      "elapsedMs": 2915,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 54,
+      "elapsedMs": 2963,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 55,
+      "elapsedMs": 3048,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 56,
+      "elapsedMs": 3093,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 57,
+      "elapsedMs": 3181,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 58,
+      "elapsedMs": 3224,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    },
+    {
+      "frame": 59,
+      "elapsedMs": 3313,
+      "y": 0.9064911104854335,
+      "supported": true,
+      "isApex": false,
+      "vy": -0.15696000000000002
+    }
+  ]
+}

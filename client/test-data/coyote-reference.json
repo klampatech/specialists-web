@@ -1,0 +1,616 @@
+{
+  "scenario": "coyote-time ledge walk-off + jump (Havok reference, pre-11.7.B)",
+  "capturedAt": "2026-08-18T20:27:02.796Z",
+  "captureFrames": 60,
+  "frameIntervalMs": 16,
+  "startPosition": {
+    "x": -5,
+    "y": 2.5,
+    "z": -2
+  },
+  "jumpImpulseY": 5.5,
+  "jumpAppliedAtFrame": 17,
+  "notes": "Havok does not implement coyote-time — the JUMP_IMPULSE applied on the contact-loss frame will register as a velocity spike but the player will still fall under gravity (no upward grace window). The post-11.7.B Rapier parity smoke should show a HIGHER peak Y because Rapier grants COYOTE_FRAMES=2.",
+  "frames": [
+    {
+      "frame": 0,
+      "elapsedMs": 1,
+      "y": 2.5808201907205586,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 1,
+      "elapsedMs": 89,
+      "y": 2.6701004010438916,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 2,
+      "elapsedMs": 176,
+      "y": 2.764690623972415,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 3,
+      "elapsedMs": 218,
+      "y": 2.817160747852325,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 4,
+      "elapsedMs": 259,
+      "y": 2.8682808685493466,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 5,
+      "elapsedMs": 339,
+      "y": 2.956571076624393,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 6,
+      "elapsedMs": 378,
+      "y": 3.006341193709372,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 7,
+      "elapsedMs": 414,
+      "y": 3.0553913093543037,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 8,
+      "elapsedMs": 453,
+      "y": 3.1027314213109007,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 9,
+      "elapsedMs": 493,
+      "y": 3.152321538143157,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 10,
+      "elapsedMs": 569,
+      "y": 3.2360217354822143,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 11,
+      "elapsedMs": 609,
+      "y": 3.284891850445268,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 12,
+      "elapsedMs": 646,
+      "y": 3.3357419703340505,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 13,
+      "elapsedMs": 684,
+      "y": 3.3838920838570568,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 14,
+      "elapsedMs": 719,
+      "y": 3.4315921963191003,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 15,
+      "elapsedMs": 757,
+      "y": 3.4782123064064954,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 16,
+      "elapsedMs": 793,
+      "y": 3.52627241980314,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.900002121925354,
+      "vz": 5
+    },
+    {
+      "frame": 17,
+      "elapsedMs": 864,
+      "y": 3.6043926037287677,
+      "supported": false,
+      "jumpAppliedAtFrame": 17,
+      "vx": 0,
+      "vy": 5.5,
+      "vz": 5
+    },
+    {
+      "frame": 18,
+      "elapsedMs": 899,
+      "y": 3.880551521952921,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 5.140953996257782,
+      "vz": 5
+    },
+    {
+      "frame": 19,
+      "elapsedMs": 931,
+      "y": 4.129831681287321,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 4.799565999064445,
+      "vz": 5
+    },
+    {
+      "frame": 20,
+      "elapsedMs": 964,
+      "y": 4.350999363234645,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 4.483683996257781,
+      "vz": 5
+    },
+    {
+      "frame": 21,
+      "elapsedMs": 996,
+      "y": 4.558865038219574,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 4.162896998128891,
+      "vz": 5
+    },
+    {
+      "frame": 22,
+      "elapsedMs": 1029,
+      "y": 4.750403730128825,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 3.8440719981288907,
+      "vz": 5
+    },
+    {
+      "frame": 23,
+      "elapsedMs": 1061,
+      "y": 4.925516599425939,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 3.5281899999999995,
+      "vz": 5
+    },
+    {
+      "frame": 24,
+      "elapsedMs": 1092,
+      "y": 5.085114217431586,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 3.2132889962577815,
+      "vz": 5
+    },
+    {
+      "frame": 25,
+      "elapsedMs": 1158,
+      "y": 5.312037485527718,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 2.5854489962577816,
+      "vz": 5
+    },
+    {
+      "frame": 26,
+      "elapsedMs": 1192,
+      "y": 5.428621909590447,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 2.258775999064445,
+      "vz": 5
+    },
+    {
+      "frame": 27,
+      "elapsedMs": 1226,
+      "y": 5.530696975745858,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 1.922292997193336,
+      "vz": 5
+    },
+    {
+      "frame": 28,
+      "elapsedMs": 1288,
+      "y": 5.654821707125815,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 1.2895479971933361,
+      "vz": 5
+    },
+    {
+      "frame": 29,
+      "elapsedMs": 1318,
+      "y": 5.705866394798411,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.9873999999999996,
+      "vz": 5
+    },
+    {
+      "frame": 30,
+      "elapsedMs": 1382,
+      "y": 5.754569276728172,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.38310399625778163,
+      "vz": 5
+    },
+    {
+      "frame": 31,
+      "elapsedMs": 1412,
+      "y": 5.762658282544804,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0.059373996257781614,
+      "vz": 5
+    },
+    {
+      "frame": 32,
+      "elapsedMs": 1475,
+      "y": 5.73959772099713,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -0.541979000935555,
+      "vz": 5
+    },
+    {
+      "frame": 33,
+      "elapsedMs": 1509,
+      "y": 5.704351355132373,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -0.849032002806664,
+      "vz": 5
+    },
+    {
+      "frame": 34,
+      "elapsedMs": 1541,
+      "y": 5.650255780481403,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -1.184534000935555,
+      "vz": 5
+    },
+    {
+      "frame": 35,
+      "elapsedMs": 1573,
+      "y": 5.582989840716662,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -1.5004160037422185,
+      "vz": 5
+    },
+    {
+      "frame": 36,
+      "elapsedMs": 1602,
+      "y": 5.50134969194556,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -1.812374000935555,
+      "vz": 5
+    },
+    {
+      "frame": 37,
+      "elapsedMs": 1633,
+      "y": 5.411304418630658,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -2.0978450000000004,
+      "vz": 5
+    },
+    {
+      "frame": 38,
+      "elapsedMs": 1665,
+      "y": 5.302736687455324,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -2.403917002806664,
+      "vz": 5
+    },
+    {
+      "frame": 39,
+      "elapsedMs": 1698,
+      "y": 5.178211876098585,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -2.714894000935555,
+      "vz": 5
+    },
+    {
+      "frame": 40,
+      "elapsedMs": 1761,
+      "y": 4.927213746119811,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -3.3525440009355547,
+      "vz": 5
+    },
+    {
+      "frame": 41,
+      "elapsedMs": 1797,
+      "y": 4.76021676807584,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -3.656654000935555,
+      "vz": 5
+    },
+    {
+      "frame": 42,
+      "elapsedMs": 1829,
+      "y": 4.559100620442902,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -4.00589,
+      "vz": 5
+    },
+    {
+      "frame": 43,
+      "elapsedMs": 1863,
+      "y": 4.355845320716059,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -4.3217720028066635,
+      "vz": 5
+    },
+    {
+      "frame": 44,
+      "elapsedMs": 1896,
+      "y": 4.129912134226993,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -4.652369000935554,
+      "vz": 5
+    },
+    {
+      "frame": 45,
+      "elapsedMs": 1965,
+      "y": 3.707351978987985,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -5.315524999999999,
+      "vz": 5
+    },
+    {
+      "frame": 46,
+      "elapsedMs": 1998,
+      "y": 3.4254430054439,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -5.656913001871108,
+      "vz": 5
+    },
+    {
+      "frame": 47,
+      "elapsedMs": 2066,
+      "y": 2.9142254312180262,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -6.326936003742217,
+      "vz": 5
+    },
+    {
+      "frame": 48,
+      "elapsedMs": 2105,
+      "y": 2.592127206764918,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -6.652628001871108,
+      "vz": 5
+    },
+    {
+      "frame": 49,
+      "elapsedMs": 2180,
+      "y": 1.9476694827684216,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -7.385434999999999,
+      "vz": 5
+    },
+    {
+      "frame": 50,
+      "elapsedMs": 2219,
+      "y": 1.5224717877684215,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -7.77293,
+      "vz": 5
+    },
+    {
+      "frame": 51,
+      "elapsedMs": 2300,
+      "y": 1.0774773102387836,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 52,
+      "elapsedMs": 2386,
+      "y": 1.0299171548266106,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 53,
+      "elapsedMs": 2428,
+      "y": 1.0299171548266106,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 54,
+      "elapsedMs": 2470,
+      "y": 1.0299171548266106,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 55,
+      "elapsedMs": 2511,
+      "y": 1.0299171548266106,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 56,
+      "elapsedMs": 2557,
+      "y": 1.0299171548266106,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 57,
+      "elapsedMs": 2605,
+      "y": 1.0299171548266106,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 58,
+      "elapsedMs": 2696,
+      "y": 1.0299171548266106,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 59,
+      "elapsedMs": 2743,
+      "y": 1.0299171548266106,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    }
+  ]
+}
