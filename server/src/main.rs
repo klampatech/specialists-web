@@ -244,8 +244,15 @@ async fn main() -> ExitCode {
                     //    clone to `physics.step`. PR 11.7.C can
                     //    refactor this into a non-locking pattern
                     //    if it becomes a hot path.
-                    let inputs_clone: std::collections::HashMap<u16, [u8; 12]> =
-                        room_guard.drained_inputs_this_tick.clone();
+                    // Convert from `Room.drained_inputs_this_tick` (HashMap)
+                    // to the BTreeMap that `PhysicsWorld::step` expects.
+                    // The conversion is O(n log n) — fine for 24 players
+                    // per tick at 64Hz.
+                    let inputs_clone: std::collections::BTreeMap<u16, [u8; 12]> =
+                        room_guard.drained_inputs_this_tick
+                            .iter()
+                            .map(|(k, v)| (*k, *v))
+                            .collect();
                     room_guard.physics.step(
                         &inputs_clone,
                         frame as u64,

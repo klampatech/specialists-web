@@ -25,7 +25,18 @@
 //   - Multi-room registry of physics worlds — there's one world per
 //     room; room-level ownership is in `Room`, not here.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+
+// NOTE: PR 11.7.B NBLK-1 — physics step uses `BTreeMap` instead of
+// `HashMap` for per-player bookkeeping (`body_handles`, `controllers`,
+// `last_grounded`, `last_grounded_frame`). `BTreeMap` iterates in
+// key order (sorted by `PlayerId = u16`), giving the physics step
+// a deterministic iteration order across runs. `HashMap::iter()`
+// uses `RandomState` (random seed per process), so two runs of the
+// same input stream would yield different float trajectories from
+// the order of `move_shape` + `set_next_kinematic_translation`
+// calls. The parity smokes at 24p depend on cross-run reproducibility
+// to diff snapshot bytes against the reference.
 
 use rapier3d::control::KinematicCharacterController;
 use rapier3d::dynamics::{
@@ -105,15 +116,17 @@ pub struct PhysicsWorld {
     integration_parameters: IntegrationParameters,
 
     /// Per-player capsule rigid body. Keyed by PlayerId.
-    body_handles: HashMap<PlayerId, RigidBodyHandle>,
+    /// Sorted by `PlayerId` for deterministic iteration.
+    body_handles: BTreeMap<PlayerId, RigidBodyHandle>,
 
     /// Per-player character controller (drives `move_shape` each
-    /// tick to produce the desired_translation).
-    controllers: HashMap<PlayerId, KinematicCharacterController>,
+    /// tick to produce the desired_translation). Sorted by
+    /// `PlayerId` for deterministic iteration.
+    controllers: BTreeMap<PlayerId, KinematicCharacterController>,
 
     /// Per-player grounded status cached at the end of the last
     /// `move_shape` call. Used by `apply_jump` for coyote-time.
-    last_grounded: HashMap<PlayerId, bool>,
+    last_grounded: BTreeMap<PlayerId, bool>,
 
     /// PR 11.7.B / §3.13 — per-player last-grounded-frame counter
     /// for the coyote-time jump grant. Updated by the `step()`
@@ -125,7 +138,7 @@ pub struct PhysicsWorld {
     /// `PhysicsWorld`, not on `Room`) — the original throwaway-
     /// local-map design was BLK-1 because the coyote window is
     /// precisely the mid-air case where `grounded_now == false`.
-    last_grounded_frame: HashMap<PlayerId, u64>,
+    last_grounded_frame: BTreeMap<PlayerId, u64>,
 
     /// PR 11.7.B / §3.13 — per-player current Y velocity from a
     /// jump impulse. Set to `JUMP_IMPULSE` on a jump grant
@@ -144,7 +157,7 @@ pub struct PhysicsWorld {
     /// immediately canceled by the controller's snap-to-ground
     /// + the next tick's gravity). Tracking the velocity as a
     /// persistent state gives the body a real arc.
-    jump_v_y: HashMap<PlayerId, f32>,
+    jump_v_y: BTreeMap<PlayerId, f32>,
 }
 
 impl std::fmt::Debug for PhysicsWorld {
@@ -183,11 +196,11 @@ impl PhysicsWorld {
             pipeline: PhysicsPipeline::new(),
             integration_parameters,
 
-            body_handles: HashMap::new(),
-            controllers: HashMap::new(),
-            last_grounded: HashMap::new(),
-            last_grounded_frame: HashMap::new(),
-            jump_v_y: HashMap::new(),
+            body_handles: BTreeMap::new(),
+            controllers: BTreeMap::new(),
+            last_grounded: BTreeMap::new(),
+            last_grounded_frame: BTreeMap::new(),
+            jump_v_y: BTreeMap::new(),
         }
     }
 
@@ -314,7 +327,7 @@ impl PhysicsWorld {
     /// timestep would break same-inputs-same-state across runs.
     pub fn step(
         &mut self,
-        inputs: &HashMap<PlayerId, EncodedInput>,
+        inputs: &BTreeMap<PlayerId, EncodedInput>,
         frame: u64,
     ) {
         let dt = self.integration_parameters.dt;
@@ -338,7 +351,7 @@ impl PhysicsWorld {
         //    decelerates the velocity to 0 (~35 ticks at
         //    JUMP_IMPULSE = 5.5 m/s, GRAVITY_Y = -9.81 m/s²), then
         //    falls back to ground.
-        let mut new_jump_v_y: HashMap<PlayerId, f32> = HashMap::new();
+        let mut new_jump_v_y: BTreeMap<PlayerId, f32> = BTreeMap::new();
         for (id, _) in &self.body_handles {
             let input = inputs.get(id);
             let jump_pressed = input
@@ -768,7 +781,7 @@ mod tests {
     fn step_with_no_inputs_keeps_player_at_origin() {
         let mut w = PhysicsWorld::new();
         w.add_player(1, Position::ZERO);
-        let inputs: HashMap<PlayerId, EncodedInput> = HashMap::new();
+        let inputs: BTreeMap<PlayerId, EncodedInput> = BTreeMap::new();
         w.step(&inputs, 0);
         // No input → no horizontal motion. The capsule settles
         // on the ground (gravity Y over many ticks pulls it down

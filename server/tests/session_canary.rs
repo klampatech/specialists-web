@@ -139,9 +139,11 @@ fn drain_inputs_populates_physics_step() {
 
     // Drain → step pipeline.
     room.drain_inputs_for_tick(0);
-    let inputs_clone: std::collections::HashMap<u16, [u8; 12]> = room
+    let inputs_clone: std::collections::BTreeMap<u16, [u8; 12]> = room
         .drained_inputs_this_tick
-        .clone();
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
     assert!(
         inputs_clone.contains_key(&player_id),
         "drained_inputs_this_tick must contain the player's input"
@@ -152,9 +154,11 @@ fn drain_inputs_populates_physics_step() {
     // time to accumulate (the per-tick translation is
     // MAX_SPEED * dt = 5.0 * 1/64 ≈ 0.078m).
     room.drain_inputs_for_tick(1);
-    let inputs_clone: std::collections::HashMap<u16, [u8; 12]> = room
+    let inputs_clone: std::collections::BTreeMap<u16, [u8; 12]> = room
         .drained_inputs_this_tick
-        .clone();
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
     room.physics.step(&inputs_clone, 1);
 
     let pos = room.physics.position(player_id).expect("player has position");
@@ -520,7 +524,7 @@ fn coyote_time_grants_jump_within_window() {
         .add_player(player_id, Position { x: 0.0, y: 0.0 });
 
     // Step 1: no input — capsule settles on ground.
-    let mut inputs = std::collections::HashMap::new();
+    let mut inputs = std::collections::BTreeMap::new();
     inputs.insert(player_id, [0u8; 12]);
     room.physics.step(&inputs, 0);
 
@@ -570,7 +574,7 @@ fn coyote_time_deny_after_window() {
     room.physics
         .add_player(player_id, Position { x: 0.0, y: 0.0 });
 
-    let mut inputs = std::collections::HashMap::new();
+    let mut inputs = std::collections::BTreeMap::new();
     inputs.insert(player_id, [0u8; 12]);
     // Step 100 times without inputs to confirm the capsule
     // stays grounded (sanity check). The actual frame counter
@@ -685,7 +689,7 @@ fn snapshot_includes_position_history() {
     // physics tick would record into PositionHistory). In a
     // real tick loop this happens inside `physics_tick_loop`;
     // here we replicate the recording manually for the test.
-    let mut inputs = std::collections::HashMap::new();
+    let mut inputs = std::collections::BTreeMap::new();
     inputs.insert(player_id, [0u8; 12]);
     room.physics.step(&inputs, 0);
     // Manually record the physics-fed position into
