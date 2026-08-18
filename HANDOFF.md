@@ -5,6 +5,28 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
 
+## 2026-08-18 — SESSION END NOTE: PR 11.7.A Q1 call (Rapier) + plan additions for Rapier↔Havok parity. Branch `docs/pr11.7-plan` (not pushed, 2 commits ahead of origin/main).
+
+**This session** (2026-08-18, ~45 min plan-revision, follow-on from the 11.7.A plan delivery):
+1. **Q1 resolved: Rapier (native Rust crate `rapier3d`)** — Kyle's concern: "anyone who played halflife or counterstrike before source engine knows exactly what that should feel like." Two player-perceptible Rapier↔Havok gaps identified: coyote-time window (Havok 2 frames vs Rapier 1 frame) and hitscan-mid-air rewind through Rapier history (new up-to-15.6ms position slop). Both addressed as additive spec sections.
+2. **Plan additions** (`docs/PR-11.7-plan.md`, +176 lines / 5.4 KB):
+   - **§3.13 Coyote-time parity (Rapier ↔ Havok)**: server-side `COYOTE_FRAMES=2` grant in `physics.rs::apply_jump` (matches Havok's empirical 2-frame support persistence). Constants added: `COYOTE_FRAMES=2`, `WALLRUN_COYOTE_FRAMES=1`, `JUMP_IMPULSE=5.5`. Smoke: `session_canary.rs::coyote_time_grants_jump` + `coyote_time_deny_after_window`.
+   - **§3.14 Hitscan-mid-air edge case (Rapier-history rewound target)**: 64Hz Rapier tick → 32Hz `PositionHistory` storage with ±15ms snap-to-nearest `snapshot_at` (finer resolution than PR 11.6.D's 31.25ms, same memory cost). Smoke: `session_canary.rs::hitscan_rewinds_through_rapier_history_mid_air`.
+   - **§4.5 Coyote-time + hitscan-mid-air parity verification (NEW)**: pre-11.7.B Havok reference capture (`client/tools/capture-havok-reference.mjs` → `client/test-data/{coyote,hitscan-mid-air,wallrun-start}-reference.json`); post-11.7.B smokes on port 5192 (`coyote-feel-smoke.mjs` + `hitscan-mid-air-feel-smoke.mjs`) assert parity within 5cm Y-trajectory + 0 reconciliation count on coyote-frame jumps.
+   - **Appendix A — 2026-08-18 Coyote-time + hitscan-mid-air parity (Rapier↔Havok)**: decisions log entry referencing §3.13, §3.14, §4.5.
+3. **`docs/SPEC.md` banner updated** to reflect parity additions (one-paragraph diff, no other changes).
+4. **Q1-Q6 status**: Q1 called (Rapier). Q2-Q6 still pending Kyle's call. My recommendations: Q2=20Hz, Q3=hard-delete lockstep, Q4=separate reload PR, Q5=11.7.F cert as planned, Q6=StateAck only.
+5. **Branch state**: `docs/pr11.7-plan @ HEAD` (will become `b1d4e3f` after commit), 2 commits ahead of `origin/main @ e9ac169`. NOT pushed. Worktree at `/home/kyle/Development/specialists-web-pr11.6.d/` holds the branch (worktree name is stale from the 11.6.D cycle — flagged in this session).
+6. **Verifier gates NOT re-run**: this is a docs-only revision; no code changed. Plan branch remains at cargo test 126/126, tsc clean, build clean 7,058.04 kB, vitest 10/10 (these were the gates from the 11.7.A delivery commit; verified unchanged at session start).
+
+**Honest framing for the next session**:
+- Q2-Q6 still need Kyle's call before `feat/phase1-pr11.7.b-server-snapshot` can branch.
+- **Pre-11.7.B Havok reference capture** (~30 min) should happen AFTER the 11.7.B branch is cut but BEFORE codex dispatches the physics tick loop, so the reference JSONs are checked in alongside the snapshot generator. Plan §4.5 spells out the capture script.
+- **Smoke port allocation**: 5190 (wire format), 5191 (HP convergence), 5192 (NEW — feel parity). The canary-server.sh script needs `--port-wt` / `--port-ws` adjustments for the port-5192 smokes.
+- **Worktree directory naming**: the worktree holding `docs/pr11.7-plan` is named `specialists-web-pr11.6.d/` (stale from the 11.6.D cycle). Not a blocker but worth renaming before the 11.7.B worktree spawns to keep the directory tree clean.
+
+**Servers**: still down (unchanged from prior session). Restart commands in HANDOFF.md TL;DR.
+
 ## 2026-08-18 — SESSION END NOTE: PR 11.7.A plan-only delivery. Branch `docs/pr11.7-plan` (not pushed).
 
 **This session** (2026-08-18, ~30 min plan-only, after two rounds of scope clarification with Kyle):
