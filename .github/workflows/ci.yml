@@ -55,6 +55,33 @@ jobs:
   # damage request → synthetic broadcast, position update → no reply,
   # inputs → no error, malformed payload → no crash, wire sizes). The
   # smoke port is independent of all other client smoke jobs.
+  # PR 11.6.D fix5: client-vitest job — runs `npm test` in CI.
+  # The 10 boundary tests (Tests A/B/C/D from fix3 + Test E for
+  # actualDelta from fix4 + Tests F/G/H for the fix4 invariants
+  # (clamped confirm convergence, drop-branch markSettled,
+  # DamageReject round-trip)) verify the damageBus pending-map
+  # invariants + the 0x07 DamageReject wire-type contract.
+  # Without this job, the only CI coverage on those invariants was
+  # the 5191 HP-convergence smoke — which is itself broken on the
+  # 12-HP gap (fix6 work). So a future PR regressing actualDelta
+  # would only be caught by the broken smoke. Adding the vitest
+  # job gives an honest unit-level green signal in CI.
+  client-vitest:
+    name: client — vitest boundary tests (PR 11.6.D fix5)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Run vitest
+        run: npm test
   client-damage-server-smoke:
     name: client — damage server smoke (PR 11.6.C, port 5190)
     # PR 11.6.C review fix B4: serialize after server-build so cold
@@ -161,6 +188,118 @@ jobs:
           pkill -f canary-server.sh || true
           pkill -f 'vite.*5190' || true
           for port in 5190 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
+  # PR 11.6.D — two-tab HP-convergence smoke (server-auth damage end-to-end).
+  # Boots TWO headless browser contexts against the SAME canary-server
+  # room, drives 1 fire from Tab A, asserts both tabs converge on the
+  # same HP. Verifies the §3.4 / §3.9 implementation:
+  #   - server-side validate_and_relay (8 gates + lag-comp rewind)
+  #   - client-side optimistic apply + broadcast confirm
+  #   - 120ms fire-rate cooldown
+  #   - DamageBroadcast fan-out to all room connections
+  # The job mirrors `client-damage-server-smoke` (PR 11.6.C) but uses
+  # port 5191 + the new `damage-server-hp-convergence-smoke.mjs`.
+  # CRITICAL: per-step `working-directory: client` (NOT job-level —
+  # the GH Actions job-level `working-directory` trap that bit
+  # PR 11.6.C; cargo resolves manifest from CWD, vite resolves smoke
+  # script paths from CWD).
+  client-damage-server-hp-convergence-smoke:
+    name: client — damage server HP-convergence smoke (PR 11.6.D, port 5191)
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (release)
+        run: cargo build --release --manifest-path server/Cargo.toml
+      - name: Test server (skip WebTransport integration)
+        run: cargo test --manifest-path server/Cargo.toml
+        env:
+          SKIP_WEBTRANSPORT_TEST: 1
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Boot canary server (ports 14433 + 14434)
+        run: |
+          nohup bash tools/canary-server.sh --port-wt 14433 --port-ws 14434             > /tmp/canary-server-hp.log 2>&1 &
+          echo $! > /tmp/canary-server-hp.pid
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+              echo "Canary server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+            echo "::error::Canary server did not become ready in 60s"
+            cat /tmp/canary-server-hp.log
+            exit 1
+          fi
+      - name: Boot Vite dev server (port 5191)
+        working-directory: client
+        run: |
+          nohup npm run dev -- --host 127.0.0.1 --port 5191 --strictPort             > /tmp/vite-5191.log 2>&1 &
+          echo $! > /tmp/vite-5191.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5191/ > /dev/null; then
+              echo "Vite (HP-convergence smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5191/ > /dev/null; then
+            echo "::error::Vite (HP-convergence smoke) did not become ready in 60s"
+            cat /tmp/vite-5191.log
+            exit 1
+          fi
+      - name: Run damage server HP-convergence smoke
+        working-directory: client
+        run: node tools/damage-server-hp-convergence-smoke.mjs
+        env:
+          HP_CONV_SMOKE_URL: http://localhost:5191/
+          HP_CONV_WT_PORT: 14433
+          HP_CONV_WS_PORT: 14434
+          SMOKE_PNG: client/tools/damage-server-hp-convergence-smoke.png
+          # PR 11.6.D FIX 9: the canary + Vite are already booted
+          # by the steps above; the smoke just connects to them.
+          SMOKE_NO_BOOT: "1"
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: damage-server-hp-convergence-smoke-screenshot
+          path: client/tools/damage-server-hp-convergence-smoke.png
+          if-no-files-found: warn
+      - name: Tear down canary + Vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server-hp.pid ]]; then kill "$(cat /tmp/canary-server-hp.pid)" || true; fi
+          if [[ -f /tmp/vite-5191.pid ]]; then kill "$(cat /tmp/vite-5191.pid)" || true; fi
+          # Belt-and-suspenders: kill any stragglers on the known ports.
+          pkill -f canary-server.sh || true
+          pkill -f 'vite.*5191' || true
+          for port in 5191 14433 14434; do
             pids=$(lsof -ti:${port} 2>/dev/null || true)
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done

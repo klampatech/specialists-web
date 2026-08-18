@@ -85,6 +85,9 @@ import {
   type MeleeResult,
 } from "./combat";
 import { applyDamage, tickRespawn, type HealthSnapshot } from "./health";
+import { sendDamageRequest as dbSendDamageRequest, sendPositionUpdateThrottled as dbSendPositionUpdateThrottled } from "../net/damageBus";
+import type { DamageRequest } from "../../../protocol/damage";
+import type { ServerTransport } from "../net/serverTransport";
 
 /** One combat event the HUD / tracer render can react to. */
 export type CombatEvent =
@@ -198,6 +201,19 @@ export interface GameSession {
    * still goes through the lockstep substrate.
    */
   submitLocalInput(input: InputState): void;
+  /**
+   * PR 11.6.D FIX 2 — this tab's local player ID. Used as
+   * `sourcePlayerId` on outbound DamageRequests. Defaults to 1.
+   * The smoke drives this via `window.__localPlayerId` and asserts
+   * it via `__gameSession.localPlayerId`.
+   */
+  readonly localPlayerId: number;
+  /**
+   * PR 11.6.D FIX 2 — the peer's player ID. Used as `targetPlayerId`
+   * on outbound DamageRequests. Defaults to 2. The smoke drives this
+   * via `window.__peerPlayerId`.
+   */
+  readonly peerPlayerId: number;
   /** All combat events ever generated this session (HUD reads `length`). */
   getCombatEvents(): CombatEvent[];
   /** Drain the combat events since the last call; the tracer render uses
@@ -213,6 +229,14 @@ export interface GameSession {
    * DEV-only in practice (production bundles omit this method entirely).
    */
   setSpectatorActive?: (active: boolean) => void;
+  /**
+   * PR 11.6.D — late-bind the server-auth damage transport. scene.ts
+   * creates the `ServerTransport` asynchronously (await connect) AFTER
+   * `createGameSession` returns, so we expose a setter the scene can
+   * call once the transport is connected. Setting to `null` reverts
+   * to the local-compute path (P2P smokes).
+   */
+  setServerTransport?: (t: ServerTransport | null) => void;
   /** Tear down both rigs + the runtime. */
   dispose(): void;
 }
@@ -230,9 +254,30 @@ const REMOTE_SPAWN_OFFSET = new Vector3(2.5, 0, 0);
  * repeat the last known remote input, by design (see the lockstep module
  * header for the honest-limitations note).
  */
+export interface CreateGameSessionOpts {
+  /** PR 11.6.D: optional server-auth damage transport. When set,
+   *  the 4 `applyDamage` call sites in `tick()` route through the
+   *  server-broadcast-driven path (send + optimistic apply on
+   *  local-fire, no-op on remote-fire — the broadcast handler
+   *  applies to the local target). When null (default — all P2P
+   *  smokes + PR 11.6.C smoke on 5190), the existing local-compute
+   *  path is preserved. */
+  serverTransport?: ServerTransport | null;
+  /** PR 11.6.D: this tab's local player ID. Used as `sourcePlayerId`
+   *  on outgoing DamageRequests. The server assigns IDs to
+   *  connections; the smoke drives this directly via the page
+   *  init script (window.__localPlayerId). */
+  localPlayerId?: number;
+  /** PR 11.6.D FIX 2 — the peer's player ID. Used as `targetPlayerId`
+   *  on outgoing DamageRequests. Defaults to 2 for the legacy 2-player
+   *  demo. The 5191 smoke drives this via `window.__peerPlayerId`. */
+  peerPlayerId?: number;
+}
+
 export function createGameSession(
   scene: Scene,
   transport: GgnetTransport,
+  opts: CreateGameSessionOpts = {},
 ): GameSession {
   const localSpawn = new Vector3(0, CAPSULE.height / 2, 0);
   const remoteSpawn = localSpawn.add(REMOTE_SPAWN_OFFSET);
@@ -272,6 +317,27 @@ export function createGameSession(
    *  remaining respawn countdown for the HUD snapshot. Updated every
    *  tick; read by `getHealthSnapshot()`. */
   let lastNowMs = 0;
+  /**
+   * PR 11.6.D — server-auth damage transport (optional). When set,
+   * the 4 `applyDamage` call sites route through the new path; when
+   * null, the existing local-compute path is preserved (the 14 P2P
+   * smokes + PR 11.6.C smoke on 5190 keep working unchanged).
+   */
+  let serverTransport: ServerTransport | null = opts.serverTransport ?? null;
+  /** PR 11.6.D — this tab's local player ID. Used as `sourcePlayerId`
+   *  on outgoing DamageRequests. Defaults to 1 (the smoke drives this
+   *  via `window.__localPlayerId` and the page init script — see
+   *  `tools/damage-server-hp-convergence-smoke.mjs`). */
+  const localPlayerId: number = opts.localPlayerId ?? 1;
+  /** PR 11.6.D FIX 2 — the peer's player ID. Used as `targetPlayerId`
+   *  on outgoing DamageRequests. Defaults to 2 (the demo's 2-player
+   *  layout). The smoke drives this via `window.__peerPlayerId` so
+   *  Tab A targets player 2 and Tab B targets player 1. */
+  const peerPlayerId: number = opts.peerPlayerId ?? 2;
+  /** PR 11.6.D — monotonic eventId counter for outbound DamageRequests.
+   *  The server rejects stale eventIds (PR 11.6.D §3.4.1 gate 6).
+   *  Start at 1 (0 is a sentinel — never used on the wire). */
+  let nextEventId = 1;
   /**
    * PR 11.4: when true, BOTH controllers skip their per-tick
    * `update()` call (the spectator camera has absorbed the WASD keys,
@@ -385,10 +451,28 @@ export function createGameSession(
         tracerTo: result.tracerTo,
         damage: result.damage,
       });
-      // PR 10: local fired → remote takes the damage (lockstep
-      // guarantees identical events on both clients).
+      // PR 10: local fired → remote takes the damage.
+      // PR 11.6.D: when the server-auth transport is wired, send the
+      // DamageRequest via damageBus.sendDamageRequest (which sends +
+      // applies optimistically + tracks in pendingApplies for the
+      // confirm/revert path). Otherwise, fall back to the local-
+      // compute path (lockstep guarantees identical events on both
+      // clients — used by the 14 P2P smokes + PR 11.6.C smoke).
       if (result.hit) {
-        applyDamage(remoteController, { source: "fire", amount: result.damage }, nowMs);
+        if (serverTransport) {
+          const eventId = nextEventId++;
+          const req: DamageRequest = {
+            frame: advanced.frame,
+            sourcePlayerId: localPlayerId,
+            targetPlayerId: peerPlayerId,
+            source: 0, // fire
+            amount: result.damage,
+            eventId,
+          };
+          dbSendDamageRequest(serverTransport, req, remoteController, nowMs, localPlayerId, peerPlayerId);
+        } else {
+          applyDamage(remoteController, { source: "fire", amount: result.damage }, nowMs);
+        }
       }
     }
     if (gameInput.meleePressed && !wasMelee) {
@@ -404,7 +488,22 @@ export function createGameSession(
           damage: result.damage,
         });
         // PR 10: melee hit also applies damage to the remote rig.
-        applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
+        // PR 11.6.D: same server-auth-vs-local-compute fork as the
+        // fire path above (line 391).
+        if (serverTransport) {
+          const eventId = nextEventId++;
+          const req: DamageRequest = {
+            frame: advanced.frame,
+            sourcePlayerId: localPlayerId,
+            targetPlayerId: peerPlayerId,
+            source: 1, // melee
+            amount: result.damage,
+            eventId,
+          };
+          dbSendDamageRequest(serverTransport, req, remoteController, nowMs, localPlayerId, peerPlayerId);
+        } else {
+          applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
+        }
       }
     }
     wasFiring = gameInput.fireHeld;
@@ -424,7 +523,14 @@ export function createGameSession(
         localController,
         scene,
       );
-      if (result.hit) {
+      // PR 11.6.D: when the server-auth transport is wired, the
+      // remote-fire path no longer applies damage locally — the
+      // server's DamageBroadcast fan-out will deliver it via
+      // `damageBus.applyBroadcast` (the broadcast handler in
+      // `scene.ts`'s __forceServerTransport block). Otherwise
+      // (P2P smokes, no server transport), the local-compute path
+      // applies the damage here so lockstep symmetry is preserved.
+      if (result.hit && !serverTransport) {
         applyDamage(localController, { source: "fire", amount: result.damage }, nowMs);
       }
     }
@@ -434,7 +540,9 @@ export function createGameSession(
         remoteController,
         localController,
       );
-      if (result.hit) {
+      // PR 11.6.D: same server-auth-vs-local-compute fork as the
+      // remote-fire path above.
+      if (result.hit && !serverTransport) {
         applyDamage(localController, { source: "melee", amount: result.damage }, nowMs);
       }
     }
@@ -447,6 +555,22 @@ export function createGameSession(
     // because their `nowMs` values are both engine-driven.
     tickRespawn(localController, nowMs);
     tickRespawn(remoteController, nowMs);
+
+    // PR 11.6.D / §3.10 — 32Hz PositionUpdate sender. Only fires when
+    // the server-auth transport is wired (P2P smokes don't speak the
+    // server wire format). The throttled helper gates on
+    // `advanced.frame % 2 === 0` internally, so the actual wire rate
+    // is ~32Hz at the engine's ~64Hz tick rate.
+    if (serverTransport) {
+      const pos = localController.state.position;
+      dbSendPositionUpdateThrottled(
+        serverTransport,
+        advanced.frame,
+        localPlayerId,
+        pos.x,
+        pos.z,
+      );
+    }
 
     // Push the per-frame events onto the session-level buffer so the HUD
     // and tracer render can read them.
@@ -492,6 +616,17 @@ export function createGameSession(
     get totalPausedFrameCount() { return runtime.totalPausedFrameCount; },
     tick,
     submitLocalInput,
+    // PR 11.6.D FIX 2: expose the local + peer player ids on the
+    // returned handle. The smoke uses these to assert the right tab
+    // is sending fire events to the right target. Both are
+    // immutable for the session's lifetime.
+    localPlayerId,
+    peerPlayerId,
+    // PR 11.6.D: late-bind server-auth transport. Defaults to the
+    // constructor option (may be `null` for P2P smokes).
+    setServerTransport: (t) => {
+      serverTransport = t;
+    },
     getCombatEvents: () => combatEvents.slice(),
     consumeUnrenderedCombatEvents: () => {
       const drain = combatEvents.slice(lastRenderedIdx);

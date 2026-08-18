@@ -51,6 +51,7 @@ client/lockstep-rollback.png
 # PR 11.6.C — temp smoke screenshots at the repo root (dev artifacts from regression runs)
 *.png
 !client/tools/damage-server-smoke.png
+!client/tools/damage-server-hp-convergence-smoke.png
 
 # Codex delegation scratch (briefs + last-message files live here transiently,
 # alongside the AGENTS.md/handoff docs which are real artifacts).
