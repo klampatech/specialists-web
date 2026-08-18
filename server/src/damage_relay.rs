@@ -585,13 +585,32 @@ mod tests {
     }
 
     #[test]
-    fn validates_rejects_snapshot_at_returns_none() {
-        // Setup: history only has frame 5+ (we add 5 to clear the
-        // gates, then ask for frame 3 — no recorded position has
-        // frame <= 3, so snapshot_at(3) returns None on both
-        // source + target and the validator rejects).
+    fn validates_rejects_when_position_history_is_empty() {
+        // PR 11.7.B / §3.14 — `snapshot_at` no longer returns
+        // None for normal lag-comp windows (it snaps to nearest
+        // within ±8 frames). The only path that returns None is
+        // an empty history buffer. The validator's
+        // `let Some(target_pos) = ... else { return None; }`
+        // rejection branch is now reachable only when the buffer
+        // is completely empty for the target.
         let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        // Clear history and add only frames 5..10.
+        // Wipe both players' history completely.
+        room.position_history.get_mut(&1).unwrap().frames.clear();
+        room.position_history.get_mut(&2).unwrap().frames.clear();
+        let mut req = passing_request();
+        req.frame = 3;
+        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
+        assert!(result.is_none(), "request with empty history must be rejected");
+    }
+
+    #[test]
+    fn validates_uses_nearest_snapshot_within_tolerance() {
+        // PR 11.7.B / §3.14 — verify the snap-to-nearest math is
+        // exercised end-to-end. History has frames 5..10; the
+        // request asks for frame 7 (an exact match). The
+        // validator should accept (the lag-comp rewind matches
+        // the recorded position).
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
         room.position_history.get_mut(&1).unwrap().frames.clear();
         room.position_history.get_mut(&2).unwrap().frames.clear();
         for frame in 5..10u32 {
@@ -599,9 +618,9 @@ mod tests {
             room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
         }
         let mut req = passing_request();
-        req.frame = 3;
+        req.frame = 7;
         let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "request with frame that has no snapshot must be rejected");
+        assert!(result.is_some(), "request with frame 7 (exact match in history) must be accepted");
     }
 
     #[test]

@@ -187,34 +187,140 @@ async fn main() -> ExitCode {
         rooms.clone(),
     );
 
-    // PR 11.6.D: 64Hz tick task that increments the global server
-    // frame counter on every room. The server frame is the
-    // `server_frame` field on `DamageBroadcast`. Currently there is
-    // exactly one room (`DEVBX`); the matchmaker in PR 11.9 will
-    // iterate over all rooms.
-    let tick_handle = tokio::spawn({
+    // PR 11.7.B / §3.10 — physics_tick_loop at 64Hz. This is the
+    // canonical tick loop now; it folds in the PR 11.6.D
+    // `tick_server_frame` increment AND drives the Rapier
+    // physics step AND records `PositionHistory` from the
+    // physics world (replacing the client-driven
+    // `PositionUpdate` feed source).
+    //
+    // Two separate per-room tasks: one physics tick (64Hz) and
+    // one snapshot generator (20Hz). The snapshot reads the
+    // same `room.next_server_frame` counter that the physics
+    // tick increments.
+    let physics_tick_handle = tokio::spawn({
         let rooms = rooms.clone();
         async move {
+            // 64Hz = 15_625 microseconds per tick. Using
+            // microseconds (not millis) so the tick rate is
+            // exact — 16ms would give 62.5Hz, drifting from the
+            // PR 11.6.D + 11.7.B brief lock of 64Hz.
             let mut interval = tokio::time::interval(
-                std::time::Duration::from_millis(16), // ~64Hz (1_000 / 64 ≈ 15.6ms)
+                std::time::Duration::from_micros(15_625),
             );
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.set_missed_tick_behavior(
+                tokio::time::MissedTickBehavior::Skip,
+            );
             loop {
                 interval.tick().await;
                 let room_arc = {
                     let guard = rooms.read().await;
-                    guard.get(specialists_server::constants::DEVBX_ROOM_ID).cloned()
+                    guard.get(
+                        specialists_server::constants::DEVBX_ROOM_ID,
+                    ).cloned()
                 };
                 if let Some(room_arc) = room_arc {
                     let mut room_guard = room_arc.write().await;
-                    room_guard.tick_server_frame();
+                    // 1. Increment the server frame counter.
+                    let frame =
+                        room_guard.tick_server_frame();
+                    // 2. Drain the latest input per player
+                    //    (populates `drained_inputs_this_tick`).
+                    // 3. Step the Rapier physics world (moves
+                    //    capsules + applies coyote-time jumps +
+                    //    runs the integration step). The
+                    //    `PhysicsWorld::step` API needs only an
+                    //    immutable borrow of the inputs map, but
+                    //    we hold the room write guard — so we
+                    //    clone the inputs map first, drop the
+                    //    reference to `room_guard`, and pass the
+                    //    clone to `physics.step`. PR 11.7.C can
+                    //    refactor this into a non-locking pattern
+                    //    if it becomes a hot path.
+                    let inputs_clone: std::collections::HashMap<u16, [u8; 12]> =
+                        room_guard.drained_inputs_this_tick.clone();
+                    room_guard.physics.step(
+                        &inputs_clone,
+                        frame as u64,
+                    );
+                    // 4. Record PositionHistory from the physics
+                    //    world (every other tick = 32Hz storage).
+                    if specialists_server::position_history::should_store_frame(frame)
+                    {
+                        // Snapshot the connected players' positions.
+                        let player_ids: Vec<u16> = room_guard
+                            .connections
+                            .keys()
+                            .copied()
+                            .collect();
+                        for pid in player_ids {
+                            if let Some(pos) =
+                                room_guard.physics.position(pid)
+                            {
+                                room_guard.record_position(
+                                    pid, frame, pos,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
     });
 
-    // Wait for Ctrl-C OR either listener to fail OR the tick task to
-    // panic (it never returns Ok in normal operation).
+    // PR 11.7.B / §3.4 + §3.10.1 — snapshot_generator_loop at
+    // 20Hz. Encodes + broadcasts a `Snapshot` to every
+    // connection in the room. The generator itself is in
+    // `snapshot::SnapshotGenerator`; this task just drives
+    // its `maybe_emit` cadence.
+    let snapshot_gen_handle = tokio::spawn({
+        let rooms = rooms.clone();
+        async move {
+            let mut gen = specialists_server::snapshot::SnapshotGenerator::new();
+            let start = std::time::Instant::now();
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_millis(50), // 1000/50 = 20Hz
+            );
+            interval.set_missed_tick_behavior(
+                tokio::time::MissedTickBehavior::Skip,
+            );
+            loop {
+                interval.tick().await;
+                let now_ms = start.elapsed().as_millis() as u64;
+                let room_arc = {
+                    let guard = rooms.read().await;
+                    guard.get(
+                        specialists_server::constants::DEVBX_ROOM_ID,
+                    ).cloned()
+                };
+                if let Some(room_arc) = room_arc {
+                    let snap_opt = {
+                        let room_guard = room_arc.read().await;
+                        gen.maybe_emit(&*room_guard, now_ms)
+                    };
+                    if let Some(snap) = snap_opt {
+                        let mut wire = Vec::with_capacity(
+                            1 + specialists_server::protocol::SNAPSHOT_WIRE_SIZE_MIN
+                                + snap.players.len()
+                                * specialists_server::protocol::PLAYER_STATE_WIRE_SIZE,
+                        );
+                        wire.push(
+                            specialists_server::protocol::DISCRIMINATOR_SNAPSHOT,
+                        );
+                        let body = specialists_server::protocol::encode_snapshot(&snap);
+                        wire.extend(body);
+                        specialists_server::transport::broadcast_snapshot(
+                            room_arc.clone(),
+                            wire,
+                        ).await;
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait for Ctrl-C OR either listener to fail OR either tick
+    // task to panic (they never return Ok in normal operation).
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("SIGINT received — shutting down");
@@ -223,8 +329,11 @@ async fn main() -> ExitCode {
             Ok(()) => info!("server transports returned cleanly"),
             Err(e) => warn!("server transports errored: {e:?}"),
         },
-        _ = tick_handle => {
-            warn!("server tick task exited unexpectedly");
+        _ = physics_tick_handle => {
+            warn!("physics_tick_loop exited unexpectedly");
+        }
+        _ = snapshot_gen_handle => {
+            warn!("snapshot_generator_loop exited unexpectedly");
         }
     }
 

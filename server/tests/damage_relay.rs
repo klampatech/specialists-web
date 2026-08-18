@@ -297,7 +297,7 @@ async fn integration_fire_rate_cooldown_enforced() {
     ws.send(Message::Binary(encode_damage_request(&req2).into())).await.expect("send2");
     // FIX 4: the validator now sends a DamageReject back to the source
     // (not a DamageBroadcast). We expect a non-broadcast message —
-    // specifically a 0x07 discriminator.
+    // specifically a 0x0C discriminator.
     let reject_msg = tokio::time::timeout(Duration::from_millis(500), ws.next())
         .await
         .expect("timeout waiting for reject")
@@ -305,7 +305,7 @@ async fn integration_fire_rate_cooldown_enforced() {
         .expect("msg ok");
     if let Message::Binary(b) = reject_msg {
         assert_eq!(b[0], specialists_server::protocol::DISCRIMINATOR_DAMAGE_REJECT,
-            "validator must send a DamageReject (0x07), not a DamageBroadcast");
+            "validator must send a DamageReject (0x0C), not a DamageBroadcast");
     } else {
         panic!("expected Binary message");
     }

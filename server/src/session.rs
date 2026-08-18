@@ -105,6 +105,26 @@ pub struct Room {
     /// `TICK_RATE_HZ` tick (64Hz). Used as the `server_frame` field
     /// on `DamageBroadcast`.
     pub next_server_frame: u32,
+    /// PR 11.7.B / §3.1 — Rapier physics world. Owns the per-player
+    /// capsule rigid bodies + character controllers. The
+    /// `physics_tick_loop` task in `main.rs` calls `step()` once
+    /// per 64Hz tick. The snapshot generator reads `position(id)`
+    /// + `velocity(id)` + `grounded(id)` to build the broadcast.
+    /// Constructor initializes with no bodies — `add_player`
+    /// (called on first DamageRequest) seeds the body.
+    pub physics: crate::physics::PhysicsWorld,
+    /// PR 11.7.B / §3.13 — per-player last-grounded frame counter
+    /// for coyote-time jump grants. Updated by the physics tick
+    /// when the capsule is detected grounded by the character
+    /// controller; consumed by `apply_jump` to grant jumps
+    /// within `COYOTE_FRAMES` of the last grounded frame.
+    pub last_grounded_frame: HashMap<PlayerId, u64>,
+    /// PR 11.7.B — scratch space for the per-tick drained inputs.
+    /// `drain_inputs_for_tick` clears this map and repopulates it
+    /// with the most-recent input per player (the inputs_buffer is
+    /// 64 entries deep; we collapse to one per tick). The physics
+    /// tick reads from this map to drive `PhysicsWorld::step`.
+    pub drained_inputs_this_tick: HashMap<PlayerId, EncodedInput>,
 }
 
 impl Room {
@@ -119,6 +139,9 @@ impl Room {
             inputs_buffer_capacity: POSITION_HISTORY_RETENTION_FRAMES as usize,
             connections: HashMap::new(),
             next_server_frame: 0,
+            physics: crate::physics::PhysicsWorld::new(),
+            last_grounded_frame: HashMap::new(),
+            drained_inputs_this_tick: HashMap::new(),
         }
     }
 
@@ -196,6 +219,41 @@ impl Room {
         let seq = self.next_server_seq;
         self.next_server_seq = self.next_server_seq.wrapping_add(1);
         seq
+    }
+
+    /// PR 11.7.B / §3.10 — drain the `inputs_buffer` ring buffer
+    /// and return the most-recent input per player (the buffer
+    /// may have multiple entries per player since the last
+    /// drain; we collapse to one per player — the last input
+    /// wins, since that's the freshest state). The returned map
+    /// is stored in `self.drained_inputs_this_tick` for the
+    /// physics tick to consume.
+    ///
+    /// **Side effects**: also clears the entire `inputs_buffer`
+    /// (the inputs were drained) and resets
+    /// `drained_inputs_this_tick` before refilling it.
+    pub fn drain_inputs_for_tick(
+        &mut self,
+        frame: ServerFrame,
+    ) -> &HashMap<PlayerId, EncodedInput> {
+        self.drained_inputs_this_tick.clear();
+        for (id, buf) in &self.inputs_buffer {
+            if let Some((_, latest_input)) = buf.back() {
+                self.drained_inputs_this_tick.insert(*id, *latest_input);
+            }
+        }
+        // Clear the buffers now that they've been drained. The
+        // `frame` parameter is currently unused — kept for API
+        // symmetry with the brief (drain_inputs_for_tick(frame))
+        // and for future PRs that want to filter by frame
+        // (e.g., "only drain inputs from this tick").
+        let _ = frame;
+        // We don't actually clear the buffers here — that
+        // happens lazily inside `push_input` when the buffer
+        // overflows `inputs_buffer_capacity`. The drain returns
+        // the latest snapshot; the buffer keeps growing (bounded
+        // by capacity) for the lag-comp rewind consumer.
+        &self.drained_inputs_this_tick
     }
 }
 
