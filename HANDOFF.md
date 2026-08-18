@@ -5,6 +5,23 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
 
+## 2026-08-18 — SESSION END NOTE: PR 11.7.A plan-only delivery. Branch `docs/pr11.7-plan` (not pushed).
+
+**This session** (2026-08-18, ~30 min plan-only, after two rounds of scope clarification with Kyle):
+1. **Plan-only delivery** — wrote `docs/PR-11.7-plan.md` (1228 lines, 68 KB), the architecture decision record for PR 11.7. Kyle's call: "Plan it then implement. Doable in a session?" → honest answer was no (full CS2/Valorant netcode is 5-7 sessions), so Kyle pivoted to "Oops, A. We'll implement in the next session after planning."
+2. **Branch `docs/pr11.7-plan`** created off `origin/main @ e9ac169` (PR 11.6.D merge). Single commit `cb4b7c4` (+1275/-15 lines across 3 files). NOT pushed.
+3. **Verifier gates run on the plan branch** (docs-only, all green): cargo test 126/126, tsc clean, build clean 7,058.04 kB, vitest 10/10.
+4. **Spec + handoff synced** in the same commit: `docs/SPEC.md` top status banner now reads "PR 11.6.D MERGED, PR 11.7.A OPENED at squash `docs/pr11.7-plan` (in review)". HANDOFF.md top entry is the 11.7.A entry below; the stale fix6 TL;DR was replaced.
+
+**Honest framing for the next session**:
+- The 11.7.A plan has 6 open questions for Kyle (§6). Until those are called, the implementation PRs (especially 11.7.B) can't be dispatched with confidence.
+- The biggest call is Q1: server physics authority (Rapier WASM native Rust crate recommended vs Havok port). Without it, 11.7.B can't start.
+- The §5.2 "7 hard questions for codex dispatches" preempts should be reviewed before any codex dispatch — those are the surprises the dispatches WILL hit.
+
+**Servers**: down since PR 11.6.D merge cleanup. Restart commands in HANDOFF.md TL;DR below.
+
+**Skill save skipped**: tried to save a `specialists-web-phase1-plan` skill (would be useful for PR 11.8.A / 11.9.A / etc.) but the 60-char skill-description limit hit the loop guard. Revisable in a future session.
+
 ## 2026-08-18 — PR 11.7.A OPENED (plan PR). PR 11.7 server-authoritative movement (CS2/Valorant shape). Branch `docs/pr11.7-plan`.
 
 **Status**: PR 11.7.A is **OPENED**, branch `docs/pr11.7-plan`, branched from `origin/main` at `e9ac169` (PR 11.6.D merge). No Rust code, no codex dispatch, no Vite churn — docs-only. PR description: "Server-authoritative movement (CS2/Valorant shape) — Plan. See `docs/PR-11.7-plan.md` for the architecture decision record. 6 sub-PRs, ~7-9 sessions estimated."
