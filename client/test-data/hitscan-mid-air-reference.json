@@ -1,6 +1,6 @@
 {
-  "scenario": "mid-air hitscan trajectory (Havok reference, pre-11.7.B)",
-  "capturedAt": "2026-08-18T20:27:06.321Z",
+  "scenario": "mid-air hitscan trajectory (Havok reference, §4.5 spec-compliant)",
+  "capturedAt": "2026-08-18T22:24:23.342Z",
   "captureFrames": 60,
   "frameIntervalMs": 16,
   "startPosition": {
@@ -9,490 +9,494 @@
     "z": 0
   },
   "jumpImpulseY": 5.5,
-  "apexFrame": 8,
-  "apexY": 3.08666051821239,
+  "apexFrame": 9,
+  "apexY": 3.0799514195419624,
   "hpAtApex": 100,
-  "notes": "Captures the Y trajectory of a player jumping straight up from y=1 with JUMP_IMPULSE=5.5 m/s + gravity=9.81. The apex is when vy crosses zero. The post-11.7.B parity smoke verifies the server's lag-comp rewinds through Rapier's PositionHistory for the mid-air target — the trajectory itself is what differs from the ground case.",
+  "twoTabMode": false,
+  "broadcastArrivalAtMs": null,
+  "hpDelta": null,
+  "damageBroadcast": null,
+  "notes": "§4.5 spec-compliant: captures the Y-trajectory of a player jumping straight up from y=1 with JUMP_IMPULSE=5.5 m/s + gravity=9.81. When HAVOK_REF_TWO_TAB=1 is set, the script also fires dual pistols from tab A at tab B mid-air at apex and records the DamageBroadcast arrival time + HP delta on tab B (these come from window.__lastBroadcastAt / __lastHpDelta set by the parent's 2-tab firing harness). Single-tab mode records trajectory only.",
   "frames": [
     {
       "frame": 0,
       "elapsedMs": 0,
-      "y": 1.4383500015735626,
-      "supported": true,
+      "y": 1.6385500020980837,
+      "supported": false,
       "isApex": true,
-      "vy": 5.34304
+      "vy": 5.5
     },
     {
       "frame": 1,
-      "elapsedMs": 95,
-      "y": 1.9673625658013438,
+      "elapsedMs": 50,
+      "y": 1.9736197920850809,
       "supported": false,
       "isApex": true,
-      "vy": 4.706371003742219
+      "vy": 4.836844000935555
     },
     {
       "frame": 2,
-      "elapsedMs": 186,
-      "y": 2.4022030385580453,
+      "elapsedMs": 92,
+      "y": 2.252396737645424,
       "supported": false,
       "isApex": true,
-      "vy": 3.679264000935555
+      "vy": 4.204099000935555
     },
     {
       "frame": 3,
-      "elapsedMs": 264,
-      "y": 2.7320108572723343,
+      "elapsedMs": 129,
+      "y": 2.469503552007158,
       "supported": false,
       "isApex": true,
-      "vy": 2.641366003742218
+      "vy": 3.6361000000000003
     },
     {
       "frame": 4,
-      "elapsedMs": 304,
-      "y": 2.85722776073601,
+      "elapsedMs": 166,
+      "y": 2.6423905145846467,
       "supported": false,
       "isApex": true,
-      "vy": 2.128303001871109
+      "vy": 3.109303001871109
     },
     {
       "frame": 5,
-      "elapsedMs": 346,
-      "y": 2.9604476360974195,
+      "elapsedMs": 201,
+      "y": 2.785212065496142,
       "supported": false,
       "isApex": true,
-      "vy": 1.5809049999999998
+      "vy": 2.5903540009355543
     },
     {
       "frame": 6,
-      "elapsedMs": 386,
-      "y": 3.034683520479756,
+      "elapsedMs": 247,
+      "y": 2.896948177842812,
       "supported": false,
       "isApex": true,
-      "vy": 1.0138870028066633
+      "vy": 2.0920060037422177
     },
     {
       "frame": 7,
-      "elapsedMs": 424,
-      "y": 3.0756955837033133,
+      "elapsedMs": 293,
+      "y": 2.9955400229721763,
       "supported": false,
       "isApex": true,
-      "vy": 0.46746999999999983
+      "vy": 1.4896720028066632
     },
     {
       "frame": 8,
-      "elapsedMs": 462,
-      "y": 3.08666051821239,
+      "elapsedMs": 335,
+      "y": 3.0577894338880576,
       "supported": false,
       "isApex": true,
-      "vy": -0.06619399625778219
+      "vy": 0.8726230018711087
     },
     {
       "frame": 9,
-      "elapsedMs": 497,
-      "y": 3.0685120729163406,
+      "elapsedMs": 409,
+      "y": 3.0799514195419624,
       "supported": false,
-      "isApex": false,
-      "vy": -0.6008389962577821
+      "isApex": true,
+      "vy": -0.056383996257782315
     },
     {
       "frame": 10,
-      "elapsedMs": 538,
-      "y": 3.0266210257832817,
+      "elapsedMs": 447,
+      "y": 3.054837014451471,
       "supported": false,
       "isApex": false,
-      "vy": -1.0952629971933368
+      "vy": -0.5802379971933368
     },
     {
       "frame": 11,
-      "elapsedMs": 576,
-      "y": 2.947510358724897,
+      "elapsedMs": 516,
+      "y": 2.9525256784669955,
       "supported": false,
       "isApex": false,
-      "vy": -1.6554139962577823
+      "vy": -1.4395939962577824
     },
     {
       "frame": 12,
-      "elapsedMs": 615,
-      "y": 2.844192361997815,
+      "elapsedMs": 551,
+      "y": 2.8595404326223526,
       "supported": false,
       "isApex": false,
-      "vy": -2.184172997193337
+      "vy": -1.9379419981288915
     },
     {
       "frame": 13,
-      "elapsedMs": 652,
-      "y": 2.7094366740708153,
+      "elapsedMs": 586,
+      "y": 2.7404049226834273,
       "supported": false,
       "isApex": false,
-      "vy": -2.7227419981288916
+      "vy": -2.4392329971933373
     },
     {
       "frame": 14,
-      "elapsedMs": 691,
-      "y": 2.552046227941092,
+      "elapsedMs": 664,
+      "y": 2.468644223190763,
       "supported": false,
       "isApex": false,
-      "vy": -3.2416909990644465
+      "vy": -3.316246998128892
     },
     {
       "frame": 15,
-      "elapsedMs": 772,
-      "y": 2.2021222572483943,
+      "elapsedMs": 705,
+      "y": 2.26099990348947,
       "supported": false,
       "isApex": false,
-      "vy": -4.164811998128892
+      "vy": -3.859720999064447
     },
     {
       "frame": 16,
-      "elapsedMs": 819,
-      "y": 1.942260159509589,
+      "elapsedMs": 745,
+      "y": 2.014111264724089,
       "supported": false,
       "isApex": false,
-      "vy": -4.735753996257783
+      "vy": -4.421833996257783
     },
     {
       "frame": 17,
-      "elapsedMs": 863,
-      "y": 1.6244989535885304,
+      "elapsedMs": 782,
+      "y": 1.743075126310629,
       "supported": false,
       "isApex": false,
-      "vy": -5.3498600000000005
+      "vy": -4.969231998128892
     },
     {
       "frame": 18,
-      "elapsedMs": 907,
-      "y": 1.2801611898762122,
+      "elapsedMs": 824,
+      "y": 1.4538557622299326,
       "supported": false,
       "isApex": false,
-      "vy": -5.945326998128891
+      "vy": -5.496028996257783
     },
     {
       "frame": 19,
-      "elapsedMs": 956,
-      "y": 0.9064911104854335,
+      "elapsedMs": 866,
+      "y": 1.11191362244511,
       "supported": false,
       "isApex": false,
-      "vy": -6.530983996257782
+      "vy": -6.060103996257783
     },
     {
       "frame": 20,
-      "elapsedMs": 1004,
-      "y": 0.9064911104854335,
+      "elapsedMs": 912,
+      "y": 1.11191362244511,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 21,
-      "elapsedMs": 1048,
-      "y": 0.9064911104854335,
-      "supported": true,
+      "elapsedMs": 954,
+      "y": 1.10940226244511,
+      "supported": false,
       "isApex": false,
       "vy": -0.15696000000000002
     },
     {
       "frame": 22,
-      "elapsedMs": 1137,
-      "y": 0.9064911104854335,
-      "supported": true,
+      "elapsedMs": 995,
+      "y": 1.074343676952886,
+      "supported": false,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": -0.7220159990644456
     },
     {
       "frame": 23,
-      "elapsedMs": 1235,
-      "y": 0.9064911104854335,
-      "supported": true,
+      "elapsedMs": 1042,
+      "y": 1.0285553062266508,
+      "supported": false,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 24,
-      "elapsedMs": 1279,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1086,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 25,
-      "elapsedMs": 1328,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1131,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 26,
-      "elapsedMs": 1379,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1217,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 27,
-      "elapsedMs": 1427,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1263,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 28,
-      "elapsedMs": 1475,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1349,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 29,
-      "elapsedMs": 1518,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1393,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 30,
-      "elapsedMs": 1565,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1434,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 31,
-      "elapsedMs": 1607,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1484,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 32,
-      "elapsedMs": 1649,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1526,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 33,
-      "elapsedMs": 1692,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1575,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 34,
-      "elapsedMs": 1739,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1659,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 35,
-      "elapsedMs": 1786,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1702,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 36,
-      "elapsedMs": 1830,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1745,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 37,
-      "elapsedMs": 1918,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1787,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 38,
-      "elapsedMs": 1960,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1833,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 39,
-      "elapsedMs": 2003,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1877,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 40,
-      "elapsedMs": 2045,
-      "y": 0.9064911104854335,
+      "elapsedMs": 1918,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 41,
-      "elapsedMs": 2144,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2000,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 42,
-      "elapsedMs": 2236,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2044,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 43,
-      "elapsedMs": 2279,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2088,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 44,
-      "elapsedMs": 2326,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2131,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 45,
-      "elapsedMs": 2411,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2176,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 46,
-      "elapsedMs": 2457,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2219,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 47,
-      "elapsedMs": 2552,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2316,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 48,
-      "elapsedMs": 2643,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2364,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 49,
-      "elapsedMs": 2691,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2455,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 50,
-      "elapsedMs": 2736,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2499,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 51,
-      "elapsedMs": 2780,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2541,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 52,
-      "elapsedMs": 2828,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2584,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 53,
-      "elapsedMs": 2915,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2663,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 54,
-      "elapsedMs": 2963,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2710,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 55,
-      "elapsedMs": 3048,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2752,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 56,
-      "elapsedMs": 3093,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2796,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 57,
-      "elapsedMs": 3181,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2837,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 58,
-      "elapsedMs": 3224,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2887,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     },
     {
       "frame": 59,
-      "elapsedMs": 3313,
-      "y": 0.9064911104854335,
+      "elapsedMs": 2967,
+      "y": 1.0285553062266508,
       "supported": true,
       "isApex": false,
-      "vy": -0.15696000000000002
+      "vy": 0
     }
   ]
 }
