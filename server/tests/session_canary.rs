@@ -105,6 +105,66 @@ async fn room_state_pushes_inputs_buffer() {
     assert_eq!(buf.back().unwrap().0, 9);
 }
 
+/// PR 11.7.B / BLK-2 — `drain_inputs_for_tick` must populate
+/// `drained_inputs_this_tick` so the physics step has the
+/// inputs to drive movement. Before the BLK-2 fix, the
+/// `physics_tick_loop` in `main.rs` called
+/// `physics.step(&drained_inputs_this_tick, ...)` without
+/// first calling `drain_inputs_for_tick(frame)` — the
+/// scratch map was always empty and the physics step ran
+/// with zero WASD inputs every tick. The player capsule
+/// never walked, never rotated, never changed horizontal
+/// velocity from the network.
+///
+/// This test asserts the end-to-end pipeline:
+///   1. Push an input packet onto the room's inputs_buffer.
+///   2. Call drain_inputs_for_tick(0).
+///   3. Step the physics world with the drained inputs.
+///   4. Assert the player's XZ position has moved rightward.
+#[test]
+fn drain_inputs_populates_physics_step() {
+    use specialists_server::position_history::Position;
+    use specialists_server::session::Room;
+
+    let mut room = Room::new("DEVBX");
+    let player_id = 1;
+    room.add_player(player_id);
+    room.physics
+        .add_player(player_id, Position { x: 0.0, y: 0.0 });
+
+    // Seed an input packet: frame=0, MOVE_RIGHT bit set.
+    let mut input_bytes = [0u8; 12];
+    input_bytes[0] = 8; // MOVE_RIGHT bit
+    room.push_input(player_id, 0, input_bytes);
+
+    // Drain → step pipeline.
+    room.drain_inputs_for_tick(0);
+    let inputs_clone: std::collections::HashMap<u16, [u8; 12]> = room
+        .drained_inputs_this_tick
+        .clone();
+    assert!(
+        inputs_clone.contains_key(&player_id),
+        "drained_inputs_this_tick must contain the player's input"
+    );
+    room.physics.step(&inputs_clone, 0);
+
+    // Step a few more times so the horizontal motion has
+    // time to accumulate (the per-tick translation is
+    // MAX_SPEED * dt = 5.0 * 1/64 ≈ 0.078m).
+    room.drain_inputs_for_tick(1);
+    let inputs_clone: std::collections::HashMap<u16, [u8; 12]> = room
+        .drained_inputs_this_tick
+        .clone();
+    room.physics.step(&inputs_clone, 1);
+
+    let pos = room.physics.position(player_id).expect("player has position");
+    assert!(
+        pos.x > 0.0,
+        "player should move rightward after MOVE_RIGHT input; got x={}",
+        pos.x
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn position_history_trims_to_capacity() {
     // §3.4.1 — per-player ring buffer caps at 64 entries.

@@ -224,8 +224,15 @@ async fn main() -> ExitCode {
                     // 1. Increment the server frame counter.
                     let frame =
                         room_guard.tick_server_frame();
-                    // 2. Drain the latest input per player
-                    //    (populates `drained_inputs_this_tick`).
+                    // 2. PR 11.7.B BLK-2 — drain the latest input
+                    //    per player. Without this call, the
+                    //    `drained_inputs_this_tick` scratch map is
+                    //    always empty and the physics step runs
+                    //    with zero WASD inputs every tick — the
+                    //    player capsule never walks, never rotates,
+                    //    never changes horizontal velocity from
+                    //    the network.
+                    room_guard.drain_inputs_for_tick(frame);
                     // 3. Step the Rapier physics world (moves
                     //    capsules + applies coyote-time jumps +
                     //    runs the integration step). The
