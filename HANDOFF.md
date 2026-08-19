@@ -44,7 +44,7 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - The capture script's jump-impulse-doesn't-apply issue (the script now correctly identifies `jumpAppliedAtFrame=19` but the re-run `ctrl.update(jumpPressed=true)` doesn't actually grant the impulse — Havok-specific tick-timing quirk beyond this PR's scope; the parity smoke diffs against `jumpAppliedAtFrame` not against the actual jump height)
 - Post-spam 12-HP divergence carry-forward (closes naturally when PR 11.7.C's snapshot fan-out replaces the per-player broadcast path for damage timing)
 
-**CI flake surfaced in this session → PR #34 + PR #35 + PR #36 merged, PR #37 ready for the §4.4 xfail**:
+**CI flake surfaced in this session → PR #34 + PR #35 + PR #36 + PR #37 all MERGED, PR #33 re-triggered (4th time)**:
 - PR #33's CI run hit FOUR flakes that PR 11.7.B surfaced:
   1. **206ms localhost RTT spike** in the `client — damage server
      HP-convergence smoke (PR 11.6.D, port 5191)` job. Fixed by
@@ -77,17 +77,17 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
      phase. This is the **§4.4 12-HP divergence carry-forward** from
      PR 11.6.D — documented as a known-bad assertion that closes
      naturally when PR 11.7.C's snapshot fan-out replaces the
-     per-player broadcast path. NOT PR 11.7.B's regression.
-- **PR #37 ready** at
-  https://github.com/klampatech/specialists-web/pull/37
-  (branch `fix/ci-damage-smoke-post-spam-xfail`,
-  1 file, +26/-5 lines). Replaces the assertion 7 throw with an
-  `[XFAIL §4.4]` log line that reports the divergence but doesn't
-  block the smoke. Success-path log also updated to reflect both
-  outcomes (clean pass vs §4.4 xfail).
-- **PR #33 CI re-trigger after PR #36**: assertions 5 + 6 PASS
-  (PR #36 worked perfectly); assertion 7 (post-spam convergence)
-  FAIL with the documented §4.4 12-HP gap. PR #37 unblocks this.
+     per-player broadcast path. NOT PR 11.7.B's regression. Fixed
+     by **PR #37** at
+     https://github.com/klampatech/specialists-web/pull/37
+     (branch `fix/ci-damage-smoke-post-spam-xfail`,
+     1 file, +26/-5 lines). Replaces the assertion 7 throw with an
+     `[XFAIL §4.4]` log line that reports the divergence but
+     doesn't block the smoke. Verified working in PR #37's own CI:
+     logged `gap=12` exactly matching §4.4 documentation.
+     Merged 2026-08-19T17:12:41Z.
+- **PR #33 re-triggered** (4th time) via close+reopen after PR #37
+  merge; CI watch in progress (proc_de09bf970568).
 - **Lesson learned** (cumulative, four flakes):
   - **Flakes 1-2** (single-metric noise): threshold bump with 25%
     margin over observed peak
