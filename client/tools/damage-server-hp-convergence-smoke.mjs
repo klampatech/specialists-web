@@ -559,30 +559,27 @@ async function runSmoke() {
       return session ? session.localController.state.hp : null;
     });
     log(`Post-spam: Tab A remote hp=${hpA_post}, Tab B local hp=${hpB_post}`);
-    // §4.4 carry-forward xfail — this assertion is documented as
-    // known-bad since PR 11.6.D (see HANDOFF.md §4.4 and PR 11.7.B
-    // HANDOFF entry "2026-08-19 — PR 11.7.B OPENED as PR #33"). The
-    // post-spam HP convergence check is a STRICT equality check that
-    // fails with a 12-HP gap (one broadcast's worth) due to an
-    // optimistic-apply vs broadcast-reconcile race that PR 11.7.B
-    // doesn't claim to fix. PR 11.7.C's snapshot fan-out (plan §3.7)
-    // closes this naturally when the per-player broadcast path is
-    // replaced by snapshot-driven damage reconciliation.
+    // §4.4 / PR 11.7.C — snapshot fan-out closes the race. PR 11.7.B
+    // documented this as a known-bad xfail (one broadcast's worth of
+    // 12-HP divergence between Tab A's remote view and Tab B's local
+    // view post-spam). PR 11.7.C wires the snapshot stream into the
+    // client (DISCRIMINATOR_SNAPSHOT=0x07) which carries the server's
+    // per-player HP as the new ground truth — the optimistic-apply +
+    // DamageBroadcast path stays for low-latency visual feedback but
+    // is no longer the source of HP convergence.
     //
-    // This xfail:
-    // - Logs the divergence explicitly so CI logs show the known gap
-    // - Does NOT silently pass (the value is reported)
-    // - Does NOT block PR 11.7.B's merge gate
-    // - Will be removed when PR 11.7.C lands (the assertion becomes
-    //   valid again because the race is closed)
+    // This is the load-bearing regression check for the snapshot
+    // wiring: if it fails, the snapshot path didn't actually close
+    // the race. Don't relax the assertion — debug the snapshot path.
     if (hpA_post !== hpB_post) {
-      log(
-        `[XFAIL §4.4] Post-spam HP convergence: Tab A remote=${hpA_post} vs Tab B local=${hpB_post} (gap=${hpA_post - hpB_post}). ` +
-        `Known-bad carry-forward from PR 11.6.D; closes in PR 11.7.C.`,
+      throw new Error(
+        `Post-spam HP convergence FAILED: Tab A remote=${hpA_post} vs Tab B local=${hpB_post} ` +
+        `(gap=${hpA_post - hpB_post}). Expected snapshot fan-out to close the §4.4 race in PR 11.7.C. ` +
+        `If the snapshot wiring regressed, investigate serverTransport.onSnapshot + the ` +
+        `damageBus.pendingApplies sweep before relaxing this assertion.`,
       );
-    } else {
-      log(`Assertion (FIX 4) PASS: post-spam HP convergence restored (both at ${hpA_post}).`);
     }
+    log(`Assertion (FIX 4) PASS: post-spam HP convergence restored (both at ${hpA_post}).`);
 
     // ---- 7. Capture screenshot ----
     // Take Tab A's screenshot (the shooter). It will show the
@@ -595,8 +592,6 @@ async function runSmoke() {
 
     if (hpA_post === hpB_post) {
       log(`OK — damage-server-hp-convergence-smoke passed (HP converged at ${hpA_post}).`);
-    } else {
-      log(`OK — damage-server-hp-convergence-smoke passed with §4.4 xfail (Tab A remote=${hpA_post} vs Tab B local=${hpB_post}).`);
     }
     await browser.close();
     return true;

@@ -59,12 +59,13 @@ import {
   encodePing,
   encodePositionUpdate,
 } from "../../../protocol/damage";
+import { DISCRIMINATOR_SNAPSHOT } from "../../../protocol/snapshot";
 import type {
   DamageRequest,
   InputsServer,
   Ping,
   PositionUpdate,
-} from "../../../protocol/damage";
+ } from "../../../protocol/damage";
 
 /** Underlying transport type reported by `getStats()`. */
 export type TransportKind = "webtransport" | "websocket";
@@ -87,12 +88,19 @@ type ListenerMap = {
    *  Wire-format stable since PR 11.6.D (server `ca9f177`); the
    *  client just didn't dispatch them before fix4. */
   damageReject: Array<(p: Uint8Array) => void>;
+  /** PR 11.7.C / §3.7 + §3.8: server → client authoritative-state
+   *  broadcast at 20Hz (`SNAPSHOT_RATE_HZ`). The predictor (LOCAL
+   *  player reconciliation) + the interpolator (REMOTE player
+   *  buffer) both consume this. The body bytes are the post-
+   *  discriminator payload — listener calls `decodeSnapshot` to
+   *  parse the typed `Snapshot`. */
+  snapshot: Array<(p: Uint8Array) => void>;
   pong: Array<(p: Uint8Array) => void>;
   disconnect: Array<() => void>;
 };
 
 function emptyListeners(): ListenerMap {
-  return {inputs: [], damageBroadcast: [], damageReject: [], pong: [], disconnect: []};
+  return {inputs: [], damageBroadcast: [], damageReject: [], snapshot: [], pong: [], disconnect: []};
 }
 
 /** Window of recent RTT samples (ms). */
@@ -220,6 +228,24 @@ export class ServerTransport {
    */
   onDamageReject(f: (p: Uint8Array) => void): void {
     this.listeners.damageReject.push(f);
+  }
+
+  /**
+   * PR 11.7.C / §3.7 + §3.8 — register an `onSnapshot` listener.
+   * The body is the post-discriminator bytes from the server's
+   * 20Hz authoritative-state broadcast (8-byte header +
+   * `player_count * 29` bytes). The listener typically calls
+   * `decodeSnapshot` from `protocol/snapshot.ts` and routes the
+   * typed `Snapshot` to the predictor (LOCAL reconciliation) +
+   * the interpolator (REMOTE buffer). Multiple listeners are
+   * allowed (the transport fans out internally).
+   *
+   * `decodeSnapshot` returns `null` on any size / discriminator
+   * mismatch — listeners should silently drop (the transport
+   * already logs a warn for a malformed snapshot).
+   */
+  onSnapshot(f: (p: Uint8Array) => void): void {
+    this.listeners.snapshot.push(f);
   }
 
   /** Send a PositionUpdate. */
@@ -568,6 +594,15 @@ export class ServerTransport {
         // pre-fix4 this branch fell through to the default
         // unknown-discriminator warning and the body was dropped.
         for (const f of this.listeners.damageReject) f(body);
+        return;
+      case DISCRIMINATOR_SNAPSHOT:
+        // PR 11.7.C / §3.7 + §3.8 — dispatch the 20Hz authoritative-
+        // state broadcast. Body is the 8-byte header + player
+        // payload (already discriminator-stripped). Listeners call
+        // `decodeSnapshot` to parse the typed `Snapshot`. Pre-11.7.C
+        // this branch fell through to the default unknown-
+        // discriminator warning and the body was dropped.
+        for (const f of this.listeners.snapshot) f(body);
         return;
       case DISCRIMINATOR_POSITION_UPDATE:
         // PositionUpdate is client → server; ignore if it arrives inbound.

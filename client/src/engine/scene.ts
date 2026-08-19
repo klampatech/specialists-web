@@ -63,6 +63,7 @@ import { createGameSession, type GameSession } from "../game/gameSession";
 import { renderTracer } from "../game/combat";
 import type { GgnetTransport } from "../net/ggnet";
 import { LockstepRuntime, ROLLBACK_CAP_FRAMES } from "../net/ggrsRuntime";
+import { decodeInput } from "../net/inputBitmask";
 
 /** Optional multiplayer kick — when present, createScene also runs a second
  *  controller and a lockstep session across the supplied transport.
@@ -780,6 +781,10 @@ export async function createScene(
           __damageBus?: unknown;
           __broadcastHandlerRegistered?: boolean;
           __pendingSweepInterval?: ReturnType<typeof setInterval>;
+          /** PR 11.7.C / §3.7 — predictor instance for smoke instrumentation. */
+          __predictor?: unknown;
+          /** PR 11.7.C / §3.8 — interpolator instance for smoke instrumentation. */
+          __interpolator?: unknown;
         };
         try {
         const { ServerTransport } = await import("../net/serverTransport");
@@ -915,6 +920,90 @@ export async function createScene(
         // player ID they own.
         if (gameSession) {
           gameSession.setServerTransport?.(server);
+        }
+        // PR 11.7.C / §3.7 + §3.8 — wire the client-side predictor +
+        // remote interpolator onto the ServerTransport's onSnapshot
+        // stream. The predictor drives LOCAL-player prediction +
+        // reconciliation; the interpolator drives REMOTE-player
+        // interpolation buffer rendering. Both consume the same
+        // 20Hz Snapshot stream (discriminator 0x07) — see
+        // `protocol/snapshot.ts::DISCRIMINATOR_SNAPSHOT` and
+        // `server/src/snapshot.rs` for the wire spec.
+        //
+        // **Late-binding the predictor**: the predictor is created
+        // AFTER `gameSession` is in scope (line ~368) but inside the
+        // same async IIFE so the closure capture sees the live
+        // `gameSession`. The GameSession's tick() forwards the
+        // encoded input to `predictor.recordLocalInput` via a
+        // late-bound setter (set below) — the predictor's havokStep
+        // wrapper reads from `gameSession.localController` so we
+        // close over `gameSession` here, not over the bare
+        // `character` alias (which is a one-shot snapshot).
+        if (gameSession) {
+          const { Predictor } = await import("./clientPredictor");
+          const { Interpolator } = await import("./remoteInterpolator");
+          const { decodeSnapshot } = await import("../../../protocol/snapshot");
+          const localCtrl = gameSession.localController;
+          // Havok-step wrapper — advances the local controller by
+          // one encoded input (mirrors what gameSession.tick()
+          // does internally with `localController.update(...)`).
+          // The wrapper returns a PlayerState snapshot for the
+          // predictor to consume. The 1/60 dt mirrors the game
+          // loop's 60Hz tick rate.
+          // Havok-step wrapper — advances the local controller by
+          // one encoded input (mirrors what gameSession.tick() does
+          // internally with `localController.update(...)`). The
+          // wrapper returns a PlayerState snapshot for the predictor
+          // to consume. The 1/60 dt mirrors the game loop's 60Hz tick
+          // rate.
+          //
+          // **Note**: CharacterState in PR 11.7.B doesn't carry
+          // `velocity` or `isFiring` (velocity is on the Havok
+          // controller via `getVelocity()`; isFiring is in the input
+          // bitmask, not the controller state). For the predictor's
+          // reconciliation we only need position (drift check) + hp
+          // — the rest is left at sensible defaults. PR 11.7.E will
+          // extend this wrapper when the wire carries more fields.
+          const havokStep = (_state: import("../../../protocol/snapshot").PlayerState, encoded: Uint8Array): import("../../../protocol/snapshot").PlayerState => {
+            const decoded = decodeInput(encoded);
+            localCtrl.update(decoded, 1 / 60, performance.now());
+            const vel = localCtrl.havok.getVelocity();
+            return {
+              playerId: localPlayerId,
+              positionX: localCtrl.state.position.x,
+              positionY: localCtrl.state.position.z,
+              velocityX: vel.x,
+              velocityY: vel.z,
+              yaw: 0, // PR 11.7.B wire doesn't carry yaw/pitch
+              pitch: 0,
+              hp: localCtrl.state.hp,
+              ammo: 0,
+              isFiring: decoded.fireHeld ? 1 : 0,
+            };
+          };
+          const predictor = new Predictor(
+            localPlayerId,
+            havokStep,
+            () => gameSession.frame,
+          );
+          const interpolator = new Interpolator(localPlayerId);
+          server.onSnapshot((body) => {
+            const snap = decodeSnapshot(body);
+            if (!snap) return;
+            const now = performance.now();
+            predictor.onSnapshot(snap, now);
+            interpolator.onSnapshot(snap, now);
+          });
+          // Late-bind the predictor onto the GameSession so tick()
+          // can call predictor.recordLocalInput alongside the
+          // existing runtime.submitLocalInput.
+          gameSession.setPredictor?.(predictor);
+          // DEV probes — forward-looking instrumentation for the
+          // future snapshot-driven smoke (5190/5191 don't exercise
+          // these yet — the snapshot path is verified via the
+          // §4.4 HP-convergence assertion in the 5191 smoke).
+          winSlot.__predictor = predictor;
+          winSlot.__interpolator = interpolator;
         }
         // PR 11.6.D FIX 4 part C — periodic sweep of expired pending
         // applies. The server's `DamageReject` packet may be dropped

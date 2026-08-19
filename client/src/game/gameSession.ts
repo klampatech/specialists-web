@@ -202,6 +202,22 @@ export interface GameSession {
    */
   submitLocalInput(input: InputState): void;
   /**
+   * PR 11.7.C / §3.7 — late-bind the client-side predictor. scene.ts
+   * creates the predictor asynchronously (await server.connect + dynamic
+   * import of clientPredictor) AFTER `createGameSession` returns. Tick()
+   * calls `predictor.recordLocalInput(advanced.frame, encodedInput)`
+   * alongside the existing runtime.submitLocalInput — the predictor
+   * uses the buffer for re-simulation after server snapshot
+   * reconciliation. Setting to `null` disables prediction (legacy
+   * lockstep-only path; used by smokes that don't exercise the
+   * snapshot stream).
+   *
+   * Optional — DEV-only in practice (production bundles omit this
+   * method entirely via Vite's tree-shake on the `import.meta.env.DEV`
+   * gates in scene.ts).
+   */
+  setPredictor?: (p: import("../engine/clientPredictor").Predictor | null) => void;
+  /**
    * PR 11.6.D FIX 2 — this tab's local player ID. Used as
    * `sourcePlayerId` on outbound DamageRequests. Defaults to 1.
    * The smoke drives this via `window.__localPlayerId` and asserts
@@ -394,8 +410,29 @@ export function createGameSession(
     //    `submitLocalInput(input)` below so PR 11.7 can swap the
     //    destination (ggrsRuntime → serverTransport) without touching
     //    this call site.
+    // 1. Encode + submit local input + advance one frame. The runtime uses
+    //    the on-wire remote input if it's already arrived, or repeats the
+    //    last-known input otherwise.
+    //
+    //    PR 11.6.B / §1.2 seam: the encode + submit is now wrapped in
+    //    `submitLocalInput(input)` below so PR 11.7 can swap the
+    //    destination (ggrsRuntime → serverTransport) without touching
+    //    this call site.
+    //
+    //    PR 11.7.C / §3.7: encode the input ONCE so the SAME bytes feed
+    //    both the runtime submit AND the predictor's recordLocalInput.
+    //    Computing encodeInput() twice could diverge (e.g., a future
+    //    patch that adds non-deterministic state to the encoder).
+    const encodedInput = encodeInput(gameInput);
     submitLocalInput(gameInput);
     const advanced = runtime.advanceFrame();
+
+    // PR 11.7.C / §3.7 — record the input in the predictor's local
+    // input buffer (keyed by advanced.frame, the frame just processed).
+    // The predictor uses this buffer for re-simulation after a server
+    // snapshot reconciliation. No-op when `predictor === null` (no
+    // snapshot transport connected — P2P smokes).
+    predictor?.recordLocalInput(advanced.frame, encodedInput);
 
     // PR 11.5: rollback-cap early-return. When the cap fires we return
     // a minimal SessionFrame WITHOUT stepping either controller, running
@@ -596,6 +633,9 @@ export function createGameSession(
   // Today this goes through the lockstep substrate (`ggrsRuntime`).
   // PR 11.7 retires lockstep and routes the same encoded input to
   // `serverTransport` instead; only this method changes.
+  // PR 11.7.C / §3.7 — late-bound predictor reference. `null` by
+  // default; scene.ts sets it once the snapshot transport is connected.
+  let predictor: import("../engine/clientPredictor").Predictor | null = null;
   const submitLocalInput = (input: InputState): void => {
     runtime.submitLocalInput(encodeInput(input));
   };
@@ -626,6 +666,12 @@ export function createGameSession(
     // constructor option (may be `null` for P2P smokes).
     setServerTransport: (t) => {
       serverTransport = t;
+    },
+    // PR 11.7.C / §3.7 — late-bind the predictor. Called by scene.ts
+    // once the snapshot transport is connected. See the interface
+    // comment above for rationale.
+    setPredictor: (p) => {
+      predictor = p;
     },
     getCombatEvents: () => combatEvents.slice(),
     consumeUnrenderedCombatEvents: () => {
