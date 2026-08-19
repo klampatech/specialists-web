@@ -5,6 +5,49 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
 
+## 2026-08-18 — SESSION END NOTE: PR 11.7.B fix dispatch landed (6 commits, 5 BLOCKING/NBLK items fixed). Branch `feat/phase1-pr11.7.b-server-snapshot @ 51e230e` PUSHED to origin. **NOT YET OPENED as PR — awaiting 2nd claude review pass (deferred due to token-budget 429).**
+
+**This session** (~3.5 hours total, follow-on from the earlier PR 11.7.B codex-1 dispatch):
+1. **First claude cross-vendor review caught 3 BLOCKING bugs** that the verifier missed:
+   - BLK-1: §3.13 coyote-time grant structurally unreachable (`apply_jumps` used throwaway per-tick map; coyote means grounded-NOW-is-false by definition, so the lookup always returned None).
+   - BLK-2: Client inputs never reached the physics step (`drain_inputs_for_tick()` implemented but never called from the tick loop).
+   - BLK-3: §3.13 unit tests asserted constants (`assert!(COYOTE_FRAMES == 2)`) instead of grant behavior. Why BLK-1 slipped through.
+2. **Fix codex dispatched** (pane `wGR:p2`, ~30 min wall time) addressed BLK-1+BLK-2+BLK-3 + NBLK-1 (HashMap→BTreeMap determinism) + NBLK-3/4 (capture script spec compliance) — per Kyle's scope decision. 6 commits landed:
+   - `612b7f5` BLK-1: persistent `last_grounded_frame: BTreeMap<PlayerId, u64>` on `PhysicsWorld`
+   - `6c9e8eb` BLK-2: `room_guard.drain_inputs_for_tick(frame);` added to physics tick loop
+   - `233abf9` NBLK-1: BTreeMap for `body_handles`/`controllers`/`last_grounded`/`jump_v_y`
+   - `edbe043` BLK-3: rewrote coyote tests to assert behavior; added new `coyote_time_grant_fires_mid_air_via_persistent_map` test (would have FAILED pre-fix)
+   - `11ce0a3` NBLK-3/4: capture-havok-reference rewrites — real Havok controller via `ctrl.update(inputState, dt, nowMs)` instead of teleport-and-setVelocity
+   - `51e230e` chore: regenerated Havok reference JSONs + smoke screenshot artifact
+3. **Verifier re-run (independent)** — all gates green:
+   - cargo test 170/170 (87 unit + 35 damage_relay + 16 protocol_wire + 20 session_canary + 12 snapshot) — up from 168, the +2 = rewritten coyote tests
+   - Determinism check: 0 failures across two cargo runs (BTreeMap fix worked; only test order differs)
+   - npm typecheck/build clean, vitest 10/10, bundle grep clean, 5191 smoke assertions 1-6 PASS
+   - Post-spam 12-HP gap persists — known carry-forward per §4.4
+4. **Plan amendments on `docs/pr11.7-plan` branch** (pushed as `d48e785`):
+   - §3.5 discriminator table rewritten + new "Discriminator reorganization" callout
+   - Appendix A: new "PR 11.7.B implementation findings" entry listing all 5 deviations
+   - `docs/SPEC.md` banner updated for implementation findings
+5. **Second claude pass (cross-vendor verification of fixes) DEFERRED** — first call hit `429 Token Plan usage limit reached`. Retried, same. **Defer to next session** when budget recovers. My verifier pass is independent but not as strong as cross-vendor; this is a known risk gap.
+6. **Watcher recipe fix saved** — pitfall #16 added to `coding-task-routing` skill v1.6.0. Verified working in this session (caught codex-2's `status=done` transition correctly).
+
+**Files pushed to origin this session**:
+- `feat/phase1-pr11.7.b-server-snapshot @ 51e230e` (8 commits total — 2 from codex-1 + 6 from codex-2)
+- `docs/pr11.7-plan @ d48e785` (docs-only retroactive amendments)
+
+**Honest framing for the next session**:
+- PR 11.7.B **is ready to open as a PR** (verifier passes, fixes verified independently, no blocking issues). The 2nd claude pass is the missing safety net — retry when token budget recovers.
+- **Decision point**: open PR now (skip 2nd claude) or wait for 2nd claude first? Kyle was asked, timed out at 10 min. Conservative default: defer PR until 2nd claude completes. If you (next session) decide to skip claude-2, the call is yours.
+- **The next-session action** (assuming token budget recovers overnight):
+  1. Re-spawn claude-2 in pane (print mode, ~10 min) with the brief at `/tmp/review2-brief-<ts>.md` (if still there) or regenerated.
+  2. Adjudicate claude-2 findings.
+  3. If clean → `gh pr create --repo klampatech/specialists-web --head feat/phase1-pr11.7.b-server-snapshot --title "feat(phase1-pr11.7.b): server physics + snapshot generator (Rapier + 64Hz tick + Snapshot 0x07 + coyote-time parity)"`.
+- **Capture script caveat**: codex shipped "spec-compliant" capture script but the JSON data shows `jumpAppliedAtFrame: -1` (Havok sync bug — script's `lastSupported=true → !supported=false` detection requires a physics step that hasn't happened in 32ms). The Y-trajectory values ARE real Havok physics output (parity-smoke diff target), just without the jump actually being applied. Acceptable for now; flagged for follow-up.
+- **Servers**: down (clean state). Restart per the handoff's "Servers" section.
+
+**Servers**: down (unchanged).
+
+
 ## 2026-08-18 — SESSION END NOTE: PR 11.7.B codex dispatch landed (2 commits, 27 files, +4597/-110 lines). Branch `feat/phase1-pr11.7.b-server-snapshot` PUSHED to origin awaiting review.
 
 **This session** (2026-08-18, ~2.5 hours, follow-on from the 11.7.A plan + parity additions):
