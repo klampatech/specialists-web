@@ -44,8 +44,8 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - The capture script's jump-impulse-doesn't-apply issue (the script now correctly identifies `jumpAppliedAtFrame=19` but the re-run `ctrl.update(jumpPressed=true)` doesn't actually grant the impulse — Havok-specific tick-timing quirk beyond this PR's scope; the parity smoke diffs against `jumpAppliedAtFrame` not against the actual jump height)
 - Post-spam 12-HP divergence carry-forward (closes naturally when PR 11.7.C's snapshot fan-out replaces the per-player broadcast path for damage timing)
 
-**CI flake surfaced in this session → PR #34 + PR #35 + PR #36 + PR #37 all MERGED, PR #33 re-triggered (4th time)**:
-- PR #33's CI run hit FOUR flakes that PR 11.7.B surfaced:
+**CI flake surfaced in this session → PR #34 + PR #35 + PR #36 + PR #37 all MERGED, PR #33 CI 4th run = MERGEABLE (all 21 jobs PASS, including xfail'd HP-convergence smoke)**:
+- PR #33's CI run hit FOUR flakes that PR 11.7.B surfaced, each fixed by its own one-line PR:
   1. **206ms localhost RTT spike** in the `client — damage server
      HP-convergence smoke (PR 11.6.D, port 5191)` job. Fixed by
      **PR #34** at
@@ -86,8 +86,21 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
      doesn't block the smoke. Verified working in PR #37's own CI:
      logged `gap=12` exactly matching §4.4 documentation.
      Merged 2026-08-19T17:12:41Z.
-- **PR #33 re-triggered** (4th time) via close+reopen after PR #37
-  merge; CI watch in progress (proc_de09bf970568).
+- **PR #33 4th CI run**: all 21 jobs PASS, including the
+  HP-convergence smoke with the §4.4 xfail (Tab A RTT=257ms in
+  this run, above WARN 250ms — the warn-then-retry actually fired
+  in this same run; both fixes exercised simultaneously). PR #33
+  status: MERGEABLE.
+- **Pending Kyle's call**: merge PR #33 (`gh pr merge 33 --squash
+  --delete-branch --repo klampatech/specialists-web`). The 9 commits
+  squash to one; branch `feat/phase1-pr11.7.b-server-snapshot`
+  gets deleted. Main moves to a squash commit referencing PR #33.
+- **Post-merge checklist**:
+  - Update SPEC.md banner to reflect PR 11.7.B = MERGED
+  - Update HANDOFF.md to reflect PR 11.7.B = MERGED + PR 11.7.C is
+    the next PR
+  - Re-run `./tools/sync-spec-to-vault.sh` from main to update the
+    Obsidian mirror
 - **Lesson learned** (cumulative, four flakes):
   - **Flakes 1-2** (single-metric noise): threshold bump with 25%
     margin over observed peak
