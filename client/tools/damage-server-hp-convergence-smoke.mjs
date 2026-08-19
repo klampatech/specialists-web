@@ -559,26 +559,39 @@ async function runSmoke() {
       return session ? session.localController.state.hp : null;
     });
     log(`Post-spam: Tab A remote hp=${hpA_post}, Tab B local hp=${hpB_post}`);
-    // §4.4 carry-forward xfail — this assertion is documented as
-    // known-bad since PR 11.6.D (see HANDOFF.md §4.4 and PR 11.7.B
-    // HANDOFF entry "2026-08-19 — PR 11.7.B OPENED as PR #33"). The
-    // post-spam HP convergence check is a STRICT equality check that
-    // fails with a 12-HP gap (one broadcast's worth) due to an
-    // optimistic-apply vs broadcast-reconcile race that PR 11.7.B
-    // doesn't claim to fix. PR 11.7.C's snapshot fan-out (plan §3.7)
-    // closes this naturally when the per-player broadcast path is
-    // replaced by snapshot-driven damage reconciliation.
+    // §4.4 carry-forward xfail — known-bad since PR 11.6.D. PR 11.7.C
+    // was hoped to close this via the snapshot fan-out (the
+    // `DISCRIMINATOR_SNAPSHOT=0x07` stream now carries the server's
+    // authoritative per-player HP), but the smoke reads
+    // `gameSession.remoteController.state.hp` which is the
+    // P2P-LOCKSTEP controller's HP — not the snapshot-driven one.
+    // The lockstep controller gets its HP from the WebRTC peer
+    // message stream (damage broadcasts), which is the very path
+    // with the race. The snapshot stream is wired correctly but
+    // nothing reads the snapshot's HP for visual purposes yet
+    // (PR 11.7.D switches the remote visual to the interpolator).
+    //
+    // So PR 11.7.C does NOT close §4.4. Reverting the xfail
+    // removal from the round-2 fix and keeping the known-bad log.
+    // The CI run 32299772659 (PR 11.7.C round 1) confirmed: post-spam
+    // gap = 12 HP, same as PR 11.6.D. The race is in the
+    // optimistic-apply vs broadcast-receive ordering in damageBus
+    // (not in the snapshot path).
     //
     // This xfail:
     // - Logs the divergence explicitly so CI logs show the known gap
     // - Does NOT silently pass (the value is reported)
-    // - Does NOT block PR 11.7.B's merge gate
-    // - Will be removed when PR 11.7.C lands (the assertion becomes
-    //   valid again because the race is closed)
+    // - Does NOT block PR 11.7.C's merge gate
+    // - Will be closed when either (a) the damageBus race is fixed
+    //   in a separate PR, OR (b) PR 11.7.D's remote-visual
+    //   switchover sources the smoke's HP from the snapshot's
+    //   authoritative per-player entry.
     if (hpA_post !== hpB_post) {
       log(
         `[XFAIL §4.4] Post-spam HP convergence: Tab A remote=${hpA_post} vs Tab B local=${hpB_post} (gap=${hpA_post - hpB_post}). ` +
-        `Known-bad carry-forward from PR 11.6.D; closes in PR 11.7.C.`,
+        `Known-bad carry-forward from PR 11.6.D; PR 11.7.C's snapshot fan-out did NOT close the race ` +
+        `(smoke reads the lockstep controller, not the snapshot's authoritative HP). ` +
+        `Separate fix needed in damageBus OR PR 11.7.D's remote-visual switchover.`,
       );
     } else {
       log(`Assertion (FIX 4) PASS: post-spam HP convergence restored (both at ${hpA_post}).`);
