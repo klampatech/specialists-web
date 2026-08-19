@@ -44,8 +44,8 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - The capture script's jump-impulse-doesn't-apply issue (the script now correctly identifies `jumpAppliedAtFrame=19` but the re-run `ctrl.update(jumpPressed=true)` doesn't actually grant the impulse — Havok-specific tick-timing quirk beyond this PR's scope; the parity smoke diffs against `jumpAppliedAtFrame` not against the actual jump height)
 - Post-spam 12-HP divergence carry-forward (closes naturally when PR 11.7.C's snapshot fan-out replaces the per-player broadcast path for damage timing)
 
-**CI flake surfaced in this session → PR #34 + PR #35 + PR #36 in pipeline, PR #33 re-triggered (3rd time)**:
-- PR #33's CI run hit THREE flakes that PR 11.7.B surfaced:
+**CI flake surfaced in this session → PR #34 + PR #35 + PR #36 all MERGED, PR #33 re-trigger surfaces 4th flake (assertion 7 post-spam HP convergence)**:
+- PR #33's CI run hit FOUR flakes that PR 11.7.B surfaced:
   1. **206ms localhost RTT spike** in the `client — damage server
      HP-convergence smoke (PR 11.6.D, port 5191)` job. Fixed by
      **PR #34** at
@@ -71,16 +71,37 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
      **warn-then-retry pattern**: WARN 250ms (trigger retry),
      HARD 400ms (fail if BOTH samples exceed). The option I
      deferred in PR #34's commit; the third flake forced the issue.
-- **PR #33 re-triggered** (3rd time) via close+reopen after PR #35
-  merge; CI watch in progress (proc_8f66d4d29cde).
-- **Lesson learned**: when the same smoke hits two distinct flakes
-  in two CI runs, the right move is the warn-then-retry pattern
-  (distinguish "noisy single sample" from "actually broken"), not
-  another threshold bump. PR #36 implements this. If a third
-  pattern (e.g. fire-rate, post-spam 12-HP gap) flaked after
-  PR #36, the next move would be **removing the assertion entirely**
-  if it's purely a noise proxy (the RTT was already marginal —
-  the `connected=true` check at the same point is the real test).
+     Merged 2026-08-19T16:34:15Z.
+  4. **Post-spam HP convergence assertion 7** — Tab A remote=52 vs
+     Tab B local=40. Strict equality check fails after the spam
+     phase. This is the **§4.4 12-HP divergence carry-forward** from
+     PR 11.6.D — documented as a known-bad assertion that closes
+     naturally when PR 11.7.C's snapshot fan-out replaces the
+     per-player broadcast path. NOT PR 11.7.B's regression; it's
+     been failing since PR 11.6.D's HANDOFF flagged it.
+- **PR #33 CI re-trigger after PR #36**: assertions 5 + 6 PASS (PR #36
+  worked perfectly); assertion 7 (post-spam convergence) FAIL with
+  the documented §4.4 12-HP gap.
+- **Decision needed**: how to handle assertion 7's known-fail:
+  - **Option A**: xfail assertion 7 in the smoke with a clear comment
+    referencing §4.4 (1-line PR; cleanest documentation)
+  - **Option B**: accept the red on PR #33 with a known-flake note
+    in the merge commit (less clean; obscures future regressions in
+    the same area)
+  - **Option C**: fix the underlying bug (deep work; closes §4.4
+    entirely; properly belongs to PR 11.7.C since that's where the
+    snapshot fan-out closes it naturally)
+- **Recommendation**: Option A (xfail). PR 11.7.B is server-side
+  infrastructure; the §4.4 carry-forward is a known-bad assertion
+  that PR 11.7.C fixes naturally. xfail with the comment makes the
+  state explicit instead of pretending it's green.
+- **Lesson learned**: when the same smoke flakes, the right move
+  depends on WHICH assertion fails. PR #36's warn-then-retry
+  pattern correctly handled the RTT noise (assertions 5 + 6 PASS).
+  But assertion 7 is a different category: it's a STRICT functional
+  check (post-spam HP must equal exactly), failing for a documented
+  reason, and the fix is in a future PR. xfail is the right tool
+  for that case.
 
 **New CI tests to add (not in CI today, deferred)**:
 1. **`cargo test twice + diff`** determinism gate — runs the existing
