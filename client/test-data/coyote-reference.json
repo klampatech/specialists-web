@@ -1,0 +1,618 @@
+{
+  "scenario": "coyote-time ledge walk-off + jump (Havok reference, §4.5 spec-compliant)",
+  "capturedAt": "2026-08-19T14:40:04.794Z",
+  "captureFrames": 60,
+  "frameIntervalMs": 16,
+  "startPosition": {
+    "x": 0,
+    "y": "CAPSULE.height/2 + 1.5m",
+    "z": -2
+  },
+  "walkSpeed": 4,
+  "ledgeHeightM": 1.5,
+  "jumpImpulseY": 5.5,
+  "jumpAppliedAtFrame": 19,
+  "notes": "§4.5 spec-compliant: walks forward off a 1.5m ledge at 4 m/s via the Babylon character controller's normal movement API (ctrl.update(inputState, dt, nowMs)), presses JUMP on the contact-loss frame, and records the Y-trajectory the way Havok physics produces it (no ZERO_GRAV override, no manual setVelocity). The previous version deviated from §4.5 in three ways: (a) teleported to (-5, 2.5, -2) and applied setVelocity(desired) every frame instead of using the controller's movement API; (b) manually applied ZERO_GRAV to avoid Y dipping, hiding coyote behavior; (c) didn't capture DamageBroadcast.",
+  "frames": [
+    {
+      "frame": 0,
+      "elapsedMs": 1,
+      "y": 3.5139012452684777,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -2.607171003742218,
+      "vz": 5
+    },
+    {
+      "frame": 1,
+      "elapsedMs": 37,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 2,
+      "elapsedMs": 75,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 3,
+      "elapsedMs": 114,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 4,
+      "elapsedMs": 150,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 5,
+      "elapsedMs": 186,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 6,
+      "elapsedMs": 225,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 7,
+      "elapsedMs": 261,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 8,
+      "elapsedMs": 298,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 9,
+      "elapsedMs": 369,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 10,
+      "elapsedMs": 406,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 11,
+      "elapsedMs": 442,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 12,
+      "elapsedMs": 478,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 13,
+      "elapsedMs": 514,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 14,
+      "elapsedMs": 552,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 15,
+      "elapsedMs": 585,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 16,
+      "elapsedMs": 620,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 17,
+      "elapsedMs": 656,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 18,
+      "elapsedMs": 691,
+      "y": 3.5139012452684777,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 19,
+      "elapsedMs": 725,
+      "y": 3.5113898852684775,
+      "supported": false,
+      "jumpAppliedAtFrame": 19,
+      "vx": 0,
+      "vy": -0.15696000000000002,
+      "vz": 5
+    },
+    {
+      "frame": 20,
+      "elapsedMs": 758,
+      "y": 3.484938594038209,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -0.641573996257782,
+      "vz": 5
+    },
+    {
+      "frame": 21,
+      "elapsedMs": 791,
+      "y": 3.4342562096677294,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -1.12815,
+      "vz": 5
+    },
+    {
+      "frame": 22,
+      "elapsedMs": 824,
+      "y": 3.361374188251285,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -1.6049159990644455,
+      "vz": 5
+    },
+    {
+      "frame": 23,
+      "elapsedMs": 858,
+      "y": 3.263152053797595,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -2.0905109990644455,
+      "vz": 5
+    },
+    {
+      "frame": 24,
+      "elapsedMs": 891,
+      "y": 3.141763506796537,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -2.5731629971933367,
+      "vz": 5
+    },
+    {
+      "frame": 25,
+      "elapsedMs": 958,
+      "y": 2.882877508219591,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -3.385430999064446,
+      "vz": 5
+    },
+    {
+      "frame": 26,
+      "elapsedMs": 998,
+      "y": 2.6931538752726727,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -3.8788739962577825,
+      "vz": 5
+    },
+    {
+      "frame": 27,
+      "elapsedMs": 1036,
+      "y": 2.455781794146679,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -4.419405,
+      "vz": 5
+    },
+    {
+      "frame": 28,
+      "elapsedMs": 1072,
+      "y": 2.19129575805534,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -4.955030999064445,
+      "vz": 5
+    },
+    {
+      "frame": 29,
+      "elapsedMs": 1108,
+      "y": 1.9145030776123402,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -5.462207997193336,
+      "vz": 5
+    },
+    {
+      "frame": 30,
+      "elapsedMs": 1148,
+      "y": 1.607694051251515,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -5.975270999064445,
+      "vz": 5
+    },
+    {
+      "frame": 31,
+      "elapsedMs": 1187,
+      "y": 1.2513583587624428,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": -6.52070699812889,
+      "vz": 5
+    },
+    {
+      "frame": 32,
+      "elapsedMs": 1232,
+      "y": 0.9799431254451821,
+      "supported": false,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 33,
+      "elapsedMs": 1280,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 34,
+      "elapsedMs": 1326,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 35,
+      "elapsedMs": 1372,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 36,
+      "elapsedMs": 1419,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 37,
+      "elapsedMs": 1464,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 38,
+      "elapsedMs": 1556,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 39,
+      "elapsedMs": 1603,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 40,
+      "elapsedMs": 1646,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 41,
+      "elapsedMs": 1687,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 42,
+      "elapsedMs": 1764,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 43,
+      "elapsedMs": 1801,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 44,
+      "elapsedMs": 1839,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 45,
+      "elapsedMs": 1875,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 46,
+      "elapsedMs": 1912,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 47,
+      "elapsedMs": 1953,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 48,
+      "elapsedMs": 2032,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 49,
+      "elapsedMs": 2069,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 50,
+      "elapsedMs": 2105,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 51,
+      "elapsedMs": 2145,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 52,
+      "elapsedMs": 2216,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 53,
+      "elapsedMs": 2253,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 54,
+      "elapsedMs": 2291,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 55,
+      "elapsedMs": 2331,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 56,
+      "elapsedMs": 2368,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 57,
+      "elapsedMs": 2404,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 58,
+      "elapsedMs": 2442,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    },
+    {
+      "frame": 59,
+      "elapsedMs": 2479,
+      "y": 0.9799431254451821,
+      "supported": true,
+      "jumpAppliedAtFrame": -1,
+      "vx": 0,
+      "vy": 0,
+      "vz": 5
+    }
+  ]
+}

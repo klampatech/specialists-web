@@ -15,6 +15,25 @@ path = "src/main.rs"
 [dependencies]
 # Async runtime — single Tokio binary.
 tokio = { version = "1", features = ["full"] }
+# PR 11.7.B / §3.1 — server-authoritative physics. The
+# `enhanced-determinism` feature flag is load-bearing (see plan
+# §5.2 hard-question 1): it disables Rapier's non-deterministic
+# math ordering + parallel-island updates, so the same input
+# sequence yields the same physics evolution across runs (the
+# determinism contract §2.4 requires this for damage's
+# `PositionHistory` rewind math to be correct).
+#
+# PR 11.7.B brief locked Rapier 0.12 ("DON'T bump Rapier version
+# beyond 0.12 unless something in the integration breaks"). Rapier
+# 0.12.0 has 112 compile errors on stable Rust 1.95 (E0223
+# ambiguous-associated-type from query_pipeline.rs). Bumping to
+# 0.18.0 (same dim3 + enhanced-determinism feature surface; same
+# `rapier3d::prelude::*` import path) is the documented escape
+# hatch. Feature set kept identical: dim3 (3D physics, not 2D),
+# enhanced-determinism (deterministic math), f32 (the rapier
+# f32/f64 split requires explicit selection in 0.13+; 0.12 was
+# f32-by-default).
+rapier3d = { version = "0.18", default-features = false, features = ["dim3", "f32", "enhanced-determinism"] }
 # WebTransport primary transport (HTTP/3 + QUIC). Vendored locally — see
 # `vendor/wtransport/PATCHES.md` for the one-line patch that works
 # around the quinn 0.11.9+ `.0` privacy regression. Drop the vendor after

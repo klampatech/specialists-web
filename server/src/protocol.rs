@@ -47,7 +47,14 @@ pub const DISCRIMINATOR_INPUTS_SERVER: u8 = 0x06;
 /// tab only (NOT broadcast) when the validator rejects a
 /// DamageRequest. The reject is privacy-scoped to the source's
 /// connection so peer tabs don't learn about the rejection.
-pub const DISCRIMINATOR_DAMAGE_REJECT: u8 = 0x07;
+// PR 11.7.B: bumped from 0x07 to 0x0C. The brief locks
+// `DISCRIMINATOR_SNAPSHOT = 0x07` and the plan §3.5 reserves
+// 0x07-0x0B for PR 11.7 types (Snapshot/StateAck/InputSeq/
+// ReloadRequest/StateResyncRequest). 0x0C is the next free slot
+// after those reservations. This is a wire-format breaking change
+// vs PR 11.6.D's 0x07; the client-side `protocol/damage.ts`
+// constant moves in lockstep.
+pub const DISCRIMINATOR_DAMAGE_REJECT: u8 = 0x0C;
 
 /// Wire-size constants (from §3.5). PR 11.6.C: these are the BODY
 /// sizes (what the Rust `encode_*` returns). The on-the-wire packet
@@ -76,6 +83,42 @@ pub const REJECT_REASON_AMMO: u8 = 1;
 pub const REJECT_REASON_EVENT_ID: u8 = 2;
 pub const REJECT_REASON_LAG_MISS: u8 = 3;
 pub const REJECT_REASON_NO_HISTORY: u8 = 4;
+
+// PR 11.7.B / §3.5 — new discriminator constants. PR 11.7.B
+// introduces the `Snapshot` wire type (server → client). `StateAck` is
+// declared as a constant in this PR but the encoder/decoder is
+// deferred to PR 11.7.C (the client doesn't send StateAck yet, so
+// only the discriminator reservation matters here).
+pub const DISCRIMINATOR_SNAPSHOT: u8 = 0x07;
+pub const DISCRIMINATOR_STATE_ACK: u8 = 0x08;
+
+/// PR 11.7.B / §3.5 — wire-size constant for the Snapshot BODY
+/// (the disc byte is prepended by the transport router, matching
+/// the DamageBroadcast / DamageReject / etc. convention). Body = 4
+/// (serverFrame u32 BE) + 4 (nextServerFrame u32 BE) + 1
+/// (playerCount u8) = 9 bytes. Per-player payload is 29 bytes (see
+/// `PLAYER_STATE_WIRE_SIZE`). Variable-length payload: total body =
+/// 9 + player_count * 29 bytes. On-the-wire size (disc + body) =
+/// 10 + player_count * 29 bytes. At 24p: 10 + 24*29 = 706 bytes; at
+/// 20Hz: 14.1 KB/s/server outbound (vs 21.5 KB/s for PR 11.6.D's
+/// per-player `PositionUpdate` at 32Hz — ·2x bandwidth reduction
+/// per the plan §3.10.1 math).
+pub const SNAPSHOT_WIRE_SIZE_MIN: usize = 4 + 4 + 1;
+
+/// Per-player payload size in a `Snapshot`. 2 + 4 + 4 + 4 + 4 + 4 + 4
+/// + 1 + 1 + 1 = 29 bytes:
+///   2  playerId u16 BE
+///   4  positionX f32 BE
+///   4  positionY f32 BE
+///   4  velocityX f32 BE
+///   4  velocityY f32 BE
+///   4  yaw f32 BE (radians; 0..2π on the client, signed f32 here)
+///   4  pitch f32 BE (radians; -π/2..+π/2 on the client)
+///   1  hp u8
+///   1  ammo u8
+///   1  isFiring u8 (0 or 1 — wire-compatible bool for forward-compat
+///      with snapshot consumers that don't need a full bool)
+pub const PLAYER_STATE_WIRE_SIZE: usize = 29;
 
 // -- DamageRequest --------------------------------------------------------
 
@@ -353,6 +396,161 @@ pub fn decode_inputs_server(buf: &[u8]) -> Option<InputsServer> {
     })
 }
 
+// -- Snapshot (NEW §3.5) -----------------------------------------------
+
+/// PR 11.7.B / §3.5 — server-to-client authoritative-state
+/// broadcast. Sent at `SNAPSHOT_RATE_HZ` (20Hz, per the plan Q2 +
+/// §3.4 + §3.10.1) to every connected tab in the room. The client
+/// uses the snapshot's local-player state to reconcile its Havok
+/// prediction (`predictor.ts` in PR 11.7.C) and the snapshot's
+/// remote-player states to advance its interpolation buffer
+/// (`interpolator.ts`).
+///
+/// **2D convention**: `position_x` + `position_y` are the XZ-plane
+/// coordinates. `z` (height) is the server's authoritative capsule
+/// y (carried implicitly as the position's `y` field). On the wire
+/// these are 2D floats (matches the PR 11.6.B/C/D `Position` type).
+/// PR 11.7.B keeps the same 2D wire shape — the server-side Rapier
+/// state IS 3D (XZ + Y for height) but only the XZ pair is broadcast
+/// per the existing wire convention. The receiver's
+/// `predictor.ts` (PR 11.7.C) maps XZ back to world coordinates using
+/// the local scene's coordinate system.
+///
+/// **Byte-endian**: every multi-byte field is BIG-endian (matches
+/// the existing wire convention; see the module-level note).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerState {
+    pub player_id: PlayerIdT,
+    pub position_x: f32,
+    pub position_y: f32,
+    pub velocity_x: f32,
+    pub velocity_y: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub hp: u8,
+    pub ammo: u8,
+    /// 0 = not firing, 1 = firing. Wire-compatible bool.
+    pub is_firing: u8,
+}
+
+/// `PlayerId` is a `u16` on the wire. Mirrored as `PlayerIdT` to
+/// avoid the dep on `session.rs` in this module (the encoder/decoder
+/// only need the numeric type).
+pub type PlayerIdT = u16;
+
+/// `ServerFrame` matches `session::ServerFrame = u32`.
+pub type ServerFrameT = u32;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    pub server_frame: ServerFrameT,
+    /// The frame clients should predict to NEXT. Server-frame-1 is
+    /// the just-stepped authoritative frame; next_server_frame is the
+    /// frame in progress (so the client knows what to advance to
+    /// before the next snapshot arrives).
+    pub next_server_frame: ServerFrameT,
+    pub players: Vec<PlayerState>,
+}
+
+/// PR 11.7.B / §3.5 — encode a `Snapshot` to wire bytes. Header
+/// + variable-length player list. Discriminator is NOT prefixed; the
+/// transport router adds the `DISCRIMINATOR_SNAPSHOT` byte (same
+/// pattern as the existing `DamageBroadcast` and other outbound
+/// wire types — see the module-level note on body vs wire sizes).
+///
+/// `debug_assert_eq!` on the produced length catches the
+/// `PLAYER_STATE_WIRE_SIZE` constant drift if the `PlayerState`
+/// fields ever change.
+pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        SNAPSHOT_WIRE_SIZE_MIN + snap.players.len() * PLAYER_STATE_WIRE_SIZE,
+    );
+    buf.put_u32(snap.server_frame);
+    buf.put_u32(snap.next_server_frame);
+    // playerCount: u8 (max 255; well above MAX_PLAYERS_PER_ROOM = 24).
+    // If a future PR raises the room ceiling past 255, this becomes
+    // a u16 + SNAPSHOT_WIRE_SIZE_MIN becomes 11.
+    debug_assert!(
+        snap.players.len() <= u8::MAX as usize,
+        "encode_snapshot: player count {} exceeds u8::MAX",
+        snap.players.len(),
+    );
+    buf.put_u8(snap.players.len() as u8);
+    for p in &snap.players {
+        buf.put_u16(p.player_id);
+        buf.put_f32(p.position_x);
+        buf.put_f32(p.position_y);
+        buf.put_f32(p.velocity_x);
+        buf.put_f32(p.velocity_y);
+        buf.put_f32(p.yaw);
+        buf.put_f32(p.pitch);
+        buf.put_u8(p.hp);
+        buf.put_u8(p.ammo);
+        buf.put_u8(p.is_firing);
+    }
+    debug_assert_eq!(
+        buf.len(),
+        SNAPSHOT_WIRE_SIZE_MIN + snap.players.len() * PLAYER_STATE_WIRE_SIZE,
+        "encode_snapshot: produced {} bytes, expected {} (header {} + {} players * {})",
+        buf.len(),
+        SNAPSHOT_WIRE_SIZE_MIN + snap.players.len() * PLAYER_STATE_WIRE_SIZE,
+        SNAPSHOT_WIRE_SIZE_MIN,
+        snap.players.len(),
+        PLAYER_STATE_WIRE_SIZE,
+    );
+    buf
+}
+
+/// Decode a wire-format Snapshot. Returns `None` on any size / format
+/// drift (matches the existing decoder pattern).
+///
+/// **Discriminator stripping**: the body passed to this function is
+/// the post-disc bytes (the discriminator byte is stripped by the
+/// transport router). The body length must be exactly
+/// `SNAPSHOT_WIRE_SIZE_MIN + n * PLAYER_STATE_WIRE_SIZE` for some
+/// `n in 0..=u8::MAX`; otherwise decode returns `None`.
+pub fn decode_snapshot(buf: &[u8]) -> Option<Snapshot> {
+    if buf.len() < SNAPSHOT_WIRE_SIZE_MIN {
+        return None;
+    }
+    let header_size = SNAPSHOT_WIRE_SIZE_MIN;
+    let body_size = buf.len() - header_size;
+    if body_size % PLAYER_STATE_WIRE_SIZE != 0 {
+        return None;
+    }
+    let n_players = body_size / PLAYER_STATE_WIRE_SIZE;
+    if n_players > u8::MAX as usize {
+        return None;
+    }
+    let mut b = buf;
+    let server_frame = b.get_u32();
+    let next_server_frame = b.get_u32();
+    let player_count = b.get_u8() as usize;
+    if player_count != n_players {
+        return None;
+    }
+    let mut players = Vec::with_capacity(player_count);
+    for _ in 0..player_count {
+        players.push(PlayerState {
+            player_id: b.get_u16(),
+            position_x: b.get_f32(),
+            position_y: b.get_f32(),
+            velocity_x: b.get_f32(),
+            velocity_y: b.get_f32(),
+            yaw: b.get_f32(),
+            pitch: b.get_f32(),
+            hp: b.get_u8(),
+            ammo: b.get_u8(),
+            is_firing: b.get_u8(),
+        });
+    }
+    Some(Snapshot {
+        server_frame,
+        next_server_frame,
+        players,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit-level size assertions (the integration suite in
@@ -453,5 +651,146 @@ mod tests {
         let bytes = encode_inputs_server(&payload);
         assert_eq!(bytes.len(), INPUTS_SERVER_WIRE_SIZE);
         assert_eq!(bytes.len(), 17);
+    }
+
+
+    // -- Snapshot wire type (PR 11.7.B) ---------------------------------
+
+    #[test]
+    fn snapshot_minimum_size_when_empty() {
+        let snap = Snapshot {
+            server_frame: 0x01020304,
+            next_server_frame: 0x05060708,
+            players: vec![],
+        };
+        let bytes = encode_snapshot(&snap);
+        assert_eq!(bytes.len(), SNAPSHOT_WIRE_SIZE_MIN);
+        assert_eq!(bytes.len(), 9, "Snapshot with 0 players is the header only: 4+4+1 = 9 bytes");
+    }
+
+    #[test]
+    fn snapshot_per_player_size_is_29() {
+        let snap = Snapshot {
+            server_frame: 1,
+            next_server_frame: 2,
+            players: vec![PlayerState {
+                player_id: 7,
+                position_x: 1.0,
+                position_y: 2.0,
+                velocity_x: 0.5,
+                velocity_y: -0.5,
+                yaw: 0.0,
+                pitch: 0.0,
+                hp: 88,
+                ammo: 6,
+                is_firing: 1,
+            }],
+        };
+        let bytes = encode_snapshot(&snap);
+        assert_eq!(bytes.len(), SNAPSHOT_WIRE_SIZE_MIN + PLAYER_STATE_WIRE_SIZE);
+        assert_eq!(bytes.len(), 9 + 29);
+        assert_eq!(bytes.len(), 38);
+    }
+
+    #[test]
+    fn snapshot_at_24_players_is_706_bytes() {
+        // PR 11.7.B plan §3.5: 24p * 29 = 696 + 9 header = 705... wait,
+        // the brief says 706. Let me recompute: 4 (server_frame) + 4
+        // (next_server_frame) + 1 (player_count) = 9 bytes header;
+        // 24 * 29 = 696 bytes players; total = 705 bytes. The plan
+        // reference uses a different per-player size (22 bytes per
+        // player, 8-byte header); the brief locks the 29-byte size.
+        // This test pins the brief math: 9 + 24*29 = 705.
+        let snap = Snapshot {
+            server_frame: 0,
+            next_server_frame: 0,
+            players: (1..=24u16)
+                .map(|id| PlayerState {
+                    player_id: id,
+                    position_x: 0.0,
+                    position_y: 0.0,
+                    velocity_x: 0.0,
+                    velocity_y: 0.0,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    hp: 100,
+                    ammo: 0,
+                    is_firing: 0,
+                })
+                .collect(),
+        };
+        let bytes = encode_snapshot(&snap);
+        assert_eq!(bytes.len(), 705, "24p snapshot is 9 header + 24*29 players = 705 bytes");
+        // And the on-the-wire size is one more (the discriminator).
+        assert_eq!(bytes.len() + 1, 706);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_all_fields() {
+        let snap = Snapshot {
+            server_frame: 0xdeadbeef,
+            next_server_frame: 0xfeedface,
+            players: vec![
+                PlayerState {
+                    player_id: 1,
+                    position_x: 1.5,
+                    position_y: -2.25,
+                    velocity_x: 0.1,
+                    velocity_y: 0.2,
+                    yaw: 1.57,
+                    pitch: -0.5,
+                    hp: 88,
+                    ammo: 6,
+                    is_firing: 1,
+                },
+                PlayerState {
+                    player_id: 2,
+                    position_x: -3.0,
+                    position_y: 4.5,
+                    velocity_x: -0.7,
+                    velocity_y: 0.0,
+                    yaw: 0.0,
+                    pitch: 0.5,
+                    hp: 100,
+                    ammo: 12,
+                    is_firing: 0,
+                },
+            ],
+        };
+        let bytes = encode_snapshot(&snap);
+        let decoded = decode_snapshot(&bytes).expect("decode must succeed");
+        assert_eq!(decoded, snap);
+    }
+
+    #[test]
+    fn snapshot_decoder_rejects_wrong_size() {
+        let snap = Snapshot {
+            server_frame: 1,
+            next_server_frame: 2,
+            players: vec![PlayerState {
+                player_id: 7,
+                position_x: 0.0,
+                position_y: 0.0,
+                velocity_x: 0.0,
+                velocity_y: 0.0,
+                yaw: 0.0,
+                pitch: 0.0,
+                hp: 100,
+                ammo: 0,
+                is_firing: 0,
+            }],
+        };
+        let bytes = encode_snapshot(&snap);
+        // Truncate 1 byte — the player_count claims 1 but the
+        // player payload is short.
+        let mut too_short = bytes.clone();
+        too_short.truncate(bytes.len() - 1);
+        assert!(decode_snapshot(&too_short).is_none());
+        // Pad 1 byte — size doesn't match `SNAPSHOT_WIRE_SIZE_MIN + n*29`.
+        let mut too_long = bytes.clone();
+        too_long.push(0x00);
+        assert!(decode_snapshot(&too_long).is_none());
+        // Empty buffer — too short.
+        assert!(decode_snapshot(&[]).is_none());
     }
 }

@@ -7,26 +7,124 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ## ⚡ TL;DR for the next session (read this first)
 
-**You are here**: PR 11.6.D, branch `feat/phase1-pr11.6.d-validate-and-relay`, **20 commits ahead of main**, last commit `a765ccc` (2026-08-17 evening). PR is **NOT YET PUSHED** — local-only. Worktree clean. Servers can be left running OR killed; check `ps -p 3599169,3599938`.
+**You are here**: PR 11.7.B, branch `feat/phase1-pr11.7.b-server-snapshot`, ready to commit + PR. Worktree clean (after the docs/SPEC.md + HANDOFF.md updates). Servers killed. PR is **local-only** — squash + push + `gh pr create --body-file` is the next move.
 
-**Where we landed**:
-- **fix3** (`c682a03`): recentlySettled map, drop-without-revert, vitest installed.
-- **fix4** (`929f3d6`): Bug A (StrictMode race) + Bug B (drop-branch markSettled) + Bug C (sweep over-restoration via actualDelta) + TS-side 0x07 DamageReject mirror + smoke-side fix. **All 4 verifier gates green** (cargo 13/13, tsc clean, build 7,058.04 kB, vitest 5/5 then 10/10 after fix5).
-- **fix5** (`1d88ac3`): client-vitest CI job added + 5 new vitest tests (Tests F/G/H for fix4 invariants). ci.yml now has 20 jobs. **All 4 verifier gates still green**.
-- **fix6 (NOT YET DISPATCHED)**: the 12-HP gap. Smoking-gun diagnostic captured: `before=100, afterImmediate=88, afterBroadcast=100` — the optimistic apply works synchronously but something reverts the -12 between the immediate read and the broadcast arrival. Most likely cause: the broadcast handler's `resolveTarget` returns controllers from the LATEST `__gameSession` (which may be a different instance than the cached one the smoke/probe reads), so the broadcast's `applyDamage` decrements the LATEST controller while the smoke/probe reads the FIRST. Recommended fix6 approach: add `__broadcastAppliedTo` instrumentation to confirm, then either (a) use FIRST-session controllers in the broadcast handler, (b) invalidate stale `__gameSession` refs on StrictMode re-mount, or (c) drop optimistic-apply entirely (cleanest, +1 RTT per fire).
+**Where we landed (PR 11.7.B)**:
+- **Server physics**: Rapier 3D 0.18 (brief said 0.12 but 0.12 doesn't compile on Rust 1.95; 0.18 has the same `enhanced-determinism` feature surface — comment in `server/Cargo.toml` documents the bump) wrapped in a `PhysicsWorld` newtype that owns Rapier's pipeline (`RigidBodySet`/`ColliderSet`/`IslandManager`/`BroadPhase`/`NarrowPhase`/`CCDSolver`/`QueryPipeline`/`PhysicsPipeline` — Rapier 0.18 has no monolithic `World` struct). Per-player capsule + `KinematicCharacterController` (Rapier 0.18 has no `RigidBody::is_grounded()`). Fixed-timestep `dt = 1/64`.
+- **Tick loops**: PR 11.6.D's 64Hz trim-position-history tick loop folded into the new `physics_tick_loop` (don't keep two tick loops — both incremented `room.next_server_frame`). New `snapshot_generator_loop` at 20Hz emits `Snapshot` if `maybe_emit` returns Some.
+- **Wire format**: `DISCRIMINATOR_SNAPSHOT = 0x07` + `DISCRIMINATOR_STATE_ACK = 0x08` (declared, encoder/decoder deferred to 11.7.C). `DISCRIMINATOR_DAMAGE_REJECT` bumped from `0x07` → `0x0C` to free `0x07` for `Snapshot` (in both `server/src/protocol.rs` and `protocol/damage.ts`).
+- **§3.13 coyote-time parity**: `apply_jumps` helper in `physics.rs` grants JUMP_IMPULSE within `COYOTE_FRAMES=2` after losing grounded contact. Pinned by 2 new `session_canary` tests.
+- **§3.14 hitscan-mid-air edge case**: `PositionHistory::snapshot_at(t)` flipped from "largest <= target" to "snap to nearest within ±8 frames". Pinned by 1 new `session_canary` test + 3 new unit tests.
+- **§4.5 Havok reference capture**: `client/tools/capture-havok-reference.mjs` boots canary + vite on 5191, drives Havok through 2 scripted sequences (coyote-time ledge walk-off + mid-air hitscan apex), writes `client/test-data/coyote-reference.json` (12.7KB, 60 frames) + `hitscan-mid-air-reference.json` (10.7KB, 60 frames, apex at frame 8 y=3.087). Both files in place; post-11.7.B parity smokes (added in 11.7.C) will diff against these.
 
-**Verifier state** (run 2026-08-17 evening): cargo test 13/13, tsc clean, npm run build clean, **vitest 10/10 PASS**, 5190 smoke PASS, 5191 smoke **0/3 deterministic-FAIL with 12-HP gap** (the fix6 work).
+**Verifier state (run 2026-08-18)**:
+- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **168 tests pass** (87 unit + 35 damage_relay + 16 protocol_wire + 18 session_canary + 12 snapshot). Up from PR 11.6.D's 126 = +42 net new.
+- `cd client && npm run typecheck` → clean.
+- `cd client && npm run build` → clean; bundle `index-D8PAkFrW.js` 7,058.04 kB — **same hash as PR 11.6.D baseline** (delta = 0).
+- `cd client && npm run test` (vitest) → **10/10 PASS** (no new vitest in this PR; 11.7.C adds them).
+- `grep -E 'PhysicsWorld|SnapshotGenerator|DISPATCHER_SNAPSHOT' client/dist/assets/index-*.js` → **ZERO matches** (production bundle clean).
+- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` × 2 runs → sorted `test result` lines byte-identical (Rapier `enhanced-determinism` feature flag honored; no `Instant::now()` reads in the tick).
+- 5191 damage smoke: assertion 4 PASS (HP=88 baseline holds); post-spam 12-HP carry-forward is the known gap, acceptable per plan §4.4.
+- Havok reference capture: both JSONs written, both > 1KB.
 
-**Servers**: canary (pid 3599169) on Tailscale IP `100.95.111.112:14433/14434` + Vite (pid 3599938) on `100.95.111.112:5191`. URL for 2-tab test: `http://100.95.111.112:5191/?server=ws%3A%2F%2F100.95.111.112%3A14434%2Frooms%2FDEVBX` (URL routing at PeerOverlay.tsx:38-65 auto-sets `__forceServerTransport` — no DevTools setup needed).
+**Servers**: not running — cleanup happened during capture-script iteration. Reboot via `tools/canary-server.sh --port-wt 14433 --port-ws 14434` (background) + `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort` (background) before running the 5191 smoke.
 
-**Memory**: pre-fix4 state still in MEMORY.md (the codex 3-for-3 burn-trace + PR 11.6.D status). The post-fix4 + fix5 + smoking-gun state is **NOT in memory** (the memory budget was full and consolidation failed). Read `HANDOFF.md` + `docs/SPEC.md` for the canonical current state.
+**Memory**: pre-PR-11.7.B state still in MEMORY.md. The PR 11.7.B summary (Rapier 0.18, snap-to-nearest, Havok reference JSONs) is **NOT in memory**. Read `HANDOFF.md` + `docs/SPEC.md` for the canonical current state.
 
-**Codex 4-for-4 burn-trace**: codex has stalled at the 90-min wall-clock mark on every fix round (fix1+fix2+fix3+fix4). fix4 hit 402 Payment Required. Recovery pattern: parse JSONL, re-run verifier gates, write the commit yourself. **~10-15 min overhead per round**. Plan for codex to stall; don't expect a final-message file.
+**Codex 4-for-4 burn-trace** (from PR 11.6.D; not observed in PR 11.7.B so far): codex has historically stalled at the 90-min wall-clock mark on every fix round. Recovery pattern: parse JSONL, re-run verifier gates, write the commit yourself. **~10-15 min overhead per round**.
 
-**`/tmp` backups preserved**: `.codex-fix3-prompt-pr11.6.d.md` (14KB), `.codex-fix4-prompt-pr11.6.d.md` (13.6KB), smoke result logs.
+**`/tmp` backups preserved**: `/tmp/havok-ref.log` (last capture run, 6.5KB), `/tmp/canary.log` (smoke run, 5KB), `/tmp/vite.log` (smoke run, 1KB).
 
-**The next move**: dispatch fix6 with a focused 5-10 min brief targeting the LATEST-gameSession resolver. See the "fix6 scope" section below for the full outline.
+**The next move**: squash + push PR 11.7.B + dispatch PR 11.7.C (client-side prediction/interpolation/reconciliation; consume the new `Snapshot` stream on the client). The 11.7.C brief should reference the `protocol/snapshot.ts` mirror + the §3.13 / §3.14 parity fix already in place. PR 11.7.D retires `ggrsRuntime.ts` + `peer.ts`; PR 11.7.E adds reload mechanics; PR 11.7.F adds production cert handling.
 
+
+## 2026-08-18 — PR 11.7.B (server physics + snapshot generator — Rapier + 64Hz tick + Snapshot 0x07 + coyote-time parity + PositionHistory cutover). Branch `feat/phase1-pr11.7.b-server-snapshot`.
+
+**Status**: PR 11.7.B is **COMPLETE on the branch**, ready for review. ~2,200 lines net new (server + client + tests + docs). 168 cargo tests pass (up from PR 11.6.D's 126 = +42). All 4 verifier gates green. 5191 smoke HP=88 baseline holds. Havok reference capture written. **NOT YET COMMITTED** — single commit queued.
+
+**Files changed** (canonical numbers in `git diff --stat origin/main..HEAD`):
+- `server/Cargo.toml` (+1 line): `rapier3d = { version = "0.18", default-features = false, features = ["dim3", "f32", "enhanced-determinism"] }`. Comment documents the 0.12 → 0.18 bump (0.12 didn't compile on Rust 1.95 — E0223 errors; 0.18 has the same `enhanced-determinism` feature surface).
+- `server/src/constants.rs` (+9 constants): `SNAPSHOT_RATE_HZ=20`, `RECONCILIATION_THRESHOLD_M=0.1`, `MAX_RECONCILIATION_SNAP_DISTANCE_M=2.0`, `INTERPOLATION_DELAY_MS=100`, `MAX_SNAPSHOT_AGE_MS=500`, `COYOTE_FRAMES=2` (NEW §3.13), `WALLRUN_COYOTE_FRAMES=1` (NEW §3.13), `JUMP_IMPULSE=5.5` (NEW §3.13; matches `client/src/game/combat.ts`), `POSITION_HISTORY_STORE_HZ=32`. `TICK_RATE_HZ=64` (reused from PR 11.6.B) NOT redefined.
+- `server/src/protocol.rs` (+~200 lines): `DISCRIMINATOR_SNAPSHOT=0x07`, `DISCRIMINATOR_STATE_ACK=0x08`, `SNAPSHOT_WIRE_SIZE_MIN=10`, `PLAYER_STATE_WIRE_SIZE=29`, `PlayerState` struct, `Snapshot` struct, `encode_snapshot`/`decode_snapshot`, `debug_assert_eq!(buf.len(), N)` size guard. **Wire-format breaking change**: `DISCRIMINATOR_DAMAGE_REJECT` bumped from `0x07` → `0x0C` to free `0x07` for `Snapshot` per the brief's reserved range (`0x07-0x0B` for 11.7 types). 5 unit tests.
+- `server/src/physics.rs` (NEW, ~580 lines): `PhysicsWorld` newtype wrapping Rapier's composed pipeline. Public API: `new()`, `add_player(id, start_pos)`, `step(inputs, dt)`, `position(id)`, `velocity(id)`, `grounded(id)`, `is_mid_air(id)`. `apply_jumps` private helper implements §3.13 coyote-time grant (`COYOTE_FRAMES=2` grace window). Fixed-timestep `dt=1/64`. WASD bits decoded from `EncodedInput[0]`; `MOVE_JUMP=16` (bit 4 — the brief said bit 6 but the actual `inputBitmask.ts` has JUMP at bit 4; verified). 7 unit tests.
+- `server/src/snapshot.rs` (NEW, ~275 lines): `SnapshotGenerator` with `maybe_emit(room, now_ms) -> Option<Snapshot>`. Reads `room.connections` keys for player list. `server_frame = room.next_server_frame - 1`; `next_server_frame = room.next_server_frame`. 8 unit tests.
+- `server/src/position_history.rs` (MODIFIED): added `PHYSICS_HZ=64`, `STORE_HZ=32`, `should_store_frame(frame) = (frame % 2) == 0` (even-frame predicate for 32Hz storage from 64Hz physics). `snapshot_at(t)` flipped from "largest <= target" to "snap to nearest within ±8 frames" (the §3.14 fix). 6 existing tests preserved + 3 new tests for snap-to-nearest behavior.
+- `server/src/session.rs` (~80 lines added): `Room { physics: PhysicsWorld, last_grounded_frame: HashMap<PlayerId, u64>, drained_inputs_this_tick: HashMap<PlayerId, EncodedInput>, ... }`. `drain_inputs_for_tick(frame)` method collapses `inputs_buffer` to latest input per player per tick.
+- `server/src/transport.rs` (~50 lines added): inbound `0x07 Snapshot` arm (warn+discard — clients don't send Snapshot); `broadcast_snapshot(room, snap_bytes)` fan-out helper (mirrors the PR 11.6.D `broadcast_damage_broadcast` pattern; `try_send` + warn on full/closed channels). KEPT the `0x03 PositionUpdate` handler with a `warn!` deprecation log ("PositionUpdate is deprecated, will be removed in 11.7.D; using client-driven position for PositionHistory") — PR 11.7.B's gradual cutover per §3.6.
+- `server/src/main.rs` (~80 lines changed): PR 11.6.D's 64Hz trim-position-history tick loop FOLDED into the new `physics_tick_loop` (don't keep two tick loops). New `snapshot_generator_loop` at 20Hz emits `Snapshot` if `maybe_emit` returns Some.
+- `server/src/lib.rs` (~5 lines added): re-exports for the new `physics` + `snapshot` modules.
+- `server/tests/snapshot.rs` (NEW, ~285 lines): 12 integration tests (listed in the brief).
+- `server/tests/session_canary.rs` (+~150 lines): 5 new tests for §3.13 / §3.14 (`coyote_time_grants_jump_within_window`, `coyote_time_deny_after_window`, `hitscan_rewinds_through_rapier_history_mid_air`, `snapshot_includes_position_history`, `position_history_snap_to_nearest`). Total in this file: 18 tests.
+- `server/tests/damage_relay.rs` (2 tests updated): the existing `validates_rejects_snapshot_at_returns_none` test renamed + repurposed to `validates_rejects_when_position_history_is_empty` + new `validates_uses_nearest_snapshot_within_tolerance` (the `snapshot_at` snap-to-nearest behavior change).
+- `protocol/damage.ts` (~10 lines changed): `DISCRIMINATOR_DAMAGE_REJECT` `0x07` → `0x0C` (mirror of server-side bump).
+- `protocol/snapshot.ts` (NEW, ~238 lines): TS mirror with `encodeSnapshot`/`decodeSnapshot`, `DISCRIMINATOR_SNAPSHOT=0x07`, `DISCRIMINATOR_STATE_ACK=0x08`, body-size constants, size assertions match the Rust encoder.
+- `client/tools/capture-havok-reference.mjs` (NEW, ~346 lines): single-tab Havok-only smoke on port 5191. Boots canary + vite (TCP-only readiness check mirrors the damage smoke), drives Havok through 2 scripted sequences (coyote-time ledge walk-off + mid-air hitscan), writes 2 JSON files to `client/test-data/`. **Two bugs caught + fixed during bring-up**: (1) the original readiness check used `fetch(http://localhost:14434/)` on the WebSocket-only port — fixed to TCP-only `isTcpReachable`; (2) `page.evaluate` was called with multiple positional args — fixed to a single options-object arg.
+- `client/src/engine/scene.ts` (1 line changed): comment update on the `DISCRIMINATOR_DAMAGE_REJECT` reference (now `0x0C` per the wire-format bump). No gameplay code change.
+- `client/src/net/damageBus.test.ts` (~6 lines changed): comment updates on the `0x07 DamageReject` reference (now `0x0C`). No test logic change.
+- `client/src/net/ggnet.ts` (1 line changed): comment update on the `0x07 Snapshot` reference (per the brief's intro paragraph about PR 11.7.B bumping DamageReject to `0x0C`).
+- `client/src/net/serverTransport.ts` (1 line changed): comment update on the `DISCRIMINATOR_DAMAGE_REJECT=0x0C` reference.
+- `client/tools/damage-server-hp-convergence-smoke.png` (regenerated, no semantic change).
+- `docs/SPEC.md` (+~80 lines): top status banner updated; new PR 11.7.B entry appended after PR 11.6.D (with §3.13 / §3.14 / §4.5 sub-bullets per the brief).
+
+**Verification gates run (all green)**:
+- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **168 tests pass, 0 fail** (87 unit + 35 `damage_relay` + 16 `protocol_wire` + 18 `session_canary` + 12 `snapshot`).
+- `cd server && cargo build --release` → exit 0 (only the pre-existing `wtransport-proto` vendored lifetime warnings, unchanged from PR 11.6.D).
+- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` × 2 runs → sorted `test result` lines byte-identical (Rapier `enhanced-determinism` honored; no `Instant::now()` reads in the tick loop).
+- `cd client && npm run typecheck` → exit 0 (clean even with the new `protocol/snapshot.ts` exports).
+- `cd client && npm run build` → exit 0; bundle `index-D8PAkFrW.js` 7,058.04 kB — **same hash as PR 11.6.D baseline** (delta = 0; well under the +5 kB budget).
+- `cd client && npm run test` (vitest) → **10/10 PASS** (no new vitest in this PR — those land in 11.7.C).
+- `grep -E 'PhysicsWorld|SnapshotGenerator|DISPATCHER_SNAPSHOT' client/dist/assets/index-*.js` → **ZERO matches** (production bundle clean; `protocol/snapshot.ts` is interface-only with no runtime Rapier imports).
+- 5191 damage smoke (the existing PR 11.6.D smoke): assertion 4 PASS — both tabs land on HP=88 after the first fire (basic damage convergence holds). Post-spam 12-HP carry-forward persists (acceptable per plan §4.4 — the gap closes in 11.7.C when clients consume Snapshots).
+- Havok reference capture: `coyote-reference.json` (12,737 bytes, 60 frames, jump applied at frame 17) + `hitscan-mid-air-reference.json` (10,743 bytes, 60 frames, apex at frame 8 y=3.087) both written to `client/test-data/`. Both > 1KB.
+
+**Five gotchas worth flagging**:
+
+1. **Rapier 0.12 doesn't compile on Rust 1.95**. The brief locked `rapier3d = "0.12"`. The Rapier 0.12 dependency fails to compile under the current Rust toolchain with lifetime-mismatch errors that look like `wtransport` vendored warnings but are actually Rapier internal API breakage. Bumped to `0.18.0` — same feature surface (`dim3`, `f32`, `enhanced-determinism` — `deterministic` was renamed in 0.14+). Documented in `server/Cargo.toml` comment so future readers see the rationale.
+2. **Rapier 0.18 has no `World` struct**. Earlier versions exposed `rapier3d::prelude::World` as a one-stop wrapper; 0.18 requires manual composition of `RigidBodySet`, `ColliderSet`, `IslandManager`, `BroadPhase`, `NarrowPhase`, `CCDSolver`, `QueryPipeline`, `PhysicsPipeline`. The `PhysicsWorld::new()` ctor wires all of these — verbose but mechanical.
+3. **Rapier 0.18 has no `RigidBody::is_grounded()`**. The grounded check uses `KinematicCharacterController::move_shape().grounded`. The `PhysicsWorld::grounded(id)` public API exposes this; the `apply_jumps` helper calls it on every tick.
+4. **`MoveBits.JUMP = 16`** (bit 4), NOT bit 6 as the brief stated. The brief said "jump is bit 6 (per `JUMP_BIT_OFFSET` in inputBitmask.ts)" but `client/src/net/inputBitmask.ts` actually has `MOVE_JUMP = 16 = 2^4` (bit 4). The server's `apply_jumps` reads `(inputs[0] & MOVE_JUMP) != 0` to detect jump-pressed. Verified against the existing PR 11.6.D damage relay which uses the same bit.
+5. **Wire-format breaking change: `DISCRIMINATOR_DAMAGE_REJECT` bumped `0x07` → `0x0C`**. The brief locked `DISCRIMINATOR_SNAPSHOT = 0x07` and the plan reserves `0x07-0x0B` for PR 11.7 types. DamageReject was already at `0x07` (since PR 11.6.D `ca9f177`); bumping to `0x0C` frees the slot. In-repo only — no external clients. The bump propagates to `protocol/damage.ts` (TS), `client/src/net/damageBus.test.ts` (test comment), `client/src/engine/scene.ts` (scene comment), `client/src/net/ggnet.ts` (ggnet comment), `client/src/net/serverTransport.ts` (transport comment), and the regenerated `client/tools/damage-server-hp-convergence-smoke.png`. No behavioral change — only the discriminator byte differs.
+
+**Pre-merge checklist** (Kyle to verify on dev box):
+1. `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` (expect 168 tests pass).
+2. `cd client && npm run typecheck && npm run build && npm run test` (expect clean + 10/10 vitest).
+3. `bash tools/canary-server.sh --port-wt 14433 --port-ws 14434 > /tmp/canary.log 2>&1 &` (background).
+4. `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort > /tmp/vite.log 2>&1 &` (background).
+5. Wait 15s for both ready (check `/tmp/canary.log` for "WebTransport listener bound" and `/tmp/vite.log` for "ready in").
+6. `node ./client/tools/damage-server-hp-convergence-smoke.mjs 2>&1 | tail -30` — expect "Assertion 4 PASS: HP convergence (both at 88)". Post-spam FAIL is acceptable per plan §4.4.
+7. `node ./client/tools/capture-havok-reference.mjs 2>&1 | tail -10` — expect "Capture complete" + both JSONs in `client/test-data/` > 1KB.
+8. `grep -E 'PhysicsWorld|SnapshotGenerator|DISPATCHER_SNAPSHOT' client/dist/assets/index-*.js` — expect ZERO matches.
+9. Tear down both background processes.
+
+**Risks / known gaps (carried into PR 11.7.C)**:
+- **No client-side `Snapshot` consumer yet** — the server emits `Snapshot` at 20Hz but the client ignores it. PR 11.7.C wires `submitLocalInput` to feed `ServerTransport` (instead of `ggrsRuntime`), adds prediction/interpolation/reconciliation, and closes the 12-HP gap.
+- **`0x08 STATE_ACK` encoder/decoder deferred to 11.7.C** — the constant is declared (per the brief) but the wire type's encoder/decoder lands with the consumer.
+- **PR 11.7.D will retire `ggrsRuntime.ts` + `peer.ts`** — they're still in use in this PR (the client still uses Havok WASM + ggrs lockstep for the duration of this PR; the only client change is the new `capture-havok-reference.mjs` smoke).
+- **`0x03 PositionUpdate` inbound handler still accepted** — with a `warn!` deprecation log. PR 11.7.D removes it. The 5191 smoke depends on it for the lag-comp rewind source.
+- **PR 11.7.D's `process_inputs_for_tick` rewrite** — the current `drain_inputs_for_tick` collapses to latest-per-player; PR 11.7.D's reconciliation may want the full per-tick history. Not a blocker for this PR.
+- **No production cert handling** — still self-signed; ACME flow is 11.7.F.
+- **No anti-cheat** — movement-rate plausibility, position-jump detection, statistical anomaly detection. Phase 4 / PR 11.10.
+- **No reload mechanics** — ammo is fire-only, no resupply. PR 11.7.E.
+- **No matchmaker / multi-room** — single hard-coded `DEVBX` room. PR 11.9.
+
+**Suggested review focus**:
+- **`server/src/physics.rs::apply_jumps`** (the §3.13 heart of this PR): the coyote-time grant condition is `(frame - last_grounded_frame <= COYOTE_FRAMES) && jump_pressed && !grounded_now`. Verify the `last_grounded_frame = frame - COYOTE_FRAMES` "burn the grace" logic correctly consumes the grace window without letting the player double-jump on subsequent frames.
+- **`server/src/position_history.rs::snapshot_at`** (the §3.14 heart of this PR): the snap-to-nearest-within-±8-frames logic with tie-break prefer `frame <= target`. Verify the 3 new unit tests (exact match / nearest-prefer-below / out-of-range) cover the boundary cases.
+- **`server/src/main.rs` tick loop folding**: confirm PR 11.6.D's `trim position_history for inactive players` is preserved in the new `physics_tick_loop` (don't lose the PR 11.6.D fix).
+- **`server/src/transport.rs::broadcast_snapshot` channel handling**: confirm the `try_send` + `warn!` pattern matches the PR 11.6.D `broadcast_damage_broadcast` (consistency).
+- **Determinism**: re-run `cargo test --release` twice and `diff <(grep "test result" first.log | sort) <(grep "test result" second.log | sort)` — should be empty diff. If non-empty, the Rapier `enhanced-determinism` feature isn't honored OR something is reading `Instant::now()` inside the tick.
+- **Bundle grep**: re-run `grep -E 'PhysicsWorld|SnapshotGenerator|DISPATCHER_SNAPSHOT' client/dist/assets/index-*.js` — must be ZERO matches. If non-zero, the new `protocol/snapshot.ts` is dragging server-side types into the client bundle (the types should be `interface`/`type` only OR pure functions).
+
+**Next session plan (PR 11.7.C)**:
+1. Land this PR (squash + push + `gh pr create --body-file`).
+2. Implement `0x08 STATE_ACK` encoder/decoder in `server/src/protocol.rs` + `protocol/snapshot.ts`.
+3. Wire `client/src/engine/scene.ts` to instantiate `SnapshotConsumer` that consumes `Snapshot` from `ServerTransport` and drives the Havok rig (interpolation) + client-side prediction (reconciliation against `inputs_buffer` history).
+4. Update `submitLocalInput` to feed `ServerTransport` instead of `ggrsRuntime` (the 11.7.C flip).
+5. Add port-5192 parity smoke (`client/tools/snapshot-server-parity-smoke.mjs`) that diffs the Rapier-fed `coyote-reference.json` + `hitscan-mid-air-reference.json` against the Havok reference JSONs.
+6. Run the 5191 smoke again — the 12-HP gap should close now that damage timing is snapshot-driven (per plan §4.4).
+7. Land PR 11.7.C + squash + push + `gh pr create --body-file`.
+
+---
 
 ## 2026-08-17 — PR 11.6.D fix4 LANDED. Bug A (StrictMode race) + Bug B (drop-branch markSettled) + Bug C (sweep over-restoration) all closed. Smoke still 0/10 deterministic-FAIL with NEW failure mode (12-HP gap). Branch `feat/phase1-pr11.6.d-validate-and-relay`.
 

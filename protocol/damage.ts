@@ -50,7 +50,13 @@ export const DISCRIMINATOR_PONG = 0x05;
 /** NEW §1.2 — server-routed inputs for PR 11.7 handoff. PR 11.6.B
  *  buffers but does not process. */
 export const DISCRIMINATOR_INPUTS_SERVER = 0x06;
-export const DISCRIMINATOR_DAMAGE_REJECT = 0x07;
+// PR 11.7.B: bumped from 0x07 to 0x0C. The brief locks
+// DISCRIMINATOR_SNAPSHOT = 0x07 and the plan §3.5 reserves 0x07-0x0B
+// for PR 11.7 types (Snapshot/StateAck/InputSeq/ReloadRequest/
+// StateResyncRequest). 0x0C is the next free slot. Server-side
+// `server/src/protocol.rs::DISCRIMINATOR_DAMAGE_REJECT` moves in
+// lockstep.
+export const DISCRIMINATOR_DAMAGE_REJECT = 0x0C;
 
 // -- Body-size constants (mirror of server/src/protocol.rs) ----------------
 //
@@ -88,8 +94,8 @@ export const PONG_WIRE_SIZE = PONG_BODY_SIZE + 1;
 /** `0x06` discriminator + u32 frame BE + 12-byte input blob = 17 bytes.
  *  `INPUT_SIZE = 12` comes from `client/src/net/inputBitmask.ts`. */
 export const INPUTS_SERVER_WIRE_SIZE = 17;
-/** PR 11.6.D FIX 4: `0x07` discriminator + u32 event_id BE +
- *  reason u8 = 6 bytes total. */
+/** PR 11.7.B: `0x0C` discriminator + u32 event_id BE + reason u8 = 6 bytes total.
+ *  Bumped from 0x07 (PR 11.6.D) so 0x07 is free for Snapshot. */
 export const DAMAGE_REJECT_WIRE_SIZE = DAMAGE_REJECT_BODY_SIZE + 1;
 
 // -- Wire-format interfaces (mirror of server/src/protocol.rs) ------------
@@ -213,7 +219,7 @@ export interface InputsServer {
  * eventId / lag-miss state).
  *
  * Wire layout (6 bytes — see `DAMAGE_REJECT_WIRE_SIZE`):
- *   byte 0       discriminator 0x07
+ *   byte 0       discriminator 0x0C
  *   byte 1..4    event_id (u32 BE — matches the `eventId` field of
  *                the rejected `DamageRequest`)
  *   byte 5       reason (u8 — see `REJECT_REASON_*` constants)
@@ -461,7 +467,7 @@ export function decodeInputsServer(buf: Uint8Array): InputsServer | null {
 
 /**
  * PR 11.6.D FIX 4: encode a `DamageReject` payload to a 6-byte
- * wire-format `Uint8Array` (discriminator 0x07 + 4-byte event_id
+ * wire-format `Uint8Array` (discriminator 0x0C + 4-byte event_id
  * BE + 1-byte reason). The reverse direction (server → client) is
  * the only one in active use — the client doesn't send rejects.
  * Symmetric encoder kept for protocol-test symmetry with the Rust

@@ -64,7 +64,8 @@ use specialists_server::protocol::{
     decode_damage_request, decode_inputs_server, decode_ping, decode_position_update,
     encode_pong, DISCRIMINATOR_DAMAGE_BROADCAST,
     DISCRIMINATOR_DAMAGE_REQUEST, DISCRIMINATOR_INPUTS, DISCRIMINATOR_INPUTS_SERVER,
-    DISCRIMINATOR_PING, DISCRIMINATOR_PONG, DISCRIMINATOR_POSITION_UPDATE, Pong,
+    DISCRIMINATOR_PING, DISCRIMINATOR_PONG, DISCRIMINATOR_POSITION_UPDATE,
+    DISCRIMINATOR_SNAPSHOT, Pong,
 };
 use specialists_server::session::{EncodedInput, PlayerId, Room, ServerFrame};
 
@@ -688,6 +689,23 @@ pub(super) async fn handle_binary(
             vec![]
         }
         DISCRIMINATOR_POSITION_UPDATE => {
+            // PR 11.7.B / §3.6 — PositionUpdate is DEPRECATED. The
+            // server-side `PositionHistory` is now fed by Rapier's
+            // physics tick (64Hz) — `Room.physics` writes to it
+            // inside `physics_tick_loop`. Per-player PositionUpdate
+            // packets from the client are still accepted for
+            // backward compatibility (the existing 5191 smoke
+            // depends on them for HP-convergence lag-comp math).
+            // PR 11.7.D removes this handler entirely.
+            //
+            // The deprecation is the gradual cutover plan from
+            // §3.6 — clients keep sending their old per-player
+            // PositionUpdate packets (Havok WASM still drives
+            // their pose prediction); the server logs a warn so
+            // the cutover timeline is observable in dev-box logs.
+            warn!(
+                "PositionUpdate (0x03) is deprecated, will be removed in 11.7.D;                  using client-driven position for PositionHistory"
+            );
             let Some(pu) = decode_position_update(&payload[1..]) else {
                 warn!("positionUpdate: decoder rejected malformed payload");
                 return vec![];
@@ -801,6 +819,19 @@ pub(super) async fn handle_binary(
             );
             vec![]
         }
+        DISCRIMINATOR_SNAPSHOT => {
+            // PR 11.7.B / §1.3 + §3.5 — clients do NOT send
+            // Snapshots. Snapshot is a server-originated broadcast
+            // only. Receiving one from a client is either a
+            // confused client (testing the wire) or a spoof
+            // attempt; either way log + drop (same anti-spoof
+            // pattern as DamageBroadcast). The discriminator
+            // itself is registered so the inbound arm rejects
+            // cleanly with the "unknown inbound discriminator"
+            // warn rather than the catch-all `other` arm.
+            warn!("client sent Snapshot — discarded (server-only wire type)");
+            vec![]
+        }
         other => {
             warn!(
                 discriminator = other,
@@ -843,6 +874,49 @@ fn sans_with_defaults(extra: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+/// PR 11.7.B / §3.4 + §3.10.1 — fan out a `Snapshot` (already
+/// encoded by `protocol::encode_snapshot` with the discriminator
+/// PREPENDED — the caller is the `snapshot_generator_loop` task
+/// in `main.rs`) to every connection in the room.
+///
+/// Mirrors the `damage_relay::relay_broadcast` fan-out pattern
+/// (each connection owns a `mpsc::Sender<Vec<u8>>` registered in
+/// `Room.connections`; we clone the encoded bytes and push onto
+/// every sender). The outbound mpsc is drained by the per-
+/// connection listener loops (both WebSocket and WebTransport),
+/// which write to the transport stream.
+pub async fn broadcast_snapshot(
+    room: Arc<RwLock<Room>>,
+    snap_bytes: Vec<u8>,
+) {
+    // Read-lock the room to enumerate senders; the snapshot body
+    // is read-only on the room.
+    let room_guard = room.read().await;
+    let n_conns = room_guard.connections.len();
+    for (player_id, sender) in room_guard.connections.iter() {
+        match sender.try_send(snap_bytes.clone()) {
+            Ok(()) => {
+                debug!(
+                    target_player_id = *player_id,
+                    n_conns = n_conns,
+                    "snapshot enqueued",
+                );
+            }
+            Err(_) => {
+                // Channel full or sender closed. The client will
+                // lag / miss this snapshot; the next snapshot
+                // tick (50ms later) will catch them up. Log at
+                // warn to surface persistent back-pressure
+                // without crashing the dispatcher.
+                warn!(
+                    target_player_id = *player_id,
+                    "snapshot fan-out: channel full / closed",
+                );
+            }
+        }
+    }
 }
 
 // -- Unit tests for the dispatcher ---------------------------------------
