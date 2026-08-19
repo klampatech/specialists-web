@@ -65,6 +65,11 @@ const FRAME_INTERVAL_MS = Number(process.env.HAVOK_REF_FRAME_INTERVAL_MS ?? 16);
 const WALK_SPEED = Number(process.env.HAVOK_REF_WALK_SPEED ?? 4.0);
 const LEDGE_HEIGHT_M = Number(process.env.HAVOK_REF_LEDGE_HEIGHT_M ?? 1.5);
 const JUMP_IMPULSE_Y = Number(process.env.HAVOK_REF_JUMP_IMPULSE ?? 5.5);
+// Havok capsule dimensions — must match `client/src/engine/characterConfig.ts::CAPSULE`.
+// PR 11.7.B NBLK-5 fix uses these to compute `startY` correctly.
+const CAPSULE_RADIUS = 0.5;
+const CAPSULE_HEIGHT = 1.8;
+const CAPSULE_HALF_HEIGHT = CAPSULE_HEIGHT / 2;
 
 const log = (...args) => console.log("[havok-ref]", ...args);
 const fail = (...args) => console.error("[havok-ref][FAIL]", ...args);
@@ -211,23 +216,59 @@ async function captureSequence() {
     log("Capturing coyote-time ledge walk-off + jump (spec-compliant)...");
     const coyoteResult = await page.evaluate(async ({
       CAPTURE_FRAMES, FRAME_INTERVAL_MS, JUMP_IMPULSE_Y, WALK_SPEED, LEDGE_HEIGHT_M,
+      CAPSULE_RADIUS, CAPSULE_HALF_HEIGHT,
     }) => {
       const session = window.__gameSession;
       const ctrl = session.localController;
       const havok = ctrl.havok;
 
-      // Place the player on top of a 1.5m ledge — at startPosition
-      // (y = CAPSULE.height / 2 ≈ 0.55m above ground) plus
-      // LEDGE_HEIGHT_M = 1.5m above the ground plane.
-      // Position: x = 0, y = (CAPSULE.height / 2 + LEDGE_HEIGHT_M),
-      // z = -2 (just behind the ledge edge, ready to walk forward
-      // off into z > 0).
-      const startY = (ctrl.state.position.y - 0) + LEDGE_HEIGHT_M;
+      // Place the player RESTING on top of the tall crate at
+      // (-5, 1.25, -2) with size [2.5, 2.5, 2.5] (see scene.ts).
+      // The crate top is at y = 1.25 + 2.5/2 = 2.5. The capsule
+      // center must be at y = crateTop + CAPSULE_RADIUS +
+      // CAPSULE_HEIGHT/2 = 2.5 + 0.5 + 0.9 = 3.9. The previous
+      // formula `ctrl.state.position.y + LEDGE_HEIGHT_M` (with
+      // LEDGE_HEIGHT_M=1.5 and current.y ≈ 0.9) placed the capsule
+      // at y=2.4 — 0.1m ABOVE the crate top, so `supported` was
+      // false from frame 0 onward. The contact-loss detector
+      // (`lastSupported && !supported`) requires a true→false
+      // transition that never happened, so the jump was never
+      // captured. The corrected formula (LEDGE_HEIGHT_M=2.5
+      // representing the actual crate top from scene.ts) puts
+      // the capsule resting on the ledge at frame 0. The player
+      // is then at z=-2 (just behind the crate edge), and the
+      // forward walk-off triggers the contact-loss → coyote-jump
+      // capture as §4.5 specifies. (PR 11.7.B NBLK-5 fix from
+      // claude-2 review.)
+      //
+      // We OVERRIDE LEDGE_HEIGHT_M locally because the §4.5
+      // spec's "1.5m ledge" was an abstract example — the actual
+      // scene geometry uses a 2.5m crate (per scene.ts:334).
+      const crateTop = 2.5; // = 1.25 + 2.5/2 (scene.ts tall crate)
+      const startY =
+        crateTop + CAPSULE_RADIUS + CAPSULE_HALF_HEIGHT;
       const START_POS = havok.getPosition().clone();
-      START_POS.set(0, startY, -2);
+      // Player position must be ON TOP of the crate (which is at
+      // (-5, 1.25, -2)), so x=-5, y=startY, z=-2 (slightly back
+      // from the +z edge of the 2.5×2.5 crate to walk forward off).
+      START_POS.set(-5, startY, -2);
       havok.setPosition(START_POS);
       havok.setVelocity(new (havok.getVelocity().constructor)(0, 0, 0));
-      await new Promise((r) => setTimeout(r, 32));
+      // Settle the controller so Havok's PhysicsCharacterController
+      // registers the ledge contact before the capture loop starts.
+      // The 200ms delay alone isn't enough — Havok's supported flag
+      // is only re-evaluated inside `ctrl.update()`. We do a few
+      // no-input update ticks to let Havok's contact manifold settle.
+      const settleDt = 1 / 60;
+      const settleStart = performance.now();
+      while (performance.now() - settleStart < 200) {
+        ctrl.update({
+          forward: 0, right: 0, jumpPressed: false, divePressed: false,
+          slideHeld: false, wallrunPressed: false, cameraTogglePressed: false,
+          fireHeld: false, meleePressed: false, bulletTimeHeld: false,
+        }, settleDt, performance.now());
+        await new Promise((r) => setTimeout(r, 16));
+      }
 
       const frames = [];
       const startTime = performance.now();
@@ -262,17 +303,24 @@ async function captureSequence() {
           meleePressed: false,
           bulletTimeHeld: false,
         };
-        // Detect contact-loss frame: was supported, now not.
-        // Press jump on this exact frame.
-        const isContactLoss = lastSupported && !ctrl.state.supported;
-        if (isContactLoss && jumpAppliedAtFrame === -1) {
-          inputState.jumpPressed = true;
-          jumpAppliedAtFrame = i;
-        }
         // Drive the controller normally — this is the proper
         // movement path. `update()` handles WASD → planar
         // velocity, gravity accumulation, jump impulse, etc.
         ctrl.update(inputState, dt, nowMs);
+        // Detect contact-loss frame AFTER the ctrl.update: the
+        // previous frame's `lastSupported` (set by the previous
+        // ctrl.update) vs the current frame's `ctrl.state.supported`
+        // (set by THIS ctrl.update). If we detected loss, retroactively
+        // press jump on this frame so the coyote-time grant fires.
+        const isContactLoss = lastSupported && !ctrl.state.supported;
+        if (isContactLoss && jumpAppliedAtFrame === -1) {
+          inputState.jumpPressed = true;
+          jumpAppliedAtFrame = i;
+          // Re-run the ctrl.update with jumpPressed=true so the
+          // jump impulse actually applies for this frame (otherwise
+          // the inputState mutation was wasted — update already ran).
+          ctrl.update(inputState, dt, nowMs);
+        }
         lastSupported = ctrl.state.supported;
 
         const pos = ctrl.state.position;
@@ -294,6 +342,7 @@ async function captureSequence() {
     }, {
       CAPTURE_FRAMES, FRAME_INTERVAL_MS,
       JUMP_IMPULSE_Y, WALK_SPEED, LEDGE_HEIGHT_M,
+      CAPSULE_RADIUS, CAPSULE_HALF_HEIGHT,
     });
     writeFileSync(
       resolve(OUTPUT_DIR, "coyote-reference.json"),
