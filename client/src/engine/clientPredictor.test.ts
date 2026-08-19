@@ -32,13 +32,20 @@ import {
   RECONCILIATION_THRESHOLD_M,
 } from "./clientPredictor";
 
-/** Mock `havokStep` — advances position by (1, 0) per call. */
+/** Per-tick advance for the mock Havok step. Default 1.0 for backward
+ *  compatibility with the earlier tests (which were written for a
+ *  unit-step mock); Test F2 overrides this to 0.01 (a realistic per-tick
+ *  Havok advance in meters at 60Hz — typical movement is <0.5 m/tick
+ *  even at sprint speed). The smaller step keeps the re-sim's
+ *  accumulated snap distance under MAX_RECONCILIATION_SNAP_DISTANCE_M
+ *  for the test scenarios that don't aim to trigger the hard-clamp. */
+let mockStepSize = 1.0;
 let mockStepCount = 0;
 function mockHavokStep(state: PlayerState, _encoded: Uint8Array): PlayerState {
   mockStepCount += 1;
   return {
     ...state,
-    positionX: state.positionX + 1.0,
+    positionX: state.positionX + mockStepSize,
     positionY: state.positionY,
   };
 }
@@ -69,6 +76,7 @@ describe("clientPredictor PR 11.7.C — prediction + reconciliation", () => {
 
   beforeEach(() => {
     mockStepCount = 0;
+    mockStepSize = 1.0; // default; tests that need realistic advance override
     localFrame = 0;
   });
 
@@ -205,5 +213,71 @@ describe("clientPredictor PR 11.7.C — prediction + reconciliation", () => {
     // Verify the threshold constant matches the documented value.
     expect(RECONCILIATION_THRESHOLD_M).toBe(0.1);
     expect(MAX_RECONCILIATION_SNAP_DISTANCE_M).toBe(2.0);
+  });
+
+  it("Test F2: retention window evicts inputs past reconcileFromFrame - 8 (in client-frame space)", () => {
+    // PR 11.7.C / §3.7 — the brief's eviction policy is hard cap
+    // (16, FIFO) AND a retention window (reconcileFromFrame - 8 in
+    // client-frame space). Test F above only exercised the hard cap;
+    // this test exercises the retention behavior by driving
+    // reconcileFromFrame forward via tick() (and the no-drift
+    // snapshot path does NOT advance reconcileFromFrame — only the
+    // reconciliation flow + the first-snapshot seed branch do).
+    //
+    // Uses a smaller per-tick mock advance (0.01 m/tick) so the
+    // re-sim's accumulated snap distance stays under
+    // MAX_RECONCILIATION_SNAP_DISTANCE_M (2.0). The default mock
+    // (1.0 m/tick) would accumulate ~4-5 m over 4-5 drained inputs
+    // and trigger the hard-clamp path, which is Test C's
+    // responsibility — not this retention test.
+    mockStepSize = 0.01;
+    const predictor = new Predictor(1, mockHavokStep, () => localFrame);
+    predictor.onSnapshot(makeSnapshot(100, [makePlayer(1, 0, 0)]), 0);
+    // First onSnapshot seeds: predictedState = (0, 0), reconcileFromFrame
+    // = getLocalFrame() = 0.
+    expect(predictor.getStats().bufferDepth).toBe(0);
+    // Record 12 inputs at frames 1..12, advance localFrame to 12.
+    // After each recordLocalInput, eviction runs with floor = 0 - 8 = -8
+    // (no retention eviction because floor < 0). Hard cap not hit.
+    for (let i = 1; i <= 12; i++) {
+      predictor.recordLocalInput(i, new Uint8Array([0]));
+      localFrame = i;
+    }
+    expect(predictor.getStats().bufferDepth).toBe(12);
+    // tick() drains 12 inputs forward, advances reconcileFromFrame to 12.
+    predictor.tick(12 * 16);
+    expect(predictor.getStats().reconciliationCount).toBe(0);
+    // Compute the predictor's current position (driven by 12 ticks at
+    // 0.01 m = 0.12 m). Use this to construct a no-drift snapshot.
+    const predictedX = predictor.getPredictedState().positionX;
+    // Record 4 more inputs at frames 13..16. Eviction runs: floor =
+    // reconcileFromFrame - 8 = 12 - 8 = 4. Entries with key <= 4
+    // (frames 1, 2, 3, 4) are evicted. Buffer: frames 5..16 = 12.
+    for (let i = 13; i <= 16; i++) {
+      predictor.recordLocalInput(i, new Uint8Array([0]));
+    }
+    expect(predictor.getStats().bufferDepth).toBe(12);
+    // No-drift snapshot at the predictor's actual position (drift = 0).
+    // The no-drift branch advances `lastServerFrame` only, NOT
+    // `reconcileFromFrame` — so reconcileFromFrame stays at 12.
+    localFrame = 16;
+    predictor.onSnapshot(makeSnapshot(110, [makePlayer(1, predictedX, 0)]), 200);
+    expect(predictor.getStats().reconciliationCount).toBe(0);
+    // Record 1 more input — eviction with floor = 12 - 8 = 4.
+    // Frames 1-4 are already gone. Buffer: frames 5..17 = 13.
+    predictor.recordLocalInput(17, new Uint8Array([0]));
+    expect(predictor.getStats().bufferDepth).toBe(13);
+    // Now drive a reconciliation (drift > threshold) — this
+    // advances reconcileFromFrame to getLocalFrame() (16).
+    // Use a small drift (0.15) just over the 0.1 threshold; the
+    // re-sim's accumulated snap distance is `0.15 + 4 * 0.01 = 0.19`,
+    // well under 2.0 (no hard-clamp).
+    predictor.onSnapshot(makeSnapshot(111, [makePlayer(1, predictedX + 0.15, 0)]), 220);
+    expect(predictor.getStats().reconciliationCount).toBe(1);
+    // Record another input — eviction with floor = 16 - 8 = 8.
+    // Frames with key <= 8 (frames 5, 6, 7, 8) are evicted.
+    // Buffer: frames 9..18 = 10.
+    predictor.recordLocalInput(18, new Uint8Array([0]));
+    expect(predictor.getStats().bufferDepth).toBe(10);
   });
 });

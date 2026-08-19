@@ -375,6 +375,15 @@ export async function createScene(
 
   let character: CharacterController;
   let applyPose: () => void = () => {};
+  // PR 11.7.C / §3.7 — per-frame predictor forward-prediction hook.
+  // Set by the DEV-probe IIFE once the ServerTransport + Predictor
+  // are wired. The render observer (around line 484) calls this
+  // BEFORE gameSession.tick() so the predictor's mirror state is
+  // current when a server snapshot arrives. The hook is `null` in
+  // the single-player path + production (the IIFE is gated by
+  // `import.meta.env.DEV` and the snapshot transport requires
+  // `__forceServerTransport`).
+  let predictorTickHook: ((nowMs: number) => void) | null = null;
 
   if (gameSession) {
     // Multiplayer branch: GameSession owns the rigs. Use the local rig for
@@ -481,6 +490,14 @@ export async function createScene(
     if (gameSession) {
       // Multiplayer path: the session drives both controllers, applies the
       // stunt pose, and pushes the visual transforms into each rig's root.
+      // PR 11.7.C / §3.7 — predictor per-frame forward-prediction fires
+      // BEFORE gameSession.tick() so the predictor's mirror state is
+      // current at snapshot arrival. The predictor uses save/restore
+      // (see the havokStep wrapper in the DEV-probe IIFE) so this
+      // doesn't double-advance Havok — the live controller is
+      // unchanged after predictorTickHook returns, then gameSession.tick
+      // advances it from the same starting state.
+      predictorTickHook?.(now);
       gameSession.tick(state, deltaSeconds, now);
       // PR 7: render tracers for any fire_hit / fire_miss events that were
       // generated since the last frame. consumeUnrenderedCombatEvents()
@@ -785,6 +802,11 @@ export async function createScene(
           __predictor?: unknown;
           /** PR 11.7.C / §3.8 — interpolator instance for smoke instrumentation. */
           __interpolator?: unknown;
+          /** PR 11.7.C / §3.7 — getter for the most recent decoded Snapshot.
+           *  Returns `null` if no snapshot has arrived yet. Used by the
+           *  future snapshot-driven smoke (5190/5191 don't read this
+           *  yet — see PR 11.7.D). */
+          __latestSnap?: () => import("../../../protocol/snapshot").Snapshot | null;
         };
         try {
         const { ServerTransport } = await import("../net/serverTransport");
@@ -923,39 +945,43 @@ export async function createScene(
         }
         // PR 11.7.C / §3.7 + §3.8 — wire the client-side predictor +
         // remote interpolator onto the ServerTransport's onSnapshot
-        // stream. The predictor drives LOCAL-player prediction +
-        // reconciliation; the interpolator drives REMOTE-player
-        // interpolation buffer rendering. Both consume the same
-        // 20Hz Snapshot stream (discriminator 0x07) — see
-        // `protocol/snapshot.ts::DISCRIMINATOR_SNAPSHOT` and
-        // `server/src/snapshot.rs` for the wire spec.
+        // stream. Both consume the same 20Hz Snapshot stream
+        // (discriminator 0x07) — see `protocol/snapshot.ts::DISCRIMINATOR_SNAPSHOT`
+        // and `server/src/snapshot.rs` for the wire spec. The
+        // predictor's `latestSnap` closure + the `predictorTickHook`
+        // let the render observer (line 484) call `predictor.tick(now)`
+        // per-frame; the interpolator accumulates state for the
+        // future PR 11.7.D visual switchover.
         //
         // **Late-binding the predictor**: the predictor is created
-        // AFTER `gameSession` is in scope (line ~368) but inside the
-        // same async IIFE so the closure capture sees the live
-        // `gameSession`. The GameSession's tick() forwards the
-        // encoded input to `predictor.recordLocalInput` via a
-        // late-bound setter (set below) — the predictor's havokStep
-        // wrapper reads from `gameSession.localController` so we
-        // close over `gameSession` here, not over the bare
-        // `character` alias (which is a one-shot snapshot).
+        // AFTER `gameSession` is in scope but inside the same async
+        // IIFE so the closure capture sees the live `gameSession`.
+        // The GameSession's tick() forwards the encoded input to
+        // `predictor.recordLocalInput` via a late-bound setter (set
+        // below) — the predictor's havokStep wrapper closes over
+        // `gameSession.localController` so we capture the live ref.
         if (gameSession) {
           const { Predictor } = await import("./clientPredictor");
           const { Interpolator } = await import("./remoteInterpolator");
           const { decodeSnapshot } = await import("../../../protocol/snapshot");
           const localCtrl = gameSession.localController;
-          // Havok-step wrapper — advances the local controller by
-          // one encoded input (mirrors what gameSession.tick()
-          // does internally with `localController.update(...)`).
-          // The wrapper returns a PlayerState snapshot for the
-          // predictor to consume. The 1/60 dt mirrors the game
-          // loop's 60Hz tick rate.
-          // Havok-step wrapper — advances the local controller by
-          // one encoded input (mirrors what gameSession.tick() does
-          // internally with `localController.update(...)`). The
-          // wrapper returns a PlayerState snapshot for the predictor
-          // to consume. The 1/60 dt mirrors the game loop's 60Hz tick
-          // rate.
+          // Havok-step wrapper (PR 11.7.C / §3.7) — advances the LIVE
+          // Havok controller by one frame, reads the post-update state,
+          // then RESTORES the controller to its prior position+velocity
+          // (a "phantom" simulation: temporarily step physics, capture
+          // the result, then revert). The live controller is unchanged
+          // after the wrapper returns, but the wrapper reports the
+          // state Havok WOULD have reached if the input had been
+          // applied. This is the predictor's source of forward-predicted
+          // positions for the snapshot-driven drift check.
+          //
+          // **Why save/restore, not just step**: `gameSession.tick()`
+          // (called from the render observer at line 484) already
+          // advances the live controller per-frame. A naive step would
+          // double-advance (latent bug, fixed in PR 11.7.C's claude
+          // review round 1). Save/restore is O(1) per call and lets
+          // the predictor drain buffered inputs forward WITHOUT
+          // perturbing the live physics.
           //
           // **Note**: CharacterState in PR 11.7.B doesn't carry
           // `velocity` or `isFiring` (velocity is on the Havok
@@ -966,20 +992,39 @@ export async function createScene(
           // extend this wrapper when the wire carries more fields.
           const havokStep = (_state: import("../../../protocol/snapshot").PlayerState, encoded: Uint8Array): import("../../../protocol/snapshot").PlayerState => {
             const decoded = decodeInput(encoded);
+            // Save the live controller's pos+vel. The wrapper will
+            // restore them after the phantom step. We use
+            // `havok.setPosition` / `setVelocity` (the same API the
+            // existing respawn path uses) — see characterController.ts
+            // line 208-210 and line 247-249 for the canonical pattern.
+            const savedPos = localCtrl.havok.getPosition().clone();
+            const savedVel = localCtrl.havok.getVelocity().clone();
+            // Phantom step: advance Havok with the encoded input.
+            // `performance.now()` for `nowMs` matches what
+            // gameSession.tick() passes (the wall-clock render frame).
             localCtrl.update(decoded, 1 / 60, performance.now());
-            const vel = localCtrl.havok.getVelocity();
-            return {
+            // Capture the post-step state for the predictor.
+            const postPos = localCtrl.havok.getPosition();
+            const postVel = localCtrl.havok.getVelocity();
+            const result: import("../../../protocol/snapshot").PlayerState = {
               playerId: localPlayerId,
-              positionX: localCtrl.state.position.x,
-              positionY: localCtrl.state.position.z,
-              velocityX: vel.x,
-              velocityY: vel.z,
+              positionX: postPos.x,
+              positionY: postPos.z,
+              velocityX: postVel.x,
+              velocityY: postVel.z,
               yaw: 0, // PR 11.7.B wire doesn't carry yaw/pitch
               pitch: 0,
               hp: localCtrl.state.hp,
               ammo: 0,
               isFiring: decoded.fireHeld ? 1 : 0,
             };
+            // Restore the live controller so the next gameSession.tick()
+            // (which advances from the saved pos+vel) sees a clean
+            // state. The visual root's position is also restored via
+            // the same `setPosition` call.
+            localCtrl.havok.setPosition(savedPos);
+            localCtrl.havok.setVelocity(savedVel);
+            return result;
           };
           const predictor = new Predictor(
             localPlayerId,
@@ -987,13 +1032,55 @@ export async function createScene(
             () => gameSession.frame,
           );
           const interpolator = new Interpolator(localPlayerId);
+          // PR 11.7.C / §3.7 + §3.8 — closure variable for the latest
+          // decoded snapshot. The render observer (line 484) reads
+          // this so the interpolator can be queried per-frame for
+          // its 100ms-lookback state. (Note: as of PR 11.7.C the
+          // remote visual is still driven by the lockstep
+          // remoteController's Havok advance — the interpolator's
+          // output is consumed by the predictor's reconciliation
+          // path only. PR 11.7.D retires the lockstep substrate and
+          // drives the remote visual from the interpolator at that
+          // point.)
+          let latestSnap: import("../../../protocol/snapshot").Snapshot | null = null;
           server.onSnapshot((body) => {
             const snap = decodeSnapshot(body);
             if (!snap) return;
             const now = performance.now();
+            latestSnap = snap;
             predictor.onSnapshot(snap, now);
             interpolator.onSnapshot(snap, now);
           });
+          // PR 11.7.C / §3.7 — per-frame predictor forward-prediction
+          // (60Hz, in lockstep with the game loop). The predictor
+          // drains buffered inputs forward using save/restore (no
+          // double-advance). The render observer calls this BEFORE
+          // `gameSession.tick()` so the predictor's state is current
+          // at snapshot arrival time (the snapshot's `serverFrame` is
+          // the post-gameSession-tick frame; predictor.tick advances
+          // the mirror state to match).
+          //
+          // The per-frame tick is what makes the drift check actually
+          // work — without it the predictor's `predictedState` only
+          // updates on snapshot arrivals (every 50ms), and the drift
+          // would be ~3 frames of Havok advance off by the time the
+          // snapshot arrives. The brief's `tick()` API was wired for
+          // this reason; this PR completes the wiring that 11.7.B
+          // set up.
+          //
+          // **Visual consumption (deferred to 11.7.D)**: the
+          // `predictor.getPredictedState()` is NOT used to drive the
+          // local visual root — Havok still drives the visual at
+          // 60Hz via `localController.state.position` (updated inside
+          // characterController.ts's `update()` at line 402). The
+          // predictor's role is reconciliation bookkeeping: track the
+          // predicted position in a separate mirror, compare against
+          // the server snapshot on arrival, re-simulate or hard-snap
+          // on drift. PR 11.7.D wires the interpolator's output into
+          // the remote visual (alongside lockstep retirement).
+          predictorTickHook = (nowMs: number) => {
+            predictor.tick(nowMs);
+          };
           // Late-bind the predictor onto the GameSession so tick()
           // can call predictor.recordLocalInput alongside the
           // existing runtime.submitLocalInput.
@@ -1004,6 +1091,7 @@ export async function createScene(
           // §4.4 HP-convergence assertion in the 5191 smoke).
           winSlot.__predictor = predictor;
           winSlot.__interpolator = interpolator;
+          winSlot.__latestSnap = () => latestSnap;
         }
         // PR 11.6.D FIX 4 part C — periodic sweep of expired pending
         // applies. The server's `DamageReject` packet may be dropped

@@ -77,10 +77,34 @@ const MAX_LOCAL_INPUT_BUFFER = 16;
  *  (keep the most recent ~8 frames of replay). */
 const INPUT_BUFFER_RETENTION_FRAMES = 8;
 
-/** Havok-step wrapper signature. Pure function: takes the predicted
- *  state + the encoded input for one frame, returns the state
- *  advanced by one `dt`. Injected by the scene-side wiring so the
- *  predictor is testable without the Babylon/Havok runtime. */
+/** Havok-step wrapper signature. **NOT pure** in the strict sense —
+ *  the wrapper advances the LIVE Havok controller by one frame, reads
+ *  the post-update state, then RESTORES the controller to its prior
+ *  position+velocity (a "phantom" simulation: temporarily step
+ *  physics, capture the result, then revert). The `state` arg is
+ *  unused (kept in the signature for forward-compat with a future
+ *  pure-physics port + for the test mock which doesn't need it).
+ *
+ *  This save/restore pattern was picked over (a) a phantom-Havok
+ *  controller (expensive: one full PhysicsCharacterController per
+ *  drained input) and (b) a refactor that makes the predictor own
+ *  the Havok advance (conflicts with the §1.2 seam — `gameSession.tick()`
+ *  already advances the controller). Save/restore is O(1) per call
+ *  and matches §3.7's "wraps, doesn't duplicate" framing: the live
+ *  controller is unchanged after the wrapper returns, but the
+ *  wrapper reports the state Havok WOULD have reached if the input
+ *  had been applied.
+ *
+ *  The test mock (`mockHavokStep` in clientPredictor.test.ts) bypasses
+ *  the save/restore entirely — it just returns `state + (1, 0)`. The
+ *  mock is fine for testing the predictor's pure bookkeeping (drift
+ *  detection, reconciliation flow, eviction policy) but does NOT
+ *  model the save/restore side effect on the live controller. That's
+ *  by design — the save/restore is the scene's responsibility, not
+ *  the predictor's.
+ *
+ *  Injected by the scene-side wiring so the predictor is testable
+ *  without the Babylon/Havok runtime. */
 export type HavokStepFn = (
   state: PlayerState,
   input: Uint8Array,
