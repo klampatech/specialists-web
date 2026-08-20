@@ -7,44 +7,89 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ## ⚡ TL;DR for the next session (read this first)
 
-**You are here**: PR 11.7.D Option B REVERTED. CI run 32420953306 (PR #41) revealed TWO regressions: (1) the Phase 0 / PR 10 health regression smoke (port 5177, single-tab WebRTC P2P) failed because PR 11.7.D removed the local-apply path; (2) the 5191 CI smoke failed on run 2 of 3 with `Tab A single fire never decremented remoteController HP: hp never dropped (broadcast didn't land within 2s)` — the StrictMode race. Both regressions were reachable from `git grep` and should have been in the pre-merge checklist. PR #41 closed, branch + worktree + remote deleted. The docs branch `docs/post-merge-pr11.7.d-s4.4-investigation` survives.
+**You are here**: PR 11.7.D Option B REVERTED. Regroup mode. Main is at `4c80258`. Servers killed. Working tree clean on `docs/post-merge-pr11.7.d-s4.4-investigation` (commit `68e4d3c`).
 
-**Where we are now (post-revert)**:
-- **Main is at `4c80258`** — PR #40 (PR 11.7.C docs post-merge) merged. PR 11.7.D in pre-flight, no longer in flight.
-- **§4.4 race still open** — the 12-HP gap in 5191 smoke is the same race it was before. The 5191 smoke is now [XFAIL §4.4] gap=12 (PR #37's xfail is back in effect via the reversion).
-- **Servers killed**. Working tree clean.
-- **The throw→warn fix in `gameSession.ts::tick()` is REVERTED** — codex's defensive `throw on no-serverTransport` is back in place. This is a real bug (the throw kills the tick loop on transient disconnects) but it's pre-existing scope, not a PR 11.7.D issue.
+**Current state of the world (2026-08-20)**:
+- **Main**: `4c80258` (post-PR-11.7.C merge). PR 11.7.D NOT in flight.
+- **§4.4 race**: STILL OPEN. The 5191 smoke is back to `[XFAIL §4.4] gap=12` (PR #37's xfail is back in effect via the reversion of PR #41).
+- **Throw on no-serverTransport**: BACK in `gameSession.ts::tick()`. Pre-existing bug, separate scope.
+- **Branches**: `docs/post-merge-pr11.7.d-s4.4-investigation` (the surviving docs branch), `docs/post-merge-pr11.7.c` (older), `feat/phase1-pr11.7.b-server-snapshot` (PR 11.7.B squash), `feat/phase1-pr11.7.c-client-predictor` (PR 11.7.C squash), `feat/phase1-pr11.7.d-...` (none — deleted).
+- **Worktrees**: `~/Development/specialists-web` (main), `~/Development/specialists-web-pr11.6.d` (PR 11.7 plan). The 11.7.d worktree is gone.
+- **CI**: PR #41 closed. Run 32420953306 (the failed one) is preserved in GitHub Actions history.
 
-**What I learned (writeup for Kyle's regroup)**:
-1. **The 5191 smoke passes locally 5/5 but fails in CI on run 2** — the StrictMode race is order-dependent. Local fresh boots don't hit it; CI warm processes + 3x run do. PR 11.7.D Option B did NOT fix this; it just made it more visible by removing the local-apply fallback.
-2. **The health regression smoke (5177) is a 3-year-old smoke that tests the P2P local-apply path.** PR 11.7.D Option B's scope "drop optimistic-apply" was too aggressive — it removed the P2P path that the smoke has been covering since Phase 0 / PR 10.
-3. **The smoke is the load-bearing test, but ONLY when it passes in CI.** Five local passes + one CI failure = a real regression. I should have run the FULL CI pipeline locally before raising, not just the load-bearing smoke.
-4. **PR 11.7.D main scope (lockstep substrate retirement) is the right place to drop P2P** — but that's a separate PR. The fix6 PR was supposed to be a focused §4.4 race fix, not a substrate retirement.
-5. **The throw→warn fix is a real bug, but it's a separate PR scope.** It should be landed as a single-line PR with the throw removed, not as part of a broader substrate change.
+**What I learned (the regroup)**:
+1. **Scope creep is the killer.** PR 11.7.D's "fix6" was supposed to be a focused §4.4 race fix. It ballooned into (a) dropping optimistic-apply entirely (which broke the 3-year-old P2P health smoke), (b) the throw→warn fix (which is a real bug but separate scope), (c) the IIFE belt-and-suspenders (which was over-engineering), (d) the runtime type guard (which was a Vivaldi-specific artifact). Each of these is a real concern, but bundling them was wrong.
+2. **The 5191 smoke passes locally 5/5 but fails in CI on run 2.** The StrictMode race is order-dependent. Local fresh-process boots don't trigger it; CI's warm processes across 3x runs do. **Five local passes + one CI failure = a real regression.** I should have run the FULL CI pipeline locally before raising.
+3. **The health regression smoke (5177) covers the P2P local-apply path that's been in place since Phase 0 / PR 10.** That smoke is the canary for "did anyone break the P2P path?" — it has been since 2024. PR 11.7.D's "drop optimistic-apply" was too aggressive because it removed the P2P path the smoke depends on.
+4. **PR 11.7.D main scope (lockstep substrate retirement) is the right place to drop P2P entirely.** A fix6 PR is NOT the right place. PR 11.7.D main scope is plan §5 work; it's a separate PR with a separate commit history.
+5. **The throw→warn fix is a real bug, but it's a separate PR scope.** It should be a 10-line PR with the throw replaced by warn+skip, nothing else. Tied into PR 11.7.D's "drop optimistic-apply" was wrong.
+6. **The IIFE belt-and-suspenders + runtime type guard were over-engineering.** Vivaldi's WebGL2 fallback bug is a browser issue, not our code. Spending PR 11.7.D's budget on browser-compat hacks was wrong.
 
-**Recommended regroup plan**:
-1. **Revert PR 11.7.D's docs PR** (the docs/post-merge-pr11.7.d-s4.4-investigation branch is in the way of PR 11.7.D main scope; leave it alone for now, the SPEC §4.4 "CLOSED" banner is wrong).
-2. **Open a focused, minimal PR** — just the throw→warn fix in `gameSession.ts::tick()`. ~10 lines. Re-runs CI. Should pass: tight scope, no regression to the health smoke (the throw was already there), no regression to the 5191 smoke (5201 smoke is unaffected by the throw).
-3. **Open a separate PR** for the §4.4 server-side broadcast drop fix (PR 11.7.D's bandwidth-management work — separate scope).
-4. **PR 11.7.D main scope** (lockstep substrate retirement) retires the P2P path, which is when the health smoke (5177) should be deleted and the 5191 smoke becomes the authoritative damage test.
+**Proposed regrouped PRs (tighter scope, sequential)**:
+
+**PR A: `chore(phase1-§4.4): replace throw on no-serverTransport with warn+skip`**
+- 1 file: `client/src/game/gameSession.ts`
+- ~10 lines: change `throw new Error(...)` → `console.warn + skip` in 2 places (fire + melee paths)
+- Risk: minimal. The throw was over-defensive; the warn+skip is the original PR 11.6.D behavior.
+- CI: expect all smokes to pass. The throw is on a defensive path that the smoke never hits.
+- Pre-merge: cargo + vitest + 5191 smoke + 5177 smoke (the throw was already there, so the smoke currently passes despite the throw — it's a defensive catch that should never fire).
+
+**PR B: `fix(phase1-server): §4.4 — fix server-side outbound channel overflow`**
+- 1 file: `server/src/transport.rs` (or split into a new file)
+- Separate scope from "drop optimistic-apply". This is the actual broadcast-drop fix.
+- Per the earlier investigation: PR 11.7.B's 20Hz snapshot stream fills the per-connection `mpsc::channel(64)` faster than headless Chromium's WS outbound drains, causing `damage_relay::try_send` to fail and the broadcast to be silently discarded.
+- Fix: split queue (separate snapshot queue vs damage queue), OR increase channel size for production, OR add backpressure.
+- Risk: minimal — server change only. The client doesn't need to know.
+- CI: expect 5191 smoke to PASS deterministically (no more broadcast drops). The 5177 health smoke is unaffected (P2P path doesn't go through the server).
+- Pre-merge: cargo + vitest + 5191 smoke (3x) + 5177 smoke. Should pass.
+
+**PR C: `docs(phase1-§4.4): mark race CLOSED after PR B lands`**
+- 1 file: `docs/SPEC.md` + `HANDOFF.md`
+- Update the §4.4 banner from "race EXISTS, XFAIL in 5191" to "race CLOSED by PR B". Mark the XFAIL block as removable in the next smoke cleanup.
+- Pure docs PR. No code change.
+
+**PR D: `refactor(phase1-§4.4): drop optimistic-apply + retire P2P path` (deferred to PR 11.7.D main scope)**
+- This is the original PR 11.7.D fix6 work, BUT deferred to PR 11.7.D main scope (per plan §5).
+- Includes: removing optimistic-apply, removing P2P health smoke (5177), updating the 5191 smoke to be the authoritative damage test.
+- Bigger change. Requires Kyle's go-ahead AFTER PR B closes the §4.4 race.
+
+**Pre-merge checklist for ALL PRs (lesson learned — run the full smoke matrix, not just the load-bearing one)**:
+1. `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` (expect 170/170).
+2. `cd client && npx tsc -b --noEmit && npx vitest run --reporter=verbose && npm run build` (expect clean + all tests PASS).
+3. **Run the full smoke matrix locally** — every CI smoke job, not just the load-bearing one:
+   - 5173 scene-smoke
+   - 5174 two-tab-smoke
+   - 5175 mouse-pitch (PR 11.3)
+   - 5176 yaw (PR 11.1)
+   - 5177 health-regression (PR 10) — tests P2P local-apply
+   - 5178 spectator-camera (PR 11.4)
+   - 5179 pause-menu (PR 11.2)
+   - 5180 jump-regression (PR 8)
+   - 5181 wallrun-regression (PR 8.1)
+   - 5182 lockstep-rollback (PR 11.5)
+   - 5190 damage-server (PR 11.6.C)
+   - 5191 hp-convergence (PR 11.6.D) — strict-equality post-merge goal
+4. `grep -E '__forceServerTransport|__serverTransport|__damageBus|__pendingOptimistic|__pendingSweepInterval|__broadcastHandlerCount|__broadcastTimestamps' client/dist/assets/index-*.js` (expect ZERO matches in prod bundle).
+5. **Then** raise the PR.
+
+**Next session plan (regouped)**:
+1. Open PR A (throw→warn fix, ~10 lines).
+2. Land PR A.
+3. Open PR B (server-side broadcast drop fix). Land.
+4. Open PR C (docs). Land.
+5. Defer PR D (lockstep substrate retirement) to PR 11.7.D main scope.
+
+**Why this is better than the original PR 11.7.D**:
+- Each PR is narrowly scoped. Each PR is reviewable in 10 minutes.
+- PR A is a no-brainer (real bug, defensive code).
+- PR B fixes the §4.4 race at its root without touching the client.
+- PR C is docs only.
+- PR D is the actual substrate retirement, which was always the right scope for "drop optimistic-apply".
+- Total scope: 1 file + 1 file + 1 file + (deferred). Each PR is independently mergeable.
 
 **Servers still to bring up when needed**:
 - canary: `cd /home/kyle/Development/specialists-web && server/target/release/specialists-server --port-wt 14433 --port-ws 14434 --cert server/certs/dev.pem --key server/certs/dev.key --sans localhost,127.0.0.1,100.95.111.112,::1`
 - vite: `cd /home/kyle/Development/specialists-web/client && npm run dev -- --host 0.0.0.0 --port 5191 --strictPort`
-
-**Pre-merge checklist (lesson learned — run the FULL CI before raising, not just the load-bearing smoke)**:
-1. `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` (expect 170/170).
-2. `cd client && npx tsc -b --noEmit && npx vitest run --reporter=verbose && npm run build` (expect clean + all tests PASS).
-3. **Run the FULL local smoke matrix** — every CI smoke job, not just the load-bearing one. List: 5173 scene, 5174 two-tab, 5175 mouse-pitch, 5176 yaw, 5177 health, 5178 spectator, 5179 pause, 5180 jump, 5181 wallrun, 5182 lockstep-rollback, 5183 health-regression, 5190 damage-server, 5191 hp-convergence. The 5177 health smoke is the one that catches the §4.4 P2P regression.
-4. `grep -E '__forceServerTransport|__serverTransport|__damageBus|__pendingOptimistic|__pendingSweepInterval|__broadcastHandlerCount|__broadcastTimestamps' client/dist/assets/index-*.js` (expect ZERO matches in prod bundle).
-5. Tear down.
-6. THEN raise the PR.
-
-**Next session plan (after regroup)**:
-1. Bring the 5191 smoke + canary back up.
-2. Open the minimal `throw→warn` PR (~10 lines).
-3. Open the docs PR (`docs/post-merge-pr11.7.d-s4.4-investigation` branch) AS A NEW SEPARATE PR that removes the SPEC §4.4 "CLOSED" banner — until PR 11.7.D main scope lands, the race is NOT closed.
-4. Open the PR 11.7.D scope expansion: the §4.4 fix is a server-side broadcast drop mitigation (PR 11.7.D's bandwidth-management work). The P2P path stays for P2P smokes; the server-auth path gets the optimistic-apply removed.
 
 ## 2026-08-19/20 — §4.4 race investigation + Option B decision (drop optimistic-apply). Branch `docs/pr11.7.b-spec-banner-update` (now = origin/main at `4c80258`).
 
