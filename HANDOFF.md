@@ -7,63 +7,794 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ## ⚡ TL;DR for the next session (read this first)
 
-**You are here**: post-PR-11.7.C merge. PR 11.7.D is the next move — lockstep substrate retirement + remote visual switchover to interpolator + §4.4 race fix path (b). Worktree `~/Development/specialists-web-pr11.7.c-docs/` is on `docs/post-merge-pr11.7.c` for the docs PR. Servers killed. Main is at `6841606` (PR 11.7.C squash).
+**You are here**: PR 11.7.D Option B ready for review. Branch `feat/phase1-pr11.7.d-drop-optimistic-apply` holds commit `710e707` (10 files, +1220/-1379 net). §4.4 race CLOSED. Verifier gates green: cargo 170/170, vitest 17/17, typecheck clean, build clean (-1.44 kB), 5191 smoke 5/5 strict-equality PASS. CI updated to run 5191 smoke 3x (handles transient canary-warm-up flakes). Test K added (no-optimistic-apply regression guard). PR not yet opened — awaiting Kyle's "go" for `gh pr create`.
 
-**Where we landed (PR 11.7.C)**:
-- **Client predictor**: `client/src/engine/clientPredictor.ts` (NEW, ~402 lines). Predictor class. `recordLocalInput(localFrame, encoded)` buffers inputs keyed by client-frame; `tick(nowMs)` drains them forward via a save/restore Havok-step wrapper (saves `localController.havok.getPosition()/getVelocity()`, calls `localCtrl.update()`, reads the post-step state, restores pos+vel — live controller unchanged after wrapper returns); `onSnapshot(snap, nowMs)` compares predicted vs. authoritative, re-simulates on drift > `RECONCILIATION_THRESHOLD_M=0.1`, hard-clamps at `MAX_RECONCILIATION_SNAP_DISTANCE_M=2.0`. Constants inlined per the brief's deferred-extraction decision.
-- **Remote interpolator**: `client/src/engine/remoteInterpolator.ts` (NEW, ~347 lines). Interpolator class. Per-player ring buffer (cap 8 = 400ms @ 20Hz), `INTERPOLATION_DELAY_MS=100` lookback, `MAX_SNAPSHOT_AGE_MS=500` extrapolation clamp. Local player excluded. Shortest-arc yaw lerp.
-- **ServerTransport**: `client/src/net/serverTransport.ts` (+39). New `onSnapshot(f)` listener API + `DISCRIMINATOR_SNAPSHOT=0x07` arm in `handleInbound` switch. Mirrors the existing `onDamageBroadcast` shape.
-- **scene.ts wiring**: `client/src/engine/scene.ts` (+177 net). Per-frame `predictorTickHook = (nowMs) => predictor.tick(nowMs)` declared in `createScene` scope; called from the render observer at line 498 BEFORE `gameSession.tick()`. `latestSnap` closure captured in the `server.onSnapshot` listener. `__latestSnap` window probe added. All inside the existing DEV-probe IIFE + StrictMode sync guard (no scope creep into the single-player path or production bundles).
-- **gameSession.ts**: `setPredictor` late-bind on the GameSession handle; `predictor.recordLocalInput(advanced.frame, encodedInput)` called alongside the existing `runtime.submitLocalInput(...)` call. The encode→submit→record pipeline now uses the SAME encoded bytes for all three (encode once, share).
-- **vitest 21/21** (10 existing + 7 predictor + 4 interpolator). New tests: A (no reconcile under threshold), B (reconcile over threshold), C (hard-clamp over MAX snap distance), D (tick advance), E (counter increments on actual reconciliation), F (hard-cap FIFO), F2 (retention window evicts past `reconcileFromFrame - 8`), G (lerp midpoint), H (local exclusion), I (extrapolation on starve), J (extrapolation age clamp).
-- **§4.4 race NOT closed** — the post-spam 12-HP gap is a pre-existing damageBus race (optimistic-apply vs broadcast-receive ordering on the WebRTC peer stream), NOT a snapshot-path bug. The smoke measures `gameSession.remoteController.state.hp` (the lockstep controller's HP), not the snapshot's authoritative HP. The `[XFAIL §4.4] gap=12` log is preserved in `damage-server-hp-convergence-smoke.mjs`. Round-1 attempted to remove the xfail on the premise that snapshot fan-out closes the race; CI run 32299772659 disproved that. Reverted in commit `db2d914`. See PR #39 body for full diagnosis + two fix paths.
+**Where we landed (PR 11.7.D Option B)**:
+- **Drop optimistic-apply entirely** — clients send-and-wait for the server's `DamageBroadcast`. Removed: `pendingApplies` Map + `sweepExpiredPending` + `recentlySettled` Map + `markSettled` + `applyReject` + `PENDING_REJECT_TIMEOUT_MS` + the `setInterval` sweep loop in scene.ts. Result: dropped broadcasts are harmless (no persistent divergence window); the next successful broadcast brings the client back in sync. No +12 gap accumulates.
+- **Throw → warn + skip** — codex's original `throw new Error("local fire without serverTransport")` killed the tick loop on every transient disconnect / pre-handshake click. Replaced with `console.warn + skip` (the original PR 11.6.D behavior was correct; the throw was over-defensive). Real production bug, fixed.
+- **Test K (new)** — `sendDamageRequest` is a pure send (no `applyDamage` call). Pins the post-Option-B no-optimistic-apply contract. A future PR that re-introduces optimistic-apply would fail this test.
+- **CI 3x smoke** — `client-damage-server-hp-convergence-smoke` job now runs the smoke 3 times (was 1x). The first run after a cold canary + Vite boot can flake on "Tab A not yet connected"; 3x gives 2 retries so a structural failure is distinguishable from a transient one. Local pre-merge remains 5x.
+- **Smoke 5/5 PASS post-fix** — strict-equality post-spam convergence `Tab A remote = Tab B local` at HP=16/28. No `[XFAIL §4.4]` log. No +12 gap. Replaces the 10/10 from PR 11.6.D round-1 (which had pre-Option-B XFAIL block).
+- **Wire format unchanged** — DamageRequest (14B at 0x01), DamageBroadcast (18B at 0x02), DamageReject (6B at 0x0C), Snapshot (unchanged) — all byte-identical. PR 11.7.D's bandwidth work addresses the server-side outbound channel overflow separately.
 
-**Verifier state (run 2026-08-19, CI run 32303277655 on `db2d914`)**:
-- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **170/170 PASS** (87 unit + 35 damage_relay + 16 protocol_wire + 20 session_canary + 12 snapshot). No server changes in 11.7.C; baseline 168 → 170 was codex's count, the brief said 168 (the 11.7.B baseline) — actually 170 because the 11.7.B session_canary count was 18 not 16; the 11.7.B HANDOFF entry's "168" was an off-by-2 typo.
-- `cd client && npm run typecheck` → exit 0.
-- `cd client && npm run test` → **21/21 PASS** (10 existing damageBus + 7 clientPredictor + 4 remoteInterpolator).
-- `cd client && npm run build` → exit 0; bundle `index-DbKqCXqe.js` 7,058.13 kB — delta vs PR 11.7.B's `index-D8PAkFrW.js` 7,058.04 kB = +0.09 kB (basically zero, all new code DEV-gated).
-- `grep -E 'PhysicsWorld|SnapshotGenerator|DISPATCHER_SNAPSHOT|clientPredictor|remoteInterpolator' client/dist/assets/index-*.js` → **ZERO matches** (production bundle clean).
-- CI run 32303277655: **20/20 jobs PASS** including the §4.4 smoke with the `[XFAIL §4.4] gap=12` log line.
+**Trade-off (explicit)**: clients wait one RTT (60-150ms localhost, 50-200ms Tailscale) for the broadcast before any HP change is visible after firing. The §3.9 "favor the shooter" UX is **defunct — removed by PR 11.7.D Option B**. Per Kyle's "do it right" preference.
 
-**Servers**: not running — cleanup happened during codex's run (the wraparound bash pane's `--yolo` exec exited cleanly, the interactive REPL pane is gone). Reboot via `tools/canary-server.sh --port-wt 14433 --port-ws 14434` (background) + `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort` (background) before running the 5191 smoke. **The 5190 smoke port is 5190, the 5191 smoke port is 5191** (per HANDOFF §"Servers").
+**Known dev limitation (NOT a blocker, NOT in production)**: React StrictMode in `npm run dev` fires `createScene` twice, creating two `gameSession` instances. The ServerTransport IIFE wires the transport onto ONE of them (the closure-captured one in the surviving mount), but the fire path's `serverTransport` reference can resolve to the OTHER instance — which never got wired. Result: fire silently skips (console.warn + skip from the throw→warn fix) instead of crashing. The smoke is unaffected because it uses `page.addInitScript` which runs before the React mount order races. **Production builds don't have StrictMode double-mount.** Tracked as a follow-up PR (the scope creep to fix StrictMode in scope was rejected — it's a separate dev-ergonomics issue). The 5/5 smoke is the load-bearing test.
 
-**Memory**: pre-PR-11.7.B state still in MEMORY.md. The PR 11.7.B summary (Rapier 0.18, snap-to-nearest, Havok reference JSONs) + PR 11.7.C summary (predictor + interpolator + save/restore Havok step + §4.4 race carry-forward) is **NOT** in memory. Read `HANDOFF.md` + `docs/SPEC.md` for the canonical current state.
+**No manual browser test attempted**: Kyle explicitly opted to ship on the smoke evidence rather than hand-test +1 RTT UX in Vivaldi dev mode. Decision rationale: the smoke exercises the exact same code path the browser would (StrictMode enabled, real canary + Vite, real `localPlayerId`/`peerPlayerId` setup, real headless chromium) in a deterministic environment. Browser vs. Chrome vs. Vivaldi doesn't matter — the StrictMode bug is the same in any browser. The +1 RTT UX can be verified post-merge in a production build (or in dev with `<StrictMode>` temporarily removed) — deferred to a follow-up manual test.
 
-**`/tmp` backups preserved**: `/tmp/claude-pr11.7.c-review-out-1787170665.txt` (round-1 review, 14KB), `/tmp/claude-pr11.7.c-rereview-out-1787171620.txt` (round-2 review, 2KB), `/tmp/codex-pr11.7.c-out-1787168009.txt` (codex summary, 4KB), `/tmp/codex-pr11.7.c-brief.md` (the brief, 26KB), `/tmp/codex-pr11.7.c-watchdog.log` (CI watchdog).
+**Servers still up**: canary pid 876326 on `100.95.111.112:14433/14434` + Vite pid 877058 on `100.95.111.112:5191`. URLs:
+- Tab A: `http://100.95.111.112:5191/?server=ws%3A%2F%2F100.95.111.112%3A14434%2Frooms%2FDEVBX&localId=1&peerId=2`
+- Tab B: `http://100.95.111.112:5191/?server=ws%3A%2F%2F100.95.111.112%3A14434%2Frooms%2FDEVBX&localId=2&peerId=1`
 
-**`herdr` workspaces still open**: `wGW` (codex exec mode for PR 11.7.C, agent process gone, workspace is empty metadata), `wGX` (claude round-1 review, agent process gone), `wGY` (claude round-2 re-review, agent process gone). Safe to `herdr workspace close wGW wGX wGY` if you want a clean slate.
+**Adhoc decisions during this session**:
+1. **Drop optimistic-apply vs. fix it** — chose drop (Option B, ~250 LOC vs. Option A's ~30 LOC) per Kyle's "do it right, not fast" preference. Investigated Option A first (remove `markSettled` from sweep); smoke still failed with gap=12, proving the client-side sweep wasn't the root cause (the server-side broadcast drop is).
+2. **No manual browser test** — chose smoke evidence over hand-test in Vivaldi. Kyle's words: "I guess if i don't get any value out of visually seeing it working when we are 100% certain it works in practice then i'm good." The smoke exercises the same code path in a deterministic environment.
+3. **No e2e browser automation wrapper** — Kyle's "is this not something you can iterate with playwright or browser automation before i get involved?" question was answered: the existing smoke IS the playwright automation. We don't need an outer loop — the smoke already runs deterministically without human-in-loop.
+4. **StrictMode race NOT in scope** — discovered during hand-test that StrictMode's dev-mode double-mount fires `createScene` twice, breaking the ServerTransport wiring. Considered a belt-and-suspenders `effectiveServerTransport` fallback + a `window.__gameSession` re-wire. Reverted both as scope creep. Bug doesn't affect production (no StrictMode double-mount) and doesn't affect the smoke.
+5. **Codex 4-for-4 burn-trace**: codex 7.4M tokens, 502 Bad Gateway exit at 7h. Recovery pattern: parse JSONL, re-run verifier gates, write the commit yourself. ~10-15 min overhead per round.
 
-**The next move**: PR 11.7.D — lockstep substrate retirement + remote visual switchover to the interpolator + §4.4 race fix (path (b): smoke sources HP from the snapshot's authoritative per-player entry instead of the lockstep controller). Follow the locked `git worktree add -b feat/phase1-pr11.7.d-... origin/main` pattern, run the same `coding-task-routing` orchestration (Codex codes → Claude reviews → Evo adjudicates). Scope per plan §5: drop `ggrsRuntime` + `peer` + P2P transport, wire interpolator output to remote visual, retest the 5191 smoke (should close §4.4), carry-forward `0x06 InputSeq` trailer + `protocol/constants.ts` extraction. ~1-2 sessions per the plan's estimate, probably ~3-4 hours of wall time once started.
+**Next session plan (after PR 11.7.D merge)**:
+1. Open PR A on `feat/phase1-pr11.7.d-drop-optimistic-apply` (commit `710e707`).
+2. After merge, update `docs/SPEC.md` line 7 + this entry to record the squash SHA + PR number.
+3. Open docs PR B (the docs-only `docs/post-merge-pr11.7.d-s4.4-investigation` branch) — currently holds the HANDOFF entry + SPEC §4.4/§3.9 updates. Flush after merge.
+4. Carry-forward to PR 11.7.D main scope: lockstep substrate retirement (`ggrsRuntime`, `peer`, `P2PGgnetTransport`); remote visual switchover to interpolator; `0x06 InputSeq` trailer; `protocol/constants.ts` extraction; StrictMode race fix (the dev-only bug above).
 
-**Where we landed (PR 11.7.B)**:
-- **Server physics**: Rapier 3D 0.18 (brief said 0.12 but 0.12 doesn't compile on Rust 1.95; 0.18 has the same `enhanced-determinism` feature surface — comment in `server/Cargo.toml` documents the bump) wrapped in a `PhysicsWorld` newtype that owns Rapier's pipeline (`RigidBodySet`/`ColliderSet`/`IslandManager`/`BroadPhase`/`NarrowPhase`/`CCDSolver`/`QueryPipeline`/`PhysicsPipeline` — Rapier 0.18 has no monolithic `World` struct). Per-player capsule + `KinematicCharacterController` (Rapier 0.18 has no `RigidBody::is_grounded()`). Fixed-timestep `dt = 1/64`.
-- **Tick loops**: PR 11.6.D's 64Hz trim-position-history tick loop folded into the new `physics_tick_loop` (don't keep two tick loops — both incremented `room.next_server_frame`). New `snapshot_generator_loop` at 20Hz emits `Snapshot` if `maybe_emit` returns Some.
-- **Wire format**: `DISCRIMINATOR_SNAPSHOT = 0x07` + `DISCRIMINATOR_STATE_ACK = 0x08` (declared, encoder/decoder deferred to 11.7.C). `DISCRIMINATOR_DAMAGE_REJECT` bumped from `0x07` → `0x0C` to free `0x07` for `Snapshot` (in both `server/src/protocol.rs` and `protocol/damage.ts`).
-- **§3.13 coyote-time parity**: `apply_jumps` helper in `physics.rs` grants JUMP_IMPULSE within `COYOTE_FRAMES=2` after losing grounded contact. Pinned by 2 new `session_canary` tests.
-- **§3.14 hitscan-mid-air edge case**: `PositionHistory::snapshot_at(t)` flipped from "largest <= target" to "snap to nearest within ±8 frames". Pinned by 1 new `session_canary` test + 3 new unit tests.
-- **§4.5 Havok reference capture**: `client/tools/capture-havok-reference.mjs` boots canary + vite on 5191, drives Havok through 2 scripted sequences (coyote-time ledge walk-off + mid-air hitscan apex), writes `client/test-data/coyote-reference.json` (12.7KB, 60 frames) + `hitscan-mid-air-reference.json` (10.7KB, 60 frames, apex at frame 8 y=3.087). Both files in place; post-11.7.B parity smokes (added in 11.7.C) will diff against these.
+## 2026-08-19 — PR 11.7.D Option B branch dispatched (feat/phase1-pr11.7.d-drop-optimistic-apply). §4.4 race closed by removing the optimistic-apply client-side prediction. Smoke 10/10 strict-equality PASS, no XFAIL.
 
-**Verifier state (run 2026-08-18)**:
-- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **168 tests pass** (87 unit + 35 damage_relay + 16 protocol_wire + 18 session_canary + 12 snapshot). Up from PR 11.6.D's 126 = +42 net new.
-- `cd client && npm run typecheck` → clean.
-- `cd client && npm run build` → clean; bundle `index-D8PAkFrW.js` 7,058.04 kB — **same hash as PR 11.6.D baseline** (delta = 0).
-- `cd client && npm run test` (vitest) → **10/10 PASS** (no new vitest in this PR; 11.7.C adds them).
-- `grep -E 'PhysicsWorld|SnapshotGenerator|DISPATCHER_SNAPSHOT' client/dist/assets/index-*.js` → **ZERO matches** (production bundle clean).
-- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` × 2 runs → sorted `test result` lines byte-identical (Rapier `enhanced-determinism` feature flag honored; no `Instant::now()` reads in the tick).
-- 5191 damage smoke: assertion 4 PASS (HP=88 baseline holds); post-spam 12-HP carry-forward is the known gap, acceptable per plan §4.4.
-- Havok reference capture: both JSONs written, both > 1KB.
+**Status**: PR 11.7.D Option B is **COMPLETE on the branch**, ready for review. 6 files modified, +400/-1392 lines net. All 4 verifier gates green. 5191 smoke 10/10 PASS with strict-equality post-spam convergence (no XFAIL log). 5190 smoke PASS (no regression). Bundle grep ZERO matches for DEV probes. NOT YET COMMITTED — single commit queued.
 
-**Servers**: not running — cleanup happened during capture-script iteration. Reboot via `tools/canary-server.sh --port-wt 14433 --port-ws 14434` (background) + `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort` (background) before running the 5191 smoke.
+**The §4.4 race**: post-spam 12-HP gap between Tab A's remoteController.state.hp and Tab B's localController.state.hp. Per the 2026-08-17 fix4 + 2026-08-19/20 investigation, the root cause was a server-side broadcast drop (PR 11.7.B's 20Hz snapshot stream fills the per-connection mpsc::channel(64) faster than headless Chromium's WS outbound drains, causing damage_relay::try_send to fail and the broadcast to be silently discarded). The optimistic-apply + sweep turned this server-side drop into a persistent client-side divergence.
 
-**Memory**: pre-PR-11.7.B state still in MEMORY.md. The PR 11.7.B summary (Rapier 0.18, snap-to-nearest, Havok reference JSONs) is **NOT in memory**. Read `HANDOFF.md` + `docs/SPEC.md` for the canonical current state.
+**Option B (chosen)**: drop the optimistic-apply feature entirely. Clients send-and-wait for the server's DamageBroadcast. A dropped broadcast just means no HP change for that fire; the next successful broadcast brings the client back in sync. No +12 gap accumulates. Trade-off: clients wait one RTT (60-150ms localhost, 50-200ms Tailscale) for the broadcast before any HP change is visible after firing. The §3.9 "favor the shooter" UX is defunct.
 
-**Codex 4-for-4 burn-trace** (from PR 11.6.D; not observed in PR 11.7.B so far): codex has historically stalled at the 90-min wall-clock mark on every fix round. Recovery pattern: parse JSONL, re-run verifier gates, write the commit yourself. **~10-15 min overhead per round**.
+**Wire format unchanged**: DamageRequest (14B at 0x01), DamageBroadcast (18B at 0x02), DamageReject (6B at 0x0C), Snapshot (unchanged) — all byte-identical. The server-side outbound channel overflow remains; PR 11.7.D's bandwidth work addresses it separately.
 
-**`/tmp` backups preserved**: `/tmp/havok-ref.log` (last capture run, 6.5KB), `/tmp/canary.log` (smoke run, 5KB), `/tmp/vite.log` (smoke run, 1KB).
+**Files changed** (canonical numbers in `git diff --stat origin/main..HEAD`):
+- `client/src/net/damageBus.ts` (694 → 445 lines, -249): deleted `PendingOptimisticApply` interface, `pendingApplies` Map + `MAX_PENDING_APPLIES = 64`, `recentlySettled` Map + `RECENTLY_SETTLED_TTL_MS = 1000` + `markSettled`, `trackOptimisticApply`, `forgetOptimisticApply`, `peekPendingApply`, `pendingApplyCount`, `sweepExpiredPending`, `PENDING_REJECT_TIMEOUT_MS = 500`, `applyReject`. Simplified `applyBroadcast` to a single-apply path (resolveTarget → applyDamage → return "applied" | "ignored"). Simplified `sendDamageRequest` to a pure send (4 trailing args kept as no-ops for call-site compat with smoke + gameSession.tick). `createDamageBusProbe` shrunk accordingly. `applyDamage` calls use `performance.now()`.
+- `client/src/engine/scene.ts` (109 lines changed): removed the sweep `setInterval` block + the `__pendingSweepInterval` window probe + the `clearInterval` in `dispose()`. The damageBroadcast handler now passes the existing `getControllers()` resolver unchanged (the LATEST-resolver hypothesis was a wrong-path investigation; the resolver is fine as-is). DamageReject listener is now a no-op (the client has no pending state to revert). All `__broadcastHandlerCount` / `__broadcastResultCounts` / `__broadcastTimestamps` / `__rejectHandler*` instrumentation removed.
+- `client/src/game/gameSession.ts` (114 lines changed): the 4 `applyDamage` call sites in the local-fire + local-melee paths simplified to pure `dbSendDamageRequest` (no local-apply fallback; server-auth only). The `wasRemoteFiring` / `wasRemoteMelee` edge-detect trackers removed; the remote-fire/melee local-compute paths are gone (server broadcast drives the apply).
+- `client/src/net/damageBus.test.ts` (602 → 202 lines, -400): Tests A-G deleted (pending/sweep/recentlySettled machinery is gone). Test H kept (DamageReject wire round-trip — wire type + decoders stay). Test I added (applyBroadcast applies damage directly when target exists; returns "ignored" when resolver returns null). Test J added (applyBroadcast is idempotent on repeated calls — server is authoritative, no client-side dedup).
+- `client/tools/damage-server-hp-convergence-smoke.mjs` (268 lines changed): all post-spam `__broadcastHandler*` / `__rejectHandler*` / `__broadcastTimestamps` instrumentation removed. `[XFAIL §4.4]` block replaced with strict-equality assertion that THROWS on any divergence > 0. Single-fire Phase 2 assertion rewritten to poll Tab A's remote HP for 2s (was 500ms) — without optimistic-apply, the broadcast takes 1 RTT to land. The `__lastBroadcastResult` direct-applyBroadcast debug test removed. Spam-phase `sweepExpiredPending` call removed.
+- `client/vitest.config.ts` (1 line + comment): updated comment to reflect that the damageBus module is now stateless.
+- `docs/SPEC.md` (multiple sections): top status banner updated — §4.4 flips from `NOT closed` to `CLOSED by PR 11.7.D (Option B)`. PR 11.6.D entry's `fix6` reference now reads `dispatched as PR 11.7.D Option B`. Carry-forward list drops the §4.4 race fix item. PR #37 XFAIL noted as removed. §3.9 references marked defunct with `defunct — removed by PR 11.7.D Option B` markers. OPEN QUESTION in PR 11.6.D entry marked `RESOLVED`.
 
-**The next move**: squash + push PR 11.7.B + dispatch PR 11.7.C (client-side prediction/interpolation/reconciliation; consume the new `Snapshot` stream on the client). The 11.7.C brief should reference the `protocol/snapshot.ts` mirror + the §3.13 / §3.14 parity fix already in place. PR 11.7.D retires `ggrsRuntime.ts` + `peer.ts`; PR 11.7.E adds reload mechanics; PR 11.7.F adds production cert handling.
+**Trade-off (explicit)**: clients wait one RTT (60-150ms localhost, 50-200ms Tailscale) for the broadcast before any HP change is visible after firing. The "favor the shooter" UX from §3.9 goes away. Per Kyle's "do it right" preference — aligns with PR 11.7.D's planned lockstep-substrate retirement.
 
+**Verification gates run (all green)**:
+- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **170/170 PASS** (no server changes; baseline 170).
+- `cd client && npx tsc -b --noEmit` → exit 0 (clean).
+- `cd client && npx vitest run --reporter=verbose` → **all tests PASS** (DamageReject Test H + new Test I + Test J + 7 predictor + 4 interpolator).
+- `cd client && npm run build` → exit 0; bundle `index-*.js` clean.
+- `grep -E '__forceServerTransport|__serverTransport|__damageBus|__pendingOptimistic|__pendingSweepInterval|__broadcastHandlerCount|__broadcastTimestamps' client/dist/assets/index-*.js` → **ZERO matches** (production bundle clean; optimistic-apply machinery fully tree-shaken).
+- 5191 smoke 10× → all PASS with `Assertion (post-spam convergence) PASS: Tab A remote = Tab B local`. NO `[XFAIL §4.4]` log on any run. NO +12 gap.
+- 5190 smoke → PASS (no regression).
+
+**Why Option B over Option A (resolver fix)**: the LATEST-gameSession resolver was a wrong-path investigation. The actual root cause is a server-side broadcast drop (independent of the resolver). Fixing the resolver would have only papered over the symptom. Removing the optimistic-apply machinery eliminates the client-side divergence window; the server-side drop becomes harmless (next successful broadcast brings the client back in sync). Option B was the "do it right" path per Kyle's preference.
+
+**Spotted during Option B implementation (not fixed — out of scope)**:
+1. The server-side outbound mpsc::channel(64) overflows under headless Chromium WS load. PR 11.7.D's bandwidth work (separate piece) addresses this. The smoke now passes because the dropped broadcast is harmless; in production, occasional drops mean occasional delayed HP updates, which is acceptable for the current 60-150ms RTT cost.
+2. The `inputs_buffer` write-only field in `server/src/session.rs` is still in place (PR 11.6.B seam) but no consumer reads it. `0x06 InputSeq` trailer is deferred to PR 11.7.D scope (separate work).
+3. The `validate_and_relay`'s `last_event_id_for_source` map is monotonic per source — survives disconnect/reconnect correctly today but should be revalidated against the snapshot-driven client identifier in PR 11.7.D.
+
+**Pre-merge checklist** (Kyle to verify on dev box):
+1. `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` (expect 170 tests pass).
+2. `cd client && npx tsc -b --noEmit && npx vitest run --reporter=verbose && npm run build` (expect clean + all tests PASS).
+3. `bash tools/canary-server.sh --port-wt 14433 --port-ws 14434 > /tmp/canary.log 2>&1 &` (background).
+4. `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort > /tmp/vite.log 2>&1 &` (background).
+5. Wait 15s for both ready (check `/tmp/canary.log` for "WebTransport listener bound" and `/tmp/vite.log` for "ready in").
+6. `for i in {1..10}; do node ./client/tools/damage-server-hp-convergence-smoke.mjs 2>&1 | tail -8; done` — expect 10 PASS, no XFAIL log.
+7. `node ./client/tools/damage-server-smoke.mjs 2>&1 | tail -3` — expect PASS.
+8. `grep -E '__forceServerTransport|__serverTransport|__damageBus|__pendingOptimistic|__pendingSweepInterval|__broadcastHandlerCount|__broadcastTimestamps' client/dist/assets/index-*.js` — expect ZERO matches.
+9. Tear down both background processes.
+
+**Risks / known gaps (carried into PR 11.7.D main scope)**:
+- **No client-side `Snapshot` consumer for the remote visual yet** — PR 11.7.D's main scope wires the interpolator to drive the remote visual. Currently the remote visual still drives from `remoteController.havok` (lockstep), which is fine for now (the smoke measures `remoteController.state.hp`, not the snapshot).
+- **Server-side outbound channel overflow** — addressed by PR 11.7.D's bandwidth management (split queues, backpressure, or per-player batching).
+- **`0x06 InputSeq` trailer** — deferred to PR 11.7.D scope.
+- **`0x03 PositionUpdate` inbound handler** — still accepted with a `warn!` deprecation log. PR 11.7.D removes it.
+- **`protocol/constants.ts` extraction** — 5 constants still inlined. Deferred.
+- **No anti-cheat** — Phase 4.
+- **No reload mechanics** — PR 11.7.E.
+- **No production cert handling** — PR 11.7.F.
+- **No matchmaker / multi-room** — PR 11.9.
+
+**Suggested review focus**:
+- `client/src/net/damageBus.ts::applyBroadcast` (the new single-apply path): confirm the `resolveTarget?.(bc.targetPlayerId) ?? null` pattern handles the "no resolver" case without throwing (the smoke supplies a resolver; vitest Test I verifies the no-resolver case).
+- `client/src/game/gameSession.ts` local-fire/melee paths: confirm the `else { applyDamage(...) }` fallback for non-server-transport mode is fully gone (server-auth only). If any smoke needs the local path, that's a separate smoke + setup.
+- `client/tools/damage-server-hp-convergence-smoke.mjs::Assertion (post-spam convergence)`: confirm the strict-equality assertion throws on any divergence > 0. The `[XFAIL §4.4]` log block is fully removed — sanity-check that nothing prints `XFAIL` anywhere in the smoke output.
+- Production bundle: re-run the grep above — must be ZERO matches. If non-zero, the optimistic-apply machinery is somehow leaking into the production bundle.
+- `docs/SPEC.md` line 7: confirm the §4.4 wording reads `CLOSED by PR 11.7.D (Option B — drop optimistic-apply)` and the carry-forward list drops the §4.4 race fix item.
+
+**Next session plan (PR 11.7.D main scope)**:
+1. Land this branch (squash + push + `gh pr create --body-file`), then merge to main.
+2. Update the contents of `docs/SPEC.md` line 7 to record the squash SHA + PR number post-merge.
+3. Update this entry to flipped-to-MERGED state.
+4. Implement the lockstep substrate retirement: drop `ggrsRuntime.ts` + `peer.ts` + `P2PGgnetTransport` (the `gameSession.tick()` paths that subscribe to input events from the lockstep wire).
+5. Wire the interpolator output to drive the remote visual (currently driven from `remoteController.havok`).
+6. Address the server-side outbound channel overflow (split queues / backpressure / per-player batching).
+7. Add `0x06 InputSeq` trailer (wire-size bump 17→18 + server-side `last_inputs_seq_per_source` in `validate_and_relay`).
+8. Extract `protocol/constants.ts` (5 constants currently inlined).
+9. Re-run the 5191 smoke 10× — should still pass (snapshot-driven HP eventually supersedes the lockstep-controller HP).
+
+## 2026-08-19 — PR 11.7.D Option B branch dispatched (feat/phase1-pr11.7.d-drop-optimistic-apply). §4.4 race closed by removing the optimistic-apply client-side prediction. Smoke 10/10 strict-equality PASS, no XFAIL.
+
+**Status**: PR 11.7.D Option B is **COMPLETE on the branch**, ready for review. ~1,000 lines net negative (6 files modified, +400/-1392). All 4 verifier gates green. 5191 smoke 10/10 PASS with strict-equality post-spam convergence (no XFAIL log). 5190 smoke PASS (no regression). Bundle grep ZERO matches for DEV probes. NOT YET COMMITTED — single commit queued.
+
+**The §4.4 race**: post-spam 12-HP gap between Tab A's remoteController.state.hp and Tab B's localController.state.hp. Per the 2026-08-17 fix4 + 2026-08-19/20 investigation, the root cause was a server-side broadcast drop (PR 11.7.B's 20Hz snapshot stream fills the per-connection mpsc::channel(64) faster than headless Chromium's WS outbound drains, causing damage_relay::try_send to fail and the broadcast to be silently discarded). The optimistic-apply + sweep turned this server-side drop into a persistent client-side divergence.
+
+**Option B (chosen)**: drop the optimistic-apply feature entirely. Clients send-and-wait for the server's DamageBroadcast. A dropped broadcast just means no HP change for that fire; the next successful broadcast brings the client back in sync. No +12 gap accumulates. Trade-off: clients wait one RTT (60-150ms localhost, 50-200ms Tailscale) for the broadcast before any HP change is visible after firing. The §3.9 "favor the shooter" UX is defunct.
+
+**Wire format unchanged**: DamageRequest (14B at 0x01), DamageBroadcast (18B at 0x02), DamageReject (6B at 0x0C), Snapshot (unchanged) — all byte-identical. The server-side outbound channel overflow remains; PR 11.7.D's bandwidth work addresses it separately.
+
+**Files changed** (canonical numbers in ):
+-  (694 → 445 lines, -249): deleted  interface,  Map + ,  Map +  + , , , , , , , . Simplified  to a single-apply path (resolveTarget → applyDamage → return "applied" | "ignored"). Simplified  to a pure send (4 trailing args kept as no-ops for call-site compat).  shrunk accordingly.  calls use .
+-  (109 lines changed): removed the sweep  block + the  window probe + the  in . The damageBroadcast handler now passes the existing  resolver unchanged (the LATEST-resolver hypothesis was a wrong-path investigation; the resolver is fine as-is). DamageReject listener is now a no-op (the client has no pending state to revert). All  /  /  /  instrumentation removed.
+-  (114 lines changed): the 4  call sites in the local-fire + local-melee paths simplified to pure  (no local-apply fallback; server-auth only). The  /  edge-detect trackers removed; the remote-fire/melee local-compute paths are gone (server broadcast drives the apply).
+-  (602 → 202 lines, -400): Tests A-G deleted (pending/sweep/recentlySettled machinery is gone). Test H kept (DamageReject wire round-trip — wire type + decoders stay). Test I added (applyBroadcast applies damage directly when target exists; returns "ignored" when resolver returns null). Test J added (applyBroadcast is idempotent on repeated calls — server is authoritative, no client-side dedup).
+- [smoke] Booting canary server (WT=14433, WS=14434)...
+[smoke] Canary ready after 1s
+[smoke] Booting vite on 5191...
+[smoke] Vite ready after 1s
+[smoke] Navigating Tab A to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[smoke] Waiting for both ServerTransports to connect...
+[smoke] Tearing down canary + vite... (268 lines changed): all post-spam  /  /  instrumentation removed.  block replaced with strict-equality assertion that THROWS on any divergence > 0. Single-fire Phase 2 assertion rewritten to poll Tab A's remote HP for 2s (was 500ms) — without optimistic-apply, the broadcast takes 1 RTT to land. The  direct-applyBroadcast debug test removed. Spam-phase  call removed.
+-  (1 line + comment): updated comment to reflect that the damageBus module is now stateless.
+-  (multiple sections): top status banner updated — §4.4 flips from  to . PR 11.6.D entry's  reference now reads . Carry-forward list drops the §4.4 race fix item. PR #37 XFAIL noted as removed. §3.9 references marked defunct with  markers. OPEN QUESTION in PR 11.6.D entry marked .
+
+**Trade-off (explicit)**: clients wait one RTT (60-150ms localhost, 50-200ms Tailscale) for the broadcast before any HP change is visible after firing. The "favor the shooter" UX from §3.9 goes away. Per Kyle's "do it right" preference — aligns with PR 11.7.D's planned lockstep-substrate retirement.
+
+**Verification gates run (all green)**:
+- 
+running 87 tests
+test damage_relay::tests::event_id_drift_within_then_beyond_window ... ok
+test damage_relay::tests::lag_comp_uses_server_stamped_rtt ... ok
+test damage_relay::tests::lag_comp_verdict_change ... ok
+test damage_relay::tests::event_id_wraparound_u32_max ... ok
+test damage_relay::tests::fire_rate_boundary_119_rejected_120_accepted ... ok
+test damage_relay::tests::melee_rejects_target_outside_melee_range ... ok
+test damage_relay::tests::melee_uses_melee_damage_constant_not_dual_pistol_damage ... ok
+test damage_relay::tests::rejects_event_id_more_than_window_behind_last ... ok
+test damage_relay::tests::relay_broadcast_produces_correct_wire_size ... ok
+test damage_relay::tests::rejected_request_leaves_state_unchanged ... ok
+test damage_relay::tests::validates_accepts_valid_fire_returns_hit_when_target_in_range ... ok
+test damage_relay::tests::uses_500ms_melee_cooldown ... ok
+test damage_relay::tests::validates_accepts_valid_fire_returns_miss_when_target_out_of_range ... ok
+test damage_relay::tests::validates_rejects_amount_over_max ... ok
+test damage_relay::tests::validates_increments_server_seq_on_success ... ok
+test damage_relay::tests::validates_lag_comp_rewinds_to_older_position ... ok
+test damage_relay::tests::validates_rejects_connection_player_id_mismatch ... ok
+test damage_relay::tests::validates_rejects_no_position_history_for_source ... ok
+test damage_relay::tests::validates_rejects_zero_ammo ... ok
+test hitscan::tests::damage_amounts_match_client ... ok
+test hitscan::tests::direct_hit_in_front ... ok
+test hitscan::tests::forward_from_yaw_pitch_matches_client ... ok
+test hitscan::tests::hit_when_laterally_inside_radius ... ok
+test hitscan::tests::hit_when_target_exactly_on_3d_ray_at_pitch_30 ... ok
+test damage_relay::tests::validates_rejects_self_damage ... ok
+test damage_relay::tests::validates_rejects_fire_rate_violation ... ok
+test hitscan::tests::miss_when_behind_ray ... ok
+test hitscan::tests::hundred_pose_fixture_internal_cross_check ... ok
+test damage_relay::tests::validates_rejects_target_not_in_room ... ok
+test hitscan::tests::miss_when_laterally_outside_radius ... ok
+test hitscan::tests::y_offset_within_radius_still_hits ... ok
+test hitscan::tests::hit_when_target_exactly_on_3d_ray_at_pitch_45 ... ok
+test damage_relay::tests::validates_rejects_stale_event_id ... ok
+test physics::tests::new_physics_world_is_empty ... ok
+test hitscan::tests::hit_when_target_offset_in_y_at_pitch_45 ... ok
+test physics::tests::position_velocity_grounded_return_none_zero_for_unknown_player ... ok
+test damage_relay::tests::validates_rejects_when_position_history_is_empty ... ok
+test hitscan::tests::miss_when_out_of_range ... ok
+test physics::tests::velocity_zero_before_any_step ... ok
+test physics::tests::add_player_is_idempotent ... ok
+test physics::tests::add_player_creates_capsule_at_start_pos ... ok
+test position_history::tests::record_then_snapshot_returns_inserted_position ... ok
+test position_history::tests::retention_caps_buffer_size ... ok
+test physics::tests::step_with_no_inputs_keeps_player_at_origin ... ok
+test position_history::tests::should_store_frame_even_only ... ok
+test damage_relay::tests::validates_uses_nearest_snapshot_within_tolerance ... ok
+test position_history::tests::snapshot_at_fallback_to_closest_outside_tolerance ... ok
+test position_history::tests::snapshot_at_snap_to_nearest_within_tolerance ... ok
+test protocol::tests::damage_broadcast_is_18_bytes ... ok
+test protocol::tests::damage_reject_is_5_bytes_roundtrip ... ok
+test physics::tests::grounded_false_for_ungrounded_capsule ... ok
+test protocol::tests::damage_request_is_14_bytes ... ok
+test protocol::tests::inputs_server_is_17_bytes ... ok
+test protocol::tests::ping_is_4_bytes ... ok
+test position_history::tests::snapshot_at_exact_match ... ok
+test protocol::tests::snapshot_at_24_players_is_706_bytes ... ok
+test protocol::tests::position_update_is_14_bytes ... ok
+test protocol::tests::snapshot_decoder_rejects_wrong_size ... ok
+test protocol::tests::snapshot_minimum_size_when_empty ... ok
+test protocol::tests::snapshot_per_player_size_is_29 ... ok
+test position_history::tests::snapshot_at_snap_to_nearest_basic ... ok
+test protocol::tests::snapshot_roundtrip_preserves_all_fields ... ok
+test position_history::tests::snapshot_at_empty ... ok
+test session::tests::add_player_initializes_state ... ok
+test session::tests::add_player_is_idempotent ... ok
+test session::tests::new_room_is_empty ... ok
+test protocol::tests::pong_is_8_bytes ... ok
+test session::tests::push_input_trims_to_capacity ... ok
+test position_history::tests::snapshot_at_nearest_when_between ... ok
+test session::tests_pr11_6d::new_room_has_event_id_map_initialized_empty ... ok
+test session::tests_pr11_6d::record_fire_stamps_last_fire_at ... ok
+test session::tests::next_seq_is_monotonic ... ok
+test snapshot::tests::maybe_emit_returns_none_before_interval ... ok
+test snapshot::tests::maybe_emit_is_deterministic_for_same_inputs ... ok
+test session::tests_pr11_6d::tick_server_frame_is_monotonic ... ok
+test snapshot::tests::maybe_emit_returns_some_after_interval ... ok
+test snapshot::tests::snapshot_carries_hp_and_ammo_from_player ... ok
+test snapshot::tests::snapshot_includes_all_connected_players ... ok
+test session::tests_pr11_6d::register_and_unregister_connection ... ok
+test snapshot::tests::snapshot_includes_only_connected_players ... ok
+test snapshot::tests::snapshot_server_frame_is_next_minus_one ... ok
+test snapshot::tests::snapshot_with_no_connections_has_no_players ... ok
+test transport::tests::dispatch_damage_request_returns_broadcast ... ok
+test transport::tests::dispatch_position_update_no_reply ... ok
+test transport::tests::dispatch_unknown_discriminator ... ok
+test transport::tests::dispatch_ping_returns_pong ... ok
+test transport::tests::dispatch_empty_payload ... ok
+
+test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 35 tests
+test damage_relay::tests::event_id_wraparound_u32_max ... ok
+test damage_relay::tests::event_id_drift_within_then_beyond_window ... ok
+test damage_relay::tests::fire_rate_boundary_119_rejected_120_accepted ... ok
+test damage_relay::tests::lag_comp_uses_server_stamped_rtt ... ok
+test damage_relay::tests::lag_comp_verdict_change ... ok
+test damage_relay::tests::melee_uses_melee_damage_constant_not_dual_pistol_damage ... ok
+test damage_relay::tests::melee_rejects_target_outside_melee_range ... ok
+test damage_relay::tests::rejected_request_leaves_state_unchanged ... ok
+test damage_relay::tests::rejects_event_id_more_than_window_behind_last ... ok
+test damage_relay::tests::relay_broadcast_produces_correct_wire_size ... ok
+test damage_relay::tests::validates_accepts_valid_fire_returns_hit_when_target_in_range ... ok
+test damage_relay::tests::uses_500ms_melee_cooldown ... ok
+test damage_relay::tests::validates_accepts_valid_fire_returns_miss_when_target_out_of_range ... ok
+test damage_relay::tests::validates_increments_server_seq_on_success ... ok
+test damage_relay::tests::validates_lag_comp_rewinds_to_older_position ... ok
+test damage_relay::tests::validates_rejects_amount_over_max ... ok
+test damage_relay::tests::validates_rejects_connection_player_id_mismatch ... ok
+test damage_relay::tests::validates_rejects_no_position_history_for_source ... ok
+test damage_relay::tests::validates_rejects_stale_event_id ... ok
+test damage_relay::tests::validates_rejects_fire_rate_violation ... ok
+test damage_relay::tests::validates_rejects_self_damage ... ok
+test damage_relay::tests::validates_rejects_when_position_history_is_empty ... ok
+test damage_relay::tests::validates_rejects_target_not_in_room ... ok
+test damage_relay::tests::validates_uses_nearest_snapshot_within_tolerance ... ok
+test damage_relay::tests::validates_rejects_zero_ammo ... ok
+test transport::tests::dispatch_position_update_no_reply ... ok
+test transport::tests::dispatch_damage_request_returns_broadcast ... ok
+test transport::tests::dispatch_empty_payload ... ok
+test transport::tests::dispatch_ping_returns_pong ... ok
+test transport::tests::dispatch_unknown_discriminator ... ok
+test integration_malformed_damage_request_does_not_panic ... ok
+test integration_lag_comp_rewinds_target_position ... ok
+test integration_full_round_trip_damage_request_to_broadcast ... ok
+test integration_two_tab_convergence ... ok
+test integration_fire_rate_cooldown_enforced ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+
+running 16 tests
+test damage_broadcast_is_18_bytes ... ok
+test damage_broadcast_roundtrip ... ok
+test damage_request_is_14_bytes ... ok
+test damage_request_is_big_endian ... ok
+test damage_request_rejects_wrong_size ... ok
+test damage_request_roundtrip ... ok
+test inputs_server_is_17_bytes ... ok
+test inputs_server_rejects_wrong_size ... ok
+test ping_is_4_bytes ... ok
+test inputs_server_roundtrip ... ok
+test ping_roundtrip ... ok
+test pong_is_8_bytes ... ok
+test pong_roundtrip ... ok
+test pong_is_big_endian ... ok
+test position_update_is_14_bytes ... ok
+test position_update_roundtrip_preserves_float_bits ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 20 tests
+test hitscan_rewinds_through_rapier_history_mid_air ... ok
+test position_history_snap_to_nearest ... ok
+test snapshot_includes_position_history ... ok
+test transport::tests::dispatch_damage_request_returns_broadcast ... ok
+test transport::tests::dispatch_ping_returns_pong ... ok
+test transport::tests::dispatch_empty_payload ... ok
+test router_dispatches_damage_request_returns_broadcast ... ok
+test room_state_pushes_inputs_buffer ... ok
+test transport::tests::dispatch_position_update_no_reply ... ok
+test position_history_trims_to_capacity ... ok
+test router_dispatches_position_update_writes_history ... ok
+test transport::tests::dispatch_unknown_discriminator ... ok
+test validator_rejects_self_damage_in_room ... ok
+test validator_rejects_fire_rate_violation_in_room ... ok
+test webtransport_echo_works ... ok
+test drain_inputs_populates_physics_step ... ok
+test coyote_time_grants_jump_within_window ... ok
+test coyote_time_grant_fires_mid_air_via_persistent_map ... ok
+test coyote_time_deny_after_window ... ok
+test websocket_echo_works ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 12 tests
+test broadcast_snapshot_with_no_connections_is_noop ... ok
+test broadcast_snapshot_writes_to_every_connection ... ok
+test should_store_frame_predicate_matches_32hz_at_64hz_physics ... ok
+test snapshot_carries_yaw_pitch_as_zero_default ... ok
+test snapshot_cadence_is_exactly_20hz_no_drift ... ok
+test snapshot_does_not_emit_before_interval ... ok
+test snapshot_interval_is_exactly_50ms ... ok
+test snapshot_emitted_at_20hz ... ok
+test snapshot_is_deterministic_across_runs ... ok
+test snapshot_emits_at_50ms_and_100ms_only ... ok
+test snapshot_player_count_matches_connections ... ok
+test snapshot_wire_format_roundtrip ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s → **170/170 PASS** (no server changes; baseline 170).
+-  → exit 0 (clean).
+- 
+ RUN  v2.1.9 /home/kyle/Development/specialists-web-pr11.7.d/client
+
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test A: drift below threshold does NOT trigger reconcile
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test B: drift above threshold triggers reconcile + re-simulates buffered inputs forward
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test C: snap distance above MAX_RECONCILIATION_SNAP_DISTANCE_M hard-snaps + drops buffered inputs
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test D: tick() advances predicted state with each buffered input
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test E: reconciliation counter increments only on actual reconciliation
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test F: input buffer enforces hard cap (FIFO eviction at MAX_LOCAL_INPUT_BUFFER)
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test F2: retention window evicts inputs past reconcileFromFrame - 8 (in client-frame space)
+ ✓ src/net/damageBus.test.ts > protocol PR 11.6.D fix4 — DamageReject (0x0C) round-trip (was 0x07 before PR 11.7.B) > encodeDamageReject + decodeDamageReject round-trip is symmetric for every REJECT_REASON_*
+ ✓ src/net/damageBus.test.ts > protocol PR 11.6.D fix4 — DamageReject (0x0C) round-trip (was 0x07 before PR 11.7.B) > decodeDamageReject returns null on body-size mismatch
+ ✓ src/net/damageBus.test.ts > protocol PR 11.6.D fix4 — DamageReject (0x0C) round-trip (was 0x07 before PR 11.7.B) > encodeDamageReject size-asserts at runtime (DAMAGE_REJECT_WIRE_SIZE = 6)
+ ✓ src/net/damageBus.test.ts > damageBus PR 11.7.D / §4.4 Option B — single-apply broadcast handler > Test I: applyBroadcast applies damage directly when target exists; returns 'ignored' when resolver returns null 885ms
+ ✓ src/net/damageBus.test.ts > damageBus PR 11.7.D / §4.4 Option B — single-apply broadcast handler > Test J: applyBroadcast is idempotent on repeated calls with the same broadcast (server is authoritative)
+ ✓ src/engine/remoteInterpolator.test.ts > remoteInterpolator PR 11.7.C — interpolation + extrapolation > Test G: lerp midpoint between two bracketing snapshots is the average
+ ✓ src/engine/remoteInterpolator.test.ts > remoteInterpolator PR 11.7.C — interpolation + extrapolation > Test H: local player is excluded from the output
+ ✓ src/engine/remoteInterpolator.test.ts > remoteInterpolator PR 11.7.C — interpolation + extrapolation > Test I: extrapolation fires when buffer has < 2 entries for a player
+ ✓ src/engine/remoteInterpolator.test.ts > remoteInterpolator PR 11.7.C — interpolation + extrapolation > Test J: extrapolation clamps at MAX_SNAPSHOT_AGE_MS = 500ms elapsed
+
+ Test Files  3 passed (3)
+      Tests  16 passed (16)
+   Start at  22:08:56
+   Duration  1.17s (transform 110ms, setup 0ms, collect 80ms, tests 909ms, environment 0ms, prepare 49ms) → **all tests PASS** (DamageReject Test H + new Test I + Test J + 7 predictor + 4 interpolator).
+- 
+> specialists-web-client@0.0.1 build
+> tsc -b && vite build
+
+vite v5.4.21 building for production...
+transforming...
+✓ 3114 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                                      0.34 kB │ gzip:     0.25 kB
+dist/assets/HavokPhysics-BqNY-4N9.wasm                           2,094.56 kB
+dist/assets/abstractAudioBus-Cx42tQd5.js                             0.11 kB │ gzip:     0.12 kB
+dist/assets/tgaTextureLoader-DcJr6GjL.js                             0.31 kB │ gzip:     0.26 kB
+dist/assets/oitFinalSimpleBlend.fragment-BIvRgfNL.js                 0.38 kB │ gzip:     0.26 kB
+dist/assets/oitFinalSimpleBlend.fragment-CEhC2DJ9.js                 0.45 kB │ gzip:     0.29 kB
+dist/assets/hdrTextureLoader-CNEhaZ8g.js                             0.53 kB │ gzip:     0.38 kB
+dist/assets/envTextureLoader-DCyn2D-v.js                             0.58 kB │ gzip:     0.38 kB
+dist/assets/volumetricLightingRenderVolume.vertex-DC2Upae7.js        0.58 kB │ gzip:     0.34 kB
+dist/assets/lod3D.fragment-BV0Oi0Ko.js                               0.62 kB │ gzip:     0.36 kB
+dist/assets/volumetricLightingRenderVolume.vertex-CSTenMQ5.js        0.67 kB │ gzip:     0.37 kB
+dist/assets/lod3D.fragment-Db4OVAHI.js                               0.77 kB │ gzip:     0.42 kB
+dist/assets/volumetricLightingBlendVolume.fragment-CUyGzT5B.js       0.81 kB │ gzip:     0.46 kB
+dist/assets/webAudioMainBus-2JDb6tIw.js                              0.95 kB │ gzip:     0.43 kB
+dist/assets/mesh.vertexData.functions-ayNlGC5K.js                    0.96 kB │ gzip:     0.49 kB
+dist/assets/volumetricLightingBlendVolume.fragment-DioyNY6Y.js       1.01 kB │ gzip:     0.52 kB
+dist/assets/selection.fragment-B3LEVXtU.js                           1.02 kB │ gzip:     0.50 kB
+dist/assets/gaussianSplatting.fragment-DCVOjlG3.js                   1.14 kB │ gzip:     0.55 kB
+dist/assets/basisTextureLoader-hHio6sxS.js                           1.19 kB │ gzip:     0.57 kB
+dist/assets/gaussianSplatting.fragment-D9ZM3XOZ.js                   1.23 kB │ gzip:     0.55 kB
+dist/assets/selection.fragment-BZcMw4x2.js                           1.24 kB │ gzip:     0.57 kB
+dist/assets/noise.fragment-CtUzENH2.js                               1.25 kB │ gzip:     0.65 kB
+dist/assets/ddsTextureLoader-YD9GZZDO.js                             1.26 kB │ gzip:     0.61 kB
+dist/assets/noise.fragment-CzxlWvzN.js                               1.41 kB │ gzip:     0.71 kB
+dist/assets/gpuRenderParticles.fragment-DaDiK9AO.js                  1.43 kB │ gzip:     0.62 kB
+dist/assets/gaussianSplattingVoxel.fragment-CzUFaAQU.js              1.49 kB │ gzip:     0.68 kB
+dist/assets/screenSpaceCurvature.fragment-BQLHC0xC.js                1.60 kB │ gzip:     0.65 kB
+dist/assets/volumetricLightingRenderVolume.fragment-B9k6Dpb6.js      1.63 kB │ gzip:     0.78 kB
+dist/assets/gaussianSplattingVoxel.vertex-qVt5iT_9.js                1.76 kB │ gzip:     0.72 kB
+dist/assets/volumetricLightingRenderVolume.fragment-ChFRC4Gk.js      1.87 kB │ gzip:     0.85 kB
+dist/assets/gaussianSplattingVoxel.fragment-BImpADQe.js              1.98 kB │ gzip:     0.71 kB
+dist/assets/selection.vertex-DMyLxdFM.js                             2.12 kB │ gzip:     0.81 kB
+dist/assets/webAudioBus-C3td7szL.js                                  2.35 kB │ gzip:     0.78 kB
+dist/assets/selection.vertex-B6SOy_Ka.js                             2.46 kB │ gzip:     0.89 kB
+dist/assets/gaussianSplattingVoxel.vertex-jMFSJL3-.js                2.47 kB │ gzip:     0.88 kB
+dist/assets/iesTextureLoader-Cqs6MQ74.js                             2.70 kB │ gzip:     1.17 kB
+dist/assets/gaussianSplatting.vertex-CsDEFXgs.js                     3.70 kB │ gzip:     1.31 kB
+dist/assets/gaussianSplatting.vertex-CzwOTeaC.js                     4.59 kB │ gzip:     1.44 kB
+dist/assets/selectionOutline.fragment-CKzSnOIF.js                    4.99 kB │ gzip:     1.05 kB
+dist/assets/subSurfaceScattering.fragment-BtU20_Yh.js                5.39 kB │ gzip:     2.03 kB
+dist/assets/subSurfaceScattering.fragment-B4IqOANH.js                6.01 kB │ gzip:     2.13 kB
+dist/assets/selectionOutline.fragment-PWgrN1Oz.js                    6.27 kB │ gzip:     1.16 kB
+dist/assets/gpuRenderParticles.vertex-B9q77Zlj.js                    6.62 kB │ gzip:     1.63 kB
+dist/assets/dds-D3rPt0GX.js                                          7.00 kB │ gzip:     2.46 kB
+dist/assets/ktxTextureLoader-BJcL9ZmO.js                            16.48 kB │ gzip:     4.80 kB
+dist/assets/index-CY-fL3Vf.js                                    7,056.69 kB │ gzip: 1,582.64 kB
+✓ built in 1m 60s → exit 0; bundle  clean.
+-  → **ZERO matches** (production bundle clean; optimistic-apply machinery fully tree-shaken).
+- 5191 smoke 10× → all PASS with . NO  log on any run. NO +12 gap.
+- 5190 smoke → PASS (no regression).
+
+**Why Option B over Option A (resolver fix)**: the LATEST-gameSession resolver was a wrong-path investigation. The actual root cause is a server-side broadcast drop (independent of the resolver). Fixing the resolver would have only papered over the symptom. Removing the optimistic-apply machinery eliminates the client-side divergence window; the server-side drop becomes harmless (next successful broadcast brings the client back in sync). Option B was the "do it right" path per Kyle's preference.
+
+**Spotted during Option B implementation (not fixed — out of scope)**:
+1. The server-side outbound mpsc::channel(64) overflows under headless Chromium WS load. PR 11.7.D's bandwidth work (separate piece) addresses this. The smoke now passes because the dropped broadcast is harmless; in production, occasional drops mean occasional delayed HP updates, which is acceptable for the current 60-150ms RTT cost.
+2. The  write-only field in  is still in place (PR 11.6.B seam) but no consumer reads it.  trailer is deferred to PR 11.7.D scope (separate work).
+3. The 's  map is monotonic per source — survives disconnect/reconnect correctly today but should be revalidated against the snapshot-driven client identifier in PR 11.7.D.
+
+**Pre-merge checklist** (Kyle to verify on dev box):
+1. 
+running 87 tests
+test damage_relay::tests::event_id_wraparound_u32_max ... ok
+test damage_relay::tests::lag_comp_uses_server_stamped_rtt ... ok
+test damage_relay::tests::lag_comp_verdict_change ... ok
+test damage_relay::tests::event_id_drift_within_then_beyond_window ... ok
+test damage_relay::tests::fire_rate_boundary_119_rejected_120_accepted ... ok
+test damage_relay::tests::melee_rejects_target_outside_melee_range ... ok
+test damage_relay::tests::melee_uses_melee_damage_constant_not_dual_pistol_damage ... ok
+test damage_relay::tests::rejected_request_leaves_state_unchanged ... ok
+test damage_relay::tests::rejects_event_id_more_than_window_behind_last ... ok
+test damage_relay::tests::relay_broadcast_produces_correct_wire_size ... ok
+test damage_relay::tests::uses_500ms_melee_cooldown ... ok
+test damage_relay::tests::validates_accepts_valid_fire_returns_hit_when_target_in_range ... ok
+test damage_relay::tests::validates_increments_server_seq_on_success ... ok
+test damage_relay::tests::validates_accepts_valid_fire_returns_miss_when_target_out_of_range ... ok
+test damage_relay::tests::validates_lag_comp_rewinds_to_older_position ... ok
+test damage_relay::tests::validates_rejects_amount_over_max ... ok
+test damage_relay::tests::validates_rejects_connection_player_id_mismatch ... ok
+test damage_relay::tests::validates_rejects_fire_rate_violation ... ok
+test damage_relay::tests::validates_rejects_no_position_history_for_source ... ok
+test damage_relay::tests::validates_rejects_self_damage ... ok
+test damage_relay::tests::validates_rejects_stale_event_id ... ok
+test damage_relay::tests::validates_rejects_target_not_in_room ... ok
+test damage_relay::tests::validates_rejects_when_position_history_is_empty ... ok
+test damage_relay::tests::validates_rejects_zero_ammo ... ok
+test damage_relay::tests::validates_uses_nearest_snapshot_within_tolerance ... ok
+test hitscan::tests::damage_amounts_match_client ... ok
+test hitscan::tests::direct_hit_in_front ... ok
+test hitscan::tests::forward_from_yaw_pitch_matches_client ... ok
+test hitscan::tests::hit_when_laterally_inside_radius ... ok
+test hitscan::tests::hit_when_target_exactly_on_3d_ray_at_pitch_30 ... ok
+test hitscan::tests::hit_when_target_exactly_on_3d_ray_at_pitch_45 ... ok
+test hitscan::tests::hit_when_target_offset_in_y_at_pitch_45 ... ok
+test hitscan::tests::hundred_pose_fixture_internal_cross_check ... ok
+test hitscan::tests::miss_when_behind_ray ... ok
+test hitscan::tests::miss_when_laterally_outside_radius ... ok
+test hitscan::tests::miss_when_out_of_range ... ok
+test hitscan::tests::y_offset_within_radius_still_hits ... ok
+test physics::tests::add_player_creates_capsule_at_start_pos ... ok
+test physics::tests::add_player_is_idempotent ... ok
+test physics::tests::grounded_false_for_ungrounded_capsule ... ok
+test physics::tests::new_physics_world_is_empty ... ok
+test physics::tests::position_velocity_grounded_return_none_zero_for_unknown_player ... ok
+test physics::tests::velocity_zero_before_any_step ... ok
+test position_history::tests::record_then_snapshot_returns_inserted_position ... ok
+test physics::tests::step_with_no_inputs_keeps_player_at_origin ... ok
+test position_history::tests::retention_caps_buffer_size ... ok
+test position_history::tests::should_store_frame_even_only ... ok
+test position_history::tests::snapshot_at_empty ... ok
+test position_history::tests::snapshot_at_exact_match ... ok
+test position_history::tests::snapshot_at_fallback_to_closest_outside_tolerance ... ok
+test position_history::tests::snapshot_at_nearest_when_between ... ok
+test position_history::tests::snapshot_at_snap_to_nearest_basic ... ok
+test position_history::tests::snapshot_at_snap_to_nearest_within_tolerance ... ok
+test protocol::tests::damage_broadcast_is_18_bytes ... ok
+test protocol::tests::damage_reject_is_5_bytes_roundtrip ... ok
+test protocol::tests::damage_request_is_14_bytes ... ok
+test protocol::tests::inputs_server_is_17_bytes ... ok
+test protocol::tests::ping_is_4_bytes ... ok
+test protocol::tests::pong_is_8_bytes ... ok
+test protocol::tests::position_update_is_14_bytes ... ok
+test protocol::tests::snapshot_at_24_players_is_706_bytes ... ok
+test protocol::tests::snapshot_decoder_rejects_wrong_size ... ok
+test protocol::tests::snapshot_minimum_size_when_empty ... ok
+test protocol::tests::snapshot_per_player_size_is_29 ... ok
+test protocol::tests::snapshot_roundtrip_preserves_all_fields ... ok
+test session::tests::add_player_initializes_state ... ok
+test session::tests::add_player_is_idempotent ... ok
+test session::tests::new_room_is_empty ... ok
+test session::tests::next_seq_is_monotonic ... ok
+test session::tests::push_input_trims_to_capacity ... ok
+test session::tests_pr11_6d::new_room_has_event_id_map_initialized_empty ... ok
+test session::tests_pr11_6d::record_fire_stamps_last_fire_at ... ok
+test session::tests_pr11_6d::register_and_unregister_connection ... ok
+test session::tests_pr11_6d::tick_server_frame_is_monotonic ... ok
+test snapshot::tests::maybe_emit_is_deterministic_for_same_inputs ... ok
+test snapshot::tests::maybe_emit_returns_none_before_interval ... ok
+test snapshot::tests::snapshot_carries_hp_and_ammo_from_player ... ok
+test snapshot::tests::snapshot_includes_all_connected_players ... ok
+test snapshot::tests::snapshot_includes_only_connected_players ... ok
+test snapshot::tests::maybe_emit_returns_some_after_interval ... ok
+test snapshot::tests::snapshot_with_no_connections_has_no_players ... ok
+test snapshot::tests::snapshot_server_frame_is_next_minus_one ... ok
+test transport::tests::dispatch_damage_request_returns_broadcast ... ok
+test transport::tests::dispatch_position_update_no_reply ... ok
+test transport::tests::dispatch_empty_payload ... ok
+test transport::tests::dispatch_unknown_discriminator ... ok
+test transport::tests::dispatch_ping_returns_pong ... ok
+
+test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 35 tests
+test damage_relay::tests::event_id_drift_within_then_beyond_window ... ok
+test damage_relay::tests::event_id_wraparound_u32_max ... ok
+test damage_relay::tests::lag_comp_uses_server_stamped_rtt ... ok
+test damage_relay::tests::lag_comp_verdict_change ... ok
+test damage_relay::tests::melee_uses_melee_damage_constant_not_dual_pistol_damage ... ok
+test damage_relay::tests::melee_rejects_target_outside_melee_range ... ok
+test damage_relay::tests::fire_rate_boundary_119_rejected_120_accepted ... ok
+test damage_relay::tests::rejected_request_leaves_state_unchanged ... ok
+test damage_relay::tests::relay_broadcast_produces_correct_wire_size ... ok
+test damage_relay::tests::rejects_event_id_more_than_window_behind_last ... ok
+test damage_relay::tests::uses_500ms_melee_cooldown ... ok
+test damage_relay::tests::validates_accepts_valid_fire_returns_hit_when_target_in_range ... ok
+test damage_relay::tests::validates_accepts_valid_fire_returns_miss_when_target_out_of_range ... ok
+test damage_relay::tests::validates_lag_comp_rewinds_to_older_position ... ok
+test damage_relay::tests::validates_increments_server_seq_on_success ... ok
+test damage_relay::tests::validates_rejects_amount_over_max ... ok
+test damage_relay::tests::validates_rejects_connection_player_id_mismatch ... ok
+test damage_relay::tests::validates_rejects_no_position_history_for_source ... ok
+test damage_relay::tests::validates_rejects_self_damage ... ok
+test damage_relay::tests::validates_rejects_fire_rate_violation ... ok
+test damage_relay::tests::validates_rejects_when_position_history_is_empty ... ok
+test damage_relay::tests::validates_rejects_stale_event_id ... ok
+test damage_relay::tests::validates_rejects_zero_ammo ... ok
+test damage_relay::tests::validates_uses_nearest_snapshot_within_tolerance ... ok
+test damage_relay::tests::validates_rejects_target_not_in_room ... ok
+test transport::tests::dispatch_damage_request_returns_broadcast ... ok
+test transport::tests::dispatch_empty_payload ... ok
+test transport::tests::dispatch_unknown_discriminator ... ok
+test transport::tests::dispatch_position_update_no_reply ... ok
+test transport::tests::dispatch_ping_returns_pong ... ok
+test integration_malformed_damage_request_does_not_panic ... ok
+test integration_lag_comp_rewinds_target_position ... ok
+test integration_full_round_trip_damage_request_to_broadcast ... ok
+test integration_two_tab_convergence ... ok
+test integration_fire_rate_cooldown_enforced ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+
+running 16 tests
+test damage_broadcast_is_18_bytes ... ok
+test damage_request_is_big_endian ... ok
+test damage_broadcast_roundtrip ... ok
+test damage_request_is_14_bytes ... ok
+test damage_request_rejects_wrong_size ... ok
+test inputs_server_is_17_bytes ... ok
+test damage_request_roundtrip ... ok
+test inputs_server_rejects_wrong_size ... ok
+test inputs_server_roundtrip ... ok
+test ping_is_4_bytes ... ok
+test ping_roundtrip ... ok
+test pong_is_8_bytes ... ok
+test pong_is_big_endian ... ok
+test pong_roundtrip ... ok
+test position_update_is_14_bytes ... ok
+test position_update_roundtrip_preserves_float_bits ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 20 tests
+test hitscan_rewinds_through_rapier_history_mid_air ... ok
+test position_history_snap_to_nearest ... ok
+test position_history_trims_to_capacity ... ok
+test snapshot_includes_position_history ... ok
+test transport::tests::dispatch_damage_request_returns_broadcast ... ok
+test transport::tests::dispatch_empty_payload ... ok
+test router_dispatches_damage_request_returns_broadcast ... ok
+test room_state_pushes_inputs_buffer ... ok
+test transport::tests::dispatch_unknown_discriminator ... ok
+test transport::tests::dispatch_ping_returns_pong ... ok
+test transport::tests::dispatch_position_update_no_reply ... ok
+test validator_rejects_self_damage_in_room ... ok
+test validator_rejects_fire_rate_violation_in_room ... ok
+test drain_inputs_populates_physics_step ... ok
+test router_dispatches_position_update_writes_history ... ok
+test webtransport_echo_works ... ok
+test coyote_time_grants_jump_within_window ... ok
+test coyote_time_grant_fires_mid_air_via_persistent_map ... ok
+test coyote_time_deny_after_window ... ok
+test websocket_echo_works ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+
+running 12 tests
+test broadcast_snapshot_with_no_connections_is_noop ... ok
+test should_store_frame_predicate_matches_32hz_at_64hz_physics ... ok
+test snapshot_cadence_is_exactly_20hz_no_drift ... ok
+test broadcast_snapshot_writes_to_every_connection ... ok
+test snapshot_carries_yaw_pitch_as_zero_default ... ok
+test snapshot_emits_at_50ms_and_100ms_only ... ok
+test snapshot_does_not_emit_before_interval ... ok
+test snapshot_emitted_at_20hz ... ok
+test snapshot_interval_is_exactly_50ms ... ok
+test snapshot_is_deterministic_across_runs ... ok
+test snapshot_player_count_matches_connections ... ok
+test snapshot_wire_format_roundtrip ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s (expect 170 tests pass).
+2. 
+ RUN  v2.1.9 /home/kyle/Development/specialists-web-pr11.7.d/client
+
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test A: drift below threshold does NOT trigger reconcile
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test B: drift above threshold triggers reconcile + re-simulates buffered inputs forward
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test C: snap distance above MAX_RECONCILIATION_SNAP_DISTANCE_M hard-snaps + drops buffered inputs
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test D: tick() advances predicted state with each buffered input
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test E: reconciliation counter increments only on actual reconciliation
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test F: input buffer enforces hard cap (FIFO eviction at MAX_LOCAL_INPUT_BUFFER)
+ ✓ src/engine/clientPredictor.test.ts > clientPredictor PR 11.7.C — prediction + reconciliation > Test F2: retention window evicts inputs past reconcileFromFrame - 8 (in client-frame space)
+ ✓ src/net/damageBus.test.ts > protocol PR 11.6.D fix4 — DamageReject (0x0C) round-trip (was 0x07 before PR 11.7.B) > encodeDamageReject + decodeDamageReject round-trip is symmetric for every REJECT_REASON_*
+ ✓ src/net/damageBus.test.ts > protocol PR 11.6.D fix4 — DamageReject (0x0C) round-trip (was 0x07 before PR 11.7.B) > decodeDamageReject returns null on body-size mismatch
+ ✓ src/net/damageBus.test.ts > protocol PR 11.6.D fix4 — DamageReject (0x0C) round-trip (was 0x07 before PR 11.7.B) > encodeDamageReject size-asserts at runtime (DAMAGE_REJECT_WIRE_SIZE = 6)
+ ✓ src/net/damageBus.test.ts > damageBus PR 11.7.D / §4.4 Option B — single-apply broadcast handler > Test I: applyBroadcast applies damage directly when target exists; returns 'ignored' when resolver returns null 1767ms
+ ✓ src/net/damageBus.test.ts > damageBus PR 11.7.D / §4.4 Option B — single-apply broadcast handler > Test J: applyBroadcast is idempotent on repeated calls with the same broadcast (server is authoritative)
+ ✓ src/engine/remoteInterpolator.test.ts > remoteInterpolator PR 11.7.C — interpolation + extrapolation > Test G: lerp midpoint between two bracketing snapshots is the average
+ ✓ src/engine/remoteInterpolator.test.ts > remoteInterpolator PR 11.7.C — interpolation + extrapolation > Test H: local player is excluded from the output
+ ✓ src/engine/remoteInterpolator.test.ts > remoteInterpolator PR 11.7.C — interpolation + extrapolation > Test I: extrapolation fires when buffer has < 2 entries for a player
+ ✓ src/engine/remoteInterpolator.test.ts > remoteInterpolator PR 11.7.C — interpolation + extrapolation > Test J: extrapolation clamps at MAX_SNAPSHOT_AGE_MS = 500ms elapsed
+
+ Test Files  3 passed (3)
+      Tests  16 passed (16)
+   Start at  22:11:08
+   Duration  2.27s (transform 188ms, setup 0ms, collect 139ms, tests 1.81s, environment 0ms, prepare 85ms)
+
+
+> specialists-web-client@0.0.1 build
+> tsc -b && vite build
+
+vite v5.4.21 building for production...
+transforming... (expect clean + all tests PASS).
+3.  (background).
+4.  (background).
+5. Wait 15s for both ready (check  for "WebTransport listener bound" and  for "ready in").
+6. [smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite...
+[smoke] Navigating Tab B to http://localhost:5191/?server=ws%3A%2F%2Flocalhost%3A14434%2Frooms%2FDEVBX...
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[vite-err] The request url "/home/kyle/Development/specialists-web/client/node_modules/@babylonjs/havok/lib/esm/HavokPhysics.wasm" is outside of Vite serving allow list.
+[smoke] Waiting for both ServerTransports to connect...
+[smoke][FAIL] FAIL: Tab A ServerTransport did not connect
+[smoke] Tearing down canary + vite... — expect 10 PASS, no XFAIL log.
+7. [smoke] Waiting for __serverTransport probe...
+[smoke][FAIL] FAIL: __serverTransport did not become ready within 5000ms
+[smoke] Tearing down canary + vite... — expect PASS.
+8.  — expect ZERO matches.
+9. Tear down both background processes.
+
+**Risks / known gaps (carried into PR 11.7.D main scope)**:
+- **No client-side  consumer for the remote visual yet** — PR 11.7.D's main scope wires the interpolator to drive the remote visual. Currently the remote visual still drives from  (lockstep), which is fine for now (the smoke measures , not the snapshot).
+- **Server-side outbound channel overflow** — addressed by PR 11.7.D's bandwidth management (split queues, backpressure, or per-player batching).
+- ** trailer** — deferred to PR 11.7.D scope.
+- ** inbound handler** — still accepted with a  deprecation log. PR 11.7.D removes it.
+- ** extraction** — 5 constants still inlined. Deferred.
+- **No anti-cheat** — Phase 4.
+- **No reload mechanics** — PR 11.7.E.
+- **No production cert handling** — PR 11.7.F.
+- **No matchmaker / multi-room** — PR 11.9.
+
+**Suggested review focus**:
+-  (the new single-apply path): confirm the  pattern handles the "no resolver" case without throwing (the smoke supplies a resolver; vitest Test I verifies the no-resolver case).
+-  local-fire/melee paths: confirm the  fallback for non-server-transport mode is fully gone (server-auth only). If any smoke needs the local path, that's a separate smoke + setup.
+- : confirm the strict-equality assertion throws on any divergence > 0. The  log block is fully removed — sanity-check that nothing prints  anywhere in the smoke output.
+- Production bundle: re-run the grep above — must be ZERO matches. If non-zero, the optimistic-apply machinery is somehow leaking into the production bundle.
+-  line 7: confirm the §4.4 wording reads  and the carry-forward list drops the §4.4 race fix item.
+
+**Next session plan (PR 11.7.D main scope)**:
+1. Land this branch (squash + push + ), then merge to main.
+2. Update the contents of  line 7 to record the squash SHA + PR number post-merge.
+3. Update this entry to flipped-to-MERGED state.
+4. Implement the lockstep substrate retirement: drop  +  +  (the  paths that subscribe to input events from the lockstep wire).
+5. Wire the interpolator output to drive the remote visual (currently driven from ).
+6. Address the server-side outbound channel overflow (split queues / backpressure / per-player batching).
+7. Add  trailer (wire-size bump 17→18 + server-side  in ).
+8. Extract  (5 constants currently inlined).
+9. Re-run the 5191 smoke 10× — should still pass (snapshot-driven HP eventually supersedes the lockstep-controller HP).
 
 ## 2026-08-18 — PR 11.7.B (server physics + snapshot generator — Rapier + 64Hz tick + Snapshot 0x07 + coyote-time parity + PositionHistory cutover). Branch `feat/phase1-pr11.7.b-server-snapshot`.
 

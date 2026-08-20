@@ -84,7 +84,7 @@ import {
   type DualPistolResult,
   type MeleeResult,
 } from "./combat";
-import { applyDamage, tickRespawn, type HealthSnapshot } from "./health";
+import { tickRespawn, type HealthSnapshot } from "./health";
 import { sendDamageRequest as dbSendDamageRequest, sendPositionUpdateThrottled as dbSendPositionUpdateThrottled } from "../net/damageBus";
 import type { DamageRequest } from "../../../protocol/damage";
 import type { ServerTransport } from "../net/serverTransport";
@@ -326,9 +326,11 @@ export function createGameSession(
   let wasFiring = false;
   /** Previous `input.meleePressed` value — tracks rising edges. */
   let wasMelee = false;
-  /** PR 10: same trackers for the REMOTE input — symmetric damage flow. */
-  let wasRemoteFiring = false;
-  let wasRemoteMelee = false;
+  // PR 11.7.D / §4.4 — Option B: the REMOTE fire/melee local-compute
+  // path is removed. There are no remote-fire edge-detect trackers
+  // anymore; the server's DamageBroadcast is the single apply path.
+  // (If a future PR needs to know "did the remote just start
+  // firing?" for tracer-line visuals, it'll add the tracker back.)
   /** PR 10: cached `nowMs` from the last tick — used to compute the
    *  remaining respawn countdown for the HUD snapshot. Updated every
    *  tick; read by `getHealthSnapshot()`. */
@@ -489,14 +491,24 @@ export function createGameSession(
         damage: result.damage,
       });
       // PR 10: local fired → remote takes the damage.
-      // PR 11.6.D: when the server-auth transport is wired, send the
-      // DamageRequest via damageBus.sendDamageRequest (which sends +
-      // applies optimistically + tracks in pendingApplies for the
-      // confirm/revert path). Otherwise, fall back to the local-
-      // compute path (lockstep guarantees identical events on both
-      // clients — used by the 14 P2P smokes + PR 11.6.C smoke).
+      // PR 11.7.D / §4.4 — Option B: pure send-and-wait. No
+      // optimistic apply; the server's `DamageBroadcast` is the only
+      // path that decrements `remoteController.hp` (handled in
+      // scene.ts's broadcast handler). The trailing args
+      // (`remoteController`, `nowMs`, `localPlayerId`, `peerPlayerId`)
+      // are kept for call-site compat but are no-ops after Option B.
       if (result.hit) {
-        if (serverTransport) {
+        // PR 11.7.D / §4.4 — Option B: server-auth only. If the
+        // server-auth transport isn't wired yet (pre-handshake,
+        // post-disconnect, or P2P-only smokes), skip the fire
+        // silently rather than throwing — throwing would kill
+        // the tick loop on every transient disconnect /
+        // pre-handshake click. The original PR 11.6.D behavior
+        // (no fire, no error) was the right call here.
+        if (!serverTransport) {
+          // eslint-disable-next-line no-console
+          console.warn("[gameSession.tick] local fire dropped: serverTransport not yet wired (handshake in flight or disconnected).");
+        } else {
           const eventId = nextEventId++;
           const req: DamageRequest = {
             frame: advanced.frame,
@@ -507,8 +519,6 @@ export function createGameSession(
             eventId,
           };
           dbSendDamageRequest(serverTransport, req, remoteController, nowMs, localPlayerId, peerPlayerId);
-        } else {
-          applyDamage(remoteController, { source: "fire", amount: result.damage }, nowMs);
         }
       }
     }
@@ -524,10 +534,14 @@ export function createGameSession(
           kind: "melee_hit",
           damage: result.damage,
         });
-        // PR 10: melee hit also applies damage to the remote rig.
-        // PR 11.6.D: same server-auth-vs-local-compute fork as the
-        // fire path above (line 391).
-        if (serverTransport) {
+        // PR 11.7.D / §4.4 — Option B: server-auth only. Same
+        // invariant as the fire path above. If the transport is
+        // not wired, skip the melee silently (handshake in
+        // flight or disconnected).
+        if (!serverTransport) {
+          // eslint-disable-next-line no-console
+          console.warn("[gameSession.tick] local melee dropped: serverTransport not yet wired (handshake in flight or disconnected).");
+        } else {
           const eventId = nextEventId++;
           const req: DamageRequest = {
             frame: advanced.frame,
@@ -538,8 +552,6 @@ export function createGameSession(
             eventId,
           };
           dbSendDamageRequest(serverTransport, req, remoteController, nowMs, localPlayerId, peerPlayerId);
-        } else {
-          applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
         }
       }
     }
@@ -553,38 +565,6 @@ export function createGameSession(
     // uses the same `dualPistolShoot` / `meleeSwing` helpers — the
     // helpers take the *firing* controller as the source and the *other*
     // as the target, which lines up exactly with what we want here.
-    if (remoteDecoded.fireHeld && !wasRemoteFiring) {
-      const result: DualPistolResult = dualPistolShoot(
-        remoteDecoded,
-        remoteController,
-        localController,
-        scene,
-      );
-      // PR 11.6.D: when the server-auth transport is wired, the
-      // remote-fire path no longer applies damage locally — the
-      // server's DamageBroadcast fan-out will deliver it via
-      // `damageBus.applyBroadcast` (the broadcast handler in
-      // `scene.ts`'s __forceServerTransport block). Otherwise
-      // (P2P smokes, no server transport), the local-compute path
-      // applies the damage here so lockstep symmetry is preserved.
-      if (result.hit && !serverTransport) {
-        applyDamage(localController, { source: "fire", amount: result.damage }, nowMs);
-      }
-    }
-    if (remoteDecoded.meleePressed && !wasRemoteMelee) {
-      const result: MeleeResult = meleeSwing(
-        remoteDecoded,
-        remoteController,
-        localController,
-      );
-      // PR 11.6.D: same server-auth-vs-local-compute fork as the
-      // remote-fire path above.
-      if (result.hit && !serverTransport) {
-        applyDamage(localController, { source: "melee", amount: result.damage }, nowMs);
-      }
-    }
-    wasRemoteFiring = remoteDecoded.fireHeld;
-    wasRemoteMelee = remoteDecoded.meleePressed;
 
     // PR 10: tick the respawn timer for both controllers every frame.
     // The teleport fires on the first frame where `nowMs >=

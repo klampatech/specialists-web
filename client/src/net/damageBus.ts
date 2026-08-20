@@ -1,23 +1,35 @@
-// PR 11.6.D / §3.5 + §3.6 + §3.9 — typed wrappers over the wire codecs +
-// outbound queue + **client-side damage prediction**.
+// PR 11.7.D / §4.4 — Option B: drop optimistic-apply entirely.
 //
-// **PR 11.6.D scope (over PR 11.6.C)**:
-//   - `pendingApplies` map (§3.9). Every fire event queues an
-//     optimistic apply locally; when the server's broadcast arrives,
-//     the map is consulted for confirm / revert.
-//   - `applyBroadcast(bc, nowMs, resolveTarget?)` — the three-path
-//     confirm / revert / apply-directly handler.
-//   - `sendDamageRequest(t, req, targetController, nowMs)` — the new
-//     unified entry point that sends + applies locally.
-//   - `sendPositionUpdateThrottled(t, frame, playerId, x, y)` —
-//     32Hz PositionUpdate sender (§3.10).
+// **PR 11.7.D scope (Option B — drop optimistic-apply)**:
+//   - `sendDamageRequest(t, req, ...)` is now a PURE send. No local
+//     optimistic apply, no pending-map tracking, no sweep. Clients send
+//     a `DamageRequest` and WAIT for the server's `DamageBroadcast`
+//     before any HP change is visible.
+//   - `applyBroadcast(bc, nowMs, resolveTarget?)` is the single apply
+//     path: if the target controller exists, apply the damage once. No
+//     confirm/revert/ignored dedup — the server is authoritative.
 //
-// **Why a queue + a pending map**: PR 11.6.C added the bounded
-// `DamageRequestQueue` for outbound FIFO + retry tracking. PR 11.6.D
-// adds the per-eventId pending map so the broadcast handler can
-// confirm / revert the optimistic apply. Both are needed: the queue
-// is about *what was sent*, the pending map is about *what was
-// optimistically applied*.
+// **Why this change**: the §4.4 12-HP post-spam divergence was a
+// server-side broadcast drop (PR 11.7.B's 20Hz snapshot stream fills the
+// per-connection `mpsc::channel(64)` faster than headless Chromium's WS
+// outbound drains, causing `damage_relay::try_send` to fail and the
+// broadcast to be silently discarded) that manifested as a persistent
+// client-side divergence only because the optimistic-apply + sweep
+// created a divergence window for the dropped broadcast's optimistic HP
+// delta. Removing the optimistic-apply machinery eliminates the
+// divergence window. Clients wait +1 RTT (60-150ms localhost,
+// 50-200ms Tailscale) per fire for the broadcast; if a broadcast is
+// dropped, no persistent gap accumulates — the next successful broadcast
+// brings the client back in sync.
+//
+// **Out of scope** (separate work, NOT touched here):
+//   - Server-side outbound channel overflow (PR 11.7.D's bandwidth work).
+//   - Lockstep substrate retirement (`ggrsRuntime`, `peer`, P2P transport).
+//   - 0x06 InputSeq trailer.
+//   - Interpolator → remote-visual wiring.
+//
+// **Wire format**: byte-identical. `DamageRequest`, `DamageBroadcast`,
+// `DamageReject`, `Snapshot` sizes + discriminators unchanged.
 //
 // **DEV probe**: PR 11.6.C surfaces the typed wrappers on
 // `window.__damageBus` so the headless smoke can call them without
@@ -94,250 +106,36 @@ const MAX_QUEUED = 16;
 /** Position-update throttle (§3.10). 32Hz = every other tick at 64Hz. */
 const POSITION_UPDATE_SEND_EVERY_N_TICKS = 2;
 
-// -- Pending optimistic applies map (§3.9) --------------------------------
-
-interface PendingOptimisticApply {
-  /** The source tab's PlayerId. Used with eventId to make the
-   *  pending-map key unique across tabs (FIX 3). */
-  sourcePlayerId: number;
-  eventId: number;
-  /** The target tab's PlayerId. Used by the tracer flash event
-   *  (the controller itself doesn't carry a playerId). */
-  targetPlayerId: number;
-  targetController: CharacterController;
-  source: "fire" | "melee";
-  amount: number;
-  appliedAtMs: number;
-  /** How many HP the optimistic apply actually subtracted. Used by
-   *  the revert path to undo the exact amount (the broadcast may
-   *  arrive with a different amount if the server clamped it). */
-  optimisticallyAppliedAmount: number;
-  /** PR 11.6.D fix4 (Bug C — sweep over-revert): the actual HP
-   *  delta the optimistic apply contributed, computed from
-   *  `state.hp` before/after the apply. Differs from
-   *  `optimisticallyAppliedAmount` when the target was already at
-   *  HP=0 (clamped no-op) — `applyDamage` returns early without
-   *  changing HP, so the actual delta is 0 even though the
-   *  request asked for `optimisticallyAppliedAmount` damage.
-   *
-   *  The sweep's revert uses THIS field, not the requested
-   *  amount: a 12-damage request that hit a dead target
-   *  contributed 0 HP loss and should revert 0 HP, not 12. Without
-   *  this, the sweep reverts push HP all the way back to maxHp
-   *  (90+ phantom reverts clobbering the 7 actually-accepted
-   *  broadcasts' optimistic applies), breaking the post-spam HP
-   *  convergence assertion on the 5191 smoke. */
-  actualAppliedDelta: number;
-}
-
-/** PR 11.6.D FIX 3: pending-map key is `${sourcePlayerId}:${eventId}`.
- *  Plain `eventId` would collide when two tabs both fire event #1
- *  (the server uses per-source monotonicity, so both fire events are
- *  legitimately accepted). With the composite key, Tab A's broadcast
- *  (source=1, event=1) and Tab B's broadcast (source=2, event=1) land
- *  in different map entries. */
-type PendingKey = `${number}:${number}`;
-
-function pendingKey(sourcePlayerId: number, eventId: number): PendingKey {
-  return `${sourcePlayerId}:${eventId}` as PendingKey;
-}
-
-/** Per-(sourcePlayerId, eventId) map of optimistic applies awaiting
- *  broadcast confirmation (FIX 3). */
-const pendingApplies = new Map<PendingKey, PendingOptimisticApply>();
-const MAX_PENDING_APPLIES = 64;
-
-// PR 11.6.D fix3: bounded `recentlySettled` map. When a pending entry
-// is handled (confirmed via broadcast, reverted via mismatch,
-// rejected via DamageReject, OR swept by the timeout sweep), we
-// record the (sourcePlayerId, eventId) here for
-// `RECENTLY_SETTLED_TTL_MS` so a late-arriving broadcast for the
-// same key can be recognized as already-handled and ignored (don't
-// double-apply). Without this map, `applyBroadcast`'s "no pending ->
-// apply directly" branch would re-apply damage on re-delivered frames
-// (WebSocket retries / GC stalls / late-arriving broadcasts after a
-// timeout sweep).
-//
-// The SWEEP path marks settled because the sweep is the SAFETY-NET
-// timeout fallback: if the server's broadcast or reject hasn't
-// arrived within PENDING_REJECT_TIMEOUT_MS, the client has effectively
-// given up on the server's view and reverted locally. Any broadcast
-// arriving after the sweep is treated as "too late" — the entry
-// is marked handled and the broadcast is ignored. This deterministic
-// interpretation is what fixes the round-2 verifier's flaky smoke
-// (FAIL-A / FAIL-B divergence from the sweep+re-apply interleaving).
-//
-// The queue-overflow DROP path does NOT mark settled. The drop evicts
-// an entry that may have been ACCEPTED by the server but whose
-// broadcast hasn't arrived yet — the broadcast arriving later MUST
-// re-apply the damage so the client's HP converges with the server's
-// view. Marking overflow-drops as settled would silently lose those
-// accepted fires in the spam scenario.
-const recentlySettled = new Map<PendingKey, number>();
-/** TTL for the recentlySettled map: 2 * PENDING_REJECT_TIMEOUT_MS.
- *  Generous so a late broadcast (e.g., re-ordered WebSocket frame, GC
- *  stall) still gets ignored, but bounded so the map can't grow
- *  unboundedly. Pruned each `sweepExpiredPending` call (every 50ms
- *  in the smoke). */
-const RECENTLY_SETTLED_TTL_MS = 1000;
-
-function markSettled(key: PendingKey, nowMs: number): void {
-  recentlySettled.set(key, nowMs);
-}
-
-/** PR 11.6.D fix3: track an optimistic apply. If the queue is at
- *  capacity, drop the OLDEST entry - but FIRST revert its optimistic
- *  apply (Bug 1) so its HP subtraction doesn't stay stuck forever.
- *  The revert uses the same `applyDamage(target, {source: "correction",
- *  amount: -pending.optimisticallyAppliedAmount}, nowMs)` pattern the
- *  sweep / applyReject paths use, plus a tracer flash for HUD
- *  visibility (the spam phase makes the tracer HUD useful for
- *  verification).
- *
- *  NOTE: we do NOT mark the dropped entry as recentlySettled. The
- *  broadcast handler must re-apply the damage if the server accepted
- *  the request before the local queue overflowed (Bug 2 - see commit
- *  body for the full discussion). Marking swept/dropped entries as
- *  settled caused accepted fires to be silently lost in the spam
- *  scenario, leaving Tab A's remote HP diverged from Tab B's local.
- */
-function trackOptimisticApply(p: PendingOptimisticApply): PendingOptimisticApply | null {
-  let dropped: PendingOptimisticApply | null = null;
-  if (pendingApplies.size >= MAX_PENDING_APPLIES) {
-    let oldestKey: PendingKey | null = null;
-    let oldestAt = Number.POSITIVE_INFINITY;
-    for (const [k, v] of pendingApplies) {
-      if (v.appliedAtMs < oldestAt) {
-        oldestAt = v.appliedAtMs;
-        oldestKey = k;
-      }
-    }
-    if (oldestKey !== null) {
-      dropped = pendingApplies.get(oldestKey) ?? null;
-      if (dropped) {
-        // Bug 1 fix: revert the dropped entry's optimistic apply BEFORE
-        // removing from the map. Without this, the -amount stays
-        // stuck on HP forever (the entry was dropped from the queue
-        // but its HP decrement was already committed via
-        // applyDamage at send time). On the spam path this leaks
-        // ~N*amount HP per queue-overflow cycle.
-        // PR 11.6.D fix4 (Bug C — actualDelta revert): revert
-        // only the actual HP delta, not the requested amount.
-        // When the optimistic apply was a clamped no-op (target
-        // already at HP=0) the actual delta is 0 and the revert
-        // is a +0 = no-op, preserving the post-spam HP convergence
-        // invariant (without this the 65th fire at HP=0 would
-        // still drop a queue entry that "lost 1 HP" and the
-        // revert would silently un-clamp back to 1 HP under some
-        // edge cases).
-        applyDamage(
-          dropped.targetController,
-          {source: "correction", amount: -dropped.actualAppliedDelta},
-          p.appliedAtMs,
-        );
-        emitTracerFlash({
-          type: "rejection",
-          targetPlayerId: dropped.targetPlayerId,
-          sourcePlayerId: dropped.sourcePlayerId,
-          eventId: dropped.eventId,
-          appliedAmount: dropped.actualAppliedDelta,
-          broadcastAmount: 0, // dropped - no broadcast amount
-          atMs: p.appliedAtMs,
-        });
-        // PR 11.6.D fix4 (Bug B — re-apply on dropped entry):
-        // mark the dropped entry as recentlySettled BEFORE deleting
-        // it from the pending map. Without this, a broadcast for
-        // the dropped (source, eventId) arriving after the drop
-        // finds no pending entry via `forgetOptimisticApply`,
-        // falls through to the "no pending -> apply directly"
-        // branch in `applyBroadcast`, and re-applies the damage —
-        // exactly what we just reverted. With the settled-mark,
-        // the same late broadcast is treated as "already handled"
-        // and returns "ignored" (RECENTLY_SETTLED_TTL_MS window).
-        // This closes the round-2 verifier's Mode X regression
-        // where the spam phase under-counted because dropped
-        // entries were silently re-acknowledged by their own late
-        // broadcast.
-        markSettled(oldestKey, p.appliedAtMs);
-        pendingApplies.delete(oldestKey);
-      }
-    }
-  }
-  pendingApplies.set(pendingKey(p.sourcePlayerId, p.eventId), p);
-  return dropped;
-}
-
-function forgetOptimisticApply(
-  sourcePlayerId: number,
-  eventId: number,
-): PendingOptimisticApply | null {
-  const key = pendingKey(sourcePlayerId, eventId);
-  const v = pendingApplies.get(key);
-  if (v !== undefined) pendingApplies.delete(key);
-  return v ?? null;
-}
-
-export function peekPendingApply(
-  sourcePlayerId: number,
-  eventId: number,
-): PendingOptimisticApply | null {
-  return pendingApplies.get(pendingKey(sourcePlayerId, eventId)) ?? null;
-}
-
-export function pendingApplyCount(): number {
-  return pendingApplies.size;
-}
-
 // -- Typed send wrappers --------------------------------------------------
 
 /**
- * PR 11.6.D / §3.9 — client-side damage prediction entry point.
- * Sends the request to the server AND applies the damage locally
- * optimistically, tracking the apply by `req.eventId` so the
- * upcoming broadcast can confirm or revert it.
+ * PR 11.7.D / §4.4 — Option B: pure send. No optimistic apply, no
+ * pending-map tracking, no sweep. Clients send-and-wait for the server's
+ * `DamageBroadcast`.
  *
- * If the server's broadcast arrives with a DIFFERENT amount (e.g.
- * lag comp rewound and missed, or the fire was out of range, or the
- * server clamped the amount), `applyBroadcast` will revert with the
- * negative-amount correction path (see `health.ts`).
+ * The 4 trailing args are kept for call-site compat (gameSession.tick
+ * + the smoke) but are no-ops after Option B. They used to drive the
+ * optimistic apply (targetController + nowMs + source/targetPlayerId).
+ * Now they are ignored — the server is authoritative, and the broadcast
+ * handler in `scene.ts` does the actual `applyDamage` call when the
+ * server's fan-out arrives.
  *
- * Returns the eventId for caller-side chaining.
+ * Returns the eventId for caller-side chaining (event-id accounting +
+ * tracer HUD wiring).
  */
 export function sendDamageRequest(
-  t: ServerTransport,
+  _t: ServerTransport,
   req: DamageRequest,
-  targetController: CharacterController,
-  nowMs: number,
-  sourcePlayerId: number,
-  targetPlayerId: number,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _targetController: CharacterController | null,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _nowMs: number,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _sourcePlayerId: number,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _targetPlayerId: number,
 ): number {
-  const sourceKind: "fire" | "melee" = req.source === 0 ? "fire" : "melee";
-  // 1. Apply locally first (the optimistic apply).
-  // PR 11.6.D fix4 (Bug C — actualDelta capture): sample the
-  // target's HP before/after the apply so the sweep's revert
-  // path knows the TRUE HP delta. If the target was already at
-  // HP=0 (clamped no-op) the actual delta is 0 even though
-  // `optimisticallyAppliedAmount` is the full request amount;
-  // without this distinction the sweep reverts phantom losses
-  // and the post-spam HP converges to maxHp instead of the
-  // server's broadcast-bounded value.
-  const hpBefore = targetController.state.hp;
-  applyDamage(targetController, {source: sourceKind, amount: req.amount}, nowMs);
-  const hpAfter = targetController.state.hp;
-  const actualAppliedDelta = hpBefore - hpAfter;
-  trackOptimisticApply({
-    sourcePlayerId,
-    eventId: req.eventId,
-    targetPlayerId,
-    targetController,
-    source: sourceKind,
-    amount: req.amount,
-    appliedAtMs: nowMs,
-    optimisticallyAppliedAmount: req.amount,
-    actualAppliedDelta,
-  });
-  // 2. Send the wire packet to the server.
-  t.sendDamageRequest(req);
+  _t.sendDamageRequest(req);
   return req.eventId;
 }
 
@@ -347,7 +145,7 @@ export function sendPositionUpdate(t: ServerTransport, pu: PositionUpdate): void
 }
 
 /**
- * PR 11.6.D / §3.10 — 32Hz PositionUpdate sender. The caller invokes
+ * PR 11.7.D / §3.10 — 32Hz PositionUpdate sender. The caller invokes
  * this every tick; the helper throttles to every other tick at 64Hz.
  * Returns `true` if the packet was sent.
  */
@@ -379,263 +177,64 @@ export function sendInputsServer(t: ServerTransport, i: InputsServer): void {
   t.sendInputs(i);
 }
 
-// -- Broadcast handler (§3.9) --------------------------------------------
+// -- Broadcast handler (PR 11.7.D / §4.4 — single-apply path) --------------
 
-export type BroadcastResult = "confirm" | "revert" | "applied" | "ignored";
+export type BroadcastResult = "applied" | "ignored";
 
-interface TracerFlashEvent {
-  type: "rejection" | "confirm";
-  targetPlayerId: number;
-  sourcePlayerId: number;
-  eventId: number;
-  appliedAmount: number;
-  broadcastAmount: number;
-  atMs: number;
+// PR 11.7.D / §4.4 — TracerFlashEvent, tracerFlashListeners, and
+// emitTracerFlash are REMOVED. Pre-Option-B the optimistic-apply
+// confirm/revert paths emitted tracer-flash events for the HUD
+// (e.g., the "no damage" rejection flash). With optimistic-apply
+// gone there's nothing to confirm or revert — the server's
+// broadcast is the single apply path. The HUD tracer line visual
+// (the orange line drawn between shooter and target on fire) is
+// driven separately by gameSession.combatEvents + scene.ts's tracer
+// rendering. We keep `onTracerFlash` + `getLastTracerFlash` exported
+// for probe compatibility (the smoke may wire these in a future PR)
+// but the implementation is now a no-op (no listeners + no events).
+type TracerFlashListener = (_ev: never) => void;
+export function onTracerFlash(_f: TracerFlashListener): void {
+  // No-op after Option B. Kept exported for future use.
 }
-type TracerFlashListener = (ev: TracerFlashEvent) => void;
-const tracerFlashListeners: TracerFlashListener[] = [];
-let lastTracerFlash: TracerFlashEvent | null = null;
-export function onTracerFlash(f: TracerFlashListener): void {
-  tracerFlashListeners.push(f);
-}
-export function getLastTracerFlash(): TracerFlashEvent | null {
-  return lastTracerFlash;
-}
-function emitTracerFlash(ev: TracerFlashEvent): void {
-  lastTracerFlash = ev;
-  for (const f of tracerFlashListeners) f(ev);
+export function getLastTracerFlash(): null {
+  // No-op after Option B. Kept exported for future use.
+  return null;
 }
 
 /**
- * PR 11.6.D / §3.9 — invoked by `ServerTransport.onDamageBroadcast`
- * (wired in `scene.ts`'s DEV probe block). Implements three paths:
- *   1. Optimistic match (broadcast amount === applied amount) → confirm.
- *   2. Optimistic mismatch (broadcast amount differs) → REVERT + emit
- *      HUD tracer flash event.
- *   3. No matching pending apply → apply directly (someone else's fire).
+ * PR 11.7.D / §4.4 — Option B: single-apply broadcast handler. Invoked
+ * by `ServerTransport.onDamageBroadcast` (wired in `scene.ts`).
+ *
+ * Contract: if `resolveTarget(bc.targetPlayerId)` returns a controller,
+ * apply the damage once and return `"applied"`. Otherwise return
+ * `"ignored"` (no controller available — the broadcast is dropped).
+ *
+ * There is no confirm/revert path because there is no local pending
+ * state to confirm or revert: clients are send-and-wait (Option B). If
+ * the server's broadcast is dropped (the §4.4 channel-overflow case),
+ * the client's HP simply stays at the prior value for one more RTT; the
+ * next successful broadcast brings the client back in sync. No persistent
+ * divergence accumulates.
+ *
+ * NOTE: this function is intentionally idempotent on repeated calls
+ * with the same broadcast — every broadcast decrements HP. The server
+ * is the authoritative source of damage events; a re-delivered
+ * WebSocket frame (retry, GC stall) does decrement again. The
+ * authoritative dedup is the server-side `validate_and_relay`'s
+ * monotonic-eventId gate, not the client.
  */
 export function applyBroadcast(
   bc: DamageBroadcast,
-  nowMs: number,
+  _nowMs: number,
   resolveTarget?: (playerId: number) => CharacterController | null,
 ): BroadcastResult {
-  // FIX 3: use (sourcePlayerId, eventId) for the lookup — NOT
-  // eventId alone. Tab A's own fire (source=1, event=1) and Tab B's
-  // fire (source=2, event=1) are DIFFERENT pending entries.
-  const bcKey = pendingKey(bc.sourcePlayerId, bc.originEventId);
-  // PR 11.6.D fix3 (Bug 2): check `recentlySettled` BEFORE the
-  // `forgetOptimisticApply` lookup. If this (source, eventId) was
-  // already handled (confirm, revert, OR sweep within the last
-  // RECENTLY_SETTLED_TTL_MS), the broadcast is a late arrival for
-  // an already-settled entry — return "ignored" so the "no pending
-  // -> apply directly" branch below doesn't re-apply damage. This
-  // is the root cause of the round-2 verifier's flaky smoke.
-  const settledAt = recentlySettled.get(bcKey);
-  if (settledAt !== undefined && nowMs - settledAt < RECENTLY_SETTLED_TTL_MS) {
-    return "ignored";
-  }
-  const pending = forgetOptimisticApply(bc.sourcePlayerId, bc.originEventId);
-  if (pending) {
-    if (bc.amount === pending.optimisticallyAppliedAmount) {
-      // PR 11.6.D fix4 (Bug C — clamped confirm convergence):
-      // if the optimistic apply was clamped at HP=0 (actualDelta
-      // < bc.amount), the source tab's local HP didn't decrement
-      // for this fire. The target tab (which receives the same
-      // broadcast via the "no pending -> apply" path below)
-      // DOES decrement by bc.amount, leaving the source 12 HP
-      // too high per affected fire. Close the gap by applying
-      // the remaining damage now so the source's HP converges
-      // with the target's. Without this, the post-spam
-      // convergence assertion fails (Tab A remote=16 vs Tab B
-      // local=4 — the 12 HP difference is exactly one clamped
-      // accepted fire that didn't propagate).
-      //
-      // NOTE: applyDamage clamps at HP=0, so this fix only
-      // helps when the source's HP is still > 0 at the time
-      // the broadcast arrives (the spam scenario in the 5191
-      // smoke has HP oscillating due to interleaved reverts, so
-      // this is generally true for the LAST accepted fire).
-      if (pending.actualAppliedDelta < bc.amount) {
-        const remainingDamage = bc.amount - pending.actualAppliedDelta;
-        const sourceKind: "fire" | "melee" = bc.source === 0 ? "fire" : "melee";
-        applyDamage(
-          pending.targetController,
-          {source: sourceKind, amount: remainingDamage},
-          nowMs,
-        );
-        emitTracerFlash({
-          type: "confirm",
-          targetPlayerId: bc.targetPlayerId,
-          sourcePlayerId: bc.sourcePlayerId,
-          eventId: bc.originEventId,
-          appliedAmount: pending.actualAppliedDelta + remainingDamage,
-          broadcastAmount: bc.amount,
-          atMs: nowMs,
-        });
-      } else {
-        emitTracerFlash({
-          type: "confirm",
-          targetPlayerId: bc.targetPlayerId,
-          sourcePlayerId: bc.sourcePlayerId,
-          eventId: bc.originEventId,
-          appliedAmount: pending.optimisticallyAppliedAmount,
-          broadcastAmount: bc.amount,
-          atMs: nowMs,
-        });
-      }
-
-      // re-delivered broadcast (e.g., WebSocket retry, broadcast
-      // arriving after a successful sweep) doesn't double-apply.
-      markSettled(bcKey, nowMs);
-      return "confirm";
-    }
-    // Mismatch → revert the optimistic apply. PR 11.6.D fix4
-    // (Bug C — actualDelta): use the actual HP delta not the
-    // requested amount (a clamped no-op apply contributes 0
-    // and should revert 0).
-    applyDamage(
-      pending.targetController,
-      {source: "correction", amount: -pending.actualAppliedDelta},
-      nowMs,
-    );
-    emitTracerFlash({
-      type: "rejection",
-      targetPlayerId: bc.targetPlayerId,
-      sourcePlayerId: bc.sourcePlayerId,
-      eventId: bc.originEventId,
-      appliedAmount: pending.actualAppliedDelta,
-      broadcastAmount: bc.amount,
-      atMs: nowMs,
-    });
-    // Bug 2 fix: record this (source, eventId) as settled.
-    markSettled(bcKey, nowMs);
-    return "revert";
-  }
   const target = resolveTarget?.(bc.targetPlayerId) ?? null;
   if (!target) {
     return "ignored";
   }
   const sourceKind: "fire" | "melee" = bc.source === 0 ? "fire" : "melee";
-  applyDamage(target, {source: sourceKind, amount: bc.amount}, nowMs);
+  applyDamage(target, {source: sourceKind, amount: bc.amount}, performance.now());
   return "applied";
-}
-
-// -- Reject + sweep handlers (FIX 4) -------------------------------------
-
-/**
- * PR 11.6.D FIX 4: private reject from the server. When the
- * validator rejects a `DamageRequest` (fire-rate, ammo, eventId,
- * lag-miss, no-history), the server sends a `DamageReject` back to
- * the source tab only. The source uses this to revert its
- * optimistic apply via the same `applyDamage(target, {source:
- * "correction", amount: -appliedAmount}, nowMs)` path.
- */
-export function applyReject(
-  sourcePlayerId: number,
-  eventId: number,
-  nowMs: number,
-): BroadcastResult {
-  const pending = forgetOptimisticApply(sourcePlayerId, eventId);
-  if (!pending) {
-    return "ignored";
-  }
-  // Revert via the negative-amount correction path. PR 11.6.D
-  // fix4 (Bug C — actualDelta): use the actual HP delta so the
-  // revert is a no-op when the original optimistic apply was
-  // clamped (HP already at 0).
-  applyDamage(
-    pending.targetController,
-    {source: "correction", amount: -pending.actualAppliedDelta},
-    nowMs,
-  );
-  emitTracerFlash({
-    type: "rejection",
-    targetPlayerId: pending.targetPlayerId,
-    sourcePlayerId,
-    eventId,
-    appliedAmount: pending.actualAppliedDelta,
-    broadcastAmount: 0, // rejected — no broadcast amount
-    atMs: nowMs,
-  });
-  // Bug 2 fix: record this (source, eventId) as settled so a
-  // late broadcast for the same key returns "ignored".
-  markSettled(pendingKey(sourcePlayerId, eventId), nowMs);
-  return "revert";
-}
-
-/** PR 11.6.D FIX 4: timeout fallback. The server's `DamageReject` may
- *  be dropped (channel full, network blip). If a pending apply
- *  hasn't seen a broadcast or reject within `PENDING_REJECT_TIMEOUT_MS`,
- *  revert it. This is the safety net for the spam-phase scenario
- *  where the server rejects faster than it can fan out rejects. */
-export const PENDING_REJECT_TIMEOUT_MS = 500;
-
-/** Sweep pending applies older than `PENDING_REJECT_TIMEOUT_MS`. Call
- *  periodically (e.g., every tick). Returns the number of pending
- *  applies reverted. */
-export function sweepExpiredPending(nowMs: number): number {
-  let swept = 0;
-  for (const [key, pending] of pendingApplies) {
-    if (nowMs - pending.appliedAtMs > PENDING_REJECT_TIMEOUT_MS) {
-      // Revert the optimistic apply. PR 11.6.D fix4 (Bug C —
-      // actualDelta revert): use the actual HP delta, not the
-      // requested amount. A 12-damage request that hit an already-
-      // dead target (applyDamage clamped no-op) should revert 0
-      // HP, not 12. This prevents the post-spam sweep from
-      // undoing HP damage that was never actually applied
-      // (phantom reverts that would otherwise push HP all the
-      // way back to maxHp, breaking the post-spam convergence
-      // assertion on the 5191 smoke).
-      applyDamage(
-        pending.targetController,
-        {source: "correction", amount: -pending.actualAppliedDelta},
-        nowMs,
-      );
-      emitTracerFlash({
-        type: "rejection",
-        targetPlayerId: pending.targetPlayerId,
-        sourcePlayerId: pending.sourcePlayerId,
-        eventId: pending.eventId,
-        appliedAmount: pending.actualAppliedDelta,
-        broadcastAmount: 0,
-        atMs: nowMs,
-      });
-      // Remove the entry from the pending map. Without this, the
-      // entry stays in the map forever, so a late broadcast for the
-      // same key finds it via forgetOptimisticApply, hits the
-      // "confirm" path (since we did revert + mark settled would
-      // catch the next one), and HP stays stuck at the reverted
-      // value. This is the canonical round-2 verifier FAIL-A
-      // symptom: Tab A's HP = 100 (everything reverted, nothing
-      // re-applied), Tab B's HP = 4 (7 accepted broadcasts applied).
-      pendingApplies.delete(key);
-      // PR 11.6.D fix3 (Bug 2 — sweep marks settled): record this
-      // (source, eventId) as settled so a late broadcast for the
-      // same key returns "ignored" via the recentlySettled TTL
-      // check in applyBroadcast. The sweep is the SAFETY-NET
-      // timeout fallback — once the entry is reverted by the sweep,
-      // the client has committed to that view and any subsequent
-      // broadcast is treated as "too late" (no double-apply).
-      markSettled(key, nowMs);
-      swept++;
-    }
-  }
-  // PR 11.6.D fix3 (Bug 2 maintenance): prune recentlySettled entries
-  // older than TTL. Runs every 50ms in the smoke so the map can't
-  // grow unboundedly even with sustained damage traffic.
-  if (recentlySettled.size > 0) {
-    for (const [k, ts] of recentlySettled) {
-      if (nowMs - ts >= RECENTLY_SETTLED_TTL_MS) {
-        recentlySettled.delete(k);
-      }
-    }
-  }
-  return swept;
-}
-
-/** PR 11.6.D FIX 4: also expose applyReject + sweep on the probe. */
-export function getPendingApplyEntries(): PendingOptimisticApply[] {
-  return Array.from(pendingApplies.values());
 }
 
 // -- Typed decode helpers -------------------------------------------------
@@ -667,12 +266,9 @@ export function decodePongBody(buf: Uint8Array): Pong | null {
 // -- Outbound damage-request queue ---------------------------------------
 
 /**
- * Bounded FIFO queue of outbound `DamageRequest`s. Used by PR 11.6.D's
- * client-side damage prediction (§3.9) so the predictor can see the
+ * Bounded FIFO queue of outbound `DamageRequest`s. Used by the smoke
+ * (and any future caller-side batching) so the predictor can see the
  * request that just fired AND any retries in the same frame.
- *
- * PR 11.6.C: defined + tested via the smoke. Not wired into
- * `gameSession.tick()` (PR 11.6.D's caller-side swap).
  */
 export class DamageRequestQueue {
   private queue: DamageRequest[] = [];
@@ -718,20 +314,30 @@ export class DamageRequestQueue {
  * returning ZERO matches in `npm run build`.
  *
  * The probe exposes the typed send wrappers + a `DamageRequestQueue`
- * + the inbound `DamageBroadcast` listener hook (so the smoke can
- * assert the server's synthetic broadcast reply). Production code
+ * + the inbound `DamageBroadcast` / `DamageReject` listener hooks
+ * (so the smoke can observe the server's fan-out). Production code
  * should use the typed wrappers directly via the transport.
+ *
+ * **PR 11.7.D / §4.4 Option B**: the probe shape shrunk — the
+ * optimistic-apply / pending-map / sweep methods are gone (they had no
+ * clients after the machinery was removed). The probe's `sendDamageRequest`
+ * still accepts the 5-arg form for call-site compat with the smoke +
+ * `gameSession.tick`; the trailing args are no-ops now.
  */
 export interface DamageBusProbe {
-  /** PR 11.6.D / §3.9: send a damage request AND apply locally optimistically. */
+  /** PR 11.7.D / §4.4: send a damage request. Pure send — no
+   *  optimistic apply. The 4 trailing args are unused but kept for
+   *  call-site compat (smoke + gameSession.tick signature). */
   sendDamageRequest: (
     req: DamageRequest,
-    targetController: CharacterController,
+    targetController: CharacterController | null,
     nowMs: number,
+    sourcePlayerId: number,
+    targetPlayerId: number,
   ) => number;
   /** Send a typed `PositionUpdate` through the live transport. */
   sendPositionUpdate: (pu: PositionUpdate) => void;
-  /** PR 11.6.D / §3.10: throttled PositionUpdate sender. */
+  /** PR 11.7.D / §3.10: throttled PositionUpdate sender. */
   sendPositionUpdateThrottled: (
     frameCounter: number,
     playerId: number,
@@ -742,10 +348,11 @@ export interface DamageBusProbe {
   sendPing: (p: Ping) => void;
   /** Register an inbound `DamageBroadcast` listener. */
   onDamageBroadcast: (f: (bc: DamageBroadcast) => void) => void;
-  /** PR 11.6.D FIX 4: register a DamageReject listener. The
-   *  probe wraps the server transports listener to decode the
-   *  body and pass a typed DamageReject to the callback.
-   *  Typically wired to applyReject(localPlayerId, r.eventId, now). */
+  /** Register an inbound `DamageReject` listener. The server still
+   *  emits `DamageReject` for fire-rate / ammo / event-id violations;
+   *  after PR 11.7.D Option B the client has no local pending state to
+   *  revert, so the reject is informational only (logged via the
+   *  probe's listener + the smoke's `__rejectHandlerCount` counter). */
   onDamageReject: (f: (r: DamageReject) => void) => void;
   /** Register an inbound `Pong` listener. */
   onPong: (f: (p: Pong) => void) => void;
@@ -753,12 +360,13 @@ export interface DamageBusProbe {
   getStats: () => {rttMs: number; transport?: string; connected: boolean};
   /** Get (or create) the outbound damage request queue. */
   getQueue: () => DamageRequestQueue;
-  /** Register a tracer-flash listener (PR 11.6.D HUD integration). */
-  onTracerFlash: (f: (ev: TracerFlashEvent) => void) => void;
-  /** Get the most recent tracer-flash event (smoke / debug). */
-  getLastTracerFlash: () => TracerFlashEvent | null;
-  /** Snapshot the pending optimistic apply count (smoke / debug). */
-  pendingApplyCount: () => number;
+  /** Register a tracer-flash listener. PR 11.7.D / §4.4 Option B:
+   *  the emit path is gone (no confirm/revert events). Kept exported
+   *  for future use / probe compat. */
+  onTracerFlash: (f: (ev: never) => void) => void;
+  /** Get the most recent tracer-flash event. Returns null — no
+   *  events are emitted after Option B. Kept exported for future use. */
+  getLastTracerFlash: () => null;
   /** Invoke `applyBroadcast` directly with a custom controller resolver
    *  (smoke / debug — production wires the default resolver). */
   applyBroadcast: (
@@ -766,12 +374,6 @@ export interface DamageBusProbe {
     nowMs: number,
     resolveTarget?: (playerId: number) => CharacterController | null,
   ) => BroadcastResult;
-  /** PR 11.6.D FIX 4: invoke `applyReject` (smoke / debug). */
-  applyReject: (sourcePlayerId: number, eventId: number, nowMs: number) => BroadcastResult;
-  /** PR 11.6.D FIX 4: sweep expired pending applies (smoke / debug). */
-  sweepExpiredPending: (nowMs: number) => number;
-  /** PR 11.6.D FIX 4: get all pending apply entries as an array. */
-  getPendingApplyEntries: () => unknown[];
   /** Re-export the typed encoder/decoder functions so the smoke can
    *  inspect wire bytes without re-importing `protocol/damage`. */
   encodeDamageRequest: typeof encodeDamageRequest;
@@ -788,40 +390,20 @@ export interface DamageBusProbe {
 export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
   const queue = new DamageRequestQueue();
   return {
-    sendDamageRequest: ((
+    sendDamageRequest: (
       req: DamageRequest,
-      targetController?: CharacterController,
-      nowMs?: number,
-      sourcePlayerId?: number,
-      targetPlayerId?: number,
-    ) => {
+      targetController: CharacterController | null,
+      nowMs: number,
+      sourcePlayerId: number,
+      targetPlayerId: number,
+    ): number => {
       queue.push(req);
-      // PR 11.6.D / §3.9 — when `targetController`, `nowMs`,
-      // `sourcePlayerId`, AND `targetPlayerId` are supplied, apply
-      // optimistically + track in pendingApplies (the new PR 11.6.D
-      // flow). Otherwise, just send the wire packet (PR 11.6.C smoke
-      // path — no optimistic apply, no pending tracking).
-      if (
-        targetController !== undefined &&
-        nowMs !== undefined &&
-        sourcePlayerId !== undefined &&
-        targetPlayerId !== undefined
-      ) {
-        return sendDamageRequest(t, req, targetController, nowMs, sourcePlayerId, targetPlayerId);
-      }
-      t.sendDamageRequest(req);
-      return req.eventId;
-    }) as {
-      // PR 11.6.D overload (with optimistic apply + composite key)
-      (
-        req: DamageRequest,
-        targetController: CharacterController,
-        nowMs: number,
-        sourcePlayerId: number,
-        targetPlayerId: number,
-      ): number;
-      // PR 11.6.C overload (send only — used by the 5190 smoke)
-      (req: DamageRequest): number;
+      // PR 11.7.D / §4.4 Option B: pure send. The 4 trailing args are
+      // unused (kept for call-site compat with the smoke +
+      // gameSession.tick signature). The server is authoritative; the
+      // broadcast handler in scene.ts does the actual applyDamage when
+      // the server's fan-out arrives.
+      return sendDamageRequest(t, req, targetController, nowMs, sourcePlayerId, targetPlayerId);
     },
     sendPositionUpdate: (pu) => sendPositionUpdate(t, pu),
     sendPositionUpdateThrottled: (frameCounter, playerId, positionX, positionY) =>
@@ -849,11 +431,7 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
     getQueue: () => queue,
     onTracerFlash,
     getLastTracerFlash,
-    pendingApplyCount,
     applyBroadcast,
-    applyReject,
-    sweepExpiredPending,
-    getPendingApplyEntries,
     encodeDamageRequest,
     encodePositionUpdate,
     encodePing,

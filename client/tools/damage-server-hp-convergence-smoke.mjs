@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PR 11.6.D / §3.5 + §3.6 — server-auth damage HP-convergence smoke.
+// PR 11.7.D / §4.4 — server-auth damage HP-convergence smoke (Option B).
 //
 // Boots the canary server (WebTransport + WebSocket) + Vite on port
 // 5191, opens TWO headless browser contexts (each with its own
@@ -7,22 +7,24 @@
 // connected to the SAME room (DEVBX), and asserts:
 //
 //   1. Both tabs' `ServerTransport.connect()` resolves within 5s.
-//   2. From Tab A: optimistic apply happens on `remoteController`
-//      (Tab A's view of Tab B) — poll for HP < 100.
-//   3. Tab B receives the broadcast (via `__lastBroadcast` spy) within 1s.
-//   4. Tab B's `localController.hp` matches Tab A's
-//      `remoteController.hp` (HP convergence — both tabs land on the
-//      same value).
-//   5. `getStats().rttMs < 50` on localhost.
-//   6. Fire-rate cooldown: spam 100x `sendDamageRequest({amount: 255})`
-//      in 1s; only ~8 should land (120ms cooldown = 8/sec max).
-//   7. take screenshot to client/tools/damage-server-hp-convergence-smoke.png
+//   2. From Tab A: a single `sendDamageRequest` lands on both tabs
+//      within 1s — Tab A's `remoteController.hp` AND Tab B's
+//      `localController.hp` drop to the same value (no optimistic
+//      apply, just send-and-wait for the server's `DamageBroadcast`).
+//   3. After the spam phase, post-spam HP convergence: Tab A's
+//      `remoteController.hp` MUST equal Tab B's `localController.hp`
+//      (strict equality — the §4.4 race is gone after Option B).
+//   4. `getStats().rttMs < 50` on localhost.
+//   5. Fire-rate cooldown: spam 100x `sendDamageRequest({amount: 12})`
+//      in 1.1s; only ~4-12 should land (120ms cooldown = 8/sec max).
+//   6. take screenshot to client/tools/damage-server-hp-convergence-smoke.png
 //
-// This is the load-bearing smoke for §3.9 client-side prediction:
-// the optimistic apply MUST fire, the broadcast MUST reach both tabs,
-// and the HP MUST converge. If any step fails, the smoke catches a
-// regression that the existing 5190 smoke can't see (the 5190 smoke
-// only exercises the wire format, not the actual damage flow).
+// This is the load-bearing smoke for §4.4 server-auth damage
+// convergence. After PR 11.7.D Option B (drop optimistic-apply),
+// the assertion is now STRICT (no XFAIL fallback). If any step fails,
+// the smoke catches a regression that the existing 5190 smoke can't
+// see (the 5190 smoke only exercises the wire format, not the actual
+// damage flow).
 
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
@@ -239,25 +241,6 @@ async function runSmoke() {
     }
     log("Assertion (FIX 2) PASS: both tabs use correct player ids (A=1→2, B=2→1).");
 
-    // Install broadcast listeners on both tabs so we can detect when
-    // the broadcast arrives (via __lastBroadcast + the typed probe).
-    await pageA.evaluate(() => {
-      const t = (window).__serverTransport;
-      const bus = (window).__damageBus;
-      t.onDamageBroadcast((body) => {
-        const bc = bus.decodeDamageBroadcast(body);
-        if (bc) (window).__lastBroadcast = bc;
-      });
-    });
-    await pageB.evaluate(() => {
-      const t = (window).__serverTransport;
-      const bus = (window).__damageBus;
-      t.onDamageBroadcast((body) => {
-        const bc = bus.decodeDamageBroadcast(body);
-        if (bc) (window).__lastBroadcast = bc;
-      });
-    });
-
     // ---- 1. Stats ----
     // Trigger an explicit Ping on each tab so both have a fresh RTT sample.
     await Promise.all([
@@ -353,18 +336,18 @@ async function runSmoke() {
     await sleep(300);
 
     // ---- 2. Tab A fires a single damage request at Tab B (player 2). ----
-    // The optimistic apply should land on Tab A's remoteController
-    // (which represents Tab B in Tab A's local view).
+    // PR 11.7.D / §4.4 Option B: NO optimistic apply. The server's
+    // DamageBroadcast is the ONLY path that decrements HP. We poll
+    // Tab A's remoteController (which represents Tab B in Tab A's
+    // local view) for HP < 100 — that proves the broadcast landed on
+    // Tab A. Then we read Tab B's localController and assert it
+    // matches — that proves the broadcast also landed on Tab B.
+    // Round-trip latency on localhost is ~60-150ms (RTT); we give it
+    // up to 2s (generous, accommodates GC stalls + 5191 spam noise).
     const eventId = Math.floor(Math.random() * 0xffffffff);
     const damageAmount = 12; // DUAL_PISTOL_DAMAGE
     const fireResult = await pageA.evaluate(async ({eventId, targetId, amount, timeoutMs}) => {
       const bus = (window).__damageBus;
-      // Resolve Tab A's remoteController (the one representing Tab B).
-      // The smoke doesn't have a direct ref to it, so we rely on the
-      // bus's sendDamageRequest applying to whatever the
-      // `localController` arg is. For the test we'll just call
-      // sendDamageRequest with a targetController obtained from the
-      // page (via the gameSession probe, exposed below).
       const session = (window).__gameSession;
       if (!session) return {ok: false, reason: "no __gameSession"};
       const targetController = session.remoteController;
@@ -376,7 +359,9 @@ async function runSmoke() {
         amount,
         eventId,
       }, targetController, performance.now(), 1, targetId);
-      // Poll the targetController's HP for change (max 500ms).
+      // Poll the targetController's HP for change (max 2s — wait
+      // for the server's broadcast to arrive and the broadcast
+      // handler to apply it).
       const start = Date.now();
       while (Date.now() - start < timeoutMs) {
         if (targetController.state.hp < 100) {
@@ -384,30 +369,19 @@ async function runSmoke() {
         }
         await new Promise((r) => setTimeout(r, 20));
       }
-      return {ok: false, reason: "hp never dropped", hp: targetController.state.hp};
-    }, {eventId, targetId: 2, amount: damageAmount, timeoutMs: 500});
+      return {ok: false, reason: "hp never dropped (broadcast didn't land within 2s)", hp: targetController.state.hp};
+    }, {eventId, targetId: 2, amount: damageAmount, timeoutMs: 2000});
     if (!fireResult.ok) {
-      throw new Error(`Tab A optimistic apply failed: ${fireResult.reason}`);
+      throw new Error(`Tab A single fire never decremented remoteController HP: ${fireResult.reason}`);
     }
-    log(`Assertion 2 PASS: Tab A optimistic apply fired (HP=${fireResult.hp}).`);
+    log(`Assertion 2 PASS: Tab A's remoteController HP dropped to ${fireResult.hp} after single fire (broadcast landed).`);
 
-    // ---- 3. Tab B receives the broadcast within 1s. ----
-    const bcastB = await pageB.evaluate(async ({timeoutMs, eventId}) => {
-      const start = Date.now();
-      while (Date.now() - start < timeoutMs) {
-        const bc = (window).__lastBroadcast;
-        if (bc && bc.originEventId === eventId) return {ok: true, bc};
-        await new Promise((r) => setTimeout(r, 20));
-      }
-      return {ok: false, reason: "broadcast never arrived"};
-    }, {timeoutMs: BROADCAST_TIMEOUT_MS, eventId});
-    if (!bcastB.ok) {
-      throw new Error(`Tab B broadcast never arrived: ${bcastB.reason}`);
-    }
-    log(`Assertion 3 PASS: Tab B received broadcast ${JSON.stringify(bcastB.bc)}.`);
-
-    // ---- 4. HP convergence: Tab B's localController.hp matches Tab A's
-    //         remoteController.hp (the same fire event applied to both).
+    // ---- 3. Single-fire HP convergence: Tab B's localController.hp
+    //         matches Tab A's remoteController.hp after the broadcast
+    //         landed on both. PR 11.7.D / §4.4 Option B is
+    //         send-and-wait, so the broadcast handler in scene.ts is
+    //         the single apply path — if both tabs land on the same
+    //         value, the server's broadcast fan-out reached both.
     const hpA = await pageA.evaluate(() => {
       const session = (window).__gameSession;
       return session ? session.remoteController.state.hp : null;
@@ -416,70 +390,41 @@ async function runSmoke() {
       const session = (window).__gameSession;
       return session ? session.localController.state.hp : null;
     });
-    // Debug: was the broadcast handler ever called?
-    const handlerCountB = await pageB.evaluate(() => (window).__broadcastHandlerCount ?? 0);
-    const handlerRegisteredB = await pageB.evaluate(() => (window).__broadcastHandlerRegistered ?? false);
-    log(`Tab B broadcast handler registered=${handlerRegisteredB}, fired ${handlerCountB} times.`);
-    const lastResultB = await pageB.evaluate(() => (window).__lastBroadcastResult ?? null);
-    const lastErrorB = await pageB.evaluate(() => (window).__broadcastHandlerError ?? null);
-    log(`Tab B last broadcast result: ${lastResultB}, error: ${lastErrorB}`);
     log(`Tab A remote hp=${hpA}, Tab B local hp=${hpB}`);
-    // Direct test: call applyBroadcast on Tab B with the same broadcast
-    // to see if the resolver+apply pipeline works at all.
-    if (bcastB.bc) {
-      const directResult = await pageB.evaluate(async ({bc, localPlayerId}) => {
-        const mod = await import("/src/net/damageBus.ts");
-        const session = (window).__gameSession;
-        if (!session) return {ok: false, reason: "no session"};
-        const before = session.localController.state.hp;
-        const result = mod.applyBroadcast(bc, performance.now(), (playerId) =>
-          playerId === localPlayerId ? session.localController : session.remoteController,
-        );
-        const after = session.localController.state.hp;
-        return {ok: true, before, after, result};
-      }, {bc: bcastB.bc, localPlayerId: 2});
-      log(`Direct applyBroadcast test: ${JSON.stringify(directResult)}`);
-    }
     if (hpA === null || hpB === null) {
       throw new Error("GameSession probe not exposed on window.__gameSession");
     }
     if (hpA !== hpB) {
-      throw new Error(`HP convergence failed: Tab A remote=${hpA} vs Tab B local=${hpB}`);
+      throw new Error(`Single-fire HP convergence failed: Tab A remote=${hpA} vs Tab B local=${hpB} (broadcast didn't reach both tabs).`);
     }
-    log(`Assertion 4 PASS: HP convergence (both at ${hpA}).`);
+    log(`Assertion 3 PASS: single-fire HP convergence (both at ${hpA}).`);
 
-    // ---- 6. Fire-rate cooldown spam (assertion 6) ----
-    // Reset both HP pools so we have a clean baseline.
-    // We just check that after spamming 100 requests in 1.1s, the
-    // number of accepted broadcasts (visible in pendingApplyCount on
-    // Tab A) is bounded by the fire-rate cooldown (~8/sec).
-    // We can also check that Tab B's HP only dropped by 8*12 = 96
-    // (or whatever the cooldown allows).
+    // ---- 4. Fire-rate cooldown spam (assertion 4) ----
+    // PR 11.7.D / §4.4 Option B: spam 100 requests in 1.1s. The
+    // server's 120ms cooldown bounds the accepted broadcasts to
+    // ~8/sec. We verify that Tab B's HP dropped by between
+    // 4*12=48 and 12*12=144 — confirming (a) the spam actually
+    // landed (≥4 hits), and (b) the cooldown is enforced (≤12 hits).
+    // No optimistic-apply state to track (Option B = send-and-wait).
     const hpBeforeSpamB = hpB;
     await pageA.evaluate(async ({timeoutMs, cooldownMs, baseEventId}) => {
       const bus = (window).__damageBus;
       const start = Date.now();
       let sent = 0;
       while (Date.now() - start < timeoutMs) {
-        // PR 11.6.D fix4 (smoke-side): re-resolve the target
-        // controller on every iteration. The broadcast handler
-        // resolves the LATEST `__gameSession` on every call
-        // (under React StrictMode the first scene() call's
-        // gameSession may be disposed and replaced by a
-        // second-mount's gameSession mid-spam — see
-        // `makeBroadcastHandler` in scene.ts). Caching
-        // `targetController` outside the loop would point at
-        // the disposed session and the spam's optimistic
-        // applies would land on a controller the broadcasts
-        // never touch, breaking the post-spam HP convergence
-        // assertion with a 12-HP (one broadcast's worth) gap.
+        // Re-resolve the target controller on every iteration.
+        // The sendDamageRequest trailing args are no-ops after
+        // Option B, but we still need a targetController for the
+        // call signature (it's unused inside damageBus.sendDamageRequest
+        // now). Using the latest `__gameSession` per call matches the
+        // broadcast handler's per-call resolver pattern.
         const session = (window).__gameSession;
         const targetController = session.remoteController;
-        // PR 11.6.D / §3.4.2 — eventId MUST be strictly monotonic
-        // per source. Random IDs are rejected by the server as
-        // stale; the smoke therefore bumps a local counter starting
-        // from the previous fire's eventId so every request passes
-        // the monotonicity gate (the fire-rate cooldown is the only
+        // eventId MUST be strictly monotonic per source. Random
+        // IDs are rejected by the server as stale; the smoke
+        // therefore bumps a local counter starting from the
+        // previous fire's eventId so every request passes the
+        // monotonicity gate (the fire-rate cooldown is the only
         // gate we want to exercise here).
         const eventId = baseEventId + 1 + sent;
         try {
@@ -508,18 +453,6 @@ async function runSmoke() {
     });
     const dmgApplied = hpBeforeSpamB - hpAfterSpamB;
     log(`Spam done: HP dropped by ${dmgApplied} (from ${hpBeforeSpamB} to ${hpAfterSpamB})`);
-    // Post-spam debug: Tab A's broadcast handler count + last result
-    const handlerCountA_post = await pageA.evaluate(() => (window).__broadcastHandlerCount ?? 0);
-    const lastResultA_post = await pageA.evaluate(() => (window).__lastBroadcastResult ?? null);
-    const resultCountsA_post = await pageA.evaluate(() => (window).__broadcastResultCounts ?? {});
-    const pendingCountA_post = await pageA.evaluate(() => (window).__damageBus ? (window).__damageBus.pendingApplyCount() : -1);
-    log(`Post-spam: Tab A broadcast handler count=${handlerCountA_post}, lastResult=${lastResultA_post}, resultCounts=${JSON.stringify(resultCountsA_post)}, pendingCount=${pendingCountA_post}.`);
-    const handlerCountB_post = await pageB.evaluate(() => (window).__broadcastHandlerCount ?? 0);
-    const resultCountsB_post = await pageB.evaluate(() => (window).__broadcastResultCounts ?? {});
-    log(`Post-spam: Tab B broadcast handler count=${handlerCountB_post}, resultCounts=${JSON.stringify(resultCountsB_post)}.`);
-    const timestampsA = await pageA.evaluate(() => (window).__broadcastTimestamps ?? []);
-    log(`Tab A broadcast timestamps (all ${timestampsA.length}):`);
-    for (const t of timestampsA) log(`  ${t.at.toFixed(0)}ms result=${t.result} pending=${t.pendingCountAfter} hpRemote=${t.hpRemote} hpLocal=${t.hpLocal}`);
     // 120ms cooldown = ~9 hits/sec, each does 12 dmg = 108 dmg max
     // (with 1100ms spam window). Allow generous upper bound (12 hits
     // for clock-skew tolerance) and lower bound (≥4 hits to verify
@@ -531,25 +464,14 @@ async function runSmoke() {
     if (dmgApplied > 12 * 12) {
       throw new Error(`Fire-rate cooldown NOT enforcing: ${dmgApplied / 12} hits landed (expected ≤ 12 with 120ms cooldown).`);
     }
-    log(`Assertion 6 PASS: fire-rate cooldown enforced (${dmgApplied / 12} hits in ~1s).`);
+    log(`Assertion 4 PASS: fire-rate cooldown enforced (${dmgApplied / 12} hits in ~1s).`);
 
-    // PR 11.6.D FIX 4: after the spam phase, the server's
-    // DamageReject + the client's timeout sweep must restore HP
-    // convergence. Tab A optimistically applied ~all spam requests
-    // locally; the server only accepted the cooldown-bounded
-    // subset. Wait for the timeout sweep (PENDING_REJECT_TIMEOUT_MS
-    // = 500ms) to revert the rejected optimistic applies, then
-    // assert both tabs' HP match again.
-    log("Waiting 1.5s for timeout sweep to revert rejected optimistic applies...");
-    await sleep(1500);
-    // Also explicitly trigger the sweep on Tab A (in case the
-    // gameSession's tick loop doesn't drive it).
-    await pageA.evaluate(() => {
-      const mod = (window).__damageBus;
-      if (mod && mod.sweepExpiredPending) {
-        mod.sweepExpiredPending(performance.now());
-      }
-    });
+    // PR 11.7.D / §4.4 Option B: wait for the spam's broadcasts to
+    // settle (the last cooldown-broadcast may still be in flight).
+    // 500ms is enough for the server's last fan-out + client
+    // applyBroadcast round trip on localhost.
+    log("Waiting 500ms for last spam broadcasts to settle...");
+    await sleep(500);
     const hpA_post = await pageA.evaluate(() => {
       const session = (window).__gameSession;
       return session ? session.remoteController.state.hp : null;
@@ -559,58 +481,26 @@ async function runSmoke() {
       return session ? session.localController.state.hp : null;
     });
     log(`Post-spam: Tab A remote hp=${hpA_post}, Tab B local hp=${hpB_post}`);
-    // §4.4 carry-forward xfail — known-bad since PR 11.6.D. PR 11.7.C
-    // was hoped to close this via the snapshot fan-out (the
-    // `DISCRIMINATOR_SNAPSHOT=0x07` stream now carries the server's
-    // authoritative per-player HP), but the smoke reads
-    // `gameSession.remoteController.state.hp` which is the
-    // P2P-LOCKSTEP controller's HP — not the snapshot-driven one.
-    // The lockstep controller gets its HP from the WebRTC peer
-    // message stream (damage broadcasts), which is the very path
-    // with the race. The snapshot stream is wired correctly but
-    // nothing reads the snapshot's HP for visual purposes yet
-    // (PR 11.7.D switches the remote visual to the interpolator).
-    //
-    // So PR 11.7.C does NOT close §4.4. Reverting the xfail
-    // removal from the round-2 fix and keeping the known-bad log.
-    // The CI run 32299772659 (PR 11.7.C round 1) confirmed: post-spam
-    // gap = 12 HP, same as PR 11.6.D. The race is in the
-    // optimistic-apply vs broadcast-receive ordering in damageBus
-    // (not in the snapshot path).
-    //
-    // This xfail:
-    // - Logs the divergence explicitly so CI logs show the known gap
-    // - Does NOT silently pass (the value is reported)
-    // - Does NOT block PR 11.7.C's merge gate
-    // - Will be closed when either (a) the damageBus race is fixed
-    //   in a separate PR, OR (b) PR 11.7.D's remote-visual
-    //   switchover sources the smoke's HP from the snapshot's
-    //   authoritative per-player entry.
+    // PR 11.7.D / §4.4: strict-equality post-spam HP convergence.
+    // With optimistic-apply gone, the client just waits for the
+    // server's broadcast; Tab A and Tab B's HP MUST converge exactly
+    // (no XFAIL fallback). If they don't, the smoke THROWS — the §4.4
+    // race is supposed to be fixed.
     if (hpA_post !== hpB_post) {
-      log(
-        `[XFAIL §4.4] Post-spam HP convergence: Tab A remote=${hpA_post} vs Tab B local=${hpB_post} (gap=${hpA_post - hpB_post}). ` +
-        `Known-bad carry-forward from PR 11.6.D; PR 11.7.C's snapshot fan-out did NOT close the race ` +
-        `(smoke reads the lockstep controller, not the snapshot's authoritative HP). ` +
-        `Separate fix needed in damageBus OR PR 11.7.D's remote-visual switchover.`,
-      );
-    } else {
-      log(`Assertion (FIX 4) PASS: post-spam HP convergence restored (both at ${hpA_post}).`);
+      throw new Error(`§4.4 race: post-spam HP convergence failed: Tab A remote=${hpA_post} vs Tab B local=${hpB_post} (gap=${hpA_post - hpB_post})`);
     }
+    log(`Assertion (post-spam convergence) PASS: Tab A remote=${hpA_post} = Tab B local=${hpB_post}.`);
 
-    // ---- 7. Capture screenshot ----
+    // ---- 6. Capture screenshot ----
     // Take Tab A's screenshot (the shooter). It will show the
-    // optimistic apply + tracer lines + reduced remote HP.
+    // tracer lines + the broadcast-driven remote HP drop.
     await pageA.screenshot({ path: SCREENSHOT_PATH });
 
     if (errors.length > 0) {
       throw new Error(`pageerror events: ${errors.join("; ")}`);
     }
 
-    if (hpA_post === hpB_post) {
-      log(`OK — damage-server-hp-convergence-smoke passed (HP converged at ${hpA_post}).`);
-    } else {
-      log(`OK — damage-server-hp-convergence-smoke passed with §4.4 xfail (Tab A remote=${hpA_post} vs Tab B local=${hpB_post}).`);
-    }
+    log(`OK — damage-server-hp-convergence-smoke passed (post-spam HP converged at ${hpA_post}).`);
     await browser.close();
     return true;
   } catch (err) {

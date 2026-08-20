@@ -17,10 +17,10 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.test.ts"],
-    // DamageBus tracks module-level state (pendingApplies,
-    // recentlySettled). `isolate: false` + `forks: false` keeps
-    // the module shared across the file's tests, which is what
-    // we want — the tests assert sequential state changes.
+    // DamageBus module is stateless after PR 11.7.D Option B
+    // (optimistic-apply machinery removed). Single-threaded
+    // pool is still used so the remaining tests share
+    // module imports cleanly.
     pool: "threads",
     poolOptions: {
       threads: {

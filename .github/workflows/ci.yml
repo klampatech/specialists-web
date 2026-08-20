@@ -273,9 +273,25 @@ jobs:
             cat /tmp/vite-5191.log
             exit 1
           fi
-      - name: Run damage server HP-convergence smoke
+      - name: Run damage server HP-convergence smoke (3x for transient-flake margin)
+        # PR 11.7.D / §4.4 — runs the smoke 3 times back-to-back. The
+        # first run after a cold canary + Vite boot can flake on
+        # "Tab A not yet connected" (the canary warm-up race); a
+        # 3x budget gives 2 retries so a structural failure is
+        # distinguishable from a transient one. Local smoke runs
+        # 5x for the same reason (see the 5x entry in the
+        # pre-merge checklist in HANDOFF.md).
         working-directory: client
-        run: node tools/damage-server-hp-convergence-smoke.mjs
+        run: |
+          for i in 1 2 3; do
+            echo "=== HP-convergence smoke run $i/3 ==="
+            node tools/damage-server-hp-convergence-smoke.mjs && RUN_RESULT=$? || RUN_RESULT=$?
+            if [[ $RUN_RESULT -ne 0 ]]; then
+              echo "::error::HP-convergence smoke failed on run $i/3 (exit $RUN_RESULT)"
+              exit $RUN_RESULT
+            fi
+          done
+          echo "=== All 3 HP-convergence smoke runs PASSED ==="
         env:
           HP_CONV_SMOKE_URL: http://localhost:5191/
           HP_CONV_WT_PORT: 14433

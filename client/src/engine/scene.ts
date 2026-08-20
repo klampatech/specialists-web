@@ -154,11 +154,12 @@ type ControllerResolver = () => {
   remote: CharacterController;
 };
 /**
- * PR 11.6.D — broadcast handler. The probe (created once, in the
- * DEV probe block below) is passed in explicitly so the broadcast
- * handler + the optimistic-apply paths share one `pendingApplies`
- * map. Vite deduplicates modules in dev, but an explicit dependency
- * is cleaner than relying on the bundler's cache behavior.
+ * PR 11.7.D / §4.4 — broadcast handler. The probe (created once, in
+ * the DEV probe block below) is passed in explicitly so the broadcast
+ * handler shares the live `__damageBus` probe with the smoke (which
+ * drives `applyBroadcast` directly for assertions). Vite deduplicates
+ * modules in dev, but an explicit dependency is cleaner than relying
+ * on the bundler's cache behavior.
  */
 function makeBroadcastHandler(
   localPlayerId: number,
@@ -166,30 +167,17 @@ function makeBroadcastHandler(
   probe: ReturnType<typeof import("../net/damageBus").createDamageBusProbe>,
 ): (body: Uint8Array) => void {
   return (body: Uint8Array) => {
-    if (typeof window !== "undefined") {
-      const w = window as unknown as {__broadcastHandlerCount?: number};
-      w.__broadcastHandlerCount = (w.__broadcastHandlerCount ?? 0) + 1;
-      (window as unknown as {__lastBroadcastHandlerAt?: number}).__lastBroadcastHandlerAt = performance.now();
-    }
     // The probe's applyBroadcast handles decoding + the resolver
-    // closure. No async needed.
+    // closure. No async needed. PR 11.7.D / §4.4 Option B: no
+    // instrumentation — the smoke verifies the broadcast landed by
+    // polling Tab A's remoteController.hp and Tab B's
+    // localController.hp (the only thing that matters post-Option-B).
     const bc = probe.decodeDamageBroadcast(body);
     if (!bc) return;
     const { local, remote } = getControllers();
-    const result = probe.applyBroadcast(bc, performance.now(), (playerId) =>
+    probe.applyBroadcast(bc, performance.now(), (playerId) =>
       playerId === localPlayerId ? local : remote,
     );
-    if (typeof window !== "undefined") {
-      const w = window as unknown as {__lastBroadcastResult?: string; __broadcastResultCounts?: Record<string, number>; __broadcastTimestamps?: Array<{at: number, result: string, pendingCountAfter: number, hpRemote?: number, hpLocal?: number}>};
-      w.__lastBroadcastResult = result;
-      w.__broadcastResultCounts = w.__broadcastResultCounts ?? {};
-      w.__broadcastResultCounts[result] = (w.__broadcastResultCounts[result] ?? 0) + 1;
-      w.__broadcastTimestamps = w.__broadcastTimestamps ?? [];
-      const session = (window as any).__gameSession;
-      const hpR = session?.remoteController?.state?.hp;
-      const hpL = session?.localController?.state?.hp;
-      w.__broadcastTimestamps.push({at: performance.now(), result, pendingCountAfter: (window as any).__damageBus?.pendingApplyCount() ?? -1, hpRemote: hpR, hpLocal: hpL});
-    }
   };
 }
 
@@ -796,8 +784,6 @@ export async function createScene(
         const winSlot = window as unknown as {
           __serverTransport?: unknown;
           __damageBus?: unknown;
-          __broadcastHandlerRegistered?: boolean;
-          __pendingSweepInterval?: ReturnType<typeof setInterval>;
           /** PR 11.7.C / §3.7 — predictor instance for smoke instrumentation. */
           __predictor?: unknown;
           /** PR 11.7.C / §3.8 — interpolator instance for smoke instrumentation. */
@@ -883,42 +869,20 @@ export async function createScene(
           probe,
         );
         server.onDamageBroadcast(broadcastHandler);
-        if (typeof window !== "undefined") {
-          const w = window as unknown as {__broadcastHandlerRegistered?: boolean; __broadcastHandlerRegisteredAt?: number};
-          w.__broadcastHandlerRegistered = true;
-          w.__broadcastHandlerRegisteredAt = performance.now();
-        }
-        // PR 11.6.D FIX 4: wire the server-private DamageReject
-        // listener so the source tab reverts each rejected
-        // `DamageRequest` IMMEDIATELY rather than waiting for the
-        // 500ms timeout sweep. Without this wiring, the sweep is
-        // the only revert path on the source tab and the spam
-        // phase over-reverts (each pending entry actualDelta gets
-        // re-added, clamped at maxHp — see fix4 commit body for
-        // the convergence failure mode). Wire-format stable since
-        // PR 11.6.D server `ca9f177` (discriminator 0x07; PR 11.7.B bumped to 0x0C);
-        // pre-fix4 the client treated it as an unknown discriminator.
-        probe.onDamageReject((r) => {
-          if (typeof window !== "undefined") {
-            const w = window as unknown as {__rejectHandlerCount?: number; __rejectHandlerResultCounts?: Record<string, number>; __rejectTimestamps?: Array<{at: number, eventId: number, result: string, hpRemote?: number, hpLocal?: number}>};
-            w.__rejectHandlerCount = (w.__rejectHandlerCount ?? 0) + 1;
-          }
-          const result = probe.applyReject(localPlayerId, r.eventId, performance.now());
-          if (typeof window !== "undefined") {
-            const w = window as unknown as {__lastRejectResult?: string; __rejectHandlerResultCounts?: Record<string, number>; __rejectTimestamps?: Array<{at: number, eventId: number, result: string, hpRemote?: number, hpLocal?: number}>};
-            w.__lastRejectResult = result;
-            w.__rejectHandlerResultCounts = w.__rejectHandlerResultCounts ?? {};
-            w.__rejectHandlerResultCounts[result] = (w.__rejectHandlerResultCounts[result] ?? 0) + 1;
-            w.__rejectTimestamps = w.__rejectTimestamps ?? [];
-            const session = (window as any).__gameSession;
-            const hpR = session?.remoteController?.state?.hp;
-            const hpL = session?.localController?.state?.hp;
-            w.__rejectTimestamps.push({at: performance.now(), eventId: r.eventId, result, hpRemote: hpR, hpLocal: hpL});
-          }
+        // PR 11.7.D / §4.4 — DamageReject is INFORMATIONAL only after
+        // Option B (drop optimistic-apply). With no local pending state
+        // to revert, the client's `applyReject` is gone. The wire type
+        // (discriminator 0x0C) + decoder are unchanged — PR 11.6.D
+        // server `ca9f177`, PR 11.7.B bumped the disc from 0x07 to
+        // 0x0C to free 0x07 for the new `Snapshot` wire type. We still
+        // register an empty listener so probe.onDamageReject is wired
+        // (for future probes / debugging); the listener no-ops.
+        probe.onDamageReject(() => {
+          // No-op after Option B. The smoke verifies the broadcast's
+          // HP convergence directly (Tab A's remoteController.hp vs
+          // Tab B's localController.hp). Reject counting was a debug
+          // aid for the pre-Option-B sweep/revert path; not needed now.
         });
-        if (typeof window !== "undefined") {
-          (window as unknown as {__rejectHandlerRegistered?: boolean}).__rejectHandlerRegistered = true;
-        }
         // PR 11.6.D fix4 (Bug A — handler-publish race): before
         // replacing the sentinel with the real ServerTransport,
         // re-check the slot. If a sibling mount somehow sneaked a
@@ -1093,19 +1057,11 @@ export async function createScene(
           winSlot.__interpolator = interpolator;
           winSlot.__latestSnap = () => latestSnap;
         }
-        // PR 11.6.D FIX 4 part C — periodic sweep of expired pending
-        // applies. The server's `DamageReject` packet may be dropped
-        // (channel full, network blip). If a pending apply hasn't seen
-        // a broadcast OR reject within `PENDING_REJECT_TIMEOUT_MS`
-        // (500ms), revert it. Without this sweep, the optimistic HP
-        // stays decremented even after the server has authoritative-
-        // state information that no damage happened. The 20Hz rate
-        // (50ms) is a balance between timely reversion and CPU cost.
-        // The interval is cleared on dispose (see handle.dispose()).
-        const sweepInterval = setInterval(() => {
-          probe.sweepExpiredPending(performance.now());
-        }, 50);
-        (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval = sweepInterval;
+        // PR 11.7.D / §4.4 — sweep interval removed. Clients now
+        // send-and-wait for broadcasts; there is no pending state to
+        // sweep. (Previously swept optimistic applies older than 500ms
+        // that had not yet received a broadcast/reject — see PR 11.6.D
+        // fix4 commit body for the historical context.)
         } catch (e) {
           // PR 11.6.D fix4 (Bug A — failure cleanup): if any step
           // in the async body throws (dynamic import failed, WS
@@ -1132,12 +1088,7 @@ export async function createScene(
     scene,
     dispose: () => {
       window.removeEventListener("resize", onResize);
-      // PR 11.6.D FIX 4 part C — clear the periodic sweep interval.
-      const sweepInterval = (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval;
-      if (sweepInterval !== undefined) {
-        clearInterval(sweepInterval);
-        (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval = undefined;
-      }
+      // PR 11.7.D / §4.4 — sweep interval cleared (no-op after Option B).
       input.dispose();
       chase.dispose();
       spectator?.dispose();
