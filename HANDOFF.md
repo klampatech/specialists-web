@@ -7,34 +7,47 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ## ⚡ TL;DR for the next session (read this first)
 
-**You are here**: post-PR-11.7.C merge. PR 11.7.D is the next move — lockstep substrate retirement + remote visual switchover to interpolator + §4.4 race fix path (b). Worktree `~/Development/specialists-web-pr11.7.c-docs/` is on `docs/post-merge-pr11.7.c` for the docs PR. Servers killed. Main is at `6841606` (PR 11.7.C squash).
+**You are here**: post-PR-11.7.C merge (origin/main = `4c80258`). §4.4 race investigation completed 2026-08-19/20: root cause is **server-side outbound channel overflow** — PR 11.7.B's 20Hz snapshot stream fills the per-connection `mpsc::channel(64)` faster than the WS outbound drains, and `damage_relay::try_send` returns `Err` on the next broadcast → that broadcast is **silently dropped server-side** for that connection. Tab B got it (its WS drained faster), Tab A missed it → persistent 12-HP gap. **Decision (Kyle, 2026-08-20): Option B — drop optimistic-apply entirely.** Closes §4.4 for good AND aligns with PR 11.7.D's lockstep-substrate retirement scope. Worktree clean on `docs/pr11.7.b-spec-banner-update` (now equals origin/main). Servers killed. The new entry below has the full investigation log + the Option-B work scope.
 
-**Where we landed (PR 11.7.C)**:
-- **Client predictor**: `client/src/engine/clientPredictor.ts` (NEW, ~402 lines). Predictor class. `recordLocalInput(localFrame, encoded)` buffers inputs keyed by client-frame; `tick(nowMs)` drains them forward via a save/restore Havok-step wrapper (saves `localController.havok.getPosition()/getVelocity()`, calls `localCtrl.update()`, reads the post-step state, restores pos+vel — live controller unchanged after wrapper returns); `onSnapshot(snap, nowMs)` compares predicted vs. authoritative, re-simulates on drift > `RECONCILIATION_THRESHOLD_M=0.1`, hard-clamps at `MAX_RECONCILIATION_SNAP_DISTANCE_M=2.0`. Constants inlined per the brief's deferred-extraction decision.
-- **Remote interpolator**: `client/src/engine/remoteInterpolator.ts` (NEW, ~347 lines). Interpolator class. Per-player ring buffer (cap 8 = 400ms @ 20Hz), `INTERPOLATION_DELAY_MS=100` lookback, `MAX_SNAPSHOT_AGE_MS=500` extrapolation clamp. Local player excluded. Shortest-arc yaw lerp.
-- **ServerTransport**: `client/src/net/serverTransport.ts` (+39). New `onSnapshot(f)` listener API + `DISCRIMINATOR_SNAPSHOT=0x07` arm in `handleInbound` switch. Mirrors the existing `onDamageBroadcast` shape.
-- **scene.ts wiring**: `client/src/engine/scene.ts` (+177 net). Per-frame `predictorTickHook = (nowMs) => predictor.tick(nowMs)` declared in `createScene` scope; called from the render observer at line 498 BEFORE `gameSession.tick()`. `latestSnap` closure captured in the `server.onSnapshot` listener. `__latestSnap` window probe added. All inside the existing DEV-probe IIFE + StrictMode sync guard (no scope creep into the single-player path or production bundles).
-- **gameSession.ts**: `setPredictor` late-bind on the GameSession handle; `predictor.recordLocalInput(advanced.frame, encodedInput)` called alongside the existing `runtime.submitLocalInput(...)` call. The encode→submit→record pipeline now uses the SAME encoded bytes for all three (encode once, share).
-- **vitest 21/21** (10 existing + 7 predictor + 4 interpolator). New tests: A (no reconcile under threshold), B (reconcile over threshold), C (hard-clamp over MAX snap distance), D (tick advance), E (counter increments on actual reconciliation), F (hard-cap FIFO), F2 (retention window evicts past `reconcileFromFrame - 8`), G (lerp midpoint), H (local exclusion), I (extrapolation on starve), J (extrapolation age clamp).
-- **§4.4 race NOT closed** — the post-spam 12-HP gap is a pre-existing damageBus race (optimistic-apply vs broadcast-receive ordering on the WebRTC peer stream), NOT a snapshot-path bug. The smoke measures `gameSession.remoteController.state.hp` (the lockstep controller's HP), not the snapshot's authoritative HP. The `[XFAIL §4.4] gap=12` log is preserved in `damage-server-hp-convergence-smoke.mjs`. Round-1 attempted to remove the xfail on the premise that snapshot fan-out closes the race; CI run 32299772659 disproved that. Reverted in commit `db2d914`. See PR #39 body for full diagnosis + two fix paths.
+**Where PR 11.7.C landed (carry-forward from previous TL;DR, for context)**:
+- **Client predictor**: `client/src/engine/clientPredictor.ts` (NEW, ~402 lines). `recordLocalInput` buffers inputs; `tick(nowMs)` drains forward via save/restore Havok-step wrapper; `onSnapshot` reconciles on drift > `RECONCILIATION_THRESHOLD_M=0.1`, hard-clamps at `MAX_RECONCILIATION_SNAP_DISTANCE_M=2.0`.
+- **Remote interpolator**: `client/src/engine/remoteInterpolator.ts` (NEW, ~347 lines). Per-player ring buffer cap 8, 100ms lookback, 500ms extrapolation clamp. Local player excluded. Shortest-arc yaw lerp.
+- **ServerTransport**: `client/src/net/serverTransport.ts` (+39). `onSnapshot(f)` listener + `DISCRIMINATOR_SNAPSHOT=0x07` arm. Mirrors `onDamageBroadcast`.
+- **scene.ts**: `predictorTickHook` called before `gameSession.tick()` from render observer. `__latestSnap` probe. All DEV-gated.
+- **gameSession.ts**: `setPredictor` late-bind; `predictor.recordLocalInput` alongside `runtime.submitLocalInput`.
+- **vitest 21/21** (10 existing + 7 predictor + 4 interpolator).
+- **§4.4 race NOT closed** in PR 11.7.C — but is **now diagnosed** (see today's entry).
 
 **Verifier state (run 2026-08-19, CI run 32303277655 on `db2d914`)**:
-- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **170/170 PASS** (87 unit + 35 damage_relay + 16 protocol_wire + 20 session_canary + 12 snapshot). No server changes in 11.7.C; baseline 168 → 170 was codex's count, the brief said 168 (the 11.7.B baseline) — actually 170 because the 11.7.B session_canary count was 18 not 16; the 11.7.B HANDOFF entry's "168" was an off-by-2 typo.
+- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **170/170 PASS**.
 - `cd client && npm run typecheck` → exit 0.
-- `cd client && npm run test` → **21/21 PASS** (10 existing damageBus + 7 clientPredictor + 4 remoteInterpolator).
-- `cd client && npm run build` → exit 0; bundle `index-DbKqCXqe.js` 7,058.13 kB — delta vs PR 11.7.B's `index-D8PAkFrW.js` 7,058.04 kB = +0.09 kB (basically zero, all new code DEV-gated).
-- `grep -E 'PhysicsWorld|SnapshotGenerator|DISPATCHER_SNAPSHOT|clientPredictor|remoteInterpolator' client/dist/assets/index-*.js` → **ZERO matches** (production bundle clean).
-- CI run 32303277655: **20/20 jobs PASS** including the §4.4 smoke with the `[XFAIL §4.4] gap=12` log line.
+- `cd client && npm run test` → **21/21 PASS**.
+- `cd client && npm run build` → exit 0; bundle 7,058.13 kB.
+- 5191 smoke (5× run today): every run shows `Tab A remote=16 vs Tab B local=4 (gap=12)` — deterministic.
+- Canary log: `WARN ... snapshot fan-out: channel full / closed target_player_id=1` — the smoking gun.
 
-**Servers**: not running — cleanup happened during codex's run (the wraparound bash pane's `--yolo` exec exited cleanly, the interactive REPL pane is gone). Reboot via `tools/canary-server.sh --port-wt 14433 --port-ws 14434` (background) + `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort` (background) before running the 5191 smoke. **The 5190 smoke port is 5190, the 5191 smoke port is 5191** (per HANDOFF §"Servers").
+**Servers**: not running. Reboot via `tools/canary-server.sh --port-wt 14433 --port-ws 14434` (background) + `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort` (background).
 
-**Memory**: pre-PR-11.7.B state still in MEMORY.md. The PR 11.7.B summary (Rapier 0.18, snap-to-nearest, Havok reference JSONs) + PR 11.7.C summary (predictor + interpolator + save/restore Havok step + §4.4 race carry-forward) is **NOT** in memory. Read `HANDOFF.md` + `docs/SPEC.md` for the canonical current state.
+**Memory**: pre-PR-11.7.B state still in MEMORY.md. The Option-B decision + §4.4 root cause is NOT in memory. Read `HANDOFF.md` for canonical current state.
 
-**`/tmp` backups preserved**: `/tmp/claude-pr11.7.c-review-out-1787170665.txt` (round-1 review, 14KB), `/tmp/claude-pr11.7.c-rereview-out-1787171620.txt` (round-2 review, 2KB), `/tmp/codex-pr11.7.c-out-1787168009.txt` (codex summary, 4KB), `/tmp/codex-pr11.7.c-brief.md` (the brief, 26KB), `/tmp/codex-pr11.7.c-watchdog.log` (CI watchdog).
+**`/tmp` artifacts preserved**: `/tmp/codex-brief-pr11.7d-s4.4-race.md` (23KB, the Option-A brief I wrote before realizing Option A doesn't work — kept for the record of the wrong-path investigation).
 
-**`herdr` workspaces still open**: `wGW` (codex exec mode for PR 11.7.C, agent process gone, workspace is empty metadata), `wGX` (claude round-1 review, agent process gone), `wGY` (claude round-2 re-review, agent process gone). Safe to `herdr workspace close wGW wGX wGY` if you want a clean slate.
+**The next move**: write Option-B codex brief + dispatch (or do it in-session). Scope:
 
-**The next move**: PR 11.7.D — lockstep substrate retirement + remote visual switchover to the interpolator + §4.4 race fix (path (b): smoke sources HP from the snapshot's authoritative per-player entry instead of the lockstep controller). Follow the locked `git worktree add -b feat/phase1-pr11.7.d-... origin/main` pattern, run the same `coding-task-routing` orchestration (Codex codes → Claude reviews → Evo adjudicates). Scope per plan §5: drop `ggrsRuntime` + `peer` + P2P transport, wire interpolator output to remote visual, retest the 5191 smoke (should close §4.4), carry-forward `0x06 InputSeq` trailer + `protocol/constants.ts` extraction. ~1-2 sessions per the plan's estimate, probably ~3-4 hours of wall time once started.
+1. **Drop `pendingApplies` map** in `client/src/net/damageBus.ts` + remove `optimisticallyAppliedAmount` / `actualAppliedDelta` tracking.
+2. **Remove optimistic apply** in `sendDamageRequest` — clients now send-and-wait for the broadcast. +1 RTT per fire; no visible optimistic HP drop.
+3. **Remove sweep** (`sweepExpiredPending`) + the 50ms `setInterval` in `scene.ts`'s DEV probe.
+4. **Remove recentlySettled map** — only existed to dedup WS retries on the confirm/revert/reject paths, which are gone.
+5. **Simplify `applyBroadcast`** — drop the `pending` lookup (no `pending` to forget) + drop the recentlySettled TTL check. Becomes pure: "if target resolver returns a controller, apply damage; otherwise ignore."
+6. **Update `damage-server-hp-convergence-smoke.mjs`** — remove all the `__broadcastHandlerCount` / `__broadcastTimestamps` instrumentation (no longer relevant); remove the `pendingApplyCount` checks; the post-spam HP convergence assertion becomes a simple strict-equality check.
+7. **Update vitest tests** in `damageBus.test.ts` — drop Tests A-E (the `pendingApplies` overflow/sweep/revert tests); keep Tests F-H (DamageReject round-trip is still relevant); add a new Test I: broadcast-without-pending just applies the damage directly.
+8. **Update SPEC.md** — §4.4 row flips to ✅. §3.9 (optimistic apply) is now defunct — leave the text for historical record but mark as "removed by Option B in PR 11.7.D".
+9. **Update HANDOFF.md** with a fresh entry at the top documenting the investigation + the Option B implementation.
+10. **No server changes** — the server-side channel overflow is a separate problem (the snapshot stream pressure). It only manifested via the optimistic-apply/sweep interaction; without optimistic-apply, broadcasts that arrive "late" just apply normally when they get through.
+
+Verification: 22/22 vitest (replace removed tests with simpler applyBroadcast-direct tests), 170/170 cargo, 5191 smoke 10× strict-equality PASS, 5190 smoke PASS.
+
+**Risk**: the "+1 RTT per fire" cost is real but bounded — 60-150ms on localhost, 50-200ms on Tailscale. The smoke + UI design assumes the optimistic-apply UX; the visual feedback loop is now "fire → wait one RTT → HP drops". Acceptable per Kyle's "do it right" preference.
 
 **Where we landed (PR 11.7.B)**:
 - **Server physics**: Rapier 3D 0.18 (brief said 0.12 but 0.12 doesn't compile on Rust 1.95; 0.18 has the same `enhanced-determinism` feature surface — comment in `server/Cargo.toml` documents the bump) wrapped in a `PhysicsWorld` newtype that owns Rapier's pipeline (`RigidBodySet`/`ColliderSet`/`IslandManager`/`BroadPhase`/`NarrowPhase`/`CCDSolver`/`QueryPipeline`/`PhysicsPipeline` — Rapier 0.18 has no monolithic `World` struct). Per-player capsule + `KinematicCharacterController` (Rapier 0.18 has no `RigidBody::is_grounded()`). Fixed-timestep `dt = 1/64`.
@@ -63,6 +76,68 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **`/tmp` backups preserved**: `/tmp/havok-ref.log` (last capture run, 6.5KB), `/tmp/canary.log` (smoke run, 5KB), `/tmp/vite.log` (smoke run, 1KB).
 
 **The next move**: squash + push PR 11.7.B + dispatch PR 11.7.C (client-side prediction/interpolation/reconciliation; consume the new `Snapshot` stream on the client). The 11.7.C brief should reference the `protocol/snapshot.ts` mirror + the §3.13 / §3.14 parity fix already in place. PR 11.7.D retires `ggrsRuntime.ts` + `peer.ts`; PR 11.7.E adds reload mechanics; PR 11.7.F adds production cert handling.
+
+
+## 2026-08-19/20 — §4.4 race investigation + Option B decision (drop optimistic-apply). Branch `docs/pr11.7.b-spec-banner-update` (now = origin/main at `4c80258`).
+
+**Status**: §4.4 race FULLY DIAGNOSED. The smoking gun is server-side, not client-side. **Decision (Kyle, 2026-08-20): Option B** — drop optimistic-apply entirely. Closes §4.4 and aligns with PR 11.7.D's lockstep retirement scope. Implementation brief to be drafted.
+
+**Investigation log (chronological)**:
+1. **Initial state**: PR 11.7.C MERGED. 5191 smoke logs `[XFAIL §4.4] gap=12` after every run. The PR #39 body said "snapshot fan-out did NOT close the race (smoke reads the lockstep controller, not the snapshot's authoritative HP)" and recommended either (a) a damageBus fix or (b) PR 11.7.D's remote-visual switchover.
+2. **Smoke-faithful replay diagnostic** (with full instrumentation: hooks on `bus.sendDamageRequest`, `applyBroadcast`, `sweepExpiredPending`, `applyReject`; HP polling at 10Hz). Captured every event on Tab A's `remoteController`. **Critical finding**: when the post-spam gap appears, Tab A's `__broadcastHandlerCount=7` (not 8). Tab B's broadcast handler also fires 7 times. The MISSING broadcast never arrived at Tab A's WS inbound — not "ignored," not "wrong controller," just **not received.**
+3. **Server-side smoking gun**: canary log lines `WARN specialists_server::transport: snapshot fan-out: channel full / closed target_player_id=1` appear continuously on the smoke's localhost. The 20Hz snapshot stream fills the per-connection `mpsc::channel(64)` faster than the WS outbound drains; subsequent `damage_relay::try_send` returns `Err` and the broadcast is **silently dropped server-side.** Comment at `server/src/transport.rs:661-664` even acknowledges the design: *"The client will lag / miss this broadcast; the timeout sweep in `damageBus.ts` (FIX 4) reverts the optimistic apply after PENDING_REJECT_TIMEOUT_MS."*
+4. **First wrong hypothesis (REVERTED)**: assumed the bug was `recentlySettled` + sweep interaction (the PR 11.6.D fix4 smoking-gun diagnostic's "broadcast reverses optimistic apply"). Applied a patch removing `markSettled` from `sweepExpiredPending`. **Smoke still failed with the same 12-HP gap.** Reverted. Lesson: the PR 11.6.D smoking-gun is a DIFFERENT bug (a single fire where the broadcast arrived in time but the sweep still reverted for some other reason — possibly unrelated to §4.4).
+5. **Real chain of events**: server tries to fan out broadcast → outbound channel full of snapshots → `try_send` returns `Err` → broadcast dropped server-side → Tab A's WS never receives it → Tab A's `pendingApplies` entry times out at 500ms → sweep reverts HP back to optimistic value → Tab A's HP is +12 too high → Tab B got the broadcast (its WS drained faster that cycle) → Tab B's HP is correct. **Persistent gap.**
+
+**Why optimistic-apply makes the symptom worse**: the client-side optimistic apply + sweep creates a window where Tab A's HP can diverge from the server's authoritative HP. Without optimistic-apply, Tab A simply waits for the broadcast — if it's dropped, Tab A still shows pre-fire HP (correct, no optimistic divergence). The next broadcast or the smoke's `hpA_post === hpB_post` check just reflects whatever the server eventually confirms. **No persistent +12 gap.**
+
+**Option B scope** (the "do it right" path per Kyle's preference):
+1. `client/src/net/damageBus.ts` — drop `pendingApplies` map, `PendingOptimisticApply` interface, `optimisticallyAppliedAmount` / `actualAppliedDelta` fields. Drop `forgetOptimisticApply`, `markSettled`, `recentlySettled` map. Drop `PENDING_REJECT_TIMEOUT_MS` constant. Drop `sweepExpiredPending` (and its 50ms `setInterval` from scene.ts). Simplify `applyBroadcast` to pure: "if target resolver returns a controller, apply damage; otherwise ignore." `applyReject` still exists for server-rejected requests (no client-side state to clean up though).
+2. `client/src/engine/scene.ts` — remove the `setInterval(() => probe.sweepExpiredPending(...), 50)` block + the `__pendingSweepInterval` window probe + its `clearInterval` in `dispose()`. Update the broadcast handler — `getControllers()` stays (still useful for the LIVE session's controllers). Remove all `pendingApplyCount` / `forgetOptimisticApply` references.
+3. `client/src/game/gameSession.ts` — `sendDamageRequest` becomes a pure send (no `applyDamage` call before send). 4 local-fire call sites in `tick()` simplify from `dbSendDamageRequest(...) + applyDamage(...)` to `dbSendDamageRequest(...)` alone.
+4. `client/tools/damage-server-hp-convergence-smoke.mjs` — remove `__broadcastHandlerCount` / `__broadcastTimestamps` instrumentation. Remove `pendingApplyCount` calls. Remove the `[XFAIL §4.4]` log block (lines 562-595). Replace with strict assertion: `if (Math.abs(hpA_post - hpB_post) > 1) throw new Error(...)`.
+5. `client/src/net/damageBus.test.ts` — drop Tests A-E (pending-map overflow/sweep/revert). Keep Tests F-H (DamageReject round-trip + body-size). Add new Test I: broadcast-with-no-pending just applies the damage directly.
+6. `docs/SPEC.md` — §4.4 row flips from `⚠️ XFAIL` to `✅ closed (PR 11.7.D Option B)`. §3.9 row (optimistic-apply) gets marked `defunct — removed by PR 11.7.D Option B`. Carry-forward lists updated.
+7. `HANDOFF.md` — this entry (already drafted above) plus the post-merge entry after the PR merges.
+8. **No server changes** — the snapshot stream pressure is a separate bandwidth-management problem (PR 11.7.D's larger scope; plan §3.4 + §3.10.1). Option B's "send-and-wait" pattern handles the dropped-broadcast scenario gracefully (HP doesn't diverge), even if the server occasionally drops broadcasts due to snapshot congestion.
+
+**Files expected to change** (~12 files, +30/-250 lines net):
+- `client/src/net/damageBus.ts` (major simplification)
+- `client/src/engine/scene.ts` (remove sweep + probe)
+- `client/src/game/gameSession.ts` (simplify 4 call sites)
+- `client/tools/damage-server-hp-convergence-smoke.mjs` (remove instrumentation + xfail block + add strict assertion)
+- `client/src/net/damageBus.test.ts` (drop 5 tests, keep 3, add 1)
+- `docs/SPEC.md` (~10 lines: flip rows + 1-line notes)
+- `HANDOFF.md` (post-merge entry)
+
+**Verification gates**:
+- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **170/170 PASS** (no server changes)
+- `cd client && npx vitest run --reporter=verbose` → **19/19 PASS** (10 damageBus with Tests F-H + new Test I = 4, + 7 predictor + 4 interpolator = 15; wait, 4+7+4 = 15. Plus the new Test I... actually need to count again post-edit.)
+- `cd client && npm run typecheck` → exit 0
+- `cd client && npm run build` → exit 0; bundle delta < 5 kB
+- 5191 smoke (10× in a row) → ALL PASS with strict-equality, NO `[XFAIL §4.4]` log line
+- 5190 smoke → PASS (no regression)
+- Bundle grep `__forceServerTransport|__serverTransport|__damageBus|__pendingOptimistic|__pendingSweepInterval` → ZERO matches (production bundle clean — drop the `__pendingSweepInterval` from the production-bundle leak list)
+
+**Six gotchas worth flagging**:
+1. **The PR 11.6.D smoking-gun diagnostic from fix4 is a SEPARATE bug**, not §4.4. That devtools probe showed `before=100, afterImmediate=88, afterBroadcast=100` for a single fire. The "afterBroadcast=100" there might be the sweep+recentlySettled interaction in a different scenario. Worth a separate diagnostic but not in this PR's scope.
+2. **The 4 gameSession.ts local-fire call sites** (lines 482-518 region) all look the same — `dbSendDamageRequest + applyDamage`. Make sure to remove BOTH calls and replace with just the `dbSendDamageRequest` (which becomes a no-op-for-HP pure send). Don't accidentally leave the local apply.
+3. **`applyReject` simplification**: after Option B, `applyReject` only needs to log (or be deleted entirely). There's no client-side pending state to clean up. Decide whether to keep the `DamageReject` wire type at all — the server still sends it (for fire-rate violations, etc.) but the client doesn't need to react. Recommendation: keep the wire type + the decode, remove the `applyReject` function (or make it a no-op log). Document the decision in the brief.
+4. **The `pendingApplies` map had a `trackOptimisticApply` overflow path** (line 206) that called `applyDamage(correction)` on overflow eviction. That entire path goes away.
+5. **Test counts**: Tests A-E in damageBus.test.ts cover pending-map overflow, late-broadcast-on-swept-entry, sweep reverts, confirm-no-double-apply, actualAppliedDelta. All gone. Tests F (clamped-confirm convergence) — also gone (no confirm path anymore). Tests G (drop-branch markSettled) — gone. Tests H (DamageReject round-trip) — keep (decoder/encoder still useful). New Test I needed.
+6. **Don't add `0x06 InputSeq` trailer** to this PR — that's PR 11.7.D's separate work per the carry-forward. Keep this PR focused on §4.4 closure.
+
+**Carry-forward (NOT closed by this PR — separate work)**:
+- `0x06 InputSeq` trailer (PR 11.7.D — input ack cadence for reconciliation)
+- Lockstep substrate retirement (`ggrsRuntime.ts` + `peer.ts` + P2P transport) (PR 11.7.D)
+- Remote visual switchover to interpolator (PR 11.7.D — interpolator already exists, just needs to drive the visual)
+- `protocol/constants.ts` extraction (PR 11.7.D — 5 constants currently inlined per the brief's deferred-extraction decision)
+- `capture-havok-reference.mjs` Havok-sync bug (separate diagnostic PR)
+- WAN-throttle verification (the 6-step checklist from PR 11.5)
+- Vendored `wtransport` drop-if-clean-build
+- Mixamo glTF character swap (visual upgrade so smoke failures are observable)
+- `rustls-acme` production cert (PR 11.7.F)
+- **Server-side outbound channel bandwidth management** — separate problem. PR 11.7.B's 20Hz snapshot stream (68B × 20Hz = 1.4 KB/s) is small but the WS outbound stall in headless Chromium is the trigger. Options: (i) increase `mpsc::channel(64)` buffer to e.g. 256, (ii) split the channel so snapshots and damage have separate queues, (iii) adaptive snapshot rate (skip emit when channel is full). Defer to PR 11.7.D's bandwidth work or follow-up.
 
 
 ## 2026-08-18 — PR 11.7.B (server physics + snapshot generator — Rapier + 64Hz tick + Snapshot 0x07 + coyote-time parity + PositionHistory cutover). Branch `feat/phase1-pr11.7.b-server-snapshot`.
