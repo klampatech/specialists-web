@@ -7,76 +7,44 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ## ⚡ TL;DR for the next session (read this first)
 
-**You are here**: post-PR-11.7.C merge (origin/main = `4c80258`). §4.4 race investigation completed 2026-08-19/20: root cause is **server-side outbound channel overflow** — PR 11.7.B's 20Hz snapshot stream fills the per-connection `mpsc::channel(64)` faster than the WS outbound drains, and `damage_relay::try_send` returns `Err` on the next broadcast → that broadcast is **silently dropped server-side** for that connection. Tab B got it (its WS drained faster), Tab A missed it → persistent 12-HP gap. **Decision (Kyle, 2026-08-20): Option B — drop optimistic-apply entirely.** Closes §4.4 for good AND aligns with PR 11.7.D's lockstep-substrate retirement scope. Worktree clean on `docs/pr11.7.b-spec-banner-update` (now equals origin/main). Servers killed. The new entry below has the full investigation log + the Option-B work scope.
+**You are here**: PR 11.7.D Option B REVERTED. CI run 32420953306 (PR #41) revealed TWO regressions: (1) the Phase 0 / PR 10 health regression smoke (port 5177, single-tab WebRTC P2P) failed because PR 11.7.D removed the local-apply path; (2) the 5191 CI smoke failed on run 2 of 3 with `Tab A single fire never decremented remoteController HP: hp never dropped (broadcast didn't land within 2s)` — the StrictMode race. Both regressions were reachable from `git grep` and should have been in the pre-merge checklist. PR #41 closed, branch + worktree + remote deleted. The docs branch `docs/post-merge-pr11.7.d-s4.4-investigation` survives.
 
-**Where PR 11.7.C landed (carry-forward from previous TL;DR, for context)**:
-- **Client predictor**: `client/src/engine/clientPredictor.ts` (NEW, ~402 lines). `recordLocalInput` buffers inputs; `tick(nowMs)` drains forward via save/restore Havok-step wrapper; `onSnapshot` reconciles on drift > `RECONCILIATION_THRESHOLD_M=0.1`, hard-clamps at `MAX_RECONCILIATION_SNAP_DISTANCE_M=2.0`.
-- **Remote interpolator**: `client/src/engine/remoteInterpolator.ts` (NEW, ~347 lines). Per-player ring buffer cap 8, 100ms lookback, 500ms extrapolation clamp. Local player excluded. Shortest-arc yaw lerp.
-- **ServerTransport**: `client/src/net/serverTransport.ts` (+39). `onSnapshot(f)` listener + `DISCRIMINATOR_SNAPSHOT=0x07` arm. Mirrors `onDamageBroadcast`.
-- **scene.ts**: `predictorTickHook` called before `gameSession.tick()` from render observer. `__latestSnap` probe. All DEV-gated.
-- **gameSession.ts**: `setPredictor` late-bind; `predictor.recordLocalInput` alongside `runtime.submitLocalInput`.
-- **vitest 21/21** (10 existing + 7 predictor + 4 interpolator).
-- **§4.4 race NOT closed** in PR 11.7.C — but is **now diagnosed** (see today's entry).
+**Where we are now (post-revert)**:
+- **Main is at `4c80258`** — PR #40 (PR 11.7.C docs post-merge) merged. PR 11.7.D in pre-flight, no longer in flight.
+- **§4.4 race still open** — the 12-HP gap in 5191 smoke is the same race it was before. The 5191 smoke is now [XFAIL §4.4] gap=12 (PR #37's xfail is back in effect via the reversion).
+- **Servers killed**. Working tree clean.
+- **The throw→warn fix in `gameSession.ts::tick()` is REVERTED** — codex's defensive `throw on no-serverTransport` is back in place. This is a real bug (the throw kills the tick loop on transient disconnects) but it's pre-existing scope, not a PR 11.7.D issue.
 
-**Verifier state (run 2026-08-19, CI run 32303277655 on `db2d914`)**:
-- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **170/170 PASS**.
-- `cd client && npm run typecheck` → exit 0.
-- `cd client && npm run test` → **21/21 PASS**.
-- `cd client && npm run build` → exit 0; bundle 7,058.13 kB.
-- 5191 smoke (5× run today): every run shows `Tab A remote=16 vs Tab B local=4 (gap=12)` — deterministic.
-- Canary log: `WARN ... snapshot fan-out: channel full / closed target_player_id=1` — the smoking gun.
+**What I learned (writeup for Kyle's regroup)**:
+1. **The 5191 smoke passes locally 5/5 but fails in CI on run 2** — the StrictMode race is order-dependent. Local fresh boots don't hit it; CI warm processes + 3x run do. PR 11.7.D Option B did NOT fix this; it just made it more visible by removing the local-apply fallback.
+2. **The health regression smoke (5177) is a 3-year-old smoke that tests the P2P local-apply path.** PR 11.7.D Option B's scope "drop optimistic-apply" was too aggressive — it removed the P2P path that the smoke has been covering since Phase 0 / PR 10.
+3. **The smoke is the load-bearing test, but ONLY when it passes in CI.** Five local passes + one CI failure = a real regression. I should have run the FULL CI pipeline locally before raising, not just the load-bearing smoke.
+4. **PR 11.7.D main scope (lockstep substrate retirement) is the right place to drop P2P** — but that's a separate PR. The fix6 PR was supposed to be a focused §4.4 race fix, not a substrate retirement.
+5. **The throw→warn fix is a real bug, but it's a separate PR scope.** It should be landed as a single-line PR with the throw removed, not as part of a broader substrate change.
 
-**Servers**: not running. Reboot via `tools/canary-server.sh --port-wt 14433 --port-ws 14434` (background) + `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort` (background).
+**Recommended regroup plan**:
+1. **Revert PR 11.7.D's docs PR** (the docs/post-merge-pr11.7.d-s4.4-investigation branch is in the way of PR 11.7.D main scope; leave it alone for now, the SPEC §4.4 "CLOSED" banner is wrong).
+2. **Open a focused, minimal PR** — just the throw→warn fix in `gameSession.ts::tick()`. ~10 lines. Re-runs CI. Should pass: tight scope, no regression to the health smoke (the throw was already there), no regression to the 5191 smoke (5201 smoke is unaffected by the throw).
+3. **Open a separate PR** for the §4.4 server-side broadcast drop fix (PR 11.7.D's bandwidth-management work — separate scope).
+4. **PR 11.7.D main scope** (lockstep substrate retirement) retires the P2P path, which is when the health smoke (5177) should be deleted and the 5191 smoke becomes the authoritative damage test.
 
-**Memory**: pre-PR-11.7.B state still in MEMORY.md. The Option-B decision + §4.4 root cause is NOT in memory. Read `HANDOFF.md` for canonical current state.
+**Servers still to bring up when needed**:
+- canary: `cd /home/kyle/Development/specialists-web && server/target/release/specialists-server --port-wt 14433 --port-ws 14434 --cert server/certs/dev.pem --key server/certs/dev.key --sans localhost,127.0.0.1,100.95.111.112,::1`
+- vite: `cd /home/kyle/Development/specialists-web/client && npm run dev -- --host 0.0.0.0 --port 5191 --strictPort`
 
-**`/tmp` artifacts preserved**: `/tmp/codex-brief-pr11.7d-s4.4-race.md` (23KB, the Option-A brief I wrote before realizing Option A doesn't work — kept for the record of the wrong-path investigation).
+**Pre-merge checklist (lesson learned — run the FULL CI before raising, not just the load-bearing smoke)**:
+1. `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` (expect 170/170).
+2. `cd client && npx tsc -b --noEmit && npx vitest run --reporter=verbose && npm run build` (expect clean + all tests PASS).
+3. **Run the FULL local smoke matrix** — every CI smoke job, not just the load-bearing one. List: 5173 scene, 5174 two-tab, 5175 mouse-pitch, 5176 yaw, 5177 health, 5178 spectator, 5179 pause, 5180 jump, 5181 wallrun, 5182 lockstep-rollback, 5183 health-regression, 5190 damage-server, 5191 hp-convergence. The 5177 health smoke is the one that catches the §4.4 P2P regression.
+4. `grep -E '__forceServerTransport|__serverTransport|__damageBus|__pendingOptimistic|__pendingSweepInterval|__broadcastHandlerCount|__broadcastTimestamps' client/dist/assets/index-*.js` (expect ZERO matches in prod bundle).
+5. Tear down.
+6. THEN raise the PR.
 
-**The next move**: write Option-B codex brief + dispatch (or do it in-session). Scope:
-
-1. **Drop `pendingApplies` map** in `client/src/net/damageBus.ts` + remove `optimisticallyAppliedAmount` / `actualAppliedDelta` tracking.
-2. **Remove optimistic apply** in `sendDamageRequest` — clients now send-and-wait for the broadcast. +1 RTT per fire; no visible optimistic HP drop.
-3. **Remove sweep** (`sweepExpiredPending`) + the 50ms `setInterval` in `scene.ts`'s DEV probe.
-4. **Remove recentlySettled map** — only existed to dedup WS retries on the confirm/revert/reject paths, which are gone.
-5. **Simplify `applyBroadcast`** — drop the `pending` lookup (no `pending` to forget) + drop the recentlySettled TTL check. Becomes pure: "if target resolver returns a controller, apply damage; otherwise ignore."
-6. **Update `damage-server-hp-convergence-smoke.mjs`** — remove all the `__broadcastHandlerCount` / `__broadcastTimestamps` instrumentation (no longer relevant); remove the `pendingApplyCount` checks; the post-spam HP convergence assertion becomes a simple strict-equality check.
-7. **Update vitest tests** in `damageBus.test.ts` — drop Tests A-E (the `pendingApplies` overflow/sweep/revert tests); keep Tests F-H (DamageReject round-trip is still relevant); add a new Test I: broadcast-without-pending just applies the damage directly.
-8. **Update SPEC.md** — §4.4 row flips to ✅. §3.9 (optimistic apply) is now defunct — leave the text for historical record but mark as "removed by Option B in PR 11.7.D".
-9. **Update HANDOFF.md** with a fresh entry at the top documenting the investigation + the Option B implementation.
-10. **No server changes** — the server-side channel overflow is a separate problem (the snapshot stream pressure). It only manifested via the optimistic-apply/sweep interaction; without optimistic-apply, broadcasts that arrive "late" just apply normally when they get through.
-
-Verification: 22/22 vitest (replace removed tests with simpler applyBroadcast-direct tests), 170/170 cargo, 5191 smoke 10× strict-equality PASS, 5190 smoke PASS.
-
-**Risk**: the "+1 RTT per fire" cost is real but bounded — 60-150ms on localhost, 50-200ms on Tailscale. The smoke + UI design assumes the optimistic-apply UX; the visual feedback loop is now "fire → wait one RTT → HP drops". Acceptable per Kyle's "do it right" preference.
-
-**Where we landed (PR 11.7.B)**:
-- **Server physics**: Rapier 3D 0.18 (brief said 0.12 but 0.12 doesn't compile on Rust 1.95; 0.18 has the same `enhanced-determinism` feature surface — comment in `server/Cargo.toml` documents the bump) wrapped in a `PhysicsWorld` newtype that owns Rapier's pipeline (`RigidBodySet`/`ColliderSet`/`IslandManager`/`BroadPhase`/`NarrowPhase`/`CCDSolver`/`QueryPipeline`/`PhysicsPipeline` — Rapier 0.18 has no monolithic `World` struct). Per-player capsule + `KinematicCharacterController` (Rapier 0.18 has no `RigidBody::is_grounded()`). Fixed-timestep `dt = 1/64`.
-- **Tick loops**: PR 11.6.D's 64Hz trim-position-history tick loop folded into the new `physics_tick_loop` (don't keep two tick loops — both incremented `room.next_server_frame`). New `snapshot_generator_loop` at 20Hz emits `Snapshot` if `maybe_emit` returns Some.
-- **Wire format**: `DISCRIMINATOR_SNAPSHOT = 0x07` + `DISCRIMINATOR_STATE_ACK = 0x08` (declared, encoder/decoder deferred to 11.7.C). `DISCRIMINATOR_DAMAGE_REJECT` bumped from `0x07` → `0x0C` to free `0x07` for `Snapshot` (in both `server/src/protocol.rs` and `protocol/damage.ts`).
-- **§3.13 coyote-time parity**: `apply_jumps` helper in `physics.rs` grants JUMP_IMPULSE within `COYOTE_FRAMES=2` after losing grounded contact. Pinned by 2 new `session_canary` tests.
-- **§3.14 hitscan-mid-air edge case**: `PositionHistory::snapshot_at(t)` flipped from "largest <= target" to "snap to nearest within ±8 frames". Pinned by 1 new `session_canary` test + 3 new unit tests.
-- **§4.5 Havok reference capture**: `client/tools/capture-havok-reference.mjs` boots canary + vite on 5191, drives Havok through 2 scripted sequences (coyote-time ledge walk-off + mid-air hitscan apex), writes `client/test-data/coyote-reference.json` (12.7KB, 60 frames) + `hitscan-mid-air-reference.json` (10.7KB, 60 frames, apex at frame 8 y=3.087). Both files in place; post-11.7.B parity smokes (added in 11.7.C) will diff against these.
-
-**Verifier state (run 2026-08-18)**:
-- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` → **168 tests pass** (87 unit + 35 damage_relay + 16 protocol_wire + 18 session_canary + 12 snapshot). Up from PR 11.6.D's 126 = +42 net new.
-- `cd client && npm run typecheck` → clean.
-- `cd client && npm run build` → clean; bundle `index-D8PAkFrW.js` 7,058.04 kB — **same hash as PR 11.6.D baseline** (delta = 0).
-- `cd client && npm run test` (vitest) → **10/10 PASS** (no new vitest in this PR; 11.7.C adds them).
-- `grep -E 'PhysicsWorld|SnapshotGenerator|DISPATCHER_SNAPSHOT' client/dist/assets/index-*.js` → **ZERO matches** (production bundle clean).
-- `cd server && SKIP_WEBTRANSPORT_TEST=1 cargo test --release` × 2 runs → sorted `test result` lines byte-identical (Rapier `enhanced-determinism` feature flag honored; no `Instant::now()` reads in the tick).
-- 5191 damage smoke: assertion 4 PASS (HP=88 baseline holds); post-spam 12-HP carry-forward is the known gap, acceptable per plan §4.4.
-- Havok reference capture: both JSONs written, both > 1KB.
-
-**Servers**: not running — cleanup happened during capture-script iteration. Reboot via `tools/canary-server.sh --port-wt 14433 --port-ws 14434` (background) + `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort` (background) before running the 5191 smoke.
-
-**Memory**: pre-PR-11.7.B state still in MEMORY.md. The PR 11.7.B summary (Rapier 0.18, snap-to-nearest, Havok reference JSONs) is **NOT in memory**. Read `HANDOFF.md` + `docs/SPEC.md` for the canonical current state.
-
-**Codex 4-for-4 burn-trace** (from PR 11.6.D; not observed in PR 11.7.B so far): codex has historically stalled at the 90-min wall-clock mark on every fix round. Recovery pattern: parse JSONL, re-run verifier gates, write the commit yourself. **~10-15 min overhead per round**.
-
-**`/tmp` backups preserved**: `/tmp/havok-ref.log` (last capture run, 6.5KB), `/tmp/canary.log` (smoke run, 5KB), `/tmp/vite.log` (smoke run, 1KB).
-
-**The next move**: squash + push PR 11.7.B + dispatch PR 11.7.C (client-side prediction/interpolation/reconciliation; consume the new `Snapshot` stream on the client). The 11.7.C brief should reference the `protocol/snapshot.ts` mirror + the §3.13 / §3.14 parity fix already in place. PR 11.7.D retires `ggrsRuntime.ts` + `peer.ts`; PR 11.7.E adds reload mechanics; PR 11.7.F adds production cert handling.
-
+**Next session plan (after regroup)**:
+1. Bring the 5191 smoke + canary back up.
+2. Open the minimal `throw→warn` PR (~10 lines).
+3. Open the docs PR (`docs/post-merge-pr11.7.d-s4.4-investigation` branch) AS A NEW SEPARATE PR that removes the SPEC §4.4 "CLOSED" banner — until PR 11.7.D main scope lands, the race is NOT closed.
+4. Open the PR 11.7.D scope expansion: the §4.4 fix is a server-side broadcast drop mitigation (PR 11.7.D's bandwidth-management work). The P2P path stays for P2P smokes; the server-auth path gets the optimistic-apply removed.
 
 ## 2026-08-19/20 — §4.4 race investigation + Option B decision (drop optimistic-apply). Branch `docs/pr11.7.b-spec-banner-update` (now = origin/main at `4c80258`).
 
