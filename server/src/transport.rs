@@ -240,7 +240,20 @@ async fn handle_websocket_connection(
     // `next_placeholder_player_id`) until its first `DamageRequest`
     // claims its real PlayerId; the dispatcher re-registers under
     // the claimed id (see `handle_binary`'s DamageRequest arm).
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(64);
+    //
+    // PR 11.7.B hardening: bump outbound mpsc from 64 → 256 slots.
+    // PR 11.7.B's 20Hz snapshot stream (SNAPSHOT_RATE_HZ=20,
+    // ~70B per snapshot ≈ 1.4 KB/s sustained outbound pressure)
+    // shares this mpsc with damage broadcasts. The 64-slot buffer
+    // was sized for damage-only traffic and intermittently saturated
+    // under snapshot pressure in headless Chromium (the WS outbound
+    // stalls under 2-tab playwright load), causing
+    // `broadcast_snapshot::try_send` to log `channel full / closed`
+    // warns. 256 slots gives ~12.8s of headroom at sustained
+    // 1.4 KB/s pressure — enough margin for the WS outbound to
+    // drain without dropping snapshots. Does NOT close the §4.4
+    // HP-gap race (that's client-side; tracked in §4.4 carry-forward).
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(256);
     let placeholder_id = next_placeholder_player_id();
     let conn_state = ConnectionState::new();
     {
@@ -395,7 +408,14 @@ async fn handle_webtransport_session(
     // PlayerId (assigned by `next_placeholder_player_id`) until
     // its first `DamageRequest` claims its real PlayerId; the
     // dispatcher re-registers under the claimed id.
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(64);
+    //
+    // PR 11.7.B hardening: matches the WebSocket listener's
+    // 256-slot outbound mpsc (above). The size MUST be identical
+    // across both listeners — Room.connections stores one Sender
+    // per transport and the dispatcher pushes to all of them, so
+    // a size mismatch would silently starve whichever transport
+    // got the smaller queue.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(256);
     let placeholder_id = next_placeholder_player_id();
     let conn_state = ConnectionState::new();
     {
