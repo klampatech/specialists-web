@@ -203,24 +203,50 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
  * PR 11.7.B / §3.5 — decode a wire-format Snapshot. Returns
  * `null` on any size / discriminator mismatch. Mirror of the
  * Rust `decode_snapshot`.
+ *
+ * **Wire convention**: `buf` is the post-discriminator BODY
+ * bytes — i.e. `wire_bytes.subarray(1)`. This matches the
+ * `serverTransport.handleInbound` contract (the discriminator
+ * is consumed at the top of `handleInbound` in
+ * `client/src/net/serverTransport.ts` to drive the dispatch
+ * switch — see `const body = bytes.subarray(1)` at line ~577 of
+ * that file, where the discriminator byte is stripped — then
+ * the remaining bytes are passed to listeners). It also matches
+ * the sibling decoder convention in `protocol/damage.ts`
+ * (`decodeDamageBroadcast`, `decodeDamageReject` both expect
+ * discriminator-stripped bodies). The full on-the-wire bytes
+ * (disc + body) are what `encodeSnapshot` produces — and what
+ * the server's `encode_snapshot` produces — so
+ * `decodeSnapshot(encodeSnapshot(s).subarray(1))` round-trips to `s`.
+ *
+ * **Why this matters (PR 11.7.D / §4.4 closure)**: pre-fix this
+ * function incorrectly checked `buf[0] !== DISCRIMINATOR_SNAPSHOT`,
+ * but `serverTransport` already strips the discriminator before
+ * dispatching — so the check always failed and `decodeSnapshot`
+ * always returned `null`. Result: `__latestSnap` was never
+ * populated from the wire, and the smoke's HP convergence
+ * assertion hung. Fixing the offsets + removing the discriminator
+ * check (since the caller already stripped it) makes
+ * `decodeSnapshot` symmetric with `decodeDamageBroadcast` /
+ * `decodeDamageReject`.
  */
 export function decodeSnapshot(buf: Uint8Array): Snapshot | null {
-  // Minimum wire size: 1 disc + 4 serverFrame + 4 nextServerFrame + 1 playerCount = 10.
-  if (buf.length < SNAPSHOT_WIRE_SIZE_MIN) return null;
-  if (buf[0] !== DISCRIMINATOR_SNAPSHOT) return null;
+  // Minimum body size: 4 serverFrame + 4 nextServerFrame + 1 playerCount = 9.
+  // (The discriminator byte has already been stripped by the caller.)
+  if (buf.length < SNAPSHOT_BODY_SIZE) return null;
   // Per-player payload size: 29 bytes each.
-  const bodySize = buf.length - SNAPSHOT_WIRE_SIZE_MIN;
+  const bodySize = buf.length - SNAPSHOT_BODY_SIZE;
   if (bodySize % PLAYER_STATE_BODY_SIZE !== 0) return null;
   const nPlayers = bodySize / PLAYER_STATE_BODY_SIZE;
   if (nPlayers > 0xff) return null;
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const serverFrame = dv.getUint32(1, false);
-  const nextServerFrame = dv.getUint32(5, false);
-  const playerCount = dv.getUint8(9);
+  const serverFrame = dv.getUint32(0, false);
+  const nextServerFrame = dv.getUint32(4, false);
+  const playerCount = dv.getUint8(8);
   if (playerCount !== nPlayers) return null;
   const players: PlayerState[] = [];
   for (let i = 0; i < playerCount; i++) {
-    const off = 10 + i * PLAYER_STATE_BODY_SIZE;
+    const off = 9 + i * PLAYER_STATE_BODY_SIZE;
     players.push({
       playerId: dv.getUint16(off + 0, false),
       positionX: dv.getFloat32(off + 2, false),
