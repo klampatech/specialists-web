@@ -323,6 +323,29 @@ pub fn validate_and_relay(
     room.last_event_id_for_source
         .insert(req_source, req.event_id);
 
+    // PR 11.7.D / D1 / §4.4 closure: mutate the target's HP on the
+    // server so the snapshot's `players[i].hp` is the
+    // server-authoritative value (the brief's premise). Without this
+    // decrement, the snapshot's HP would stay at 100 forever — the
+    // client-side `applyBroadcast` was the only path that ever
+    // changed HP, and the §4.4 race (optimistic-apply vs broadcast-
+    // receive ordering) was the only reason HP could diverge on the
+    // same broadcast. With the snapshot's HP mutated here, the
+    // snapshot stream is the single source of truth and broadcast
+    // drops become invisible (the snapshot doesn't drop under the
+    // outbound-channel pressure that the damage-broadcast stream
+    // does).
+    //
+    // Gate 3 (above, `room.players.contains_key(&req_target)`) already
+    // validated the target is present; the `expect` documents that
+    // invariant explicitly and avoids the redundant HashMap lookup
+    // the `if let Some` would incur.
+    let target_player = room
+        .players
+        .get_mut(&req_target)
+        .expect("validate_and_relay: gate 3 invariant violated — req_target not in room.players");
+    target_player.hp = target_player.hp.saturating_sub(amount);
+
     Some(bc)
 }
 
