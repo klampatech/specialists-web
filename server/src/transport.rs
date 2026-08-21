@@ -52,7 +52,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 use wtransport::{Endpoint, ServerConfig};
@@ -254,39 +254,40 @@ async fn handle_websocket_connection(
     // drain without dropping snapshots. Does NOT close the §4.4
     // HP-gap race (that's client-side; tracked in §4.4 carry-forward).
     //
-    // PR 11.7.D / CF-N1 bump: 256 → 512. CI run 32508157666 on the
-    // snapshot-driven smoke showed the 256-slot mpsc intermittently
-    // saturating under sustained headless 2-tab load (3-hits-landed
-    // in the spam window where 6+ should land given the 120ms cooldown).
-    // The CF-N1 warn-then-retry pattern caught it as `[CI-FLAKE:CF-N1]
-    // persistent`, confirming this is real outbound-channel saturation,
-    // not a cooldown-broken regression. 512 slots doubles headroom;
-    // the snapshot-driven smoke reads HP from `__latestSnap()` so
-    // broadcast drops are invisible to the snapshot reader, but
-    // persistent drops become visible as the fire-rate lower bound
-    // failing (3 hits landed vs the expected ≥ 4). PR D2 brief carries
-    // this forward: full back-pressure is the right fix; this bump
-    // buys ~25s of headroom at 1.4 KB/s sustained pressure.
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(512);
+    // PR 11.7.D2: switched from `mpsc::channel(512)` to a
+    // `ConnectionOutbound` (bounded queue + Notify) so the
+    // `broadcast_snapshot` back-pressure can implement drop-oldest.
+    // See `server/src/connection_outbound.rs` for the rationale —
+    // `mpsc::Sender` has no `try_recv`, so the producer can't drop
+    // from the front of an mpsc queue. The custom type gives the
+    // producer access to both ends.
+    //
+    // Capacity: 512 — matches the pre-D2 mpsc capacity. The brief
+    // locks this: "DO NOT bump the mpsc capacity for the
+    // CF-N1-persistent fix — the new back-pressure mechanism is
+    // the right answer." The drop-oldest policy on the producer
+    // side means saturation no longer translates to broadcast drops
+    // visible to the smoke.
+    let outbound = specialists_server::connection_outbound::ConnectionOutbound::new();
     let placeholder_id = next_placeholder_player_id();
     let conn_state = ConnectionState::new();
     {
         let mut room_guard = room_arc.write().await;
-        room_guard.register_connection(placeholder_id, outbound_tx);
+        room_guard.register_connection(placeholder_id, outbound.clone());
     }
 
     let (mut sink, mut stream) = ws.split();
 
-    // PR 11.6.D: the inbound loop drains `outbound_rx` between
-    // handling inbound messages. Tungstenite's `split` is exclusive,
-    // so we can't have a separate outbound task. The outbound
-    // mpsc acts as a write-side queue: the dispatcher pushes
-    // encoded bytes (broadcasts + replies) onto it via
+    // PR 11.6.D: the inbound loop drains the outbound queue
+    // between handling inbound messages. Tungstenite's `split` is
+    // exclusive, so we can't have a separate outbound task. The
+    // outbound queue acts as a write-side buffer: the dispatcher
+    // pushes encoded bytes (broadcasts + replies) onto it via
     // `Room.connections`, and this loop pops + writes them.
     loop {
         tokio::select! {
             // Outbound: drain whatever's been queued.
-            maybe_bytes = outbound_rx.recv() => {
+            maybe_bytes = outbound.recv() => {
                 match maybe_bytes {
                     Some(bytes) => {
                         if let Err(e) = sink.send(Message::Binary(bytes.into())).await {
@@ -295,10 +296,10 @@ async fn handle_websocket_connection(
                         }
                     }
                     None => {
-                        // Sender dropped (the connection's outbound_tx
-                        // was removed from Room.connections). Nothing
-                        // more to write; loop continues to drain
-                        // inbound.
+                        // Outbound closed (the connection's sender
+                        // was removed from Room.connections via
+                        // `close()`). Nothing more to write; loop
+                        // continues to drain inbound.
                     }
                 }
             }
@@ -355,11 +356,12 @@ async fn handle_websocket_connection(
         }
     }
 
-    // Cleanup: unregister the connection from the room.
+    // Cleanup: close + unregister the connection from the room.
     {
         let mut room_guard = room_arc.write().await;
         room_guard.unregister_connection(placeholder_id);
     }
+    outbound.close();
     info!(%peer, "WebSocket connection closed");
     Ok(())
 }
@@ -430,21 +432,24 @@ async fn handle_webtransport_session(
     // a size mismatch would silently starve whichever transport
     // got the smaller queue.
     //
-    // PR 11.7.D / CF-N1 bump: 256 → 512 (see WS listener above for
-    // rationale; both listeners bumped together). PR 11.7.D's
-    // CF-N1 warn-then-retry pattern + this 2× capacity bump should
-    // close the CI-localhost outbound-saturation flake for good.
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(512);
+    // PR 11.7.D2: switched from `mpsc::channel(512)` to a
+    // `ConnectionOutbound` (bounded queue + Notify) so
+    // `broadcast_snapshot` can implement drop-oldest back-pressure.
+    // See the WS listener comment above + the
+    // `server/src/connection_outbound.rs` module doc for the
+    // rationale. Capacity matches the WS listener's capacity (512)
+    // — the brief locks this as identical across both listeners.
+    let outbound = specialists_server::connection_outbound::ConnectionOutbound::new();
     let placeholder_id = next_placeholder_player_id();
     let conn_state = ConnectionState::new();
     {
         let mut room_guard = room_arc.write().await;
-        room_guard.register_connection(placeholder_id, outbound_tx);
+        room_guard.register_connection(placeholder_id, outbound.clone());
     }
 
     loop {
         tokio::select! {
-            maybe_bytes = outbound_rx.recv() => {
+            maybe_bytes = outbound.recv() => {
                 match maybe_bytes {
                     Some(bytes) => {
                         // PR 11.6.D: server-originated broadcasts go
@@ -457,7 +462,7 @@ async fn handle_webtransport_session(
                         }
                     }
                     None => {
-                        // Sender dropped (connection unregister). Just
+                        // Outbound closed (connection unregister). Just
                         // continue waiting on inbound.
                     }
                 }
@@ -630,11 +635,11 @@ pub(super) async fn handle_binary(
                     specialists_server::protocol::REJECT_REASON_FIRE_RATE,
                 );
                 let room_guard = room_arc.read().await;
-                let sender = room_guard.connections
+                let outbound = room_guard.connections
                     .get(&claimed_player_id)
                     .or_else(|| room_guard.connections.get(&placeholder_player_id));
-                if let Some(sender) = sender {
-                    let _ = sender.try_send(reject_bytes);
+                if let Some(outbound) = outbound {
+                    let _ = outbound.try_send(reject_bytes).await;
                 }
                 return vec![];
             };
@@ -681,33 +686,29 @@ pub(super) async fn handle_binary(
             // to every connection in the room (including the source —
             // optimistic apply on the source matches the broadcast).
             let wire_bytes = specialists_server::damage_relay::relay_broadcast(&bc);
-            // Fan out to every connection in the room.
+            // Fan out to every connection in the room. PR 11.7.D2:
+            // uses the `ConnectionOutbound::try_send` drop-oldest path
+            // (same as broadcast_snapshot) so damage broadcasts
+            // receive the same back-pressure treatment as snapshots.
+            // Pre-D2, this was the same "channel full / closed" warn
+            // surface that CF-N1 was tracking; drop-oldest closes
+            // the underlying saturation.
             {
                 let room_guard = room_arc.read().await;
                 let n_conns = room_guard.connections.len();
-                for (player_id, sender) in room_guard.connections.iter() {
-                    match sender.try_send(wire_bytes.clone()) {
-                        Ok(()) => {
-                            debug!(
-                                target_player_id = *player_id,
-                                n_conns = n_conns,
-                                "damageBroadcast enqueued",
-                            );
-                        }
-                        Err(_) => {
-                            // Channel full or sender closed. The
-                            // client will lag / miss this broadcast;
-                            // the timeout sweep in `damageBus.ts`
-                            // (FIX 4) reverts the optimistic apply
-                            // after PENDING_REJECT_TIMEOUT_MS. We log
-                            // at warn to surface the issue without
-                            // crashing the dispatcher.
-                            warn!(
-                                target_player_id = *player_id,
-                                "damageBroadcast fan-out: channel full / closed",
-                            );
-                        }
+                for (player_id, outbound) in room_guard.connections.iter() {
+                    if let Err(()) = outbound.try_send(wire_bytes.clone()).await {
+                        warn!(
+                            target_player_id = *player_id,
+                            "damageBroadcast fan-out: outbound closed (connection dying)",
+                        );
+                        continue;
                     }
+                    debug!(
+                        target_player_id = *player_id,
+                        n_conns = n_conns,
+                        "damageBroadcast enqueued",
+                    );
                 }
             }
             // Return the encoded bytes so the inbound loop's "fallback
@@ -829,6 +830,11 @@ pub(super) async fn handle_binary(
             // §1.2: server-routed inputs for PR 11.7. PR 11.6.C
             // buffers onto `inputs_buffer` (WRITE-ONLY this PR).
             // PR 11.7 reads them for snapshot generation.
+            //
+            // PR 11.7.D2 / §1.2: the wire format now carries a
+            // `last_inputs_seq` trailer (one u32 BE) for replay
+            // protection. Stale inputs (older `last_inputs_seq` than
+            // the last seen seq for the source) are dropped.
             let Some(inputs) = decode_inputs_server(payload) else {
                 warn!("inputsServer: decoder rejected malformed payload");
                 return vec![];
@@ -849,11 +855,35 @@ pub(super) async fn handle_binary(
             let player_id: PlayerId = input_bytes[0] as PlayerId;
             {
                 let mut room_guard = room_arc.write().await;
+                // PR 11.7.D2 / §1.2: replay protection on the
+                // inputs_seq trailer. Reject if the incoming seq is
+                // older than the last seen seq for this source.
+                let prev_seq = room_guard
+                    .last_inputs_seq_per_source
+                    .get(&player_id)
+                    .copied()
+                    .unwrap_or(0);
+                if inputs.last_inputs_seq < prev_seq {
+                    warn!(
+                        player_id,
+                        last_inputs_seq = inputs.last_inputs_seq,
+                        prev_seq,
+                        "inputsServer: rejected — stale last_inputs_seq (replay)",
+                    );
+                    return vec![];
+                }
+                // Saturating stamp — same shape as the
+                // last_event_id_for_source gate above. Never wrap.
+                let stamped = std::cmp::max(inputs.last_inputs_seq, prev_seq);
+                room_guard
+                    .last_inputs_seq_per_source
+                    .insert(player_id, stamped);
                 room_guard.push_input(player_id, frame, input_bytes);
             }
             debug!(
                 player_id,
                 frame,
+                last_inputs_seq = inputs.last_inputs_seq,
                 "inputsServer buffered onto Room.inputs_buffer"
             );
             vec![]
@@ -921,11 +951,26 @@ fn sans_with_defaults(extra: Vec<String>) -> Vec<String> {
 /// in `main.rs`) to every connection in the room.
 ///
 /// Mirrors the `damage_relay::relay_broadcast` fan-out pattern
-/// (each connection owns a `mpsc::Sender<Vec<u8>>` registered in
+/// (each connection owns a `ConnectionOutbound` registered in
 /// `Room.connections`; we clone the encoded bytes and push onto
-/// every sender). The outbound mpsc is drained by the per-
+/// every outbound). The outbound queue is drained by the per-
 /// connection listener loops (both WebSocket and WebTransport),
 /// which write to the transport stream.
+///
+/// **PR 11.7.D2 back-pressure (CF-N1-persistent closer)**: the
+/// outbound queue's `try_send` is drop-oldest by construction
+/// (see `server/src/connection_outbound.rs::ConnectionOutbound::try_send`).
+/// When the queue is full, the OLDEST queued snapshot is dropped
+/// to make room. Older snapshots are useless once newer ones
+/// arrive — the consumer (interpolator) only needs the latest
+/// within its 100ms interpolation window. The drop-oldest policy
+/// matches the consumer's actual data needs.
+///
+/// This is the right direction (NOT another capacity bump). Per
+/// the brief's gotcha #5: "per-connection mpsc capacity is 512
+/// (was 256, was 64). Both WS + WT listeners MUST stay identical.
+/// **DO NOT bump the mpsc capacity** for the CF-N1-persistent fix
+/// — the new back-pressure mechanism is the right answer."
 pub async fn broadcast_snapshot(
     room: Arc<RwLock<Room>>,
     snap_bytes: Vec<u8>,
@@ -934,27 +979,29 @@ pub async fn broadcast_snapshot(
     // is read-only on the room.
     let room_guard = room.read().await;
     let n_conns = room_guard.connections.len();
-    for (player_id, sender) in room_guard.connections.iter() {
-        match sender.try_send(snap_bytes.clone()) {
-            Ok(()) => {
-                debug!(
-                    target_player_id = *player_id,
-                    n_conns = n_conns,
-                    "snapshot enqueued",
-                );
-            }
-            Err(_) => {
-                // Channel full or sender closed. The client will
-                // lag / miss this snapshot; the next snapshot
-                // tick (50ms later) will catch them up. Log at
-                // warn to surface persistent back-pressure
-                // without crashing the dispatcher.
-                warn!(
-                    target_player_id = *player_id,
-                    "snapshot fan-out: channel full / closed",
-                );
-            }
+    for (player_id, outbound) in room_guard.connections.iter() {
+        // The drop-oldest semantics live inside
+        // ConnectionOutbound::try_send — we just call it. A `Ok(())`
+        // means either it pushed normally (queue not full) OR it
+        // dropped the oldest to make room and pushed. There's no
+        // separate "full" return — saturation is the expected case
+        // under sustained load and is handled transparently.
+        if let Err(()) = outbound.try_send(snap_bytes.clone()).await {
+            // Closed — connection was unregistered but the room
+            // entry hasn't been cleaned up yet. The listener loop
+            // will see `recv() == None` and exit; this snapshot
+            // was lost (acceptable — the connection is dying).
+            warn!(
+                target_player_id = *player_id,
+                "snapshot broadcast: outbound closed (connection dying)",
+            );
+            continue;
         }
+        debug!(
+            target_player_id = *player_id,
+            n_conns = n_conns,
+            "snapshot enqueued",
+        );
     }
 }
 

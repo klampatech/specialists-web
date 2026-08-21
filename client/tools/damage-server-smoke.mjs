@@ -431,16 +431,17 @@ async function runSmoke() {
         }).length,
         ping: bus.encodePing({ clientTimestamp: 1 }).length,
         inputsServer: bus.encodeInputsServer({
-          frame: 1, encodedInput: new Uint8Array(12),
+          frame: 1, encodedInput: new Uint8Array(12), lastInputsSeq: 0,
         }).length,
       };
     });
     log(`Wire sizes: ${JSON.stringify(wireSizes)}`);
     // PR 11.6.C review fix B2: every TS encoder prefixes the
-    // discriminator, so the wire sizes are body+1. InputsServer was
-    // already 17 (disc + body) so it stays at 17. The others grow
-    // by 1 (14 -> 15, 18 -> 19, 4 -> 5).
-    const EXPECTED = { damageRequest: 15, damageBroadcast: 19, positionUpdate: 15, ping: 5, inputsServer: 17 };
+    // discriminator, so the wire sizes are body+1. PR 11.7.D2 adds
+    // the lastInputsSeq trailer to inputsServer — wire size grows
+    // from 17 to 21 (+4 bytes for the u32 BE lastInputsSeq trailer).
+    // The others stay at body+1.
+    const EXPECTED = { damageRequest: 15, damageBroadcast: 19, positionUpdate: 15, ping: 5, inputsServer: 21 };
     for (const [k, v] of Object.entries(EXPECTED)) {
       if (wireSizes[k] !== v) {
         throw new Error(`Wire size mismatch for ${k}: got ${wireSizes[k]}, expected ${v}`);

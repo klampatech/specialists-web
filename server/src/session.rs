@@ -89,18 +89,33 @@ pub struct Room {
     /// seen value for the source tab. Prevents replay / out-of-order
     /// duplicates from producing broadcasts.
     pub last_event_id_for_source: HashMap<PlayerId, u32>,
+    /// PR 11.7.D2 / §1.2: per-source `inputs_seq` counter — the
+    /// sender's monotonic inputs_seq on the wire (last 4 bytes of
+    /// the 0x06 packet). Server uses this for replay protection:
+    /// an incoming packet whose `last_inputs_seq` is older than
+    /// the last seen seq for that source is dropped. Stored
+    /// alongside `last_event_id_for_source` because they serve the
+    /// same role (replay protection for that source).
+    pub last_inputs_seq_per_source: HashMap<PlayerId, u32>,
     /// Inputs buffer retention in entries per player. Matches
     /// `POSITION_HISTORY_RETENTION_FRAMES` (64) so lag-comp reads can
     /// correlate position frames with input frames over the same
     /// 1-second window.
     pub inputs_buffer_capacity: usize,
     /// PR 11.6.D: per-room outbound fan-out. The transport layer
-    /// spawns one `mpsc::Sender<Vec<u8>>` per connected player; when
-    /// `validate_and_relay` emits a `DamageBroadcast`, the listener
-    /// pushes the encoded bytes onto every sender in this map so the
-    /// broadcast reaches ALL tabs in the room (including the source --
-    /// the source applies optimistically, the broadcast confirms).
-    pub connections: HashMap<PlayerId, tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// registers one `ConnectionOutbound` per connected player; when
+    /// `validate_and_relay` emits a `DamageBroadcast` or the snapshot
+    /// generator emits a `Snapshot`, `broadcast_snapshot` pushes the
+    /// encoded bytes onto every outbound in this map so the message
+    /// reaches ALL tabs in the room (including the source — the
+    /// source applies optimistically, the broadcast confirms).
+    ///
+    /// PR 11.7.D2: switched from `mpsc::Sender<Vec<u8>>` to
+    /// `ConnectionOutbound` to enable drop-oldest back-pressure.
+    /// The previous `mpsc::channel(512)` could only drop-newest on
+    /// overflow (Sender has no `try_recv`); see
+    /// `server/src/connection_outbound.rs` for the rationale.
+    pub connections: HashMap<PlayerId, crate::connection_outbound::ConnectionOutbound>,
     /// PR 11.6.D: global server frame counter. Increments per
     /// `TICK_RATE_HZ` tick (64Hz). Used as the `server_frame` field
     /// on `DamageBroadcast`.
@@ -130,6 +145,7 @@ impl Room {
             inputs_buffer: HashMap::new(),
             next_server_seq: 0,
             last_event_id_for_source: HashMap::new(),
+            last_inputs_seq_per_source: HashMap::new(),
             inputs_buffer_capacity: POSITION_HISTORY_RETENTION_FRAMES as usize,
             connections: HashMap::new(),
             next_server_frame: 0,
@@ -171,14 +187,18 @@ impl Room {
         }
     }
 
-    /// PR 11.6.D: register an outbound `mpsc::Sender` for the given
-    /// player. Called by the listener loop on connect; the
+    /// PR 11.6.D: register an outbound `ConnectionOutbound` for the
+    /// given player. Called by the listener loop on connect; the
     /// connection map is the per-room fan-out target for
-    /// `DamageBroadcast` (and any future server-originated broadcasts).
+    /// `DamageBroadcast` and `Snapshot`.
+    ///
+    /// PR 11.7.D2: type changed from `mpsc::Sender<Vec<u8>>` to
+    /// `ConnectionOutbound` for drop-oldest back-pressure (see
+    /// `connection_outbound.rs`).
     pub fn register_connection(
         &mut self,
         id: PlayerId,
-        sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+        sender: crate::connection_outbound::ConnectionOutbound,
     ) {
         self.connections.insert(id, sender);
     }
@@ -319,12 +339,12 @@ mod tests_pr11_6d {
     //! additions so a regression in either has an isolated signal.
 
     use super::*;
-    use tokio::sync::mpsc;
 
     #[test]
     fn new_room_has_event_id_map_initialized_empty() {
         let room = Room::new("DEVBX");
         assert!(room.last_event_id_for_source.is_empty());
+        assert!(room.last_inputs_seq_per_source.is_empty());
         assert!(room.connections.is_empty());
         assert_eq!(room.next_server_frame, 0);
     }
@@ -332,8 +352,8 @@ mod tests_pr11_6d {
     #[test]
     fn register_and_unregister_connection() {
         let mut room = Room::new("DEVBX");
-        let (tx, _rx) = mpsc::channel(8);
-        room.register_connection(7, tx);
+        let co = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        room.register_connection(7, co);
         assert!(room.connections.contains_key(&7));
         room.unregister_connection(7);
         assert!(!room.connections.contains_key(&7));

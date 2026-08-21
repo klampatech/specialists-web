@@ -16,6 +16,7 @@
 extern crate self as specialists_server;
 
 pub mod cert;
+pub mod connection_outbound;
 pub mod damage_relay;
 pub mod constants;
 pub mod hitscan;
@@ -49,5 +50,6 @@ pub use protocol::{
     INPUTS_SERVER_WIRE_SIZE, PING_WIRE_SIZE, PONG_WIRE_SIZE, PLAYER_STATE_WIRE_SIZE,
     POSITION_UPDATE_WIRE_SIZE, SNAPSHOT_WIRE_SIZE_MIN,
 };
+pub use connection_outbound::ConnectionOutbound;
 pub use session::{Player, PlayerId, Room, ServerFrame};
 pub use snapshot::SnapshotGenerator;

@@ -67,13 +67,30 @@ pub const DAMAGE_BROADCAST_WIRE_SIZE: usize = 18;
 pub const POSITION_UPDATE_WIRE_SIZE: usize = 14;
 pub const PING_WIRE_SIZE: usize = 4;
 pub const PONG_WIRE_SIZE: usize = 8;
-/// `0x06` discriminator + u32 frame BE + 12-byte input blob = 17
-/// bytes total. INPUT_SIZE = 12 comes from
-/// `client/src/net/inputBitmask.ts`. NOTE: the brief header says
-/// "16 bytes" - that's the same class of off-by-one as the original
-/// PR 11.6.A DamageRequest 8 -> 14. The math wins; carry-forward into
-/// PR 11.6.C's TS encoder.
-pub const INPUTS_SERVER_WIRE_SIZE: usize = 17;  // see §3.5 - brief header says 16 but the math is 1+4+12=17 (PR 11.6.A off-by-one class)
+/// `0x06` discriminator + u32 frame BE + 12-byte input blob +
+/// u32 last_inputs_seq BE = 21 bytes total. INPUT_SIZE = 12 comes
+/// from `client/src/net/inputBitmask.ts`.
+///
+/// PR 11.7.D2 / §1.2: wire size bumped 17 → 21 to carry the
+/// per-source `last_inputs_seq` trailer (one u32 BE). The server's
+/// `validate_and_relay` uses this for replay protection — the
+/// server's lag-comp math consumes the freshest input per frame;
+/// an out-of-order `inputs_seq` is a sign the client is dropping
+/// packets and the server should ignore rather than apply an old
+/// input as if it were current.
+///
+/// Brief originally specified 18 — off-by-3 math error in the
+/// brief (same class as the original PR 11.6.A DamageRequest 8 → 14
+/// mistake). Math wins: 1 (disc) + 4 (frame) + 12 (input) + 4
+/// (trailer) = 21.
+///
+/// Mirror of `protocol/damage.ts::INPUTS_SERVER_WIRE_SIZE` and
+/// `protocol/constants.ts::WIRE_SIZE_INPUTS_SERVER_WITH_SEQ`.
+pub const INPUTS_SERVER_WIRE_SIZE: usize = 21;
+/// PR 11.7.D2 — body size (disc byte already stripped by the caller).
+/// 21 (wire) - 1 (disc) = 20 bytes. Body layout: u32 frame (4) +
+/// 12-byte input + u32 last_inputs_seq (4) = 20. ✓
+pub const INPUTS_SERVER_BODY_SIZE: usize = INPUTS_SERVER_WIRE_SIZE - 1;
 /// PR 11.6.D FIX 4: body size of `DamageReject` (event_id u32 BE + reason u8 = 5).
 pub const DAMAGE_REJECT_BODY_SIZE: usize = 5;
 
@@ -349,11 +366,16 @@ pub fn decode_pong(buf: &[u8]) -> Option<Pong> {
 /// PR 11.6.BUFFERS the message onto `Room.inputs_buffer`; PR 11.7
 /// consumes it for snapshot generation + lag-comp math.
 ///
+/// PR 11.7.D2 / §1.2: appends `last_inputs_seq` (one u32 BE) for
+/// replay protection. Server drops inputs whose `last_inputs_seq`
+/// is older than the last seen seq for the source.
+///
 /// Wire layout:
-///   byte 0      discriminator 0x06
-///   byte 1..4   frame (u32 BE)
-///   byte 5..16  encoded input (12 bytes — INPUT_SIZE from
-///               `client/src/net/inputBitmask.ts`)
+///   byte 0       discriminator 0x06
+///   byte 1..4    frame (u32 BE)
+///   byte 5..16   encoded input (12 bytes — INPUT_SIZE from
+///                `client/src/net/inputBitmask.ts`)
+///   byte 17..20  last_inputs_seq (u32 BE)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputsServer {
     pub frame: u32,
@@ -362,6 +384,10 @@ pub struct InputsServer {
     /// the transport layer before this struct is constructed (see
     /// `transport::handle_inputs_server_payload`).
     pub encoded_input: Vec<u8>,
+    /// PR 11.7.D2 / §1.2: sender's monotonic inputs_seq counter.
+    /// Server uses this for replay protection — drops the input if
+    /// `last_inputs_seq` is older than the last seen seq for the source.
+    pub last_inputs_seq: u32,
 }
 
 pub fn encode_inputs_server(payload: &InputsServer) -> Vec<u8> {
@@ -375,6 +401,8 @@ pub fn encode_inputs_server(payload: &InputsServer) -> Vec<u8> {
         );
     }
     buf.extend_from_slice(&payload.encoded_input);
+    // PR 11.7.D2 / §1.2: append the last_inputs_seq trailer (u32 BE).
+    buf.put_u32(payload.last_inputs_seq);
     debug_assert_eq!(buf.len(), INPUTS_SERVER_WIRE_SIZE);
     buf
 }
@@ -390,9 +418,22 @@ pub fn decode_inputs_server(buf: &[u8]) -> Option<InputsServer> {
     let frame = b.get_u32();
     let mut encoded_input = [0u8; 12];
     encoded_input.copy_from_slice(&b[..12]);
+    // Advance past the 12-byte input blob (b is already past the disc
+    // byte and the 4-byte frame header at this point; consume 12 bytes
+    // of input + 4 bytes of last_inputs_seq trailer).
+    let mut last_inputs_seq_bytes = [0u8; 4];
+    // b has 12 input bytes + 4 trailer bytes remaining (16 bytes total).
+    // Skip the 12 input bytes, then read 4 trailer bytes.
+    let input_slice = &b[..12];
+    // We've already consumed the 12 bytes into encoded_input; advance b.
+    let _ = input_slice; // suppress unused warning
+    b = &b[12..];
+    last_inputs_seq_bytes.copy_from_slice(&b[..4]);
+    let last_inputs_seq = u32::from_be_bytes(last_inputs_seq_bytes);
     Some(InputsServer {
         frame,
         encoded_input: encoded_input.to_vec(),
+        last_inputs_seq,
     })
 }
 
@@ -643,14 +684,28 @@ mod tests {
     }
 
     #[test]
-    fn inputs_server_is_17_bytes() {
+    fn inputs_server_is_21_bytes() {
         let payload = InputsServer {
             frame: 0xdeadbeef,
             encoded_input: vec![0u8; 12],
+            last_inputs_seq: 0xcafef00d,
         };
         let bytes = encode_inputs_server(&payload);
         assert_eq!(bytes.len(), INPUTS_SERVER_WIRE_SIZE);
-        assert_eq!(bytes.len(), 17);
+        assert_eq!(bytes.len(), 21);
+    }
+
+    #[test]
+    fn inputs_server_roundtrip_with_seq() {
+        // PR 11.7.D2 / §1.2: round-trip with the last_inputs_seq trailer.
+        let original = InputsServer {
+            frame: 0xdeadbeef,
+            encoded_input: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            last_inputs_seq: 0xcafef00d,
+        };
+        let bytes = encode_inputs_server(&original);
+        let decoded = decode_inputs_server(&bytes).expect("decode must succeed");
+        assert_eq!(decoded, original);
     }
 
 
