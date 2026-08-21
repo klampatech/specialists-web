@@ -7,10 +7,9 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ## ⚡ TL;DR for the next session (read this first)
 
-**You are here**: post-PR 11.7.D merge. PR 11.7.D2 is the next move — lockstep substrate retirement (`ggrsRuntime.ts`, `peer.ts`, `ggnet` P2P transport) + 4 lockstep smokes rewritten via `ServerTransport` + `0x06 InputSeq` trailer + `protocol/constants.ts` extraction. Main is at the squash SHA from PR 11.7.D (verify post-PR raise). Servers killed. Worktree `~/Development/specialists-web-pr11.7-d2/` is pre-made on branch `feat/phase1-pr11.7.d2-substrate-retirement`, off the PR 11.7.D base. **BLOCK**: do NOT fire D2 until D1 lands green + merged. Per Kyle: big PRs haven't worked — D2 stays scoped.
+**You are here**: post-PR 11.7.D merge. PR 11.7.D2 is the next move — lockstep substrate retirement (`ggrsRuntime.ts`, `peer.ts`, `ggnet` P2P transport) + 4 lockstep smokes rewritten via `ServerTransport` + `0x06 InputSeq` trailer + `protocol/constants.ts` extraction. Main is at `6b571f0` (PR #45 squash, 2026-08-21T18:16:36Z). Servers killed. Worktree `~/Development/specialists-web-pr11.7-d2/` is pre-made on branch `feat/phase1-pr11.7.d2-substrate-retirement`, off the PR 11.7.D base. **GO**: D2 is unblocked as of PR 11.7.D merge. Per Kyle: big PRs haven't worked — D2 stays scoped, with the CF-N1 carry-forward for back-pressure if needed.
 
 **What landed since the 11.7.C docs entry (PRs #42 + #43, "the regroup" + PR 11.7.D, "§4.4 closer")**:
->>>>>>> 5a6b4ff (feat(phase1-pr11.7.d1): source HP from Snapshot.players[i].hp — §4.4 closed)
 - **PR #42 MERGED** (`a586051`, 2026-08-21, branch `chore/phase1-server-outbound-channel-bump`) — bumps the per-connection outbound mpsc 64→256 in BOTH the WS and WT listeners (`server/src/transport.rs:243,398`). One-file, +22/-2. Goal: mitigate PR 11.7.B's 20Hz snapshot fan-out (706B/snapshot × 20Hz = 13.8KB/s/server outbound per player) saturating the 64-slot mpsc under sustained load (the channel-full drops logged as `WARN specialists_server::transport: snapshot fan-out: channel full / closed target_player_id=N`). The bump buys ~4× more headroom; CI run 32487689523's canary log shows snapshot-fan-out drop counts dropped from ~889/run → ~6/run.
 - **PR #43 MERGED** (`2298b14`, 2026-08-21, branch `fix/phase1-s4.4-drop-optimistic-apply` — the `s4.4` is ASCII for "§4.4" after the §-in-branch-name bug blocked GH merge UI) — drops the PR 11.6.D optimistic-apply machinery from `damageBus.ts`. **3 commits, 5 files, +329/-1175 net -846 lines.** Test rewrite (3→5 vitest in `damageBus.test.ts`): drop Tests A-E (pending-map overflow, late-broadcast-on-swept-entry, sweep reverts, confirm-no-double-apply, actualDelta), drop F-G (clamped-confirm convergence, drop-branch markSettled), keep 3 DamageReject round-trip tests, **add Test I** (`broadcast-with-no-pending applies damage directly`) + "ignored when resolver returns null" test — these two pin the new single-path `applyBroadcast` invariant. Two smoke-alignment commits (`137fef4`, `1e30c5f`) updated `damage-server-hp-convergence-smoke.mjs` to test what PR #43 actually ships — dropped the optimistic-apply polling assertion (the machinery it tested is gone), dropped the `__lastBroadcast` poll (the probe was deleted by PR #43), dropped the FIX 3 "Direct applyBroadcast test" diagnostic, replaced the pre-spam convergence check with a poll on `gameSession.remoteController.state.hp< beforeHp` (the only signal post-PR-#43), and widened the `[XFAIL §4.4]` block to cover pre-spam broadcast-arrival + fire-rate lower-bound failures when the §4.4 race wins.
 
@@ -48,7 +47,7 @@ Also carry-forward from PR 11.7.B/11.7.C: `0x06 InputSeq` trailer (wire-size 17�
 
 ## 2026-08-21 — 🎉 PR 11.7.D MERGED — §4.4 race closed definitively via snapshot-driven HP
 
-**Status**: PR 11.7.D merged. 4 file changes: smoke rewrite + snapshot decoder fix + server-side HP mutation + regenerated PNG. Smoke 10/10 PASS with zero `[XFAIL §4.4]` lines. Server is now authoritative for HP (the architectural shift that makes the snapshot's `players[i].hp` the source of truth). Main is at the squash SHA from PR 11.7.D (verify post-merge). 20/20 CI jobs target. PR 11.7.D2 stays gated on this merge.
+**Status**: PR 11.7.D MERGED at squash `6b571f0` (PR #45, merged 2026-08-21T18:16:36Z by Kyle). 8 file changes (smoke rewrite + snapshot decoder fix + server-side HP mutation + CF-N1 fire-rate warn-then-retry + 512-slot outbound mpsc bump + regenerated PNG + HANDOFF + SPEC.md). Smoke 10/10 PASS locally with zero `[XFAIL §4.4]` lines. CI run 32508740114 (post-CF-N1 + 512-bump) → **20/20 PASS**, 5191 hit 8 broadcasts applied (5 hits in spam window vs ≥4 threshold; 8/8 broadcast handler fires survived the outbound channel). Server is now authoritative for HP (the architectural shift that makes the snapshot's `players[i].hp` the source of truth). PR 11.7.D2 unblocked.
 
 **§4.4 closer, finally** (PR 11.7.D, branch `feat/phase1-pr11.7.d1-snapshot-hp-smoke`):
 
@@ -89,7 +88,11 @@ The smoke now reads HP from `__latestSnap().players[i].hp` (server-authoritative
 
 **CI runs ledger**:
 - 32505697094 (initial run, head `5443293`): 19/20 PASS, 5191 FAIL (3 hits landed, below strict `≥ 4` threshold; pre-CF-N1)
-- 32507556643 (post-CF-N1, head `0a14073`): 20/20 PASS, 5191 hit 4 — exactly at threshold, strict pass without CF-N1 retry needed
+- 32507556643 (CF-N1 only, head `c99a6a2`): 20/20 PASS, 5191 hit 4 — exactly at threshold, strict pass without CF-N1 retry needed
+- 32508157666 (CF-N1 only, head `c99a6a2` again, force-push triggered re-run): 19/20 PASS, 5191 FAIL — `[CI-FLAKE:CF-N1] persistent after retry — investigate PR #42 mpsc capacity`. Confirmed: real outbound saturation, not cooldown-broken regression.
+- 32508740114 (CF-N1 + 512-bump, head `f3f942f`): 20/20 PASS, 5191 hit 8 broadcasts applied, 5 in spam window, post-spam HP converged at 16 (Tab A = Tab B = 16, strict equality holds).
+
+**Next session task** (PR 11.7.D2): see TL;DR + "Carry-forward from PR 11.7.D" below. D2 is unblocked as of squash `6b571f0`.
 
 
 **The regroup story (the "§4.4 was wrong" finding)**:
