@@ -797,7 +797,6 @@ export async function createScene(
           __serverTransport?: unknown;
           __damageBus?: unknown;
           __broadcastHandlerRegistered?: boolean;
-          __pendingSweepInterval?: ReturnType<typeof setInterval>;
           /** PR 11.7.C / §3.7 — predictor instance for smoke instrumentation. */
           __predictor?: unknown;
           /** PR 11.7.C / §3.8 — interpolator instance for smoke instrumentation. */
@@ -810,7 +809,7 @@ export async function createScene(
         };
         try {
         const { ServerTransport } = await import("../net/serverTransport");
-        const { createDamageBusProbe } = await import("../net/damageBus");
+        const { createDamageBusProbe, applyReject: dbApplyReject } = await import("../net/damageBus");
         // Default: point at localhost:5190 (the vite dev server). The
         // smoke can override the transport ports via
         // `window.__damageServerPorts = { wt: 14433, ws: 14434 }`
@@ -903,7 +902,12 @@ export async function createScene(
             const w = window as unknown as {__rejectHandlerCount?: number; __rejectHandlerResultCounts?: Record<string, number>; __rejectTimestamps?: Array<{at: number, eventId: number, result: string, hpRemote?: number, hpLocal?: number}>};
             w.__rejectHandlerCount = (w.__rejectHandlerCount ?? 0) + 1;
           }
-          const result = probe.applyReject(localPlayerId, r.eventId, performance.now());
+          // PR 11.7.D / §4.4 closure: applyReject no longer takes
+          // nowMs (no client-side pending state to clean up after
+          // optimistic-apply removal). Just record the rejection for
+          // dev observability. Imported directly from damageBus —
+          // not on the probe surface anymore (B2 may consolidate).
+          const result = dbApplyReject(localPlayerId, r.eventId, r.reason);
           if (typeof window !== "undefined") {
             const w = window as unknown as {__lastRejectResult?: string; __rejectHandlerResultCounts?: Record<string, number>; __rejectTimestamps?: Array<{at: number, eventId: number, result: string, hpRemote?: number, hpLocal?: number}>};
             w.__lastRejectResult = result;
@@ -1093,19 +1097,16 @@ export async function createScene(
           winSlot.__interpolator = interpolator;
           winSlot.__latestSnap = () => latestSnap;
         }
-        // PR 11.6.D FIX 4 part C — periodic sweep of expired pending
-        // applies. The server's `DamageReject` packet may be dropped
-        // (channel full, network blip). If a pending apply hasn't seen
-        // a broadcast OR reject within `PENDING_REJECT_TIMEOUT_MS`
-        // (500ms), revert it. Without this sweep, the optimistic HP
-        // stays decremented even after the server has authoritative-
-        // state information that no damage happened. The 20Hz rate
-        // (50ms) is a balance between timely reversion and CPU cost.
-        // The interval is cleared on dispose (see handle.dispose()).
-        const sweepInterval = setInterval(() => {
-          probe.sweepExpiredPending(performance.now());
-        }, 50);
-        (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval = sweepInterval;
+        // PR 11.7.D / §4.4 closure — periodic sweep of expired pending
+        // applies REMOVED. The sweep existed to revert optimistic
+        // applies whose broadcast/reject never arrived (the §4.4 race
+        // window). With optimistic-apply gone, there's no client-side
+        // pending state to sweep — the client just sends and waits
+        // for the broadcast. If the broadcast never arrives, HP
+        // simply doesn't decrement (no optimistic apply was made), so
+        // there's nothing to revert. The sweep setInterval + the
+        // __pendingSweepInterval window probe are gone too (the
+        // probe symbol is no longer needed).
         } catch (e) {
           // PR 11.6.D fix4 (Bug A — failure cleanup): if any step
           // in the async body throws (dynamic import failed, WS
@@ -1132,12 +1133,10 @@ export async function createScene(
     scene,
     dispose: () => {
       window.removeEventListener("resize", onResize);
-      // PR 11.6.D FIX 4 part C — clear the periodic sweep interval.
-      const sweepInterval = (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval;
-      if (sweepInterval !== undefined) {
-        clearInterval(sweepInterval);
-        (window as unknown as {__pendingSweepInterval?: ReturnType<typeof setInterval>}).__pendingSweepInterval = undefined;
-      }
+      // PR 11.7.D / §4.4 closure: __pendingSweepInterval dispose
+      // cleanup REMOVED. The sweep setInterval was deleted (see the
+      // optimistic-apply removal note above); there's no interval to
+      // clear on dispose.
       input.dispose();
       chase.dispose();
       spectator?.dispose();
