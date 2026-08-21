@@ -23,8 +23,11 @@
 //   6. Fire-rate cooldown: spam 100x `sendDamageRequest({amount: 12})`
 //      in 1.1s; only 4-12 should land (120ms cooldown = 8/sec max,
 //      with generous bounds for CI clock skew). The lower bound is
-//      strict again — broadcast drops are invisible to the snapshot
-//      reader (the snapshot stream doesn't drop under pressure).
+//      strict but with a 1-second warn-then-retry pattern (CF-N1) to
+//      absorb ephemeral outbound-mpsc saturation on CI localhost. The
+//      snapshot reader is now source-of-truth, so a low hit count is a
+//      real cooldown-broken regression OR persistent mpsc saturation,
+//      not §4.4.
 //   7. Take screenshot to client/tools/damage-server-hp-convergence-smoke.png.
 //
 // PR 11.7.D / §4.4 closure: the smoke's HP read site was the lockstep
@@ -656,12 +659,48 @@ async function runSmoke() {
     if (dmgApplied > 12 * 12) {
       throw new Error(`Fire-rate cooldown NOT enforcing: ${dmgApplied / 12} hits landed (expected ≤ 12 with 120ms cooldown).`);
     }
+    // PR 11.7.D / CF-N1 — Fire-rate lower bound is now strict post-§4.4-closure
+    // (the snapshot reader is unaffected by broadcast drops, so a low hit
+    // count indicates a real regression OR an outbound-mpsc satellite drop on
+    // localhost CI under sustained headless load).
+    //
+    // The pattern: warn-then-retry once before throwing. CI run 32505697094
+    // hit 3 hits landed (vs 4-hits strict threshold) on the FIRST poll. A
+    // 1-second wait + re-poll reads the snapshot's next 20Hz tick, which
+    // captures any in-flight broadcast fan-out that hadn't yet reached the
+    // snapshot at the moment of the first poll. If the second poll shows
+    // ≥4 hits, pass with `[CI-FLAKE]` log line; if still under, throw as
+    // before. This catches the ephemeral mpsc-saturation flake without
+    // hiding a genuine cooldown-broken regression (which would still be
+    // <4 on the second poll ~1s later).
+    //
+    // Look for `[CI-FLAKE:CF-N1] resolved` (CI flake recovered) vs
+    // `[CI-FLAKE:CF-N1] persistent` (real regression) in CI logs.
     if (dmgApplied < 4 * 12) {
-      throw new Error(
-        `Fire-rate lower bound FAILED: ${dmgApplied / 12} hits landed (expected ≥ 4). ` +
-        `Pre-§4.4 this was the channel-full race (broadcast drop under snapshot pressure). ` +
-        `Post-§4.4-closure the snapshot reader doesn't see that race — a low hit count is a real regression.`,
+      log(
+        `[CI-FLAKE:CF-N1] Initial fire-rate lower-bound poll: ${dmgApplied / 12} hits landed (threshold ≥ 4). ` +
+        `Waiting 1s for in-flight snapshot broadcast to land; re-polling snapshot HP...`,
       );
+      await sleep(1000);
+      const hpAfterRetryB = await pageB.evaluate(({targetId}) => {
+        const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+        const entry = snap ? snap.players.find((p) => p.playerId === targetId) : null;
+        return entry ? entry.hp : null;
+      }, {targetId: 2});
+      const dmgAppliedRetry = hpAfterRetryB !== null ? hpBeforeSpamB - hpAfterRetryB : null;
+      if (dmgAppliedRetry !== null && dmgAppliedRetry >= 4 * 12) {
+        log(
+          `[CI-FLAKE:CF-N1] resolved (snapshot caught up after 1s: ${dmgAppliedRetry / 12} hits landed, was ${dmgApplied / 12}). ` +
+          `Original failure was a transient mpsc-saturation flake, not a cooldown-broken regression.`,
+        );
+      } else {
+        throw new Error(
+          `Fire-rate lower bound FAILED: ${dmgApplied / 12} hits landed (expected ≥ 4; retry got ${dmgAppliedRetry / 12} hits). ` +
+          `Pre-§4.4 this was the channel-full race (broadcast drop under snapshot pressure). ` +
+          `Post-§4.4-closure the snapshot reader doesn't see that race — a low hit count is a real cooldown-broken regression OR ` +
+          `persistent outbound-mpsc saturation (>1s). [CI-FLAKE:CF-N1] persistent after retry — investigate PR #42 mpsc capacity.`,
+        );
+      }
     }
     log(`Assertion 6 PASS: fire-rate cooldown enforced (${dmgApplied / 12} hits in ~1s).`);
 

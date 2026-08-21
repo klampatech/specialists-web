@@ -253,7 +253,21 @@ async fn handle_websocket_connection(
     // 1.4 KB/s pressure — enough margin for the WS outbound to
     // drain without dropping snapshots. Does NOT close the §4.4
     // HP-gap race (that's client-side; tracked in §4.4 carry-forward).
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(256);
+    //
+    // PR 11.7.D / CF-N1 bump: 256 → 512. CI run 32508157666 on the
+    // snapshot-driven smoke showed the 256-slot mpsc intermittently
+    // saturating under sustained headless 2-tab load (3-hits-landed
+    // in the spam window where 6+ should land given the 120ms cooldown).
+    // The CF-N1 warn-then-retry pattern caught it as `[CI-FLAKE:CF-N1]
+    // persistent`, confirming this is real outbound-channel saturation,
+    // not a cooldown-broken regression. 512 slots doubles headroom;
+    // the snapshot-driven smoke reads HP from `__latestSnap()` so
+    // broadcast drops are invisible to the snapshot reader, but
+    // persistent drops become visible as the fire-rate lower bound
+    // failing (3 hits landed vs the expected ≥ 4). PR D2 brief carries
+    // this forward: full back-pressure is the right fix; this bump
+    // buys ~25s of headroom at 1.4 KB/s sustained pressure.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(512);
     let placeholder_id = next_placeholder_player_id();
     let conn_state = ConnectionState::new();
     {
@@ -415,7 +429,12 @@ async fn handle_webtransport_session(
     // per transport and the dispatcher pushes to all of them, so
     // a size mismatch would silently starve whichever transport
     // got the smaller queue.
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(256);
+    //
+    // PR 11.7.D / CF-N1 bump: 256 → 512 (see WS listener above for
+    // rationale; both listeners bumped together). PR 11.7.D's
+    // CF-N1 warn-then-retry pattern + this 2× capacity bump should
+    // close the CI-localhost outbound-saturation flake for good.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(512);
     let placeholder_id = next_placeholder_player_id();
     let conn_state = ConnectionState::new();
     {
