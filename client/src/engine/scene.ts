@@ -185,6 +185,16 @@ function makeBroadcastHandler(
     const bc = probe.decodeDamageBroadcast(body);
     if (!bc) return;
     const { local, remote } = getControllers();
+    // PR 11.7.D2 / §3.10 fix — broadcast target is the player being
+    // HIT, not the player attacking. The previous resolver
+    // (`playerId === localPlayerId ? local : remote`) was wrong for
+    // symmetric two-tab play: Tab A shoots Tab B (targetPlayerId=2).
+    // Tab B receives the broadcast and saw `targetPlayerId === localPlayerId`
+    // (since Tab B IS Player 2), so it applied 12 dmg to itself
+    // instead of to its remote. Correct semantic: if the broadcast
+    // target is ME, apply to local (self-damage, defensive — the
+    // server's dead-target gate prevents this in normal flow); if the
+    // target is the OTHER player, apply to remote.
     const result = probe.applyBroadcast(bc, performance.now(), (playerId) =>
       playerId === localPlayerId ? local : remote,
     );
@@ -1028,12 +1038,26 @@ export async function createScene(
         }
         winSlot.__serverTransport = server;
         winSlot.__damageBus = probe;
-        // PR 11.6.D — late-bind the server transport onto the
-        // GameSession so tick() routes damage through it. The smoke
-        // passes the localPlayerId explicitly so both tabs know which
-        // player ID they own.
-        if (gameSession) {
-          gameSession.setServerTransport?.(server);
+        // PR 11.7.D2.1 / FIX — late-bind the server transport onto the
+        // LIVE GameSession (resolved via window.__gameSession, NOT the
+        // closure's `gameSession` variable). Pre-fix: the closure
+        // captures the local `gameSession`, which under React
+        // StrictMode is the FIRST createScene() call's session — but
+        // `window.__gameSession` holds the SECOND (live) session. The
+        // first call's session gets disposed when React unmounts it,
+        // so its `setServerTransport` updates a dead reference. The
+        // live session's `serverTransport` closure stayed null, so
+        // `gameSession.tick()` never sent PositionUpdate or
+        // DamageRequest via the wire — manual tests saw `positionSends: 0`
+        // + damage requests rejected at the server's Gate3.
+        //
+        // Resolution: read the LIVE gameSession from the window slot,
+        // not from the closure. This mirrors the pattern already used
+        // in `makeBroadcastHandler` (line ~957-974: "PR 11.6.D fix4"
+        // comment) for the same StrictMode race.
+        if (typeof window !== "undefined") {
+          const liveSession = (window as unknown as { __gameSession?: GameSession }).__gameSession;
+          liveSession?.setServerTransport?.(server);
         }
         // PR 11.7.D2 / §3.10 — stash the server on the SceneHandle
         // (closure capture) so the PauseMenu\'s "Disconnect Server"

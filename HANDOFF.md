@@ -44,6 +44,9 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 Also carry-forward from PR 11.7.B/11.7.C: `0x06 InputSeq` trailer (wire-size 17→18 + `last_inputs_seq_per_source` in `validate_and_relay`), `protocol/constants.ts` extraction (5 constants currently inlined: `SNAPSHOT_RATE_HZ`, `RECONCILIATION_THRESHOLD_M`, `MAX_RECONCILIATION_SNAP_DISTANCE_M`, `INTERPOLATION_DELAY_MS`, `MAX_SNAPSHOT_AGE_MS`).
 
 ---
+## 2026-08-22 — PR 11.7.D2.2.1 follow-up — 3 lockstep smokes rewritten via ServerTransport
+
+
 
 ## 2026-08-21 — 🎉 PR 11.7.D MERGED — §4.4 race closed definitively via snapshot-driven HP
 

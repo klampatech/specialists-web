@@ -754,6 +754,32 @@ pub(super) async fn handle_binary(
             let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
             {
                 let mut room_guard = room_arc.write().await;
+                // PR 11.7.D2.1 / FIX — promote the connection from its
+                // placeholder id to the claimed `pu.player_id` on the
+                // FIRST PositionUpdate, mirroring the DamageRequest
+                // promotion path. Pre-fix: connections stayed under
+                // their placeholder ids (1000+) until the first
+                // DamageRequest. The snapshot iterates `room.connections`,
+                // so the wire-form player ids were 1009/1010 instead of
+                // the client-claimed 1/2. Both the per-tab interpolator
+                // (which buffers by player id) and the validator's Gate3
+                // (`target NOT IN room.players`) failed in different ways
+                // — Gate3 was the visible break (damage broadcasts never
+                // reached Tab B's HP). The smoke's manual
+                // `sendPositionUpdate({playerId: 2})` workaround
+                // (smoke lines 372-394) side-stepped this only because
+                // it ALSO promoted via the subsequent DamageRequest.
+                //
+                // Note: the placeholder has not yet sent a successful
+                // DamageRequest (placeholder id != claimed id means
+                // Gate2 anti-spoof would reject). We promote BEFORE
+                // add_player so the snapshot's player id matches the
+                // client's claim.
+                if placeholder_player_id != pu.player_id {
+                    if let Some((_, sender)) = room_guard.connections.remove_entry(&placeholder_player_id) {
+                        room_guard.connections.entry(pu.player_id).or_insert(sender);
+                    }
+                }
                 // PR 11.6.D: a PositionUpdate also auto-registers the
                 // player in the room. Anyone reporting position IS a
                 // player — this aligns with §3.4.1 and unblocks the
@@ -1014,6 +1040,7 @@ pub async fn broadcast_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use specialists_server::connection_outbound::ConnectionOutbound;
     use specialists_server::protocol::{
         decode_damage_broadcast, decode_pong, encode_damage_request, encode_ping,
         encode_position_update, PositionUpdate,
@@ -1126,6 +1153,58 @@ mod tests {
             .expect("snapshot at frame 42");
         assert_eq!(entry.x, 1.5);
         assert_eq!(entry.y, -2.25);
+    }
+
+    #[tokio::test]
+    async fn dispatch_position_update_promotes_connection_from_placeholder() {
+        // PR 11.7.D2.1 / regression test — the first PositionUpdate
+        // from a connection must promote it from its placeholder id
+        // to the claimed `player_id` (mirroring the DamageRequest
+        // promotion path). Pre-fix: connections stayed under
+        // placeholder ids (1000+) until the first DamageRequest. The
+        // snapshot iterates `room.connections`, so wire-form player
+        // ids were 1000+ instead of the client's claim — both the
+        // interpolator's player-id-keyed buffer and Gate3's
+        // connection is re-registered under its real PlayerId.
+        let rooms = fresh_rooms();
+        // Simulate the handshake: register the connection under
+        // placeholder 1009.
+        {
+            let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
+            let mut room_guard = room_arc.write().await;
+            room_guard.register_connection(1009, ConnectionOutbound::new());
+        }
+        // First PositionUpdate claims player_id=2 (e.g., a tab with
+        // `?localId=2`). Pre-fix this would leave the connection
+        // under placeholder 1009 and `room.players` would still lack
+        // entry 2 (the snapshot would carry [1009] only).
+        let pu = PositionUpdate {
+            server_frame: 100,
+            player_id: 2,
+            position_x: 5.0,
+            position_y: 0.0,
+        };
+        let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+        payload.extend(encode_position_update(&pu));
+        let reply = handle_binary(&payload, &rooms, 1009, ConnectionState::new()).await;
+        assert!(reply.is_empty(), "positionUpdate must not produce a reply");
+        // Verify the connection was promoted: `room.connections`
+        // now has key `2`, not `1009`.
+        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
+        let room_guard = room_arc.read().await;
+        assert!(
+            room_guard.connections.contains_key(&2),
+            "connection should be re-registered under claimed player_id=2 after first PositionUpdate, but was still under placeholder: {:?}",
+            room_guard.connections.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !room_guard.connections.contains_key(&1009),
+            "placeholder 1009 should have been removed during promotion"
+        );
+        assert!(
+            room_guard.players.contains_key(&2),
+            "room.players should include player_id=2 after the first PositionUpdate"
+        );
     }
 
     #[tokio::test]

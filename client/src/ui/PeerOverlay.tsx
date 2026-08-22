@@ -63,6 +63,20 @@ if (
           (window as unknown as {__localPlayerId?: number}).__localPlayerId = n;
         }
       }
+      // PR 11.7.D2.1 / FIX — peerId URL param was silently ignored.
+      // Pre-fix: PeerOverlay read `?localId` but NOT `?peerId`, so
+      // Tab B's URL `?localId=2&peerId=1` set __localPlayerId=2 but
+      // __peerPlayerId fell back to its default (2). Both tabs
+      // thought Player 2 was the peer, leading to misrouted
+      // DamageRequests when the server's Gate3 fix landed. Reading
+      // both URL params keeps the two tabs symmetric.
+      const peerIdParam = url.searchParams.get("peerId");
+      if (peerIdParam) {
+        const n = Number(peerIdParam);
+        if (Number.isFinite(n) && n > 0) {
+          (window as unknown as {__peerPlayerId?: number}).__peerPlayerId = n;
+        }
+      }
     } catch {
       // Malformed server URL — ignore, fall back to default path.
     }

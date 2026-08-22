@@ -178,15 +178,25 @@ function chestPosition(controller: CharacterController): Vector3 {
 // ---------------------------------------------------------------------------
 
 export interface DualPistolResult {
-  hit: boolean;
   /** Always set — even on a miss, the tracer still draws so the player
    *  gets feedback. `tracerFrom` is the chest ray origin; `tracerTo` is
    *  either the hit point or `tracerFrom + forward * maxRangeMeters`. */
   tracerFrom: Vector3;
   tracerTo: Vector3;
-  /** What was hit, if anything. The hit point is also `tracerTo`. */
+  /** What was hit, if anything. The hit point is also `tracerTo`.
+   *  PR 11.7.D2 / §3.10 fix: distinguishes between the remote rig
+   *  (which should damage the peer) and any other pickable mesh
+   *  (crate props, world geometry — which should NOT damage the peer).
+   *  Pre-fix, the fire path sent a damage request whenever `hit` was
+   *  true regardless of target, so shooting crates/ground damaged
+   *  the peer. Replaces the pre-fix `hit: boolean` field — callers
+   *  should use `hitTarget !== null` for "any hit" / `hitTarget ===
+   *  "remote"` for "peer hit only". */
+  hitTarget: "remote" | "prop" | null;
   hitPoint: Vector3 | null;
-  /** Damage logged for this shot (PR 9 actually applies it). */
+  /** Damage logged for this shot. PR 11.7.D2 / §3.10: only set
+   *  when `hitTarget === "remote"` (a peer hit). Shooting crates
+   *  returns 0 — the tracer still draws for visual feedback. */
   damage: number;
   /** Cooldown gate result — true when the shot was rejected by cooldown. */
   onCooldown: boolean;
@@ -222,23 +232,35 @@ export function dualPistolShoot(
   const predicate = buildCombatPickPredicate("local_");
   const pick = scene.pickWithRay(ray, predicate);
 
-  let hit = false;
   let hitPoint: Vector3 | null = null;
+  // PR 11.7.D2 / §3.10 fix: classify the pick so the fire path
+  // knows whether the raycast actually hit the peer (should damage)
+  // or just a crate / world geometry (should NOT damage — pre-fix,
+  // every "hit" damaged the peer).
+  let hitTarget: "remote" | "prop" | null = null;
 
-  if (pick && pick.hit && pick.pickedPoint) {
-    hit = true;
+  if (pick && pick.hit && pick.pickedPoint && pick.pickedMesh) {
     hitPoint = pick.pickedPoint.clone();
+    // Mesh names follow the `remote_<part>` pattern from
+    // createRemotePlayer() in remotePlayer.ts: `remote_torso`,
+    // `remote_head`, etc. Local rig is filtered out by the predicate.
+    hitTarget = pick.pickedMesh.name.startsWith("remote_")
+      ? "remote"
+      : "prop";
   } else {
     // Miss — tracer still draws, but extends to max range.
     hitPoint = rayEnd.clone();
   }
 
   return {
-    hit,
+    hitTarget,
     tracerFrom: origin.clone(),
     tracerTo: hitPoint.clone(),
-    hitPoint: hit ? hitPoint : null,
-    damage: hit ? COMBAT.dualPistol.damage : 0,
+    hitPoint: hitPoint,
+    // PR 11.7.D2 / §3.10: only peer hits deal damage. Shooting a
+    // crate or the ground returns 0 (the tracer + sound still play
+    // for visual feedback, but no DamageRequest is sent).
+    damage: hitTarget === "remote" ? COMBAT.dualPistol.damage : 0,
     onCooldown: false, // cooldown is enforced at the call site (rising edge)
   };
 }

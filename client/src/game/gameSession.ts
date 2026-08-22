@@ -493,7 +493,12 @@ export function createGameSession(
       );
       frameCombatEvents.push({
         frame: advanced.frame,
-        kind: result.hit ? "fire_hit" : "fire_miss",
+        // PR 11.7.D2 / §3.10 fix: combat event kind reflects whether
+        // the raycast actually hit the peer (`fire_hit`) vs a prop
+        // (`fire_miss` — includes crate hits, which used to register
+        // as `fire_hit` but did 0 damage). The visual tracer still
+        // draws for any hit (the kind affects HUD combat-event labels).
+        kind: result.hitTarget === "remote" ? "fire_hit" : "fire_miss",
         tracerFrom: result.tracerFrom,
         tracerTo: result.tracerTo,
         damage: result.damage,
@@ -505,7 +510,14 @@ export function createGameSession(
       // confirm/revert path). Otherwise, fall back to the local-
       // compute path (lockstep guarantees identical events on both
       // clients — used by the 14 P2P smokes + PR 11.6.C smoke).
-      if (result.hit) {
+      // PR 11.7.D2 / §3.10 fix: gate on `hitTarget === "remote"`
+      // instead of `result.hit`. Pre-fix, shooting crates / world
+      // geometry sent a DamageRequest (and the server applied it),
+      // making HP drop on every shot regardless of whether the peer
+      // was actually hit. result.damage is now 0 for non-peer hits
+      // (see combat.ts:dualPistolShoot), so the smoke path also
+      // needs to gate to avoid sending zero-amount requests.
+      if (result.hitTarget === "remote") {
         if (serverTransport) {
           const eventId = nextEventId++;
           const req: DamageRequest = {
