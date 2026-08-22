@@ -182,7 +182,7 @@ mod tests {
         let mut gen = SnapshotGenerator::new();
         let mut room = room_with_players(&[1, 2]);
         // Only register a connection for player 1.
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let tx = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
         room.register_connection(1, tx);
         let snap = gen.maybe_emit(&room, 100).expect("emit");
         assert_eq!(snap.players.len(), 1);
@@ -193,8 +193,8 @@ mod tests {
     fn snapshot_includes_all_connected_players() {
         let mut gen = SnapshotGenerator::new();
         let mut room = room_with_players(&[1, 2, 3]);
-        let (tx1, _rx1) = tokio::sync::mpsc::channel(8);
-        let (tx2, _rx2) = tokio::sync::mpsc::channel(8);
+        let tx1 = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        let tx2 = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
         room.register_connection(1, tx1);
         room.register_connection(3, tx2);
         let snap = gen.maybe_emit(&room, 100).expect("emit");
@@ -209,7 +209,7 @@ mod tests {
     fn snapshot_server_frame_is_next_minus_one() {
         let mut gen = SnapshotGenerator::new();
         let mut room = room_with_players(&[1]);
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let tx = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
         room.register_connection(1, tx);
         room.next_server_frame = 42;
         let snap = gen.maybe_emit(&room, 100).expect("emit");
@@ -221,7 +221,7 @@ mod tests {
     fn snapshot_carries_hp_and_ammo_from_player() {
         let mut gen = SnapshotGenerator::new();
         let mut room = room_with_players(&[1]);
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let tx = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
         room.register_connection(1, tx);
         // Mutate the player's HP/ammo.
         if let Some(p) = room.players.get_mut(&1) {
@@ -241,15 +241,15 @@ mod tests {
         let mut gen_b = SnapshotGenerator::new();
         let mut room_a = room_with_players(&[1, 2, 3]);
         let mut room_b = room_with_players(&[1, 2, 3]);
-        let (txa1, _rx) = tokio::sync::mpsc::channel(8);
-        let (txa2, _rx) = tokio::sync::mpsc::channel(8);
-        let (txa3, _rx) = tokio::sync::mpsc::channel(8);
+        let txa1 = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        let txa2 = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        let txa3 = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
         room_a.register_connection(1, txa1);
         room_a.register_connection(2, txa2);
         room_a.register_connection(3, txa3);
-        let (txb1, _rx) = tokio::sync::mpsc::channel(8);
-        let (txb2, _rx) = tokio::sync::mpsc::channel(8);
-        let (txb3, _rx) = tokio::sync::mpsc::channel(8);
+        let txb1 = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        let txb2 = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        let txb3 = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
         room_b.register_connection(1, txb1);
         room_b.register_connection(2, txb2);
         room_b.register_connection(3, txb3);

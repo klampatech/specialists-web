@@ -840,7 +840,7 @@ fn snapshot_includes_position_history() {
     room.add_player(player_id);
     room.physics
         .add_player(player_id, Position { x: 1.5, y: -2.5 });
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let tx = specialists_server::connection_outbound::ConnectionOutbound::with_capacity(8);
     room.register_connection(player_id, tx);
 
     // Step the physics world at frame 0 (which is an even

@@ -135,6 +135,22 @@ pub fn validate_and_relay(
         return None;
     }
 
+    // --- Gate 4b: target is alive (D2 carry-forward from Claude D1
+    // review). PR 11.7.D1 made the server authoritative for HP
+    // (`validate_and_relay` now mutates `room.players[target].hp`),
+    // but didn't gate on `hp > 0` — a damage request targeting a
+    // dead player would still produce a broadcast, leading to a
+    // spurious "kill" broadcast after death (HP was already 0, the
+    // `saturating_sub` is a no-op, but the broadcast fan-out still
+    // runs). Gate it here.
+    if room.players[&req_target].hp == 0 {
+        warn!(
+            target = req_target,
+            "validate_and_relay: rejected — target HP is 0 (already dead)",
+        );
+        return None;
+    }
+
     // --- Gate 5: source type (debug-only assert; u8 already constrains it)
     debug_assert!(
         req.source <= 1,
@@ -320,8 +336,29 @@ pub fn validate_and_relay(
     };
 
     // Stamp the per-source eventId last-seen (after broadcast built).
-    room.last_event_id_for_source
-        .insert(req_source, req.event_id);
+    // PR 11.7.D2 / D1 Claude review carry-forward: use saturating
+    // semantics on the `last_event_id_for_source` storage. The
+    // `validate_and_relay` monotonicity gate uses bounded-window
+    // semantics above, but the STAMPED value (this insert) can still
+    // wrap around if `req.event_id == u32::MAX` and a subsequent
+    // request comes in with event_id < u32::MAX (after a long session
+    // or a tab reload). Saturating arithmetic avoids silently wrapping
+    // and re-accepting stale IDs that should be rejected.
+    let prev_event_id = room
+        .last_event_id_for_source
+        .get(&req_source)
+        .copied()
+        .unwrap_or(0);
+    let new_event_id = if req.event_id < prev_event_id {
+        // Stale eventId (within the bounded window above): keep the
+        // stored value at the supremum so subsequent requests with
+        // event_id > prev_event_id are still accepted. Saturating,
+        // not wrapping.
+        prev_event_id
+    } else {
+        req.event_id
+    };
+    room.last_event_id_for_source.insert(req_source, new_event_id);
 
     // PR 11.7.D / D1 / §4.4 closure: mutate the target's HP on the
     // server so the snapshot's `players[i].hp` is the
@@ -902,6 +939,61 @@ mod tests {
         let result = validate_and_relay(&req_zero, 1, &mut room, 0,
             now + Duration::from_millis(200));
         assert!(result.is_none(), "event_id=0 after u32::MAX is more than WINDOW behind -> reject");
+    }
+
+    #[test]
+    fn validates_rejects_target_with_zero_hp() {
+        // PR 11.7.D2: dead-target gate. A damage request targeting a
+        // player with HP=0 must be rejected (avoiding spurious "kill"
+        // broadcasts after death — the server is now authoritative for
+        // HP via the snapshot stream; a dead player can't be killed
+        // again).
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        // Kill the target — set HP to 0.
+        room.players.get_mut(&2).unwrap().hp = 0;
+        let req = passing_request();
+        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
+        assert!(result.is_none(), "damage request targeting dead player must be rejected");
+    }
+
+    #[test]
+    fn event_id_stamp_saturates_does_not_wrap() {
+        // PR 11.7.D2: u32 saturation. After stamping a near-max
+        // event_id, a subsequent request with a SMALLER event_id
+        // (within the bounded window) must NOT wrap the stored value
+        // — saturate at the prior maximum instead.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let now = Instant::now();
+        // First: stamp event_id = u32::MAX - 1.
+        let mut req_max = passing_request();
+        req_max.event_id = u32::MAX - 1;
+        let result = validate_and_relay(&req_max, 1, &mut room, 0, now);
+        assert!(result.is_some(), "first request with event_id near MAX must succeed");
+        assert_eq!(
+            room.last_event_id_for_source.get(&1).copied(),
+            Some(u32::MAX - 1),
+        );
+
+        // Second: event_id = u32::MAX - 1 - 30 (well within EVENT_ID_WINDOW=64).
+        // This is a "stale" eventId within the window — the gate
+        // ACCEPTS it (bounded window), but the SATURATION must keep
+        // the stored value at u32::MAX - 1, not wrap to (u32::MAX - 1 - 30).
+        let mut req_within_window = passing_request();
+        req_within_window.event_id = u32::MAX - 1 - 30;
+        let result = validate_and_relay(
+            &req_within_window,
+            1,
+            &mut room,
+            0,
+            now + Duration::from_millis(200),
+        );
+        assert!(result.is_some(), "stale eventId within EVENT_ID_WINDOW must be accepted");
+        // Stored value must NOT decrease (saturate, don't wrap).
+        assert_eq!(
+            room.last_event_id_for_source.get(&1).copied(),
+            Some(u32::MAX - 1),
+            "stored event_id must saturate, not wrap to a smaller value",
+        );
     }
 
     #[test]

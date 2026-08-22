@@ -91,9 +91,32 @@ export const DAMAGE_BROADCAST_WIRE_SIZE = DAMAGE_BROADCAST_BODY_SIZE + 1;
 export const POSITION_UPDATE_WIRE_SIZE = POSITION_UPDATE_BODY_SIZE + 1;
 export const PING_WIRE_SIZE = PING_BODY_SIZE + 1;
 export const PONG_WIRE_SIZE = PONG_BODY_SIZE + 1;
-/** `0x06` discriminator + u32 frame BE + 12-byte input blob = 17 bytes.
- *  `INPUT_SIZE = 12` comes from `client/src/net/inputBitmask.ts`. */
-export const INPUTS_SERVER_WIRE_SIZE = 17;
+/** `0x06` discriminator + u32 frame BE + 12-byte input blob +
+ *  u32 last_inputs_seq BE = 21 bytes.
+ *  `INPUT_SIZE = 12` comes from `client/src/net/inputBitmask.ts`.
+ *
+ *  PR 11.7.D2 / §1.2 carry-forward: wire size bumped from 17 → 21
+ *  to carry the per-source `last_inputs_seq` trailer (one u32 BE).
+ *  The server's `validate_and_relay` uses this to drop stale
+ *  inputs (replay protection) — the server's lag-comp math consumes
+ *  the freshest input per frame; an out-of-order `inputs_seq` is a
+ *  sign the client is dropping packets and the server should ignore
+ *  rather than apply an old input as if it were current.
+ *
+ *  Brief originally specified 18 — that's a brief-level off-by-3
+ *  math error (same class as the original PR 11.6.A DamageRequest
+ *  8 → 14 mistake). Math wins: 1 (disc) + 4 (frame) + 12 (input) +
+ *  4 (trailer) = 21.
+ *
+ *  Mirror of `server/src/protocol.rs::INPUTS_SERVER_WIRE_SIZE` and
+ *  `WIRE_SIZE_INPUTS_SERVER_WITH_SEQ` in `protocol/constants.ts`.
+ *  Encoder appends a u32 BE trailer; decoder reads the last 4 bytes
+ *  as the trailer and verifies the disc byte at byte 0. */
+export const INPUTS_SERVER_WIRE_SIZE = 21;
+/** PR 11.7.D2 — body size (disc byte already stripped by the caller).
+ *  Wire size 21 - 1 (disc) = 20 bytes body. Body layout: u32 frame
+ *  (4) + 12-byte input + u32 last_inputs_seq (4) = 20. ✓ */
+export const INPUTS_SERVER_BODY_SIZE = INPUTS_SERVER_WIRE_SIZE - 1;
 /** PR 11.7.B: `0x0C` discriminator + u32 event_id BE + reason u8 = 6 bytes total.
  *  Bumped from 0x07 (PR 11.6.D) so 0x07 is free for Snapshot. */
 export const DAMAGE_REJECT_WIRE_SIZE = DAMAGE_REJECT_BODY_SIZE + 1;
@@ -199,17 +222,27 @@ export interface Pong {
  * PR 11.6.B does not transmit this; PR 11.6.C wires the encoder +
  * router. PR 11.7 consumes it for snapshot generation + lag-comp math.
  *
- * Wire layout (17 bytes — see INPUTS_SERVER_WIRE_SIZE note above):
+ * PR 11.7.D2 / §1.2: appends the `lastInputsSeq` trailer (one u32
+ * BE per packet — the sender's inputs_seq counter; the receiver
+ * uses this for replay protection on the lag-comp rewind).
+ *
+ * Wire layout (21 bytes — see INPUTS_SERVER_WIRE_SIZE note above):
  *   byte 0       discriminator 0x06
  *   byte 1..4    frame (u32 BE)
  *   byte 5..16   encoded input (12 bytes — INPUT_SIZE from
  *                client/src/net/inputBitmask.ts)
+ *   byte 17..20  lastInputsSeq (u32 BE) — sender's inputs_seq
  */
 export interface InputsServer {
   frame: number;
   /** 12-byte input blob. Matches `INPUT_SIZE` in
    *  `client/src/net/inputBitmask.ts`. */
   encodedInput: Uint8Array;
+  /** PR 11.7.D2 / §1.2: sender's monotonic inputs_seq counter.
+   *  Server uses this for replay protection — drops the input if
+   *  `lastInputsSeq` is older than the last seen seq for the source.
+   *  Counter starts at 0 on connect and increments once per packet. */
+  lastInputsSeq: number;
 }
 
 /**
@@ -428,9 +461,11 @@ export function decodePong(buf: Uint8Array): Pong | null {
   };
 }
 
-/** Encode an `InputsServer` payload to a 17-byte wire-format
+/** Encode an `InputsServer` payload to a 21-byte wire-format
  *  `Uint8Array` (discriminator 0x06 + 4-byte frame BE + 12-byte
- *  input blob). The input blob is preserved verbatim. */
+ *  input blob + 4-byte lastInputsSeq BE trailer). The input blob is
+ *  preserved verbatim. The trailer carries the sender's monotonic
+ *  inputs_seq counter for server-side replay protection. */
 export function encodeInputsServer(i: InputsServer): Uint8Array {
   if (i.encodedInput.length !== 12) {
     throw new Error(
@@ -441,6 +476,7 @@ export function encodeInputsServer(i: InputsServer): Uint8Array {
     new Uint8Array([DISCRIMINATOR_INPUTS_SERVER]), // disc
     u32BE(i.frame),
     i.encodedInput,
+    u32BE(i.lastInputsSeq), // PR 11.7.D2 / §1.2 trailer
   ]);
   console.assert(
     bytes.length === INPUTS_SERVER_WIRE_SIZE,
@@ -449,9 +485,13 @@ export function encodeInputsServer(i: InputsServer): Uint8Array {
   return bytes;
 }
 
-/** Decode a 17-byte wire-format buffer (discriminator-prefixed) to an
+/** Decode a 21-byte wire-format buffer (discriminator-prefixed) to an
  *  `InputsServer`. Returns null on size mismatch or wrong
  *  discriminator.
+ *
+ *  PR 11.7.D2 / §1.2: reads the `lastInputsSeq` trailer (last 4
+ *  bytes) and returns it as a field. Server uses it for replay
+ *  protection on the lag-comp rewind path.
  *
  *  Mirrors the Rust `decode_inputs_server` exactly. */
 export function decodeInputsServer(buf: Uint8Array): InputsServer | null {
@@ -461,7 +501,8 @@ export function decodeInputsServer(buf: Uint8Array): InputsServer | null {
   const frame = dv.getUint32(1, false);
   const input = new Uint8Array(12);
   input.set(buf.subarray(5, 17));
-  return { frame, encodedInput: input };
+  const lastInputsSeq = dv.getUint32(17, false);
+  return { frame, encodedInput: input, lastInputsSeq };
 }
 
 

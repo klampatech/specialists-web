@@ -174,14 +174,16 @@ fn pong_roundtrip() {
 // -- InputsServer (NEW §1.2) -----------------------------------------
 
 #[test]
-fn inputs_server_is_17_bytes() {
+fn inputs_server_is_21_bytes() {
+    // PR 11.7.D2 / §1.2: wire size 17 → 21 (added u32 last_inputs_seq trailer).
     let payload = InputsServer {
         frame: 0xdeadbeef,
         encoded_input: vec![0u8; 12],
+        last_inputs_seq: 0xdeadbeef,
     };
     let bytes = encode_inputs_server(&payload);
     assert_eq!(bytes.len(), INPUTS_SERVER_WIRE_SIZE);
-    assert_eq!(bytes.len(), 17);
+    assert_eq!(bytes.len(), 21);
 }
 
 #[test]
@@ -189,11 +191,13 @@ fn inputs_server_roundtrip() {
     let original = InputsServer {
         frame: 0xabcd1234,
         encoded_input: (0..12u8).collect(),
+        last_inputs_seq: 0x01020304,
     };
     let bytes = encode_inputs_server(&original);
     let decoded = decode_inputs_server(&bytes).expect("decode must succeed");
     assert_eq!(original.frame, decoded.frame);
     assert_eq!(original.encoded_input, decoded.encoded_input);
+    assert_eq!(original.last_inputs_seq, decoded.last_inputs_seq);
 }
 
 #[test]
@@ -201,9 +205,11 @@ fn inputs_server_rejects_wrong_size() {
     let payload = InputsServer {
         frame: 1,
         encoded_input: vec![0u8; 12],
+        last_inputs_seq: 0,
     };
     let bytes = encode_inputs_server(&payload);
-    // Truncate to 15 bytes (off-by-one).
+    // Truncate to 15 bytes (off-by-many — 21 - 6 = 15, the post-disc body
+    // starts at byte 1, so 15 bytes is 14 bytes of body — clearly too short).
     assert!(decode_inputs_server(&bytes[..15]).is_none());
     // Wrong discriminator.
     let mut bad = bytes.clone();
