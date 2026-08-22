@@ -10,11 +10,12 @@
 // hard-snap to server position + drop buffered inputs (the buffer is
 // drained beyond the point where re-simulation makes physical sense).
 //
-// **Constants source**: the 5 numbers below are a MIRROR of
-// `server/src/constants.rs` (PR 11.7.B). The PR 11.7.C brief locks the
-// decision to NOT extract a `protocol/constants.ts` file in this PR;
-// each new module inlines the constants with a `MIRROR of
-// server/src/constants.rs` comment. Carry-forward to a later PR.
+// **Constants source**: the constants below are now IMPORTED from
+// `protocol/constants.ts` (PR 11.7.D2 / §1.2). Before D2 the
+// constants were a MIRROR of `server/src/constants.rs` (PR 11.7.B),
+// inlined per-module. PR 11.7.D2.1 extracted the canonical
+// `protocol/constants.ts`; this file dropped the inlined copies
+// and imports from the canonical source.
 //
 // **Havok step**: the predictor wraps (does not duplicate) the existing
 // `characterController.tick(planarVelocity)` Havok step. The constructor
@@ -40,25 +41,21 @@
 //     only drains inputs recorded AFTER the snapshot.
 
 import type { Snapshot, PlayerState } from "../../../protocol/snapshot";
+import {
+  MAX_RECONCILIATION_SNAP_DISTANCE_M,
+  RECONCILIATION_THRESHOLD_M,
+} from "../../../protocol/constants";
 
-// -- Constants (MIRROR of server/src/constants.rs) ----------------
-
-/** PR 11.7.B / §3.10 — snapshot broadcast cadence (Hz). */
-const SNAPSHOT_RATE_HZ = 20;
-
-/** PR 11.7.B / §2.4 + §3.7 — client-side reconciliation drift
- *  threshold (meters). Drift above this triggers re-simulation from
- *  the last server-confirmed frame forward. 10cm is the CS2/Valorant
- *  default. Sub-threshold drift is invisible (Havok vs Rapier float
- *  noise). */
-const RECONCILIATION_THRESHOLD_M = 0.1;
-
-/** PR 11.7.B / §2.4 — max visual snap distance on a reconciliation
- *  (meters). Beyond this the predictor hard-snaps to server position
- *  + drops the buffered inputs (the buffer is too drained for
- *  re-simulation to make sense). 2m prevents teleporting across the
- *  map when the client falls > 1s behind. */
-const MAX_RECONCILIATION_SNAP_DISTANCE_M = 2.0;
+// -- Constants (canonical — sourced from protocol/constants.ts) ---
+//
+// PR 11.7.D2 / §1.2: SNAPSHOT_RATE_HZ / RECONCILIATION_THRESHOLD_M /
+// MAX_RECONCILIATION_SNAP_DISTANCE_M MOVED to `protocol/constants.ts`
+// (the canonical source for both client + server; the TS module was
+// extracted in PR 11.7.D2.1). The previous mirror-of-server/constants.rs
+// inlined copies are gone — these names now come straight from the
+// canonical import above. The re-export at the bottom of this file
+// is also removed; importers should reach into
+// `protocol/constants.ts` directly.
 
 /** PR 11.7.C — max number of inputs to retain in the per-frame buffer.
  *  FIFO eviction when over. The cap exists so a runaway buffer can't
@@ -396,7 +393,3 @@ export class Predictor {
     };
   }
 }
-
-// Re-export for tests that want to mock the wire-side helpers without
-// importing the full protocol module.
-export { SNAPSHOT_RATE_HZ, RECONCILIATION_THRESHOLD_M, MAX_RECONCILIATION_SNAP_DISTANCE_M };

@@ -48,8 +48,7 @@ try {
   await page.waitForFunction(
     () =>
       typeof window.__pointerLockToggle === "function" &&
-      typeof window.__chaseCameraProbe === "function" &&
-      typeof window.__peer === "object",
+      typeof window.__chaseCameraProbe === "function",
     null,
     { timeout: 15000 },
   );
@@ -222,10 +221,15 @@ try {
     timeout: 2000,
   });
   const peerStateBefore = await page.evaluate(() => {
-    const peer = window.__peer;
+    // PR 11.7.D2 / §3.10 — `__peer` DELETED with the WebRTC
+    // substrate. The PauseMenu's Disconnect button now closes the
+    // ServerTransport instead. Probe `__serverTransport` so the
+    // pause-menu disconnect-then-resume flow still has a meaningful
+    // hook for the smoke.
+    const t = window.__serverTransport ?? null;
     return {
-      hasPeer: !!peer,
-      connectionState: peer?.connection?.connectionState ?? null,
+      hasPeer: t !== null,
+      connectionState: t && typeof t.close === "function" ? "open" : null,
     };
   });
   // PR 11.2.1: click the Disconnect button via React's dispatchEvent
@@ -248,12 +252,17 @@ try {
   });
   await page.waitForTimeout(300);
   const peerStateAfter = await page.evaluate(() => {
-    const peer = window.__peer;
+    // PR 11.7.D2 / §3.10 — see comment above. The ServerTransport
+    // after close() has `close` no longer callable in the normal
+    // path; treat the transport as closed when the slot is null
+    // (peer writes the close + clears the slot) OR has no `close`
+    // method.
+    const t = window.__serverTransport ?? null;
     return {
-      hasPeer: !!peer,
-      connectionState: peer?.connection?.connectionState ?? null,
-      signState: peer?.connection?.signalingState ?? null,
-      connectionClosed: peer?.connection ? peer.connection.connectionState === "closed" : true,
+      hasPeer: t !== null,
+      connectionState: t && typeof t.close === "function" ? "open" : "closed",
+      signState: t && typeof t.close === "function" ? "stable" : "closed",
+      connectionClosed: t === null || typeof t.close !== "function",
     };
   });
   if (peerStateBefore.hasPeer && !peerStateAfter.connectionClosed) {
