@@ -61,31 +61,34 @@ import { CAPSULE, WORLD_GRAVITY } from "./characterConfig";
 import { createInputListener, type InputListener } from "./inputListener";
 import { createGameSession, type GameSession } from "../game/gameSession";
 import { renderTracer } from "../game/combat";
-import type { GgnetTransport } from "../net/ggnet";
-import { LockstepRuntime, ROLLBACK_CAP_FRAMES } from "../net/ggrsRuntime";
+// PR 11.7.D2 / §3.10 — ggrsRuntime + ggnet DELETED. The peer WebRTC
+// lockstep substrate is gone; gameSession now owns a LockstepState stub
+// (no peer concept). The scene-level types just need a flag to opt
+// into the multiplayer scene-mode (we still build a remote rig +
+// snapshot interpolator), not the legacy WebRTC transport.
 import { decodeInput } from "../net/inputBitmask";
 
-/** Optional multiplayer kick — when present, createScene also runs a second
- *  controller and a lockstep session across the supplied transport.
+/** Optional multiplayer kick — when present, createScene also runs a
+ *  second character (remote rig) + wires the snapshot interpolator
+ *  for remote-visual position. There is NO transport parameter in
+ *  PR 11.7.D2 / §3.10 (the P2P WebRTC + GGRS lockstep substrate was
+ *  retired — see `engine/lockstepState.ts`).
  *
- *  PR 11.6.C review fix N1: `useServerTransport` is the programmatic
- *  override that gates the DEV-only `ServerTransport` instantiation in
- *  scene.ts. Default `false`. Programmatic callers can pass `true`
- *  here to exercise the server-transport path through the public API
- *  (planned for PR 11.6.D's URL-routed `?server=` flag). The DEV
- *  probe `__forceServerTransport` is still honored as a backup (the
- *  smoke uses that — `page.addInitScript` sets it BEFORE the page
- *  loads so scene.ts sees it on boot).
+ *  Two ways to enable multiplayer:
+ *    1. Programmatic: pass `multiplayer: { useServerTransport: true }`
+ *       to `createScene()`.
+ *    2. URL-flag: `?server=ws://...` / `?server=https://...` sets
+ *       `window.__forceServerTransport` before the scene module
+ *       loads (PeerOverlay.tsx reads the URL on module load).
+ *
+ *  Either path wires the ServerTransport + snapshot interpolator +
+ *  remote Havok controller. The smoke uses the URL-flag path.
  */
 export interface MultiplayerOptions {
-  transport: GgnetTransport;
-  /** PR 11.6.C review fix N1: programmatic override that gates the
-   *  server-transport DEV probe in scene.ts. `true` enables the
-   *  `ServerTransport` instantiation (equivalent to setting
-   *  `window.__forceServerTransport` before the page loads). The
-   *  smoke uses the window-probe path; future programmatic callers
-   *  (PR 11.6.D's URL-routed `?server=` flag) will pass `true`
-   *  directly via this field. */
+  /** Programmatic override equivalent to setting
+   *  `window.__forceServerTransport` before page load. The
+   *  `?server=` URL flag is the canonical trigger; this field
+   *  exists for future programmatic callers. */
   useServerTransport?: boolean;
 }
 
@@ -135,6 +138,12 @@ export interface SceneHandle {
    *  user-initiated event handler or the smoke; the browser will refuse
    *  in random places). The chase camera handles viewMode restoration. */
   setPointerLock?: (locked: boolean) => void;
+  /** PR 11.7.D2 / §3.10 — ServerTransport accessor for the
+   *  PauseMenu's "Disconnect Server" button + any future UI that
+   *  needs to drive the transport lifecycle (close / reconnect).
+   *  Returns `null` when no transport is wired (single-player
+   *  mode). */
+  getServerTransport?: () => import("../net/serverTransport").ServerTransport | null;
 }
 
 /**
@@ -176,6 +185,16 @@ function makeBroadcastHandler(
     const bc = probe.decodeDamageBroadcast(body);
     if (!bc) return;
     const { local, remote } = getControllers();
+    // PR 11.7.D2 / §3.10 fix — broadcast target is the player being
+    // HIT, not the player attacking. The previous resolver
+    // (`playerId === localPlayerId ? local : remote`) was wrong for
+    // symmetric two-tab play: Tab A shoots Tab B (targetPlayerId=2).
+    // Tab B receives the broadcast and saw `targetPlayerId === localPlayerId`
+    // (since Tab B IS Player 2), so it applied 12 dmg to itself
+    // instead of to its remote. Correct semantic: if the broadcast
+    // target is ME, apply to local (self-damage, defensive — the
+    // server's dead-target gate prevents this in normal flow); if the
+    // target is the OTHER player, apply to remote.
     const result = probe.applyBroadcast(bc, performance.now(), (playerId) =>
       playerId === localPlayerId ? local : remote,
     );
@@ -366,8 +385,27 @@ export async function createScene(
     (window as unknown as { __localPlayerId?: number }).__localPlayerId ?? 1;
   const initPeerPlayerId =
     (window as unknown as { __peerPlayerId?: number }).__peerPlayerId ?? 2;
-  const gameSession = multiplayer
-    ? createGameSession(scene, multiplayer.transport, {
+  // PR 11.7.D2 / §3.10 — createGameSession no longer takes a
+  // transport arg (no peer wire to plug in). The gameSession owns a
+  // LockstepState stub for HUD compat. The remote visual is driven
+  // by the snapshot interpolator wired below (interpolatorTickHook).
+  //
+  // PR 11.7.D2 / fixes #49-verify: derive `effectiveMultiplayer` from
+  // either the `multiplayer` arg OR the `__forceServerTransport` window
+  // flag. App.tsx's createScene(canvas) call no longer passes
+  // `multiplayer` after D2.2 — the URL-routed `?server=` flag sets
+  // `__forceServerTransport` via PeerOverlay's URL reader + the smoke
+  // sets it via `page.addInitScript`. Either path should now create
+  // a gameSession + ServerTransport wiring (matching PR 11.6.D's
+  // pre-D2.2 behavior).
+  const effectiveMultiplayer: MultiplayerOptions | undefined =
+    multiplayer ??
+    ((typeof window !== "undefined" &&
+      (window as unknown as { __forceServerTransport?: boolean }).__forceServerTransport === true)
+      ? { useServerTransport: true }
+      : undefined);
+  const gameSession = effectiveMultiplayer
+    ? createGameSession(scene, {
         localPlayerId: initLocalPlayerId,
         peerPlayerId: initPeerPlayerId,
       })
@@ -384,6 +422,16 @@ export async function createScene(
   // `import.meta.env.DEV` and the snapshot transport requires
   // `__forceServerTransport`).
   let predictorTickHook: ((nowMs: number) => void) | null = null;
+  // PR 11.7.D2 / §3.10 — interpolator tick hook. Fires before
+  // gameSession.tick() so the interpolated remote position is
+  // fresh at the moment the Havok write-target `setPosition()`
+  // runs (in the body of `interpolatorTickHook`, see below). The
+  // interpolated position is what drives the remote visual root
+  // — the Havok controller is a write-target only after D2.2.
+  let interpolatorTickHook: ((nowMs: number) => void) | null = null;
+  // PR 11.7.D2 / §3.10 — ServerTransport ref for the PauseMenu
+  // disconnect button + future server-lifecycle UI.
+  let serverRef: import("../net/serverTransport").ServerTransport | null = null;
 
   if (gameSession) {
     // Multiplayer branch: GameSession owns the rigs. Use the local rig for
@@ -488,8 +536,20 @@ export async function createScene(
     // controller on frame-N+1 (consistent with how yaw is applied).
     state.pitchRadians = chase.getPitch();
     if (gameSession) {
-      // Multiplayer path: the session drives both controllers, applies the
-      // stunt pose, and pushes the visual transforms into each rig's root.
+      // Multiplayer path: the session drives the local controller,
+      // applies the stunt pose, and pushes the visual transforms
+      // into each rig's root. The REMOTE rig's position comes from
+      // the snapshot interpolator (interpolatorTickHook below).
+      //
+      // PR 11.7.D2 / §3.10 — render observer ordering:
+      //   1. predictorTickHook (predictor per-frame drain)
+      //   2. interpolatorTickHook (interpolator per-frame sample
+      //      → applies position to remoteController.havok via
+      //      setPosition)
+      //   3. gameSession.tick (drives localController; remote
+      //      controller's Havok is now at the interpolated position
+      //      and the controller's pose applier runs from that base)
+      //
       // PR 11.7.C / §3.7 — predictor per-frame forward-prediction fires
       // BEFORE gameSession.tick() so the predictor's mirror state is
       // current at snapshot arrival. The predictor uses save/restore
@@ -498,6 +558,13 @@ export async function createScene(
       // unchanged after predictorTickHook returns, then gameSession.tick
       // advances it from the same starting state.
       predictorTickHook?.(now);
+      // PR 11.7.D2 / §3.10 — interpolator per-frame sample. The
+      // hook's body reads the latest snapshot + applies the
+      // interpolated position to remoteController.havok. Runs
+      // BEFORE gameSession.tick() so the remote's pose applier
+      // (applyRemotePose inside gameSession.tick) reads the
+      // current Havok position.
+      interpolatorTickHook?.(now);
       gameSession.tick(state, deltaSeconds, now);
       // PR 7: render tracers for any fire_hit / fire_miss events that were
       // generated since the last frame. consumeUnrenderedCombatEvents()
@@ -661,14 +728,62 @@ export async function createScene(
       // negation (Babylon sign convention).
       pitchRadians: chase.getPitch(),
     });
-    // PR 10: smoke-only accessor for the health-regression test. Teleports
-    // the REMOTE rig onto a known position so every shot in the smoke
-    // is a guaranteed hit. Gated behind `import.meta.env.DEV` (same as
-    // `__jumpProbe`); stripped from production bundles by Vite.
+    // PR 10: smoke-only accessor for the health-regression test.
+    // Teleports the REMOTE rig onto a known position so every
+    // shot in the smoke is a guaranteed hit. Gated behind
+    // `import.meta.env.DEV` (same as `__jumpProbe`); stripped
+    // from production bundles by Vite.
+    //
+    // PR 11.7.D2 / §3.10 — two-step teleport:
+    //   1. setPosition on remoteController.havok (immediate
+    //      visual move; covers the same-frame read).
+    //   2. Push a synthetic snapshot at the teleport position
+    //      into the interpolator\'s per-player buffer. Without
+    //      this, the next tick() would overwrite the setPosition
+    //      with the snapshot\'s last known position (likely the
+    //      spawn or wherever the remote was last seen). The
+    //      synthetic entry guarantees the teleport sticks for
+    //      the next several frames (until a real server
+    //      snapshot supersedes it).
     if (gameSession) {
       (window as unknown as { __teleportRemote?: (x: number, z: number) => void }).__teleportRemote =
         (x: number, z: number) => {
-          gameSession.remoteController.havok.setPosition(new Vector3(x, 1, z));
+          const pos = new Vector3(x, 1, z);
+          gameSession.remoteController.havok.setPosition(pos);
+          // Find the interpolator (closure-captured via
+          // the predictorTickHook setup above; exposed on
+          // window via __interpolator for the smoke). We
+          // push a synthetic snapshot entry into the
+          // buffer for the remote player (non-local).
+          const interp = (window as unknown as {__interpolator?: {
+            buffers: Map<number, {push: (e: {arrivedAtMs: number; snapshot: unknown; player: {playerId: number; positionX: number; positionY: number; velocityX: number; velocityY: number; yaw: number; pitch: number; hp: number; ammo: number; isFiring: number}}) => void}>;
+          }}).__interpolator;
+          if (interp) {
+            const now = performance.now();
+            for (const [pid, buffer] of interp.buffers) {
+              // Skip the local player; push a synthetic entry
+              // at the teleport position for each remote.
+              const syntheticSnap = {
+                players: [{
+                  playerId: pid,
+                  positionX: x,
+                  positionY: z,
+                  velocityX: 0,
+                  velocityY: 0,
+                  yaw: 0,
+                  pitch: 0,
+                  hp: 100,
+                  ammo: 0,
+                  isFiring: 0,
+                }],
+              };
+              buffer.push({
+                arrivedAtMs: now,
+                snapshot: syntheticSnap,
+                player: syntheticSnap.players[0],
+              });
+            }
+          }
         };
     }
     // PR 11.4: dev-box free-fly spectator camera DEV probes. The
@@ -709,29 +824,12 @@ export async function createScene(
       (deltaRadians: number) => spectator!.applyYawDelta(deltaRadians);
     (window as unknown as { __spectatorPitchDelta?: (deltaRadians: number) => void }).__spectatorPitchDelta =
       (deltaRadians: number) => spectator!.applyPitchDelta(deltaRadians);
-    // PR 11.5: dev-only probe for the lockstep-rollback smoke. Wraps a
-    // throwaway LockstepRuntime with a no-op transport so the smoke can
-    // verify ROLLBACK_CAP_FRAMES is loaded + the public getters return
-    // sane defaults (no .paused / .pausedFrames access on a real session
-    // because the smoke creates its OWN runtime programmatically; this
-    // probe is just a sanity check + the signature smoke the rest of
-    // the suite uses to detect "module loaded"). Stripped from
-    // production by Vite (import.meta.env.DEV → false). The probe
-    // matches the convention of the existing __spectator* / __chaseCamera*
-    // probes — same shape, same DEV-only gate, same tree-shaking story.
-    const __lockstepTestRuntime = new LockstepRuntime({
-      onPacket: () => {},
-      send: () => {},
-    } as unknown as GgnetTransport);
-    (window as unknown as { __lockstepProbe?: () => unknown }).__lockstepProbe = () => ({
-      cap: ROLLBACK_CAP_FRAMES,
-      isPaused: __lockstepTestRuntime.isPaused,
-      pausedFrames: __lockstepTestRuntime.pausedFrames,
-      totalPausedFrames: __lockstepTestRuntime.totalPausedFrameCount,
-      frame: __lockstepTestRuntime.frame,
-      repeatedFrameCount: __lockstepTestRuntime.repeatedFrameCount,
-      predictionDepth: __lockstepTestRuntime.predictionDepth,
-    });
+    // PR 11.7.D2 / §3.10 — __lockstepProbe REMOVED. The
+    // lockstep substrate (ggrsRuntime + peer + ggnet) is gone;
+    // the lockstep-rollback smoke is rewritten to test snapshot
+    // interpolation (post-D2.2 architectural shift). No probe
+    // for the deleted runtime.
+
     // PR 11.6.C: server-transport DEV probe. The smoke sets
     // `window.__forceServerTransport = true` via `page.addInitScript`
     // BEFORE this scene module loads. When the flag is set, we
@@ -754,7 +852,7 @@ export async function createScene(
     // `MultiplayerOptions.useServerTransport` (planned for PR 11.6.D's
     // URL-routed `?server=` flag). Either is sufficient to enable the
     // server-transport instantiation.
-    const useServerTransportFromOpts = multiplayer?.useServerTransport === true;
+    const useServerTransportFromOpts = effectiveMultiplayer?.useServerTransport === true;
     const useServerTransportFromWindow = (
       typeof window !== "undefined" &&
       (window as unknown as { __forceServerTransport?: boolean }).__forceServerTransport === true
@@ -940,13 +1038,31 @@ export async function createScene(
         }
         winSlot.__serverTransport = server;
         winSlot.__damageBus = probe;
-        // PR 11.6.D — late-bind the server transport onto the
-        // GameSession so tick() routes damage through it. The smoke
-        // passes the localPlayerId explicitly so both tabs know which
-        // player ID they own.
-        if (gameSession) {
-          gameSession.setServerTransport?.(server);
+        // PR 11.7.D2.1 / FIX — late-bind the server transport onto the
+        // LIVE GameSession (resolved via window.__gameSession, NOT the
+        // closure's `gameSession` variable). Pre-fix: the closure
+        // captures the local `gameSession`, which under React
+        // StrictMode is the FIRST createScene() call's session — but
+        // `window.__gameSession` holds the SECOND (live) session. The
+        // first call's session gets disposed when React unmounts it,
+        // so its `setServerTransport` updates a dead reference. The
+        // live session's `serverTransport` closure stayed null, so
+        // `gameSession.tick()` never sent PositionUpdate or
+        // DamageRequest via the wire — manual tests saw `positionSends: 0`
+        // + damage requests rejected at the server's Gate3.
+        //
+        // Resolution: read the LIVE gameSession from the window slot,
+        // not from the closure. This mirrors the pattern already used
+        // in `makeBroadcastHandler` (line ~957-974: "PR 11.6.D fix4"
+        // comment) for the same StrictMode race.
+        if (typeof window !== "undefined") {
+          const liveSession = (window as unknown as { __gameSession?: GameSession }).__gameSession;
+          liveSession?.setServerTransport?.(server);
         }
+        // PR 11.7.D2 / §3.10 — stash the server on the SceneHandle
+        // (closure capture) so the PauseMenu\'s "Disconnect Server"
+        // button can close it via `handle.getServerTransport()?.close()`.
+        serverRef = server;
         // PR 11.7.C / §3.7 + §3.8 — wire the client-side predictor +
         // remote interpolator onto the ServerTransport's onSnapshot
         // stream. Both consume the same 20Hz Snapshot stream
@@ -1036,6 +1152,43 @@ export async function createScene(
             () => gameSession.frame,
           );
           const interpolator = new Interpolator(localPlayerId);
+          // PR 11.7.D2 / §3.10 — interpolatorTickHook body. The
+          // hook is called per-frame from the render observer
+          // (BEFORE gameSession.tick). It samples the
+          // 100ms-lookback interpolated state for the REMOTE
+          // player (playerId !== localPlayerId) and applies the
+          // position to remoteController.havok via setPosition.
+          // The remote Havok body becomes a write-target — its
+          // own physics integration (if any) is bypassed by
+          // setPosition + the fact that gameSession.tick() no
+          // longer calls remoteController.update().
+          //
+          // **No snapshot → no remote**: when no snapshot has
+          // arrived yet (very-first frames), the interpolator
+          // returns null and we skip the setPosition (the remote
+          // rig stays at its initial spawn). This matches the
+          // pre-D2.2 behavior on first-connect.
+          interpolatorTickHook = (nowMs: number) => {
+            const states = interpolator.tick(nowMs);
+            if (states.length === 0) return;
+            const remoteCtrl = gameSession.remoteController;
+            // For the 2-player MVP: apply the FIRST remote player
+            //\'s interpolated position. (Multiple remote players
+            // would each need their own Havok body + rig; PR 11.7.D2
+            // keeps the single-remote-controller shape from PR 4.)
+            // Future multi-player work would iterate states and
+            // drive N remote controllers (one per non-local player).
+            const remoteState = states[0];
+            // `state.position` is the interpolated Vec3 in world
+            // space (Babylon convention: XZ = horizontal, Y =
+            // vertical). Apply via Havok setPosition; the
+            // visualRoot.position.copyFrom(pos) in
+            // characterController.ts publishes it to the mesh.
+            // We skip `state.rotation` for now (yaw/pitch on the
+            // wire are zero in PR 11.7.B per server snapshot.rs;
+            // the remote rig renders with its default yaw).
+            remoteCtrl.havok.setPosition(remoteState.position);
+          };
           // PR 11.7.C / §3.7 + §3.8 — closure variable for the latest
           // decoded snapshot. The render observer (line 484) reads
           // this so the interpolator can be queried per-frame for
@@ -1232,6 +1385,9 @@ export async function createScene(
 
   if (gameSession) {
     handle.getGameSession = () => gameSession;
+    // PR 11.7.D2 / §3.10 — ServerTransport accessor for the
+    // PauseMenu disconnect button + future UI.
+    handle.getServerTransport = () => serverRef;
     handle.getRemoteTransform = () => {
       const ctrl = gameSession.remoteController;
       return {

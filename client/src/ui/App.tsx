@@ -22,8 +22,8 @@ import { createScene, type SceneHandle } from "../engine/scene";
 import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
 import { PauseMenu } from "./PauseMenu";
-import { WebRTCPeer, smokeSignalPut, smokeSignalGet } from "../net/peer";
-import { GgnetTransport } from "../net/ggnet";
+// PR 11.7.D2 / §3.10 — WebRTCPeer + GgnetTransport imports REMOVED.
+ // The P2P lockstep substrate is gone; see the header comment.
 
 /** Snapshot the HUD reads each frame. We sample a handful of fields rather
  *  than the whole transport so React doesn't re-render on every input. */
@@ -66,7 +66,8 @@ interface HudState {
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sceneRef = useRef<SceneHandle | null>(null);
-  const peerRef = useRef<WebRTCPeer | null>(null);
+  // PR 11.7.D2 / §3.10 — peerRef REMOVED. No WebRTC peer to own;
+  // the snapshot stream is the multiplayer connection now.
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
   const [engineLabel, setEngineLabel] = useState<"webgpu" | "webgl2" | null>(null);
@@ -86,59 +87,27 @@ export function App() {
     viewMode: 0,
   });
 
-  // Construct the WebRTC peer once per mount. The peer lives across scene
-  // rebuilds (so "disconnect → reconnect" doesn't drop ICE state). The
-  // transport wraps it for the GameSession.
-  if (!peerRef.current) peerRef.current = new WebRTCPeer();
-  const peer = peerRef.current;
-
-  // Expose smoke-test API on window — the smoke script calls window.__join()
-  // explicitly after mount, so this works regardless of StrictMode timing.
-  useEffect(() => {
-    (window as unknown as Record<string, unknown>).__peer = peer;
-    (window as unknown as Record<string, unknown>).__smokeSignal = {
-      put: smokeSignalPut,
-      get: smokeSignalGet,
-    };
-    // Called by the smoke script after mount — triggers the signaling flow
-    // without relying on URL param reading timing inside a React effect.
-    (window as unknown as Record<string, unknown>).__join = (offerB64: string) => {
-      const offer = JSON.parse(atob(offerB64));
-      peer.createAnswer(offer).then((answer) => {
-        smokeSignalPut("sw_answer", JSON.stringify(answer));
-      }).catch((err) => {
-        console.error("[__join] createAnswer failed:", err);
-      });
-    };
-  }, [peer]);
+  // PR 11.7.D2 / §3.10 — WebRTC peer / __peer / __smokeSignal /
+  // __join probes REMOVED. The P2P lockstep signaling flow is
+  // gone; the smoke uses `?server=` URL routing + the
+  // ServerTransport DEV probes instead.
 
   // Stable callback so PeerOverlay's useEffect doesn't re-fire every render.
   const reportConnection = useCallback((s: HudState["connectionStatus"]) => {
     setHud((h) => (h.connectionStatus === s ? h : { ...h, connectionStatus: s }));
   }, []);
 
-  // Wire peer lifecycle to the HUD.
-  useEffect(() => {
-    const onOpen = () => reportConnection("connected");
-    const onDisconnect = () => reportConnection("disconnected");
-    peer.on("open", onOpen);
-    peer.on("disconnect", onDisconnect);
-    return () => {
-      // PeerOverlay's cleanup closes the connection on unmount — don't
-      // double-close here.
-    };
-  }, [peer, reportConnection]);
-
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     let disposed = false;
-    const transport = new GgnetTransport(peer);
-    createScene(
-      canvas,
-      { transport }, // multiplayer-on from frame 0; the runtime idles until peer connects
-    )
+    // PR 11.7.D2 / §3.10 — no transport arg. The multiplayer scene
+    // is enabled by the `?server=` URL flag (PeerOverlay.tsx reads
+    // it on module load + sets `__forceServerTransport`). When set,
+    // scene.ts wires ServerTransport + remoteInterpolator + remote
+    // Havok controller. If unset, the scene is single-player.
+    createScene(canvas)
       .then((handle) => {
         if (disposed) {
           handle.dispose();
@@ -151,23 +120,53 @@ export function App() {
         // Poll the runtime at ~10Hz for HUD display (avoids per-render React
         // re-renders from per-frame state updates).
         const hudTimer = window.setInterval(() => {
-          const session = handle.getGameSession?.();
-          if (!session) return;
-          // PR 7: pull the live InputState snapshot for the bullet-time chip.
-          const inputState = handle.getInputState?.();
-          // PR 10: pull the health snapshot so the HUD chip can render HP
-          // + respawn countdown. Cheap read — just two field accesses.
-          const health = session.getHealthSnapshot();
+          // PR 11.7.D2 / fixes #50-verify: read chase state FIRST
+          // (it's independent of gameSession — the pause menu /
+          // pointer-lock UI needs it even in single-player mode).
+          // The health + repeatedFrames + combatEvents reads below
+          // remain gated on gameSession existence (single-player
+          // has no gameSession; the values are multiplayer-only).
+          //
           // PR 11.2: chase-camera state (pointer lock + menu orbit +
-          // viewMode). Drives the pause-menu visibility. Single source of
-          // truth: `handle.getChaseState?.()` returns a snapshot read of
-          // the chase camera's internal flags.
+          // viewMode). Drives the pause-menu visibility. Single source
+          // of truth: `handle.getChaseState?.()` returns a snapshot
+          // read of the chase camera's internal flags.
           const chase = handle.getChaseState?.() ?? {
             isPointerLocked: false,
             isMenuOrbit: false,
             everLocked: false,
             viewMode: 0,
           };
+          const session = handle.getGameSession?.();
+          if (!session) {
+            // Single-player path: keep chase-derived HUD fields live
+            // (pointer lock, everLocked, viewMode) but skip the
+            // multiplayer-only reads (HP, repeated frames, combat
+            // events, bullet time).
+            setHud((h) => ({
+              ...h,
+              connectionStatus: "offline",
+              frame: 0,
+              repeatedFrames: 0,
+              hasRemote: false,
+              hits: 0,
+              bulletTime: false,
+              localHp: 100,
+              remoteHp: 100,
+              localRespawningMs: 0,
+              remoteRespawningMs: 0,
+              isPointerLocked: chase.isPointerLocked,
+              everLocked: chase.everLocked,
+              viewMode: chase.viewMode,
+            }));
+            return;
+          }
+          // PR 7: pull the live InputState snapshot for the bullet-time chip.
+          const inputState = handle.getInputState?.();
+          // PR 10: pull the health snapshot so the HUD chip can render HP
+          // + respawn countdown. Cheap read — just two field accesses.
+          const health = session.getHealthSnapshot();
+          // chase already declared above
           setHud((h) => ({
             ...h,
             frame: session.frame,
@@ -203,7 +202,7 @@ export function App() {
       }
       sceneRef.current = null;
     };
-  }, [peer]);
+  }, []);
 
   return (
     <div
@@ -240,7 +239,12 @@ export function App() {
         <>
           <KeybindHud engineLabel={engineLabel} />
           <BulletTimeChip active={hud.bulletTime} />
-          <PeerOverlay peer={peer} onStatusChange={reportConnection} />
+          {/* PR 11.7.D2 / §3.10 — PeerOverlay repurposed for server
+              connection status (no peer). The overlay no longer
+              drives SDP copy/paste; it surfaces the ServerTransport
+              connect/disconnect lifecycle via the existing
+              onStatusChange prop. */}
+          <PeerOverlay onStatusChange={reportConnection} />
           <BulletHud
             frame={hud.frame}
             repeatedFrames={hud.repeatedFrames}
@@ -273,16 +277,15 @@ export function App() {
               handle.setPointerLock?.(true);
             }}
             onDisconnect={() => {
-              // Close the peer connection. The PeerOverlay shows its own
-              // host/join UI; closing the connection surfaces the local
-              // "disconnected" state and lets the user re-host or join
-              // a new peer. We don't reset the React state explicitly —
-              // PeerOverlay reads `peer.connectionState` on its own
-              // interval and updates accordingly.
+              // PR 11.7.D2 / §3.10 — close the ServerTransport.
+              // The PeerOverlay surfaces the "disconnected" state
+              // via its own interval; React state updates via
+              // reportConnection. No peer to close.
               try {
-                peer.close();
+                const t = sceneRef.current?.getServerTransport?.();
+                t?.close?.();
               } catch (e) {
-                console.error("[pause-menu] peer.close failed:", e);
+                console.error("[pause-menu] server-transport close failed:", e);
               }
             }}
             viewMode={hud.viewMode}

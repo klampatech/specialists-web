@@ -4,16 +4,16 @@
 //
 // **What this is**: the orchestrator that bridges the existing PR 3 stack
 // (InputListener + CharacterController + procedural humanoid + chase camera)
-// with the new PR 4 netcode substrate (LockstepRuntime over WebRTC) and the
-// PR 7 combat layer (dual-pistol raycast + melee cone hit + per-client
-// bullet-time scaling).
+// with the post-D2.2 architecture: local input → local Havok controller +
+// local combat; remote → snapshot stream → interpolator → remote Havok
+// controller (write-target only). The lockstep surface is preserved as a
+// no-op `LockstepState` stub for call-site compatibility.
 //
 // **Determinism rule (SPEC §"Determinism rule")**: the tick receives
 // `deltaSeconds` + `nowMs` from the engine's frame observer and never reads
-// `Date.now()` / `performance.now()`. Both clients run the same physics step
-// with the same two inputs, so Havok lands on identical results on both ends
-// (modulo float-rounding quirks we accept for the feel test — documented in
-// the PR body and the SPEC decisions block).
+// `Date.now()` / `performance.now()`. With the lockstep substrate retired,
+// the local controller is the only Havok body driven by the local input —
+// the remote controller is repositioned from the snapshot each frame.
 //
 // **Combat semantics (PR 7)**:
 //   - On the rising edge of `fireHeld` (false→true), cast a ray from the
@@ -22,51 +22,34 @@
 //     endpoints. The scene's render observer then calls `renderTracer`
 //     for each event.
 //   - On the rising edge of `meleePressed`, do the cone-vs-position check
-//     using `meleeSwing`. Only emit a `CombatEvent` on a hit (a miss is
-//     silent — no animation, no event).
+//     using `meleeSwing`. Only emit a `CombatEvent` on a hit.
 //   - Bullet time is per-client LOCAL: when `input.bulletTimeHeld` is true,
 //     the LOCAL controller receives a scaled dt (`* COMBAT.bulletTime.scale
-//     = 0.25`). The REMOTE controller always receives the unscaled dt —
-//     bullet time is not on the wire.
+//     = 0.25`).
 //
-// **Combat events**: kept in a module-scoped array on the GameSession so
-// the HUD chip and the scene's tracer render can poll without touching
-// the tick's hot path. `getCombatEvents()` returns the full history (HUD
-// counts `length`); `consumeUnrenderedCombatEvents()` returns the slice
-// since the last consume and advances the internal cursor (the scene
-// render observer calls this each frame to know which new tracers to
-// draw).
+// **Remote-fire / remote-melee REMOVED (PR 11.7.D2)**: the lockstep
+// substrate no longer ships the peer's encoded input to us, so the
+// `remoteDecoded` from the stub is always zero (no remote input). The
+// remote player's fire / melee damage arrives via the server's
+// DamageRequest flow: the other tab sends the request via
+// `damageBus.sendDamageRequest`, the server validates + applies HP,
+// and the snapshot fan-out carries the new HP to both tabs at 20Hz.
+// The `wasRemoteFiring` / `wasRemoteMelee` rising-edge trackers are
+// gone (no input to track).
 //
-// **Rising-edge correctness**: `wasFiring` / `wasMelee` track the
-// previously-seen input. Each tick sets them to the *current* input value
-// (not just on the rising edge), so a release-then-press pair registers
-// correctly. `meleePressed` is cleared by the inputListener on read()
-// so it's true for exactly one frame per RMB press.
+// **Two-character scene**: we still construct one Havok controller per
+// rig (for visual + hitscan queries against the remote body), but the
+// remote controller's POSITION is now driven by
+// `remoteInterpolator.tick(now).position` applied via Havok
+// `setPosition()` (wired in `scene.ts`). The local controller is the
+// only Havok body that's integrated from inputs per-tick.
 //
-// **Health & respawn (PR 10)**: damage application lives in
-// `game/health.ts`. On each rising-edge combat event we call
-// `applyDamage(opponent, ...)`; both controllers' respawn timers are
-// ticked every frame via `tickRespawn`. `wasRemoteFiring` /
-// `wasRemoteMelee` mirror the local trackers so the same damage flow
-// runs for the peer player's input. Both clients compute identical
-// damage events from identical inputs (lockstep), apply them to the
-// opponent locally, and teleport to spawn at the same `nowMs`.
-//
-// **Two-character scene**: we have *one* Havok controller per rig. Each tab
-// runs both controllers — local receives the tab's own encoded input, remote
-// receives whatever the peer's `LockstepRuntime` has for that frame. Both
-// characters are visible from frame 0; the remote stays at its spawn until
-// the peer actually sends inputs.
-//
-// **PR 11.5 — pause-and-wait gate**: when the `LockstepRuntime` cap fires
-// (local frame more than `MAX_PREDICTION_FRAMES` ahead of the peer), the
-// runtime returns a sentinel `{paused: true, ...}` frame. We short-circuit
-// out of the tick before updating either controller, running combat, or
-// ticking respawn timers. The wire encoder already ran (submitLocalInput
-// fires before advanceFrame), so the peer keeps receiving our packets and
-// will eventually catch up. Once the runtime unpauses, both clients
-// resume from the same frame on the same tick — guaranteed-deterministic
-// resume. See `docs/SPEC.md` PR 11.5 decisions log for the full rationale.
+// **PR 11.5 pause-and-wait gate — REMOVED**: the cap was a lockstep-only
+// feature. With the substrate gone there's no peer to "fall behind" —
+// the stub's `advanceFrame()` always returns `paused: false`. The
+// `if (advanced.paused) return makeEmptyFrame(...)` short-circuit in
+// the tick is retained as a defensive guard (it never fires) so the
+// call-site shape is unchanged.
 
 import { type Scene, Vector3 } from "@babylonjs/core";
 
@@ -74,8 +57,13 @@ import { CAPSULE } from "../engine/characterConfig";
 import { createCharacterController, type CharacterController, type InputState } from "../engine/characterController";
 import { attachPoseUpdater, createCharacterModel } from "../engine/characterModel";
 import { decodeInput, encodeInput } from "../net/inputBitmask";
-import { LockstepRuntime } from "../net/ggrsRuntime";
-import type { GgnetTransport } from "../net/ggnet";
+// PR 11.7.D2 / §3.10 — lockstep substrate replaced by a stub.
+// The P2P WebRTC + GGRS lockstep runtime (ggrsRuntime.ts) is gone;
+// the new `LockstepState` is a no-op replacement that preserves the
+// `submitLocalInput` / `advanceFrame` / getters surface for
+// gameSession compat. See `engine/lockstepState.ts` for the design.
+import { LockstepState } from "../engine/lockstepState";
+
 import { createRemotePlayer } from "./remotePlayer";
 import {
   bulletTimeScale,
@@ -168,7 +156,11 @@ export interface GameSession {
   /** Remote player visual rig (cyan trim variant). */
   readonly remoteModel: import("./remotePlayer").RemotePlayer["model"];
   /** Underlying lockstep runtime — exposed for the HUD + tests. */
-  readonly runtime: LockstepRuntime;
+  /** PR 11.7.D2 / §3.10 — lockstep substrate replacement stub.
+   *  The P2P WebRTC + GGRS runtime is gone; see `engine/lockstepState.ts`.
+   *  Surface preserved for HUD compat — all P2P-derived getters
+   *  return zero. */
+  readonly runtime: LockstepState;
   /** Local frame number (the next frame to be advanced). */
   readonly frame: number;
   /** Last frame the runtime confirmed from the peer. -1 if none yet. */
@@ -292,7 +284,6 @@ export interface CreateGameSessionOpts {
 
 export function createGameSession(
   scene: Scene,
-  transport: GgnetTransport,
   opts: CreateGameSessionOpts = {},
 ): GameSession {
   const localSpawn = new Vector3(0, CAPSULE.height / 2, 0);
@@ -315,7 +306,9 @@ export function createGameSession(
   const applyRemotePose = attachPoseUpdater(remote.model, remoteController);
 
   // ---- Lockstep runtime -------------------------------------------------------
-  const runtime = new LockstepRuntime(transport);
+  // PR 11.7.D2 / §3.10 — LockstepState stub replaces the old
+  // LockstepRuntime. No transport needed (no peer wire).
+  const runtime = new LockstepState();
 
   // ---- PR 7: combat event buffer + rising-edge trackers ----------------------
   /** All combat events emitted by this session. The HUD reads `length`. */
@@ -326,9 +319,13 @@ export function createGameSession(
   let wasFiring = false;
   /** Previous `input.meleePressed` value — tracks rising edges. */
   let wasMelee = false;
-  /** PR 10: same trackers for the REMOTE input — symmetric damage flow. */
-  let wasRemoteFiring = false;
-  let wasRemoteMelee = false;
+  // PR 11.7.D2 / §3.10 — wasRemoteFiring / wasRemoteMelee REMOVED.
+  // The P2P lockstep substrate is gone; there is no longer a
+  // "remote input" in the lockstep sense. The remote player's
+  // fire / melee damage arrives via the server's snapshot HP
+  // decrement (the other tab sent the DamageRequest via
+  // damageBus.sendDamageRequest, the server applied it, and the
+  // resulting Snapshot is broadcast to both tabs at 20Hz).
   /** PR 10: cached `nowMs` from the last tick — used to compute the
    *  remaining respawn countdown for the HUD snapshot. Updated every
    *  tick; read by `getHealthSnapshot()`. */
@@ -459,13 +456,26 @@ export function createGameSession(
     // 4. Step both Havok controllers with their respective inputs.
     //    Same physics, same timestep, same inputs ⇒ same world, modulo the
     //    documented Havok float-rounding acknowledgements.
-    // PR 11.4: gate both controller updates on `!spectatorActive`. When
-    // the spectator is free-flying, the character controller shouldn't
+    // PR 11.4: gate the LOCAL controller update on `!spectatorActive`.
+    // When the spectator is free-flying, the character controller shouldn't
     // see any movement (WASD absorbed by the spectator, no character
     // velocity). Combat events also gated — no F2-during-spectator fire.
+    //
+    // PR 11.7.D2 / §3.10 — `remoteController.update(remoteDecoded, ...)`
+    // REMOVED. The remote visual is now driven by the snapshot stream
+    // via `remoteInterpolator.tick(now)` + `remoteController.havok.setPosition()`
+    // (wiring lives in `scene.ts`). The remote controller stays as a
+    // write-target only — its Havok body is repositioned each frame from
+    // the interpolator's output. Hitscan combat (`dualPistolShoot`,
+    // `meleeSwing`) still reads the remote controller's Havok position
+    // because the interpolator's setPosition() keeps that in sync.
     if (!spectatorActive) {
       localController.update(localDecoded, scaledDt, nowMs);
-      remoteController.update(remoteDecoded, deltaSeconds, nowMs);
+      // Remote controller update is delegated to the snapshot
+      // interpolator (see scene.ts render observer + the new
+      // interpolatorTickHook). The Havok body stays at the
+      // interpolated position; combat hitscan reads Havok's
+      // position which is now authoritative-from-server.
     }
 
     // 5. PR 7: rising-edge combat semantics on the local input.
@@ -483,7 +493,12 @@ export function createGameSession(
       );
       frameCombatEvents.push({
         frame: advanced.frame,
-        kind: result.hit ? "fire_hit" : "fire_miss",
+        // PR 11.7.D2 / §3.10 fix: combat event kind reflects whether
+        // the raycast actually hit the peer (`fire_hit`) vs a prop
+        // (`fire_miss` — includes crate hits, which used to register
+        // as `fire_hit` but did 0 damage). The visual tracer still
+        // draws for any hit (the kind affects HUD combat-event labels).
+        kind: result.hitTarget === "remote" ? "fire_hit" : "fire_miss",
         tracerFrom: result.tracerFrom,
         tracerTo: result.tracerTo,
         damage: result.damage,
@@ -495,7 +510,14 @@ export function createGameSession(
       // confirm/revert path). Otherwise, fall back to the local-
       // compute path (lockstep guarantees identical events on both
       // clients — used by the 14 P2P smokes + PR 11.6.C smoke).
-      if (result.hit) {
+      // PR 11.7.D2 / §3.10 fix: gate on `hitTarget === "remote"`
+      // instead of `result.hit`. Pre-fix, shooting crates / world
+      // geometry sent a DamageRequest (and the server applied it),
+      // making HP drop on every shot regardless of whether the peer
+      // was actually hit. result.damage is now 0 for non-peer hits
+      // (see combat.ts:dualPistolShoot), so the smoke path also
+      // needs to gate to avoid sending zero-amount requests.
+      if (result.hitTarget === "remote") {
         if (serverTransport) {
           const eventId = nextEventId++;
           const req: DamageRequest = {
@@ -553,38 +575,18 @@ export function createGameSession(
     // uses the same `dualPistolShoot` / `meleeSwing` helpers — the
     // helpers take the *firing* controller as the source and the *other*
     // as the target, which lines up exactly with what we want here.
-    if (remoteDecoded.fireHeld && !wasRemoteFiring) {
-      const result: DualPistolResult = dualPistolShoot(
-        remoteDecoded,
-        remoteController,
-        localController,
-        scene,
-      );
-      // PR 11.6.D: when the server-auth transport is wired, the
-      // remote-fire path no longer applies damage locally — the
-      // server's DamageBroadcast fan-out will deliver it via
-      // `damageBus.applyBroadcast` (the broadcast handler in
-      // `scene.ts`'s __forceServerTransport block). Otherwise
-      // (P2P smokes, no server transport), the local-compute path
-      // applies the damage here so lockstep symmetry is preserved.
-      if (result.hit && !serverTransport) {
-        applyDamage(localController, { source: "fire", amount: result.damage }, nowMs);
-      }
-    }
-    if (remoteDecoded.meleePressed && !wasRemoteMelee) {
-      const result: MeleeResult = meleeSwing(
-        remoteDecoded,
-        remoteController,
-        localController,
-      );
-      // PR 11.6.D: same server-auth-vs-local-compute fork as the
-      // remote-fire path above.
-      if (result.hit && !serverTransport) {
-        applyDamage(localController, { source: "melee", amount: result.damage }, nowMs);
-      }
-    }
-    wasRemoteFiring = remoteDecoded.fireHeld;
-    wasRemoteMelee = remoteDecoded.meleePressed;
+    // PR 11.7.D2 / §3.10 — remote-fire / remote-melee BLOCK REMOVED.
+    // Pre-D2.2 the lockstep peer's input flowed through
+    // `remoteDecoded`; if `remoteDecoded.fireHeld` (rising-edge
+    // tracked via `wasRemoteFiring`) we raycast from the remote
+    // rig at the local rig and apply damage locally. Post-D2.2
+    // there is no remote input in the lockstep sense (the stub
+    // returns zeros); the remote fire / melee damage arrives via
+    // the server DamageRequest flow (the other tab sent the
+    // request, the server validated + applied HP, and the snapshot
+    // fan-out carries the new HP to both tabs at 20Hz). The
+    // `wasRemoteFiring` / `wasRemoteMelee` trackers are gone.
+
 
     // PR 10: tick the respawn timer for both controllers every frame.
     // The teleport fires on the first frame where `nowMs >=
