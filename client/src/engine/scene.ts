@@ -185,6 +185,16 @@ function makeBroadcastHandler(
     const bc = probe.decodeDamageBroadcast(body);
     if (!bc) return;
     const { local, remote } = getControllers();
+    // PR 11.7.D2 / §3.10 fix — broadcast target is the player being
+    // HIT, not the player attacking. The previous resolver
+    // (`playerId === localPlayerId ? local : remote`) was wrong for
+    // symmetric two-tab play: Tab A shoots Tab B (targetPlayerId=2).
+    // Tab B receives the broadcast and saw `targetPlayerId === localPlayerId`
+    // (since Tab B IS Player 2), so it applied 12 dmg to itself
+    // instead of to its remote. Correct semantic: if the broadcast
+    // target is ME, apply to local (self-damage, defensive — the
+    // server's dead-target gate prevents this in normal flow); if the
+    // target is the OTHER player, apply to remote.
     const result = probe.applyBroadcast(bc, performance.now(), (playerId) =>
       playerId === localPlayerId ? local : remote,
     );
@@ -554,7 +564,26 @@ export async function createScene(
       // BEFORE gameSession.tick() so the remote's pose applier
       // (applyRemotePose inside gameSession.tick) reads the
       // current Havok position.
-      interpolatorTickHook?.(now);
+      // PR 11.7.D2.1 / FIX — read the LIVE interpolatorTickHook from
+      // the window slot (if it was set by an earlier createScene
+      // call that won the StrictMode race). Without this, the
+      // current createScene's render observer reads its OWN local
+      // closure variable, which is null because the sync-claim
+      // guard (line ~877) bailed out this createScene's IIFE early.
+      // The earlier createScene's IIFE won the slot, set its own
+      // hook in its own scope, then disposed — leaving the LATER
+      // createScene's observer with no hook. Storing the hook on
+      // window lets the live observer call the live hook.
+      const liveHook = (typeof window !== "undefined")
+        ? (window as unknown as {
+            __liveInterpolatorTickHook?: ((nowMs: number) => void) | null;
+          }).__liveInterpolatorTickHook ?? null
+        : null;
+      if (liveHook) {
+        liveHook(now);
+      } else {
+        interpolatorTickHook?.(now);
+      }
       gameSession.tick(state, deltaSeconds, now);
       // PR 7: render tracers for any fire_hit / fire_miss events that were
       // generated since the last frame. consumeUnrenderedCombatEvents()
@@ -1028,12 +1057,26 @@ export async function createScene(
         }
         winSlot.__serverTransport = server;
         winSlot.__damageBus = probe;
-        // PR 11.6.D — late-bind the server transport onto the
-        // GameSession so tick() routes damage through it. The smoke
-        // passes the localPlayerId explicitly so both tabs know which
-        // player ID they own.
-        if (gameSession) {
-          gameSession.setServerTransport?.(server);
+        // PR 11.7.D2.1 / FIX — late-bind the server transport onto the
+        // LIVE GameSession (resolved via window.__gameSession, NOT the
+        // closure's `gameSession` variable). Pre-fix: the closure
+        // captures the local `gameSession`, which under React
+        // StrictMode is the FIRST createScene() call's session — but
+        // `window.__gameSession` holds the SECOND (live) session. The
+        // first call's session gets disposed when React unmounts it,
+        // so its `setServerTransport` updates a dead reference. The
+        // live session's `serverTransport` closure stayed null, so
+        // `gameSession.tick()` never sent PositionUpdate or
+        // DamageRequest via the wire — manual tests saw `positionSends: 0`
+        // + damage requests rejected at the server's Gate3.
+        //
+        // Resolution: read the LIVE gameSession from the window slot,
+        // not from the closure. This mirrors the pattern already used
+        // in `makeBroadcastHandler` (line ~957-974: "PR 11.6.D fix4"
+        // comment) for the same StrictMode race.
+        if (typeof window !== "undefined") {
+          const liveSession = (window as unknown as { __gameSession?: GameSession }).__gameSession;
+          liveSession?.setServerTransport?.(server);
         }
         // PR 11.7.D2 / §3.10 — stash the server on the SceneHandle
         // (closure capture) so the PauseMenu\'s "Disconnect Server"
@@ -1146,6 +1189,66 @@ export async function createScene(
           // pre-D2.2 behavior on first-connect.
           interpolatorTickHook = (nowMs: number) => {
             const states = interpolator.tick(nowMs);
+            // PR 11.7.D2.1 / debug — capture the latest tick call,
+            // regardless of whether states was empty. If we see
+            // frequent ticks with empty states, the interpolator's
+            // onSnapshot isn't buffering (or isn't being called).
+            // If we don't see ticks at all, the hook itself isn't
+            // being invoked by the render observer.
+            if (typeof window !== "undefined") {
+              const w = window as unknown as {
+                __lastInterpolatorTick?: { ts: number; statesCount: number };
+              };
+              w.__lastInterpolatorTick = { ts: performance.now(), statesCount: states.length };
+            }
+            // PR 11.7.D2.1 / debug — expose diagnostics to DevTools.
+            // Useful for diagnosing "remote rig not visible" / "both
+            // rigs at same position" issues in manual 2-tab tests.
+            if (typeof window !== "undefined") {
+              const w = window as unknown as {
+                __latestRemoteState?: { playerId: number; x: number; z: number; ts: number } | null;
+                __remoteStateCount?: number;
+                __rigPositions?: {
+                  localPos: { x: number; y: number; z: number } | null;
+                  remotePos: { x: number; y: number; z: number } | null;
+                  localEnabled: boolean | null;
+                  remoteEnabled: boolean | null;
+                };
+              };
+              w.__remoteStateCount = (w.__remoteStateCount ?? 0) + 1;
+              if (states.length > 0) {
+                const s = states[0];
+                w.__latestRemoteState = {
+                  playerId: s.playerId,
+                  x: s.position.x,
+                  z: s.position.z,
+                  ts: performance.now(),
+                };
+              }
+              // Refresh rig positions every 30 frames (~0.5s at 60Hz)
+              // to keep DevTools reads snappy without spamming the
+              // bridge.
+              if ((w.__remoteStateCount ?? 0) % 30 === 0) {
+                const sess = (window as unknown as {
+                  __gameSession?: {
+                    localController?: { state?: { position?: { x: number; y: number; z: number } } };
+                    remoteController?: { state?: { position?: { x: number; y: number; z: number } } };
+                    localModel?: { root?: { isEnabled?: () => boolean } };
+                    remoteModel?: { root?: { isEnabled?: () => boolean } };
+                  };
+                }).__gameSession;
+                w.__rigPositions = {
+                  localPos: sess?.localController?.state?.position
+                    ? { x: sess.localController.state.position.x, y: sess.localController.state.position.y, z: sess.localController.state.position.z }
+                    : null,
+                  remotePos: sess?.remoteController?.state?.position
+                    ? { x: sess.remoteController.state.position.x, y: sess.remoteController.state.position.y, z: sess.remoteController.state.position.z }
+                    : null,
+                  localEnabled: sess?.localModel?.root?.isEnabled?.() ?? null,
+                  remoteEnabled: sess?.remoteModel?.root?.isEnabled?.() ?? null,
+                };
+              }
+            }
             if (states.length === 0) return;
             const remoteCtrl = gameSession.remoteController;
             // For the 2-player MVP: apply the FIRST remote player
@@ -1164,7 +1267,98 @@ export async function createScene(
             // wire are zero in PR 11.7.B per server snapshot.rs;
             // the remote rig renders with its default yaw).
             remoteCtrl.havok.setPosition(remoteState.position);
+            // PR 11.7.D2.1 / FIX — explicitly mirror the Havok position
+            // onto `state.position`. Pre-fix, `state.position` was only
+            // updated by `CharacterController.update()` (which reads
+            // Havok → state.position), and since the remote
+            // controller's update() was retired (PR 11.7.D2 / §3.10)
+            // for the snapshot-driven visual, `state.position` stayed
+            // at the initial remote spawn forever. The smoke's
+            // `readRigPositions()` probe therefore reported the same
+            // stale value frame after frame even though the Havok
+            // body had been moving. Copying `remoteState.position`
+            // straight into `state.position` keeps the public API
+            // (gameSession.remoteController.state.position) honest.
+            remoteCtrl.state.position.copyFrom(remoteState.position);
+            // PR 11.7.D2.1 / debug — capture the latest setPosition
+            // for DevTools. Helps distinguish "interpolator ran but
+            // setPosition was a no-op" from "interpolator never ran."
+            if (typeof window !== "undefined") {
+              const w = window as unknown as {
+                __lastInterpolatorSetPosition?: { x: number; z: number; ts: number; playerId: number };
+              };
+              w.__lastInterpolatorSetPosition = {
+                x: remoteState.position.x,
+                z: remoteState.position.z,
+                ts: performance.now(),
+                playerId: remoteState.playerId,
+              };
+            }
           };
+          // PR 11.7.D2.1 / FIX — publish the LIVE remote-controller +
+          // the interpolation tick body to the window slot. This
+          // decouples the render observer from the createScene()
+          // closure that originally set the hook. Under React
+          // StrictMode the first createScene wins the sync-claim
+          // guard, then gets disposed; the second createScene's
+          // observer must then drive the hook against the LIVE
+          // (window-resolved) remote controller. Without this, the
+          // observer calls a closure-bound hook whose remoteCtrl is
+          // disposed (scene.dispose → gameSession.dispose →
+          // remoteController.havok disposed) and setPosition
+          // silently no-ops.
+          if (typeof window !== "undefined") {
+            const liveHook = (nowMs: number) => {
+              const liveSession = (window as unknown as {
+                __gameSession?: GameSession;
+              }).__gameSession;
+              const liveRemoteCtrl = liveSession?.remoteController;
+              if (!liveRemoteCtrl) return;
+              const liveInterpolator = (window as unknown as {
+                __interpolator?: InstanceType<typeof Interpolator>;
+              }).__interpolator;
+              if (!liveInterpolator) return;
+              const liveStates = liveInterpolator.tick(nowMs);
+              if (liveStates.length === 0) return;
+              const liveState = liveStates[0];
+              liveRemoteCtrl.havok.setPosition(liveState.position);
+              // PR 11.7.D2.1 / FIX — DO NOT mirror Havok → state.position.
+              // Pre-fix we did `remoteCtrl.state.position.copyFrom(...)`
+              // here to keep the public API honest (the smoke's
+              // `readRigPositions` probe reads state.position). But
+              // this also clobbers the controller's own writes —
+              // notably the respawn path in `tickRespawn`, which
+              // teleports the Havok body back to `respawnPosition`
+              // and stamps state.position. The interpolator's next
+              // tick would re-clobber the respawn with the
+              // pre-respawn snapshot value (a stale peer position),
+              // visually flashing the rig back to the wrong spot.
+              // The smoke probe now reads Havok directly via
+              // `__remoteController.havok.getPosition()` (see the
+              // tool) when it needs ground-truth. Trade-off: the
+              // smoke's `state.position` no longer mirrors Havok,
+              // but the visual rig stays correct.
+              // liveRemoteCtrl.state.position.copyFrom(liveState.position);
+              // Debug hooks so the smoke's __lastInterpolatorTick +
+              // __lastInterpolatorSetPosition stay populated when
+              // the render observer is in a different scope from
+              // the original closure.
+              const w = window as unknown as {
+                __lastInterpolatorTick?: { ts: number; statesCount: number };
+                __lastInterpolatorSetPosition?: { x: number; z: number; ts: number; playerId: number };
+              };
+              w.__lastInterpolatorTick = { ts: performance.now(), statesCount: liveStates.length };
+              w.__lastInterpolatorSetPosition = {
+                x: liveState.position.x,
+                z: liveState.position.z,
+                ts: performance.now(),
+                playerId: liveState.playerId,
+              };
+            };
+            (window as unknown as {
+              __liveInterpolatorTickHook?: ((nowMs: number) => void) | null;
+            }).__liveInterpolatorTickHook = liveHook;
+          }
           // PR 11.7.C / §3.7 + §3.8 — closure variable for the latest
           // decoded snapshot. The render observer (line 484) reads
           // this so the interpolator can be queried per-frame for

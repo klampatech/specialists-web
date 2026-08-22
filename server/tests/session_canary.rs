@@ -146,7 +146,7 @@ async fn router_dispatches_position_update_writes_history() {
         position_y: -3.25,
     }));
 
-    let reply = handle_binary(&payload, &rooms, 0, transport::ConnectionState::new() /* placeholder */).await;
+    let reply = handle_binary(&payload, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
     assert!(
         reply.is_empty(),
         "positionUpdate must not produce a reply (got {} bytes)",
@@ -199,7 +199,7 @@ async fn router_dispatches_damage_request_returns_broadcast() {
     let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
     payload.extend(encode_damage_request(&req));
 
-    let reply = handle_binary(&payload, &rooms, 0, transport::ConnectionState::new() /* placeholder */).await;
+    let reply = handle_binary(&payload, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
     assert_eq!(
         reply.len(),
         1 + specialists_server::DAMAGE_BROADCAST_WIRE_SIZE,
@@ -243,7 +243,7 @@ async fn seed_room_for_validator(
     };
     let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
     payload.extend(encode_position_update(&pu));
-    let _ = transport::handle_binary(&payload, rooms, 0, transport::ConnectionState::new() /* placeholder */).await;
+    let _ = transport::handle_binary(&payload, rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
 
     // Now grab the room + populate it.
     let room_arc = rooms.read().await.get(specialists_server::constants::DEVBX_ROOM_ID).unwrap().clone();
@@ -291,7 +291,7 @@ async fn validator_rejects_self_damage_in_room() {
     };
     let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
     payload.extend(encode_damage_request(&req));
-    let reply = handle_binary(&payload, &rooms, 0, transport::ConnectionState::new() /* placeholder */).await;
+    let reply = handle_binary(&payload, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
     assert!(reply.is_empty(), "self-damage must produce no broadcast reply");
 }
 
@@ -316,7 +316,7 @@ async fn validator_rejects_fire_rate_violation_in_room() {
     };
     let mut payload1 = vec![DISCRIMINATOR_DAMAGE_REQUEST];
     payload1.extend(encode_damage_request(&req1));
-    let reply1 = handle_binary(&payload1, &rooms, 0, transport::ConnectionState::new() /* placeholder */).await;
+    let reply1 = handle_binary(&payload1, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
     assert!(!reply1.is_empty(), "first request must produce a broadcast");
 
     // Second request with a fresh eventId but no time elapsed —
@@ -331,7 +331,7 @@ async fn validator_rejects_fire_rate_violation_in_room() {
     };
     let mut payload2 = vec![DISCRIMINATOR_DAMAGE_REQUEST];
     payload2.extend(encode_damage_request(&req2));
-    let reply2 = handle_binary(&payload2, &rooms, 0, transport::ConnectionState::new() /* placeholder */).await;
+    let reply2 = handle_binary(&payload2, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
     assert!(reply2.is_empty(), "second request within cooldown must produce no broadcast");
 }
 

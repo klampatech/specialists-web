@@ -252,6 +252,27 @@ export interface GameSession {
 /** Where the remote capsule spawns. Offset from the local spawn so both are
  *  visible from frame 0 — to the right of the local rig. */
 const REMOTE_SPAWN_OFFSET = new Vector3(2.5, 0, 0);
+/** PR 11.7.D2.1 / FIX — per-player local spawn offset. The default
+ *  PR 10 spawn `(0, CAPSULE.height/2, 0)` was used for BOTH tabs, so
+ *  Player 1's local rig and Player 2's local rig started at the
+ *  same world position. Pre-fix: both tabs sent `state.position =
+ *  (0, 0)` and the snapshot showed Player 1 and Player 2 overlaid
+ *  — visually indistinguishable as one rig. Stacking also made
+ *  the remote rig invisible until the user walked one tab away.
+ *  Player-id-derived X offset keeps both rigs visible from frame 0
+ *  (matches the smoke's manual `sendPositionUpdate({positionX: 5})`
+ *  workaround). */
+const PLAYER_SPAWN_X_OFFSET = (localId: number) =>
+  ((localId - 1) % 5 - 2) * 4; // player 1 → -8, 2 → -4, 3 → 0, 4 → +4, 5 → +8
+/** PR 11.7.D2.1 / spawn-from-state — server's snapshot already has
+ *  the player's reported position (or the placeholder (0,0) before
+ *  their first PositionUpdate). When we open Tab B and the server's
+ *  room already has Tab A connected, we want the remote rig to
+ *  render where Tab A actually is — not at our local spawn. The
+ *  `interpolator.onSnapshot(snap, now)` call below happens before
+ *  the first `interpolatorTickHook?.(nowMs)` runs, so the buffer
+ *  starts populated with whichever player entries arrived in the
+ *  first snapshot. Tick() then returns those positions at frame 0. */
 
 /**
  * Build a 2-player GameSession for the given scene + transport.
@@ -286,7 +307,20 @@ export function createGameSession(
   scene: Scene,
   opts: CreateGameSessionOpts = {},
 ): GameSession {
-  const localSpawn = new Vector3(0, CAPSULE.height / 2, 0);
+  // PR 11.7.D2.1 / FIX — per-player local spawn offset. Player 1
+  // spawns at x=-8, Player 2 at x=-4, etc. so the local rigs
+  // don't overlap in 2-tab manual tests. The smoke uses explicit
+  // `sendPositionUpdate({positionX: 5})` for the same reason.
+  const localSpawnOffsetX = PLAYER_SPAWN_X_OFFSET(opts.localPlayerId ?? 1);
+  const localSpawn = new Vector3(
+    localSpawnOffsetX,
+    CAPSULE.height / 2,
+    0,
+  );
+  // The remote rig never needs a unique spawn (it's driven by the
+  // interpolator from the first snapshot — `tick()` returns the
+  // server-authoritative positions). Keep the visual-only spawn
+  // offset so the rig is visible before the first snapshot lands.
   const remoteSpawn = localSpawn.add(REMOTE_SPAWN_OFFSET);
 
   // ---- Local rig + controller -------------------------------------------------
@@ -493,7 +527,12 @@ export function createGameSession(
       );
       frameCombatEvents.push({
         frame: advanced.frame,
-        kind: result.hit ? "fire_hit" : "fire_miss",
+        // PR 11.7.D2 / §3.10 fix: combat event kind reflects whether
+        // the raycast actually hit the peer (`fire_hit`) vs a prop
+        // (`fire_miss` — includes crate hits, which used to register
+        // as `fire_hit` but did 0 damage). The visual tracer still
+        // draws for any hit (the kind affects HUD combat-event labels).
+        kind: result.hitTarget === "remote" ? "fire_hit" : "fire_miss",
         tracerFrom: result.tracerFrom,
         tracerTo: result.tracerTo,
         damage: result.damage,
@@ -505,7 +544,14 @@ export function createGameSession(
       // confirm/revert path). Otherwise, fall back to the local-
       // compute path (lockstep guarantees identical events on both
       // clients — used by the 14 P2P smokes + PR 11.6.C smoke).
-      if (result.hit) {
+      // PR 11.7.D2 / §3.10 fix: gate on `hitTarget === "remote"`
+      // instead of `result.hit`. Pre-fix, shooting crates / world
+      // geometry sent a DamageRequest (and the server applied it),
+      // making HP drop on every shot regardless of whether the peer
+      // was actually hit. result.damage is now 0 for non-peer hits
+      // (see combat.ts:dualPistolShoot), so the smoke path also
+      // needs to gate to avoid sending zero-amount requests.
+      if (result.hitTarget === "remote") {
         if (serverTransport) {
           const eventId = nextEventId++;
           const req: DamageRequest = {
@@ -597,6 +643,14 @@ export function createGameSession(
         pos.x,
         pos.z,
       );
+      // PR 11.7.D2.1 / debug — count actual PositionUpdate sends.
+      if (typeof window !== "undefined") {
+        (window as unknown as { __positionUpdateSends?: number }).__positionUpdateSends =
+          ((window as unknown as { __positionUpdateSends?: number }).__positionUpdateSends ?? 0) + 1;
+      }
+    } else if (typeof window !== "undefined") {
+      (window as unknown as { __positionUpdateSkips?: number }).__positionUpdateSkips =
+        ((window as unknown as { __positionUpdateSkips?: number }).__positionUpdateSkips ?? 0) + 1;
     }
 
     // Push the per-frame events onto the session-level buffer so the HUD

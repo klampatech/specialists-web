@@ -108,7 +108,19 @@ export const CAMERA = {
   /** Lerp factor for the look-at target. */
   lookLerp: 0.35,
   /** Vertical FOV (degrees). */
-  fovDegrees: 65,
+  /** PR 11.7.D2.1 — wider FOV (90° vs the legacy 65°) so the
+   *  remote peer rig stays in frame at typical 2-tab distances.
+   *  Pre-fix the chase camera's 65° FOV cone covered ±32.5° of
+   *  horizontal arc; a peer 2.5m to the side at the chase camera's
+   *  ~2.8m back-off fell at ~39° off-axis — visually outside the
+   *  cone, so the player only saw their own rig and assumed the
+   *  other tab was "broken." 90° (half-angle 45°) comfortably
+   *  encloses the peer in the standard 2-tab test setup. The
+   *  first-person view inherits the same FOV (Babylon single
+   *  UniversalCamera) — the slight widening is acceptable for a
+   *  multiplayer context where situational awareness matters more
+   *  than the tight 65° immersion. */
+  fovDegrees: 90,
 } as const;
 
 /**

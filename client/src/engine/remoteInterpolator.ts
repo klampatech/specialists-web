@@ -248,6 +248,20 @@ export class Interpolator {
   onSnapshot(snap: Snapshot, nowMs: number): void {
     for (const player of snap.players) {
       if (player.playerId === this.localPlayerId) continue;
+      // PR 11.7.D2.1 / FIX — skip placeholder ids (>= 1000).
+      // Pre-fix, brief windows where a peer connection had just
+      // arrived but hadn't yet been promoted via PositionUpdate
+      // would leave the snapshot including the placeholder id
+      // (e.g., 1001). The interpolator buffered it; `tick()`
+      // returned it as `states[0]`; the scene-side setPosition
+      // pinned the remote Havok body to the placeholder's last
+      // known position (always Position::ZERO since no physics
+      // body had been created yet) — so the remote rig froze at
+      // the world origin until promotion landed. Skipping
+      // placeholders at the buffer-write stage avoids the freeze
+      // entirely (the player's "real" id is buffered as soon as
+      // the next snapshot arrives post-promotion).
+      if (player.playerId >= 1000) continue;
       let buffer = this.buffers.get(player.playerId);
       if (!buffer) {
         buffer = new RingBuffer<BufferedSnapshot>(RING_BUFFER_CAPACITY);
@@ -403,6 +417,10 @@ export class Interpolator {
       // Local player is never in this map (onSnapshot skips it),
       // but be defensive.
       if (playerId === this.localPlayerId) continue;
+      // PR 11.7.D2.1 / defense-in-depth — skip placeholder ids that
+      // somehow made it into the buffer (e.g., a stale placeholder
+      // from before this fix shipped). See `onSnapshot` comment.
+      if (playerId >= 1000) continue;
       const latestArrived = this.latestArrivedAtMs.get(playerId);
       const bufArr = buffer.toArray();
       // Decide: lerp, extrapolate, or fallback.

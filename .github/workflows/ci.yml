@@ -386,18 +386,18 @@ jobs:
           fi
           pkill -f 'vite' || true
 
-  # Phase 0 / PR 4: headless two-tab WebRTC handshake smoke.
-  # Boots a SECOND vite dev-server on port 5174 (so this job can run in
-  # parallel with `client-scene-smoke` on 5173 without colliding), opens two
-  # headless pages on the same browser context, drives the manual SDP/ICE
-  # copy-paste flow, asserts both pages reach the "Connected" state, and
-  # uploads both screenshots as artifacts.
-  #
-  # TURN relay: the smoke passes `?turn=force` to both tabs so the peer
-  # uses openrelay.metered.ca TURN servers. STUN-only may fail in GH
-  # sandboxed runners; TURN works because it routes via a public relay.
+
+  # PR 11.7.D2 / §3.10 — two-tab ServerTransport smoke (REWRITTEN post-D2.2).
+  # Boots the canary server (WT=14433 + WS=14434) + Vite on port 5174,
+  # opens TWO headless browser contexts (each with its own
+  # `?server=` URL param + `__forceServerTransport = true` init script)
+  # connected to the SAME room (DEVBX). Asserts both
+  # ServerTransport.connect() resolve within 5s, then both tabs'
+  # __latestSnap() match after a 500ms settle (server-authoritative
+  # Snapshot fan-out). Replaces the pre-D2.2 WebRTC clipboard handshake
+  # smoke (P2P substrate retired in squash 36e475a).
   client-two-tab-smoke:
-    name: client — two-tab smoke (WebRTC handshake)
+    name: client — two-tab smoke (ServerTransport, PR 11.7.D2)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -412,9 +412,6 @@ jobs:
       - run: npm ci
       - name: Cache Playwright browsers
         # PR 11.4.1: cache the Playwright browser binary across runs.
-        # ~/.cache/ms-playwright is the standard Playwright cache location.
-        # The key is scoped by the Playwright version + OS so a version
-        # bump picks up a fresh download automatically.
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
@@ -422,16 +419,51 @@ jobs:
           restore-keys: |
             playwright-${{ runner.os }}-chromium-
       - name: Install Playwright browser (chromium only — no --with-deps)
-        # PR 11.4.1: --with-deps hangs on self-hosted runners without sudo
-        # (apt install prompts for password). The system deps are already
-        # installed on the runner (Chromium runs fine for all 14 smokes).
-        # The Playwright cache below restores ~/.cache/ms-playwright/
-        # between runs so we don't re-download the browser each time.
         run: npx playwright install chromium
         timeout-minutes: 3
+      # PR 11.7.D2.1 / fix: pre-build the server (matches the pattern
+      # in client-damage-server-hp-convergence-smoke / PR 11.6.D).
+      # Without this step the canary-server.sh's built-in cargo build
+      # takes longer than the 60s wait-for-ready loop, so the loop
+      # times out before the server binds 14433/14434. The pre-build
+      # uses the rust cache so subsequent runs are <5s.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (release)
+        # PR 11.7.D2.1 / fix: explicit working-directory: . (repo
+        # root) overrides the job-level default of `client`. The
+        # `cargo build --manifest-path server/Cargo.toml` command
+        # needs to find server/Cargo.toml from the repo root, not
+        # from client/ (where it would try client/server/Cargo.toml).
+        working-directory: .
+        run: cargo build --release --manifest-path server/Cargo.toml
+      - name: Boot canary server (ports 14433 + 14434)
+        run: |
+          # PR 11.7.D2.1 / fix: relative path `../tools/canary-server.sh`
+          # because this job has `defaults: working-directory: client`
+          # at the job level (inherited from the pre-D2.2 WebRTC two-tab
+          # smoke). Without the `../`, `tools/canary-server.sh` resolves
+          # to `client/tools/canary-server.sh` which doesn't exist
+          # (the script lives at REPO_ROOT/tools/canary-server.sh).
+          nohup bash ../tools/canary-server.sh --port-wt 14433 --port-ws 14434 > /tmp/canary-server-two-tab.log 2>&1 &
+          echo $! > /tmp/canary-server-two-tab.pid
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+              echo "Canary server (two-tab smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+            echo "::error::Canary server (two-tab smoke) did not become ready in 60s"
+            cat /tmp/canary-server-two-tab.log
+            exit 1
+          fi
       - name: Boot second dev server (port 5174)
         run: |
-          nohup npm run dev -- --host 0.0.0.0 --port 5174 > /tmp/vite-dev2.log 2>&1 &
+          nohup npm run dev -- --host 127.0.0.1 --port 5174 --strictPort > /tmp/vite-dev2.log 2>&1 &
           echo $! > /tmp/vite-dev2.pid
           for i in $(seq 1 60); do
             if curl -sf http://localhost:5174/ > /dev/null; then
@@ -449,39 +481,106 @@ jobs:
         run: node ./tools/two-tab-smoke.mjs
         env:
           URL: http://localhost:5174/
-          CONNECT_TIMEOUT_MS: 60000
+          SMOKE_NO_BOOT: "1"
       - name: Upload screenshot (tab A — host)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: two-tab-screenshot
-          path: client/two-tab-smoke.png
+          path: client/tools/two-tab-smoke.png
           if-no-files-found: warn
       - name: Upload screenshot (tab B — guest)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: two-tab-screenshot-connected
-          path: client/two-tab-smoke-connected.png
+          path: client/tools/two-tab-smoke-connected.png
           if-no-files-found: warn
-      - name: Tear down dev server 2
+  client-two-tab-manual-flow-smoke:
+    # PR 11.7.D2.1 — manual-flow smoke. Replicates the exact
+    # Kyle-uses-Tailscale 2-tab manual test as an automated
+    # Playwright check. Distinct from the 2-tab smoke above in that
+    # it asserts the user-visible rig positions + cross-tab walk
+    # mirroring, not just server-authoritative damage routing.
+    # Asserts:
+    #   1. Snapshot integrity ([1, 2] only, no ghost connections).
+    #   2. Rigs separated by player-id-derived spawn (no overlap).
+    #   3. Both rig meshes enabled in both tabs.
+    #   4. Tab A walks forward → Tab B's remote rig mirrors the walk.
+    #   5. HP cross-tab converges after firing from Tab A.
+    # See client/tools/two-tab-manual-flow.mjs for the full assertion list.
+    # NOTE: this smoke is a manual-flow REPLICA, not part of the
+    # automated PR gate yet. CI's slow dev-cert generation (~75s)
+    # races the smoke's canary-wait timeout, making this job flaky
+    # on a cold runner. Kyle runs it manually via
+    # `node client/tools/two-tab-manual-flow.mjs` against his local
+    # canary+vite to validate cross-tab visible behavior. Once we
+    # wire canary-server.sh to skip cert generation when a
+    # pre-baked cert exists in CI's cache, this flips to a required
+    # gate. (CI FAIL is expected on the first few runs as we
+    # stabilize the boot ordering.)
+    name: client — two-tab manual-flow smoke (replicates user manual test, PR 11.7.D2.1, opt-in)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Pre-build canary binary (avoid racing smoke's boot)
+        run: |
+          # Belt-and-suspenders: kill any stragglers from previous
+          # jobs that left canary/vite on the expected ports.
+          for port in 5174 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+          # PR 11.6.B server is a release-mode cargo binary; build it
+          # FIRST so the smoke doesn't have to wait for compile +
+          # cert generation at smoke time. CI's cold dev-cert
+          # generation alone takes ~75-85s; building the binary
+          # first lets the smoke's own canary boot immediately on
+          # top. Note: this job's defaults.run.working-directory is
+          # `client/`, so we cd up one level to find the repo root.
+          (cd ../server && cargo build --release --bin specialists-server)
+        env:
+          CARGO_TERM_COLOR: never
+      - name: Run two-tab manual-flow smoke
+        run: node ./tools/two-tab-manual-flow.mjs
+        env:
+          TWO_TAB_FLOW_BOOT: "1"
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-tab-manual-flow-screenshots
+          path: client/tools/two-tab-manual-flow
+          if-no-files-found: warn
+      - name: Tear down canary + Vite
         if: always()
         run: |
-          if [[ -f /tmp/vite-dev2.pid ]]; then
-            kill "$(cat /tmp/vite-dev2.pid)" || true
-          fi
-          pkill -f 'vite' || true
-
-  # Phase 0 / PR 8: jump regression smoke. Asserts that holding Space
-  # produces ONE jump (peak Y above initial) and returns the character
-  # to ground within 2s — i.e., the "fly up forever" bug observed during
-  # the dev-box playtest is caught before merge.
-  #
-  # Why a separate job: this PR's fix (gravity accumulation in the
-  # controller's update) is small and easy to accidentally regress in a
-  # future PR. The smoke is the regression guard. It can run on a
-  # dedicated port so the scene-smoke and two-tab-smoke jobs stay
-  # unaffected.
+          pkill -f canary-server.sh || true
+          pkill -f 'vite.*5174' || true
+          for port in 5174 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
   client-jump-smoke:
     name: client — jump regression smoke (PR 8)
     runs-on: ubuntu-latest
@@ -679,9 +778,40 @@ jobs:
         # between runs so we don't re-download the browser each time.
         run: npx playwright install chromium
         timeout-minutes: 3
+      # PR 11.7.D2.1 / fix: pre-build the server (matches the
+      # two-tab job above + 5191). See comment there for context.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (release)
+        # See the two-tab job's Build step comment for context
+        # (job-level working-directory: client needs an explicit
+        # override to find server/Cargo.toml at the repo root).
+        working-directory: .
+        run: cargo build --release --manifest-path server/Cargo.toml
+      - name: Boot canary server (ports 14433 + 14434)
+        run: |
+          # PR 11.7.D2.1 / fix: relative path `../tools/canary-server.sh`
+          # because this job has `defaults: working-directory: client`
+          # at the job level. See the two-tab job comment for context.
+          nohup bash ../tools/canary-server.sh --port-wt 14433 --port-ws 14434 > /tmp/canary-server-health.log 2>&1 &
+          echo $! > /tmp/canary-server-health.pid
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+              echo "Canary server (health smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+            echo "::error::Canary server (health smoke) did not become ready in 60s"
+            cat /tmp/canary-server-health.log
+            exit 1
+          fi
       - name: Boot dev server (port 5177)
         run: |
-          nohup npm run dev -- --host 0.0.0.0 --port 5177 > /tmp/vite-dev5.log 2>&1 &
+          nohup npm run dev -- --host 127.0.0.1 --port 5177 --strictPort > /tmp/vite-dev5.log 2>&1 &
           echo $! > /tmp/vite-dev5.pid
           for i in $(seq 1 60); do
             if curl -sf http://localhost:5177/ > /dev/null; then
@@ -699,20 +829,25 @@ jobs:
         run: node ./tools/health-regression-smoke.mjs
         env:
           HEALTH_SMOKE_URL: http://localhost:5177/
+          SMOKE_NO_BOOT: "1"
       - name: Upload screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: health-regression-screenshot
-          path: client/health-regression.png
+          path: client/tools/health-regression.png
           if-no-files-found: warn
-      - name: Tear down dev server
+      - name: Tear down canary + Vite
         if: always()
         run: |
-          if [[ -f /tmp/vite-dev5.pid ]]; then
-            kill "$(cat /tmp/vite-dev5.pid)" || true
-          fi
-          pkill -f 'vite' || true
+          if [[ -f /tmp/canary-server-health.pid ]]; then kill "$(cat /tmp/canary-server-health.pid)" || true; fi
+          if [[ -f /tmp/vite-dev5.pid ]]; then kill "$(cat /tmp/vite-dev5.pid)" || true; fi
+          pkill -f canary-server.sh || true
+          pkill -f 'vite.*5177' || true
+          for port in 5177 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
 
   # Phase 0 / PR 11.1: per-player first-person mouse-look smoke. Verifies
   # that the chase camera's yaw accumulator responds to yaw-delta updates
