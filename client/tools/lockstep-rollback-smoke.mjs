@@ -1,60 +1,88 @@
 #!/usr/bin/env node
-// Phase 0 / PR 11.5 — gap-bridging rollback cap smoke.
+// PR 11.7.D2 / §3.10 — lockstepState stub smoke (REWRITTEN post-D2.2).
 //
-// Verifies the PR 11.5 pause-when-too-far-behind cap in LockstepRuntime.
-// The cap fires when `localFrame - highestRemoteFrameSeen >=
-// ROLLBACK_CAP_FRAMES (8)`. When it fires, `advanceFrame()` returns a
-// sentinel `{paused: true, ...}` frame instead of advancing the
-// simulation. Wire encode + submit still happens every tick so the peer
-// can catch up.
+// The original Phase 0 / PR 11.5 smoke drove the P2P `LockstepRuntime`
+// rollback-cap math (when `localFrame - highestRemoteFrameSeen >= 8`
+// the runtime returns a `{paused: true, ...}` sentinel). The P2P
+// lockstep substrate was DELETED in PR 11.7.D2 (`ggrsRuntime.ts`,
+// `peer.ts`, `ggnet.ts` — see squash 36e475a). The rollback concept
+// is gone with it (no peer wire, no cap, no pause-and-wait).
 //
-// Headless Chromium can't reach TURN (documented in HANDOFF §"PR 6
-// caveat"), so the smoke exercises the runtime directly via a synthetic
-// in-memory transport stub — no WebRTC, no peer setup. Same pattern as
-// the yaw/pitch wire-format smokes (import the module via Vite, drive
-// the API directly, assert the public state).
+// **What this smoke verifies now**: the new `client/src/engine/lockstepState.ts`
+// stub produces the right `AdvancedFrame` shape so `gameSession.tick()`
+// can keep compiling + running unchanged after the substrate swap. The
+// stub replaces the P2P runtime but preserves the call-site surface —
+// this smoke is the regression guard against any drift in that surface.
 //
-// What this smoke verifies:
-//   1. ROLLBACK_CAP_FRAMES === 8 (the documented-but-unused constant
-//      became load-bearing; smear test that the re-export compiles).
-//   2. Feed 1 peer packet (highestRemoteFrameSeen = 0). Advance 9
-//      times within the cap → all advance, none paused, localFrame
-//      reaches 9. (The cap fires at aheadBy >= 8 where aheadBy = max(0,
-//      localFrame - 1 - highestRemoteFrameSeen). With
-//      highestRemoteFrameSeen = 0, the cap fires when localFrame - 1 ≥ 8
-//      → localFrame = 9 on advance #10 (CHECK is at localFrame=9). So
-//      advances 1..9 succeed, advance #10 is the first over-cap tick.)
-//   3. Advance 5 more times (over the cap) → all return paused=true,
-//      localFrame stays at 9, isPaused=true, pausedFrames grows to 5,
-//      totalPausedFrameCount is 5.
-//   4. Wire encode + submit still happens while paused (peer needs
-//      our packets to catch up). 9 + 5 = 14 sent packets from the
-//      main loop + 1 caught-up = 15 total.
-//   5. Feed 10 zeroed-input peer packets at frames 0..9.
-//      After the feed, highestRemoteFrameSeen = 9. The next
-//      advanceFrame call sees aheadBy = max(0, 9 - 1 - 9) = 0 and
-//      resumes normally.
-//   6. The caught-up advance returns paused=false, localFrame
-//      increments to 10, pausedFrames resets to 0,
-//      totalPausedFrameCount stays at 5 (monotonic — never decreases).
-//   7. The new __lockstepProbe DEV probe exposes cap + the paused
-//      counters + the existing frame + repeated + prediction getters.
-//      Production bundle grep verifies the probe + ROLLBACK_CAP_FRAMES
-//      name are tree-shaken out of `dist/assets/index-*.js`.
+// The smoke exercises the stub DIRECTLY via Vite's module import
+// (no scene / no PeerOverlay / no canvas). Same in-memory pattern the
+// yaw / pitch wire-format smokes use: drive the API, assert public
+// state. No WebRTC / no peer setup — there is no peer concept in the
+// stub.
 //
-// Screenshot to `lockstep-rollback.png` for CI artifact upload.
+// Assertions:
+//   1. `LockstepState` is constructible with no args (no transport).
+//   2. `submitLocalInput(encoded)` stashes a defensive copy — mutating
+//      the caller's buffer after submit does NOT affect the stub's
+//      stored input.
+//   3. `advanceFrame()` returns the canonical sentinel shape:
+//        { frame, local, remote: zeroed, remoteConfirmed: true, paused: false }
+//      where `local` is the most-recently-submitted encoded input
+//      (defensively copied) and `frame` is the just-finished frame.
+//   4. Frame counter increments monotonically: 0 → 1 → 2 → 3 across
+//      4 advance calls.
+//   5. `latestConfirmedFrame` mirrors `frame - 1` after at least one
+//      advance has fired (the stub doesn't wait for snapshot-server
+//      confirmation; this getter is the legacy P2P surface).
+//   6. `predictionDepth` === 0, `repeatedFrameCount` === 0,
+//      `pausedFrames` === 0, `totalPausedFrameCount` === 0,
+//      `hasRemote` === false, `isPaused` === false (P2P-derived
+//      getters all return zero / false in the stub).
+//   7. `INPUT_SIZE === 12` (the wire-body byte count from
+//      `protocol/inputBitmask.ts` — unaffected by D2.2; just confirms
+//      the stub imports the same constant the rest of the engine uses).
+//   8. The runtime surface used by `gameSession.tick()` (the call sites
+//      in `client/src/game/gameSession.ts`) is intact: the stub
+//      exposes `submitLocalInput`, `advanceFrame`, `frame`,
+//      `latestConfirmedFrame`, `repeatedFrameCount`, `pausedFrames`,
+//      `totalPausedFrameCount`, `predictionDepth`, `hasRemote`,
+//      `isPaused`, `dispose`. We list them here as a regression guard
+//      so a future PR that accidentally removes a method from the
+//      stub will surface here, not in 5191's HP-convergence CI run.
+//   9. After `dispose()`, further `advanceFrame()` returns the
+//      disposed sentinel `{paused: true, ...}` (defensive — the smoke
+//      also relies on this for teardown symmetry with the old
+//      LockstepRuntime.dispose() contract).
+//  10. Screenshot to `lockstep-rollback.png` for CI artifact upload
+//      (matches the pre-D2.2 file path so the existing CI upload step
+//      keeps working without changes).
+//
 // Exit 0 on pass; exit 1 with `[FAIL]` diagnostic on fail.
 
 import { chromium } from "playwright";
 
 const URL = process.env.LOCKSTEP_ROLLBACK_SMOKE_URL ?? "http://localhost:5188/";
 const SCREENSHOT = process.env.LOCKSTEP_ROLLBACK_SMOKE_PNG ?? "lockstep-rollback.png";
-const EXPECTED_CAP = 8;
-const WITHIN_CAP_ADVANCES = 9;     // 9 successful advances after seeding highestRemoteFrameSeen=0 (see ggrsRuntime.ts cap math)
-const OVER_CAP_ADVANCES = 5;       // 5 paused advances (paused counter hits 5)
-const EXPECTED_TOTAL_PAUSED = 5;    // matches OVER_CAP_ADVANCES
-const CATCHUP_FRAMES = 10;          // feed 10 peer packets (frames 0..9) to put highestRemoteFrameSeen = 9
-const EXPECTED_TOTAL_SENT_PACKETS = WITHIN_CAP_ADVANCES + OVER_CAP_ADVANCES + 1; // 15
+
+// The shape gameSession.tick() depends on (matches the read sites in
+// client/src/game/gameSession.ts lines 163-181, 639-657). If any of
+// these names disappear from the stub, gameSession's compile will
+// break — but we check at runtime too as a defense-in-depth smoke
+// (a future patch could keep the TS surface intact while breaking
+// the runtime behavior; this list is the safety net).
+const REQUIRED_RUNTIME_SURFACE = [
+  "submitLocalInput",
+  "advanceFrame",
+  "frame",
+  "latestConfirmedFrame",
+  "repeatedFrameCount",
+  "pausedFrames",
+  "totalPausedFrameCount",
+  "predictionDepth",
+  "hasRemote",
+  "isPaused",
+  "dispose",
+];
 
 const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
@@ -63,11 +91,8 @@ const errors = [];
 
 page.on("pageerror", (err) => errors.push(`pageerror: ${err.message}`));
 page.on("console", (msg) => {
-  // Match the project convention (see mouse-pitch-smoke.mjs,
-  // pointer-lock-camera-smoke.mjs, spectator-camera-smoke.mjs):
-  // surface console.errors EXCEPT for known headless-environment noise
-  // (WebGPU adapter unavailable, Babylon/Havok warnings, WebGL perf
-  // warnings, GPU stall drift).
+  // Match the project convention (see yaw/pitch wire-format smokes):
+  // surface console.errors EXCEPT for known headless-environment noise.
   if (msg.type() === "error" && !/WebGPU|Babylon|WebGL|GPU stall/.test(msg.text())) {
     errors.push(`console.error: ${msg.text()}`);
   }
@@ -75,251 +100,258 @@ page.on("console", (msg) => {
 
 try {
   await page.goto(URL, { waitUntil: "networkidle", timeout: 30000 });
-
-  // Wait for the scene to be ready — the DEV-only lockstep probe.
+  // The lockstepState module doesn't depend on a runtime scene — we just
+  // need Vite up so the dynamic import resolves. Wait for the React shell
+  // to settle then run the assertion block.
   await page.waitForFunction(
-    () => typeof window.__lockstepProbe === "function",
+    () => typeof window !== "undefined",
     null,
-    { timeout: 15000 },
+    { timeout: 5000 },
   );
-  // Give the engine a frame to settle so the probe's internal state
-  // is what we observe (currently the test runtime is never advanced,
-  // so all counters are 0; this just confirms the probe is wired).
-  await page.waitForTimeout(200);
-
-  // (1) Probe sanity — the runtime module is loaded and the cap
-  // constant is exposed. The probe wraps a no-op runtime so
-  // `cap` should be ROLLBACK_CAP_FRAMES = 8 and all counters
-  // start at 0.
-  const probe1 = await page.evaluate(() => window.__lockstepProbe());
-  if (probe1.cap !== EXPECTED_CAP) {
-    throw new Error(
-      `[probe-cap] expected __lockstepProbe().cap === ${EXPECTED_CAP}, got ${probe1.cap}`,
-    );
-  }
-  if (probe1.frame !== 0) {
-    throw new Error(`[probe-frame] expected frame === 0, got ${probe1.frame}`);
-  }
-  if (probe1.isPaused !== false) {
-    throw new Error(`[probe-ispaused] expected isPaused === false, got ${probe1.isPaused}`);
-  }
-  if (probe1.pausedFrames !== 0) {
-    throw new Error(`[probe-pausedframes] expected pausedFrames === 0, got ${probe1.pausedFrames}`);
-  }
-  if (probe1.totalPausedFrames !== 0) {
-    throw new Error(`[probe-totalpaused] expected totalPausedFrames === 0, got ${probe1.totalPausedFrames}`);
-  }
-  console.log(`PROBE_OK: cap=${probe1.cap}, frame=${probe1.frame}, isPaused=${probe1.isPaused}`);
 
   // Drive the whole scenario in a single page.evaluate so the math
-  // lives in the browser context (where the runtime / encoding /
-  // etc. modules are loaded) and we don't fight cross-realm
-  // Uint8Array serialization. Pattern matches yaw-wire-format-smoke.mjs.
-  const result = await page.evaluate(async (cap) => {
-    const mod = await import("/src/net/ggrsRuntime.ts");
-    const { LockstepRuntime, INPUT_SIZE, PACKET_SIZE } = mod;
+  // lives in the browser context (where the Vite module loader can
+  // resolve `/src/engine/lockstepState.ts`). Pattern matches the
+  // yaw / pitch wire-format smokes (single dynamic import, in-browser
+  // asserts, return a serializable result).
+  const result = await page.evaluate(async () => {
+    // The new stub lives in client/src/engine/lockstepState.ts (PR 11.7.D2
+    // moved it out of net/ alongside the substrate retirement). Importing
+    // via Vite's dev-server transform hits the same module instance the
+    // production bundle would use, so the smoke exercises the actual
+    // surface the game consumes.
+    const mod = await import("/src/engine/lockstepState.ts");
+    const { LockstepState } = mod;
 
-    // Synthetic in-memory transport stub. The runtime only calls
-    // `transport.send(packet)` and `transport.onPacket(callback)` —
-    // a duck-typed object with both shapes is enough. The lockstep
-    // runtime's constructor expects a `GgnetTransport` instance at
-    // the TS type level, but we're in the browser JS context here
-    // (TS types don't apply at runtime), so the duck-typed object
-    // is fine.
-    let capturedInboundCallback = null;
-    const sentPackets = [];
-    const syntheticTransport = {
-      onPacket: (cb) => { capturedInboundCallback = cb; },
-      send: (p) => { sentPackets.push(p); },
+    // Surface checklist: every name gameSession.tick() reads on the
+    // runtime. A future patch that removes any of these breaks the
+    // smoke before it breaks CI compile. The getters are defined on the
+    // class prototype (TS `get frame()` compiles to a prototype accessor)
+    // — instance `Object.keys()` only enumerates own properties, so we
+    // look at BOTH the instance AND the prototype chain.
+    const instanceKeys = Object.keys(new LockstepState());
+    const protoNames = Object.getOwnPropertyNames(LockstepState.prototype);
+    const protoKeys = protoNames.filter((n) => n !== "constructor");
+    const surfaceHas = (k) => instanceKeys.includes(k) || protoKeys.includes(k);
+
+    // (1) Constructible with no args.
+    const runtime = new LockstepState();
+
+    // (2) Defensive copy on submit. We mutate the caller's buffer
+    // after submitLocalInput and verify the stored `local` returned
+    // by advanceFrame is unaffected. The check happens BEFORE the
+    // multi-advance loop below — otherwise subsequent submitLocalInput
+    // calls would overwrite `lastLocalInput` and the first-frame
+    // sentinel would reflect the most-recent input, not the 0xAB we
+    // submitted for this assertion.
+    const submitted = new Uint8Array(12);
+    submitted[0] = 0xAB;
+    submitted[5] = 0xCD;
+    runtime.submitLocalInput(submitted);
+    submitted[0] = 0x00;
+    submitted[5] = 0x00;
+    const defensiveCopyFrame = runtime.advanceFrame();
+
+    // (3) + (4) Drive 4 more advances with monotonically incrementing
+    // sentinels so we can check frame-counter + sentinel-shape across
+    // multiple calls. Each advance returns the canonical sentinel
+    // shape; the first of these is `frame=1` (since the defensive-copy
+    // call above already bumped localFrame from 0 to 1).
+    const frames = [];
+    for (let i = 0; i < 4; i++) {
+      const fresh = new Uint8Array(12);
+      fresh[0] = 0x10 + i;
+      runtime.submitLocalInput(fresh);
+      frames.push(runtime.advanceFrame());
+    }
+
+    // (5) After 4 advances, frame === 4 (next-to-advance) and
+    // latestConfirmedFrame === 3 (last advanced frame).
+    const frameGetter = runtime.frame;
+    const latestConfirmedGetter = runtime.latestConfirmedFrame;
+
+    // (6) P2P-derived getters — all zero / false in the stub.
+    const p2pGetters = {
+      repeatedFrameCount: runtime.repeatedFrameCount,
+      pausedFrames: runtime.pausedFrames,
+      totalPausedFrameCount: runtime.totalPausedFrameCount,
+      predictionDepth: runtime.predictionDepth,
+      hasRemote: runtime.hasRemote,
+      isPaused: runtime.isPaused,
     };
 
-    const runtime = new LockstepRuntime(syntheticTransport);
+    // (7) INPUT_SIZE constant import + sanity (the stub uses it
+    // internally; we re-read from inputBitmask to catch a future
+    // accidental decoupling — same module the wire-format smokes use).
+    const inputBitmask = await import("/src/net/inputBitmask.ts");
+    const inputSize = inputBitmask.INPUT_SIZE;
 
-    // Helper: build a zeroed-input peer packet for a given frame.
-    // The peer's input bits are all zero (no input / first connect),
-    // but the wire format is unchanged from PR 11.3 — 4-byte header
-    // + 12-byte input.
-    const makePeerPacket = (frame) => {
-      const packet = new Uint8Array(PACKET_SIZE);
-      new DataView(packet.buffer).setUint32(0, frame);
-      // bytes 4..PACKET_SIZE-1 are zeroed (no input)
-      return packet;
+    // (9) dispose() flips the stub into the disposed sentinel mode.
+    runtime.dispose();
+    const disposedFrame = runtime.advanceFrame();
+
+    // Return a serializable result. We can't return the runtime
+    // instance directly (functions aren't serializable), so we
+    // flatten everything we want to assert on.
+    const frameShapes = frames.map((f) => ({
+      frame: f.frame,
+      localLen: f.local.length,
+      localByte0: f.local[0],
+      remoteLen: f.remote.length,
+      remoteAllZero: Array.from(f.remote).every((b) => b === 0),
+      remoteConfirmed: f.remoteConfirmed,
+      paused: f.paused,
+    }));
+    const defensiveCopy = {
+      frame: defensiveCopyFrame.frame,
+      localByte0: defensiveCopyFrame.local[0],
+      remoteConfirmed: defensiveCopyFrame.remoteConfirmed,
+      paused: defensiveCopyFrame.paused,
     };
-
-    // --- Phase 0: seed one peer packet so highestRemoteFrameSeen = 0 ---
-    // Without this, the cap would NEVER fire (it's gated on
-    // highestRemoteFrameSeen >= 0 — a solo browser has no peer to
-    // "fall behind"). The smoke models the post-handshake state.
-    capturedInboundCallback(makePeerPacket(0));
-
-    // --- Phase A: 9 within-cap advances ---
-    const withinCap = [];
-    for (let i = 0; i < 9; i++) {
-      runtime.submitLocalInput(new Uint8Array(INPUT_SIZE));
-      const advanced = runtime.advanceFrame();
-      withinCap.push({
-        paused: advanced.paused,
-        frame: advanced.frame,
-        remoteConfirmed: advanced.remoteConfirmed,
-        localFrame: runtime.frame,
-        isPaused: runtime.isPaused,
-        pausedFrames: runtime.pausedFrames,
-        totalPausedFrameCount: runtime.totalPausedFrameCount,
-      });
-    }
-
-    // --- Phase B: 5 over-cap advances (cap fires) ---
-    const overCap = [];
-    for (let i = 0; i < 5; i++) {
-      runtime.submitLocalInput(new Uint8Array(INPUT_SIZE));
-      const advanced = runtime.advanceFrame();
-      overCap.push({
-        paused: advanced.paused,
-        frame: advanced.frame,
-        remoteConfirmed: advanced.remoteConfirmed,
-        localFrame: runtime.frame,
-        isPaused: runtime.isPaused,
-        pausedFrames: runtime.pausedFrames,
-        totalPausedFrameCount: runtime.totalPausedFrameCount,
-      });
-    }
-    const totalPausedAtEndOfPhaseB = runtime.totalPausedFrameCount;
-
-    // --- Phase C: feed 10 peer packets (catch-up) ---
-    for (let f = 0; f < 10; f++) {
-      capturedInboundCallback(makePeerPacket(f));
-    }
-
-    // --- Phase D: 1 caught-up advance (should resume) ---
-    runtime.submitLocalInput(new Uint8Array(INPUT_SIZE));
-    const caughtUp = runtime.advanceFrame();
-
     return {
-      cap,
-      withinCap,
-      overCap,
-      totalPausedAtEndOfPhaseB,
-      caughtUp: {
-        paused: caughtUp.paused,
-        frame: caughtUp.frame,
-        remoteConfirmed: caughtUp.remoteConfirmed,
-        localFrame: runtime.frame,
-        isPaused: runtime.isPaused,
-        pausedFrames: runtime.pausedFrames,
-        totalPausedFrameCount: runtime.totalPausedFrameCount,
+      instanceKeys,
+      protoKeys,
+      surfaceHas: Object.fromEntries([
+        "submitLocalInput",
+        "advanceFrame",
+        "frame",
+        "latestConfirmedFrame",
+        "repeatedFrameCount",
+        "pausedFrames",
+        "totalPausedFrameCount",
+        "predictionDepth",
+        "hasRemote",
+        "isPaused",
+        "dispose",
+      ].map((k) => [k, surfaceHas(k)])),
+      frameShapes,
+      defensiveCopy,
+      frameGetter,
+      latestConfirmedGetter,
+      p2pGetters,
+      inputSize,
+      disposedShape: {
+        frame: disposedFrame.frame,
+        paused: disposedFrame.paused,
+        localLen: disposedFrame.local.length,
+        remoteLen: disposedFrame.remote.length,
+        remoteConfirmed: disposedFrame.remoteConfirmed,
       },
-      sentPacketCount: sentPackets.length,
     };
-  }, EXPECTED_CAP);
+  });
 
-  // (2) Cap constant value matches.
-  if (result.cap !== EXPECTED_CAP) {
-    throw new Error(`[cap] expected ROLLBACK_CAP_FRAMES === ${EXPECTED_CAP}, got ${result.cap}`);
+  // (1) Surface checklist — every name gameSession.tick() reads on
+  // the runtime must still be exposed by the stub. Defensive against
+  // a future PR removing one of these methods (the stub's purpose
+  // is call-site compatibility).
+  for (const k of REQUIRED_RUNTIME_SURFACE) {
+    if (!result.surfaceHas[k]) {
+      throw new Error(
+        `[surface-${k}] expected LockstepState to expose "${k}" (gameSession.tick() reads it); missing.`,
+      );
+    }
   }
-  console.log(`CAP_OK: ROLLBACK_CAP_FRAMES === ${result.cap}`);
+  console.log(`SURFACE_OK: ${REQUIRED_RUNTIME_SURFACE.length} runtime methods exposed (${REQUIRED_RUNTIME_SURFACE.join(", ")})`);
 
-  // (3) Within-cap advances: all 9 succeed, no paused, localFrame 0→9.
-  if (result.withinCap.length !== WITHIN_CAP_ADVANCES) {
-    throw new Error(`[within-cap-count] expected ${WITHIN_CAP_ADVANCES} advances, got ${result.withinCap.length}`);
-  }
-  for (let i = 0; i < result.withinCap.length; i++) {
-    const a = result.withinCap[i];
-    if (a.paused !== false) {
-      throw new Error(`[within-cap ${i}] expected paused === false, got ${a.paused}`);
-    }
-    if (a.frame !== i) {
-      throw new Error(`[within-cap ${i}] expected frame === ${i}, got ${a.frame}`);
-    }
-    if (a.localFrame !== i + 1) {
-      throw new Error(`[within-cap ${i}] expected localFrame === ${i + 1}, got ${a.localFrame}`);
-    }
-    if (a.isPaused !== false) {
-      throw new Error(`[within-cap ${i}] expected isPaused === false, got ${a.isPaused}`);
-    }
-    if (a.pausedFrames !== 0) {
-      throw new Error(`[within-cap ${i}] expected pausedFrames === 0, got ${a.pausedFrames}`);
-    }
-  }
-  console.log(`WITHIN_CAP_OK: ${WITHIN_CAP_ADVANCES} advances succeeded, localFrame 0→${result.withinCap[result.withinCap.length - 1].localFrame}`);
-
-  // (4) Over-cap advances: all 5 paused, localFrame stays at 9.
-  if (result.overCap.length !== OVER_CAP_ADVANCES) {
-    throw new Error(`[over-cap-count] expected ${OVER_CAP_ADVANCES} over-cap advances, got ${result.overCap.length}`);
-  }
-  for (let i = 0; i < result.overCap.length; i++) {
-    const a = result.overCap[i];
-    if (a.paused !== true) {
-      throw new Error(`[over-cap ${i}] expected paused === true, got ${a.paused}`);
-    }
-    if (a.frame !== 9) {
-      throw new Error(`[over-cap ${i}] expected frame === 9 (unchanged), got ${a.frame}`);
-    }
-    if (a.localFrame !== 9) {
-      throw new Error(`[over-cap ${i}] expected localFrame === 9 (unchanged), got ${a.localFrame}`);
-    }
-    if (a.isPaused !== true) {
-      throw new Error(`[over-cap ${i}] expected isPaused === true, got ${a.isPaused}`);
-    }
-    if (a.pausedFrames !== i + 1) {
-      throw new Error(`[over-cap ${i}] expected pausedFrames === ${i + 1}, got ${a.pausedFrames}`);
-    }
-    if (a.totalPausedFrameCount !== i + 1) {
-      throw new Error(`[over-cap ${i}] expected totalPausedFrameCount === ${i + 1}, got ${a.totalPausedFrameCount}`);
-    }
-  }
-  const lastOverCap = result.overCap[result.overCap.length - 1];
-  console.log(
-    `OVER_CAP_OK: ${OVER_CAP_ADVANCES} advances paused, localFrame stayed at ${lastOverCap.localFrame}, ` +
-    `totalPausedFrameCount=${lastOverCap.totalPausedFrameCount}`,
-  );
-
-  // (5) Wire encode + submit still happens while paused (peer needs
-  // our packets to catch up). Submit fires once per advanceFrame call
-  // (in our test). 7 + 5 + 1 = 13 sent packets total.
-  if (result.sentPacketCount !== EXPECTED_TOTAL_SENT_PACKETS) {
+  // (2) The defensive-copy frame's local is the submitted input
+  // (with the post-submit mutation NOT visible). We submitted 0xAB
+  // then mutated back to 0x00 before advancing; if the stub copied
+  // by reference the stored local[0] would be 0x00.
+  if (result.defensiveCopy.localByte0 !== 0xAB) {
     throw new Error(
-      `[sent-packets] expected ${EXPECTED_TOTAL_SENT_PACKETS} sent packets (${WITHIN_CAP_ADVANCES} within + ${OVER_CAP_ADVANCES} paused + 1 caught up), got ${result.sentPacketCount}`,
+      `[defensive-copy] expected defensive-copy frame local[0] === 0xAB (preserved across submitLocalInput's defensive copy); got 0x${result.defensiveCopy.localByte0.toString(16)}. ` +
+      `If this is 0x00 the stub is storing a reference instead of a copy — would corrupt the input buffer when the caller mutates it.`,
     );
   }
-  console.log(`SENT_PACKETS_OK: ${result.sentPacketCount} sent packets (wire encoded every tick, even while paused)`);
+  console.log(`DEFENSIVE_COPY_OK: submitLocalInput copies (preserved 0xAB across post-submit mutation)`);
 
-  // (6) Caught-up advance: paused=false, localFrame=10, pausedFrames=0,
-  // totalPausedFrameCount stays at 5 (monotonic — never decreases).
-  if (result.caughtUp.paused !== false) {
-    throw new Error(`[caught-up] expected paused === false, got ${result.caughtUp.paused}`);
+  // (3) Sentinel shape: every advance returns the canonical
+  // {frame, local, remote, remoteConfirmed: true, paused: false}
+  // with remote zeroed. The contract is the same for every frame.
+  for (let i = 0; i < result.frameShapes.length; i++) {
+    const f = result.frameShapes[i];
+    const expectedFrame = i + 1; // defensive-copy call advanced localFrame to 1 already
+    if (f.frame !== expectedFrame) {
+      throw new Error(`[frame-counter ${i}] expected frame === ${expectedFrame}, got ${f.frame}`);
+    }
+    if (f.localLen !== 12) {
+      throw new Error(`[local-len ${i}] expected local.length === 12, got ${f.localLen}`);
+    }
+    if (f.remoteLen !== 12) {
+      throw new Error(`[remote-len ${i}] expected remote.length === 12, got ${f.remoteLen}`);
+    }
+    if (!f.remoteAllZero) {
+      throw new Error(`[remote-zeroed ${i}] expected remote to be all zeros (no peer), got non-zero bytes`);
+    }
+    if (f.remoteConfirmed !== true) {
+      throw new Error(`[remote-confirmed ${i}] expected remoteConfirmed === true, got ${f.remoteConfirmed}`);
+    }
+    if (f.paused !== false) {
+      throw new Error(`[paused ${i}] expected paused === false, got ${f.paused}`);
+    }
+    if (f.localByte0 !== 0x10 + i) {
+      throw new Error(`[local-content ${i}] expected local[0] === ${0x10 + i} (submitted this round), got 0x${f.localByte0.toString(16)}`);
+    }
   }
-  if (result.caughtUp.frame !== 9) {
-    throw new Error(`[caught-up] expected frame === 9, got ${result.caughtUp.frame}`);
+  console.log(`SHAPE_OK: ${result.frameShapes.length} advances returned canonical AdvancedFrame {frame, local, remote: zeroed, remoteConfirmed: true, paused: false}`);
+
+  // (4) Frame counter monotonic — frame getter is the next-to-advance
+  // number. After 1 defensive-copy advance + 4 loop advances, that's
+  // 5 advances total → frame === 5 (next-to-advance), latestConfirmed
+  // === 4 (last advanced).
+  if (result.frameGetter !== 5) {
+    throw new Error(`[frame-getter] expected runtime.frame === 5 after 5 advances (1 defensive-copy + 4 loop), got ${result.frameGetter}`);
   }
-  if (result.caughtUp.localFrame !== 10) {
-    throw new Error(`[caught-up] expected localFrame === 10, got ${result.caughtUp.localFrame}`);
+  if (result.latestConfirmedGetter !== 4) {
+    throw new Error(`[latest-confirmed] expected runtime.latestConfirmedFrame === 4 after 5 advances, got ${result.latestConfirmedGetter}`);
   }
-  if (result.caughtUp.isPaused !== false) {
-    throw new Error(`[caught-up] expected isPaused === false, got ${result.caughtUp.isPaused}`);
+  console.log(`MONOTONIC_OK: frame=${result.frameGetter}, latestConfirmedFrame=${result.latestConfirmedGetter} (counter increments every advance)`);
+
+  // (5) P2P-derived getters all zero / false in the stub. These are
+  // the legacy LockstepRuntime HUD-surfaced values — the stub
+  // preserves them as zero so the HUD compiles but they always
+  // report "no peer" state.
+  for (const k of ["repeatedFrameCount", "pausedFrames", "totalPausedFrameCount", "predictionDepth"]) {
+    if (result.p2pGetters[k] !== 0) {
+      throw new Error(`[p2p-getter ${k}] expected 0, got ${result.p2pGetters[k]}`);
+    }
   }
-  if (result.caughtUp.pausedFrames !== 0) {
-    throw new Error(`[caught-up] expected pausedFrames === 0 (reset on resume), got ${result.caughtUp.pausedFrames}`);
+  for (const k of ["hasRemote", "isPaused"]) {
+    if (result.p2pGetters[k] !== false) {
+      throw new Error(`[p2p-getter ${k}] expected false, got ${result.p2pGetters[k]}`);
+    }
   }
-  if (result.caughtUp.totalPausedFrameCount !== EXPECTED_TOTAL_PAUSED) {
+  console.log(`P2P_GETTERS_OK: repeatedFrameCount=0 pausedFrames=0 totalPausedFrameCount=0 predictionDepth=0 hasRemote=false isPaused=false (no peer concept)`);
+
+  // (6) INPUT_SIZE constant matches the engine wire-format (12 bytes).
+  // The stub's `new Uint8Array(INPUT_SIZE)` uses this; if it ever
+  // drifted from inputBitmask the wire format would silently break.
+  if (result.inputSize !== 12) {
+    throw new Error(`[input-size] expected INPUT_SIZE === 12, got ${result.inputSize}`);
+  }
+  console.log(`INPUT_SIZE_OK: INPUT_SIZE === ${result.inputSize} (matches protocol/inputBitmask.ts wire body)`);
+
+  // (7) dispose() flips the stub into the disposed sentinel mode —
+  // advanceFrame returns {paused: true, ...} for symmetry with the
+  // old LockstepRuntime.dispose() contract (gameSession.dispose()
+  // calls runtime.dispose(); the subsequent tick must short-circuit
+  // cleanly).
+  if (result.disposedShape.paused !== true) {
     throw new Error(
-      `[caught-up] expected totalPausedFrameCount === ${EXPECTED_TOTAL_PAUSED} (monotonic — never decreases), got ${result.caughtUp.totalPausedFrameCount}`,
+      `[disposed-paused] expected advanceFrame after dispose() to return paused: true, got ${result.disposedShape.paused}`,
     );
   }
-  console.log(
-    `CAUGHT_UP_OK: unpaused, localFrame=${result.caughtUp.localFrame}, ` +
-    `pausedFrames=${result.caughtUp.pausedFrames}, totalPausedFrameCount=${result.caughtUp.totalPausedFrameCount}`,
-  );
-
-  // (7) Monotonic — totalPausedFrameCount NEVER decreased across the
-  // session (Phase B end vs. caught-up).
-  if (result.caughtUp.totalPausedFrameCount < result.totalPausedAtEndOfPhaseB) {
+  if (result.disposedShape.localLen !== 12 || result.disposedShape.remoteLen !== 12) {
     throw new Error(
-      `[monotonic] totalPausedFrameCount decreased from ${result.totalPausedAtEndOfPhaseB} to ${result.caughtUp.totalPausedFrameCount}`,
+      `[disposed-shape] expected disposed advanceFrame to still return zeroed local+remote Uint8Array(12), got localLen=${result.disposedShape.localLen} remoteLen=${result.disposedShape.remoteLen}`,
     );
   }
-  console.log(
-    `MONOTONIC_OK: totalPausedFrameCount ${result.totalPausedAtEndOfPhaseB} → ${result.caughtUp.totalPausedFrameCount} (non-decreasing)`,
-  );
+  if (result.disposedShape.remoteConfirmed !== true) {
+    throw new Error(
+      `[disposed-remote-confirmed] expected remoteConfirmed === true even after dispose, got ${result.disposedShape.remoteConfirmed}`,
+    );
+  }
+  console.log(`DISPOSE_OK: advanceFrame() after dispose() returns {paused: true, ...} sentinel (call-site symmetry preserved)`);
 
   await page.screenshot({ path: SCREENSHOT });
 
@@ -329,7 +361,7 @@ try {
     process.exit(1);
   }
 
-  console.log(`OK — lockstep rollback cap verified (7 assertions: cap, within-cap, over-cap, sent-packets, caught-up, monotonic, probe)`);
+  console.log(`OK — lockstepState stub smoke passed (10 assertions: surface, defensive-copy, sentinel-shape, monotonic, p2p-getters, input-size, dispose)`);
   await browser.close();
   process.exit(0);
 } catch (err) {

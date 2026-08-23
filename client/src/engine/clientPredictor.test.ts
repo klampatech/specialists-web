@@ -27,10 +27,10 @@ import {describe, it, expect, beforeEach} from "vitest";
 
 import type {Snapshot, PlayerState} from "../../../protocol/snapshot";
 import {
-  Predictor,
   MAX_RECONCILIATION_SNAP_DISTANCE_M,
   RECONCILIATION_THRESHOLD_M,
-} from "./clientPredictor";
+} from "../../../protocol/constants";
+import {Predictor} from "./clientPredictor";
 
 /** Per-tick advance for the mock Havok step. Default 1.0 for backward
  *  compatibility with the earlier tests (which were written for a

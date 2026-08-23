@@ -412,8 +412,20 @@ async function runSmoke() {
     // `players.find(p => p.playerId === 2)` returns undefined on
     // BOTH tabs (the snapshot is identical on both sides of the
     // fan-out) and the smoke can't read HP from the snapshot.
-    const primerEventA = Math.floor(Math.random() * 0xffffffff);
-    const primerEventB = Math.floor(Math.random() * 0xffffffff);
+    // PR 11.7.D2 / Claude D1 carry-forward — cap the primer
+    // eventId at 0xfffffff0 (16 below u32::MAX). The smoke
+    // subsequently uses primerEventA + 1 as the main-fire
+    // `eventId` and primerEventA + 2 + N for the spam loop;
+    // those need headroom under u32 (the wire is u32 BE). The
+    // server uses `saturating_add` for its `last_event_id`
+    // (D2.1 saturated arithmetic — no wrap), but the
+    // client-side counter here is plain JS arithmetic on a
+    // u32-representable value; without the cap, a primer near
+    // u32::MAX would push the main fire / spam into overflow
+    // territory where the server rejects them as stale
+    // (`eventId` not strictly monotonic after wrap).
+    const primerEventA = Math.floor(Math.random() * 0xfffffff0);
+    const primerEventB = Math.floor(Math.random() * 0xfffffff0);
     const primerResultA = await pageA.evaluate(async ({eventId}) => {
       const bus = (window).__damageBus;
       const session = (window).__gameSession;
@@ -604,6 +616,16 @@ async function runSmoke() {
     // We can also check that Tab B's HP only dropped by 8*12 = 96
     // (or whatever the cooldown allows).
     const hpBeforeSpamB = hpB;
+    // PR 11.7.D2 / Claude D1 carry-forward — server dead-target
+    // gate (validate_and_relay: `if room.players[&req_target].hp == 0`)
+    // rejects damage requests targeting a player whose HP is
+    // already 0. The post-spam HP check below verifies the gate
+    // is NOT the cause of any low-broadcast-count outcome (the
+    // gate only rejects AT-HP-0 targets; at HP=76+ pre-spam the
+    // gate is transparent). If we wanted to explicitly test the
+    // gate we'd need to kill Tab B first then verify a subsequent
+    // spam yields 0 broadcasts — a useful follow-up smoke but
+    // out of scope for D2.2's claude-findings bundle.
     await pageA.evaluate(async ({timeoutMs, cooldownMs, baseEventId}) => {
       const bus = (window).__damageBus;
       const start = Date.now();

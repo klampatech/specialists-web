@@ -11,11 +11,16 @@
 // `BulletHud` so the bottom-left HUD chip stays in sync.
 
 import { useEffect, useState } from "react";
-import { WebRTCPeer } from "../net/peer";
-import { decodePayload, encodePayload, joinBlob } from "../net/signaling";
+
+// PR 11.7.D2 / §3.10 — WebRTCPeer + signaling imports REMOVED.
+// The P2P host/join flow is gone; the overlay now surfaces the
+// ServerTransport lifecycle (driven by scene.ts via a future
+// getServerTransport accessor + a window probe).
 
 interface PeerOverlayProps {
-  peer: WebRTCPeer;
+  /** PR 11.7.D2 / §3.10 — peer prop REMOVED. The WebRTC overlay
+   *  is gone; the overlay now drives purely off the `?server=`
+   *  URL flag + the ServerTransport connection lifecycle. */
   /** Mirror the connection status up to App so BulletHud can show it. */
   onStatusChange?: (status: "offline" | "waiting-ice" | "connected" | "disconnected") => void;
 }
@@ -58,99 +63,68 @@ if (
           (window as unknown as {__localPlayerId?: number}).__localPlayerId = n;
         }
       }
+      // PR 11.7.D2.1 / FIX — peerId URL param was silently ignored.
+      // Pre-fix: PeerOverlay read `?localId` but NOT `?peerId`, so
+      // Tab B's URL `?localId=2&peerId=1` set __localPlayerId=2 but
+      // __peerPlayerId fell back to its default (2). Both tabs
+      // thought Player 2 was the peer, leading to misrouted
+      // DamageRequests when the server's Gate3 fix landed. Reading
+      // both URL params keeps the two tabs symmetric.
+      const peerIdParam = url.searchParams.get("peerId");
+      if (peerIdParam) {
+        const n = Number(peerIdParam);
+        if (Number.isFinite(n) && n > 0) {
+          (window as unknown as {__peerPlayerId?: number}).__peerPlayerId = n;
+        }
+      }
     } catch {
       // Malformed server URL — ignore, fall back to default path.
     }
   }
 }
 
-/** Tracks whether the last-created blob was an offer or an answer, so the
- *  `data-testid` is unambiguous regardless of SDP body content. */
-type BlobKind = "offer" | "answer";
+export function PeerOverlay({ onStatusChange }: PeerOverlayProps) {
+  const [status, setStatus] = useState<string>("Server: waiting");
 
-export function PeerOverlay({ peer, onStatusChange }: PeerOverlayProps) {
-  const [paste, setPaste] = useState("");
-  const [blob, setBlob] = useState("");
-  const [blobKind, setBlobKind] = useState<BlobKind | null>(null);
-  const [status, setStatus] = useState<string>(
-    typeof window !== "undefined" && joinBlob() ? "Joining from URL…" : "Waiting for room",
-  );
-
-  // Reflect peer lifecycle into the status badge + up to App.
+  // PR 11.7.D2 / §3.10 — replaced WebRTC peer-lifecycle hooks
+  // (`peer.on("open" / "disconnect")`) with a polling loop on
+  // `window.__serverTransport` (set by scene.ts's
+  // __forceServerTransport probe). Polls every 200ms; reports the
+  // current `getStats().connected` bit + transport kind up to the
+  // parent via `onStatusChange`.
   useEffect(() => {
-    const off = (s: string) => {
-      setStatus(s);
+    let cancelled = false;
+    const poll = () => {
+      if (cancelled) return;
+      const t = (window as unknown as {__serverTransport?: {getStats?: () => {connected?: boolean; transport?: string}}}).__serverTransport;
+      if (!t || !t.getStats) {
+        setStatus("Server: offline (no __serverTransport)");
+        return;
+      }
+      const stats = t.getStats();
+      if (stats.connected) {
+        setStatus(`Server: connected (${stats.transport ?? "unknown"})`);
+      } else {
+        setStatus(`Server: connecting (${stats.transport ?? "unknown"})`);
+      }
     };
-    const onOpen = () => off("Connected");
-    const onDisconnect = () => off("Disconnected");
-    peer.on("open", onOpen);
-    peer.on("disconnect", onDisconnect);
+    poll();
+    const interval = window.setInterval(poll, 200);
     return () => {
-      // We don't unregister listeners — the peer is owned at the App level
-      // for the mount lifetime.
+      cancelled = true;
+      window.clearInterval(interval);
     };
-  }, [peer]);
+  }, []);
 
-  // Whenever the connection status string changes, classify it for the
-  // parent's HUD chip + the BulletHud connection state.
+  // Mirror the status up to App for the BulletHud connection chip.
   useEffect(() => {
     if (!onStatusChange) return;
     let s: "offline" | "waiting-ice" | "connected" | "disconnected" = "offline";
-    if (status === "Connected") s = "connected";
-    else if (status === "Disconnected") s = "disconnected";
-    else if (status.includes("ICE") || status.includes("Joining")) s = "waiting-ice";
-    else s = "offline";
+    if (status.startsWith("Server: connected")) s = "connected";
+    else if (status.startsWith("Server: connecting")) s = "waiting-ice";
+    else if (status.startsWith("Server: offline")) s = "disconnected";
     onStatusChange(s);
   }, [status, onStatusChange]);
-
-  const create = async (): Promise<void> => {
-    setStatus("Gathering ICE…");
-    try {
-      const payload = await peer.createOffer();
-      setBlob(encodePayload(payload));
-      setBlobKind("offer");
-      // PR 10.1: surface how many candidates got bundled so the user
-      // can self-diagnose a slow TURN / no-TURN network. <2 candidates
-      // means connection may not establish — copy the offer and continue
-      // anyway, but warn the user.
-      const candidateCount = payload.candidates.length;
-      setStatus(
-        candidateCount < 2
-          ? `Offer ready (${candidateCount} candidate${candidateCount === 1 ? "" : "s"} — TURN may be unreachable)`
-          : `Offer ready (${candidateCount} candidates) — copy and share`,
-      );
-    } catch (e) {
-      setStatus(e instanceof Error ? e.message : "Could not create offer");
-    }
-  };
-
-  const join = async (): Promise<void> => {
-    setStatus("Joining from URL…");
-    try {
-      const initial = paste || joinBlob() || "";
-      const payload = await peer.createAnswer(decodePayload(initial));
-      setBlob(encodePayload(payload));
-      setBlobKind("answer");
-      // PR 10.1: same candidate-count warning as `create`.
-      const candidateCount = payload.candidates.length;
-      setStatus(
-        candidateCount < 2
-          ? `Answer ready (${candidateCount} candidate${candidateCount === 1 ? "" : "s"} — TURN may be unreachable)`
-          : `Answer ready (${candidateCount} candidates) — copy and share`,
-      );
-    } catch (e) {
-      setStatus(e instanceof Error ? e.message : "Could not parse blob");
-    }
-  };
-
-  const answer = async (): Promise<void> => {
-    try {
-      await peer.acceptAnswer(decodePayload(paste));
-      setStatus("Waiting for connection…");
-    } catch {
-      setStatus("Could not parse — make sure you pasted the full blob");
-    }
-  };
 
   return (
     <div
@@ -169,26 +143,11 @@ export function PeerOverlay({ peer, onStatusChange }: PeerOverlayProps) {
         borderRadius: 6,
       }}
     >
-      <b>WebRTC peer bootstrap</b>
+      {/* PR 11.7.D2 / §3.10 — overlay renamed to "Server connection"
+          and now shows only the ServerTransport status. The
+          Host/Join clipboard UI is gone (no P2P). */}
+      <b>Server connection</b>
       <div data-testid="status" style={{ margin: "8px 0" }}>{status}</div>
-      <button onClick={create} data-testid="btn-create">Create Room</button>
-      <button onClick={join} style={{ marginLeft: 6 }} data-testid="btn-join">Join</button>
-      <textarea
-        value={paste}
-        onChange={(e) => setPaste(e.target.value)}
-        placeholder="Paste offer / answer"
-        style={{ width: "100%", height: 55, marginTop: 8 }}
-        data-testid="paste-area"
-      />
-      <button onClick={answer} data-testid="btn-paste-answer">Paste Answer</button>
-      {blob && (
-        <textarea
-          data-testid={blobKind === "offer" ? "offer-blob" : "answer-blob"}
-          readOnly
-          value={blob}
-          style={{ width: "100%", height: 55, marginTop: 8 }}
-        />
-      )}
     </div>
   );
 }

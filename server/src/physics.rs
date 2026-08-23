@@ -158,6 +158,12 @@ pub struct PhysicsWorld {
     /// + the next tick's gravity). Tracking the velocity as a
     /// persistent state gives the body a real arc.
     jump_v_y: BTreeMap<PlayerId, f32>,
+    /// PR 11.7.D2.1 — set of player ids whose translation is
+    /// authoritative on the CLIENT side (post-substrate-
+    /// retirement). `step()` skips these bodies so the server's
+    /// input-driven physics sim doesn't overwrite the client's
+    /// reported translation. See `set_position`.
+    client_driven: std::collections::BTreeSet<PlayerId>,
 }
 
 impl std::fmt::Debug for PhysicsWorld {
@@ -201,6 +207,17 @@ impl PhysicsWorld {
             last_grounded: BTreeMap::new(),
             last_grounded_frame: BTreeMap::new(),
             jump_v_y: BTreeMap::new(),
+            /// PR 11.7.D2.1 — clients whose position is the authority
+            /// (post-substrate-retirement: the CLIENT Havok is the
+            /// source of truth; the server reads the client's
+            /// reported translation via `PositionUpdate` and the
+            /// server's `physics.step()` should NOT integrate inputs
+            /// to move these bodies — only the client's reported
+            /// translation, applied via `set_position` (which calls
+            /// `set_next_kinematic_translation` so the body reads
+            /// correctly in the snapshot between steps), is
+            /// authoritative). See the `set_position` doc comment.
+            client_driven: std::collections::BTreeSet::new(),
         }
     }
 
@@ -482,6 +499,16 @@ impl PhysicsWorld {
         let mut new_translations: Vec<(PlayerId, Vector<f32>, bool)> =
             Vec::new();
         for (id, handle) in &self.body_handles {
+            // PR 11.7.D2.1 — skip client-driven bodies. Their
+            // translation is set via `set_position` (which queues
+            // `set_next_kinematic_translation`); the input-driven
+            // step would overwrite that queue with stale
+            // physics-derived motion. Bail out before the
+            // `move_shape` call so the queued translation lands
+            // untouched.
+            if self.client_driven.contains(id) {
+                continue;
+            }
             let controller = match self.controllers.get(id) {
                 Some(c) => *c,
                 None => continue,
@@ -631,6 +658,38 @@ impl PhysicsWorld {
         let body = self.bodies.get(*handle)?;
         let t = body.translation();
         Some(Position { x: t.x, y: t.z })
+    }
+
+    /// PR 11.7.D2.1 — snap a kinematic player body to a client-
+    /// authoritative position (the wire format is 2D XZ; we set
+    /// the body's y to `CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS` so
+    /// the capsule rests on the ground after the teleport). The
+    /// server-side physics simulation runs in `step()` and
+    /// computes body translation from inputs, but the post-
+    /// substrate-retirement (PR 11.7.D) model treats the CLIENT
+    /// Havok as authoritative for position — so on each
+    /// `PositionUpdate` the server snaps the kinematic body to
+    /// whatever the client reported. This ensures
+    /// `SnapshotGenerator` (which reads `physics.position(id)`)
+    /// reflects the client's reported position immediately,
+    /// without waiting for the next `step()` to integrate
+    /// inputs into a (possibly stale) server-side guess.
+    ///
+    /// Also marks the player as `client_driven` — `step()` then
+    /// skips its physics integration, so the body's translation
+    /// stays at whatever the client reported (instead of being
+    /// overwritten by the server's input-driven physics sim).
+    pub fn set_position(&mut self, id: PlayerId, pos: Position) {
+        self.client_driven.insert(id);
+        if let Some(handle) = self.body_handles.get(&id) {
+            if let Some(body) = self.bodies.get_mut(*handle) {
+                body.set_next_kinematic_translation(vector![
+                    pos.x,
+                    CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS,
+                    pos.y
+                ]);
+            }
+        }
     }
 
     /// 2D XZ velocity for a player (XZ components of linvel).

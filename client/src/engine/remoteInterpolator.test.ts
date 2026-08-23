@@ -171,4 +171,56 @@ describe("remoteInterpolator PR 11.7.C — interpolation + extrapolation", () =>
     // raw 600ms × 1.0 m/s = 0.6m.
     expect(result[0].positionX).toBeCloseTo(0.5, 5);
   });
+
+  // PR 11.7.D2 / §3.10 — Test K: the new `tick(nowMs)` method
+  // returns a single RemotePlayerState per remote player with a
+  // Babylon Vector3 position. The local player is excluded.
+  // The interpolation math is the same as `getInterpolatedStates`
+  // but tick() reads the latest snapshot from its own buffer
+  // (no external latestSnap parameter needed). This is the
+  // canonical consumer surface post-substrate-retirement.
+  it("Test K: tick(now) returns a Babylon Vector3 per remote player (local excluded)", () => {
+    const interp = new Interpolator(/* localPlayerId */ 1);
+    const snap1: Snapshot = {
+      serverFrame: 100,
+      nextServerFrame: 105,
+      players: [
+        { playerId: 1, positionX: 0, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0 },
+        { playerId: 2, positionX: 5, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0 },
+      ],
+    };
+    const snap2: Snapshot = {
+      serverFrame: 105,
+      nextServerFrame: 110,
+      players: [
+        { playerId: 1, positionX: 0, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0 },
+        { playerId: 2, positionX: 7, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0 },
+      ],
+    };
+    interp.onSnapshot(snap1, /* arrivedAtMs */ 1000);
+    interp.onSnapshot(snap2, /* arrivedAtMs */ 1050);
+
+    // Render at 1025ms → targetTime = 925ms (before snap1's arrival).
+    // Buffer has 2 entries; the lerp t = 0 (target is before both
+    // entries), so the result should be snap1's position (x=5).
+    const states = interp.tick(/* renderTimestampMs */ 1025);
+    expect(states.length).toBe(1);
+    expect(states[0].playerId).toBe(2);
+    // Position is a Babylon Vector3 (X, Y=1 capsule-half, Z=Y-of-wire)
+    // We can't import Vector3 in the test directly (vitest is in
+    // Node, no Babylon), but the shape has x/y/z numeric fields.
+    expect(states[0].position.x).toBeCloseTo(5, 5);
+    expect(states[0].position.y).toBe(1);
+    expect(states[0].position.z).toBeCloseTo(0, 5);
+  });
+
+  // PR 11.7.D2 — Test L: tick() returns an empty array when no
+  // remote has been seen yet (very-first frames, before the first
+  // snapshot arrives). The visual wiring skips setPosition on
+  // empty result (remote rig stays at spawn).
+  it("Test L: tick(now) returns [] when no snapshot has arrived yet", () => {
+    const interp = new Interpolator(/* localPlayerId */ 1);
+    const states = interp.tick(/* renderTimestampMs */ 1000);
+    expect(states).toEqual([]);
+  });
 });

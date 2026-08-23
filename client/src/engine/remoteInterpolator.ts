@@ -6,11 +6,14 @@
 // for smooth visual. LOCAL player is predicted (see clientPredictor.ts);
 // remotes are interpolated.
 //
-// **Constants source**: the numbers below are a MIRROR of
-// `server/src/constants.rs` (PR 11.7.B). The PR 11.7.C brief locks the
-// decision to NOT extract a `protocol/constants.ts` file in this PR;
-// each new module inlines the constants with a `MIRROR of
-// server/src/constants.rs` comment. Carry-forward to a later PR.
+// **Constants source**: the numbers below are now IMPORTED from
+// `protocol/constants.ts` (PR 11.7.D2 / §1.2). Before D2 the
+// constants were a MIRROR of `server/src/constants.rs` (PR 11.7.B),
+// inlined per-module. PR 11.7.D2.1 extracted the canonical
+// `protocol/constants.ts`; this file dropped the inlined copies
+// and imports from the canonical source. The server-side mirror is
+// still `server/src/constants.rs`; the protocol round-trip test
+// (server/tests/protocol_wire.rs) catches drift.
 //
 // **Lookback**: `INTERPOLATION_DELAY_MS = 100`. At 20Hz snapshot rate
 // that's 2 snapshots of latency — the interpolator renders the
@@ -39,23 +42,24 @@
 // time of the latest snapshot). This keeps the wire format unchanged
 // while still supporting extrapolation age tracking.
 
+import type { Vector3 as Vector3Type } from "@babylonjs/core";
+import { Vector3 } from "@babylonjs/core";
 import type { Snapshot, PlayerState } from "../../../protocol/snapshot";
+import {
+  INTERPOLATION_DELAY_MS,
+  MAX_SNAPSHOT_AGE_MS,
+} from "../../../protocol/constants";
 
-// -- Constants (MIRROR of server/src/constants.rs) ----------------
-
-/** PR 11.7.B / §3.10 — snapshot broadcast cadence (Hz). */
-const SNAPSHOT_RATE_HZ = 20;
-
-/** PR 11.7.B / §3.9 — remote-player interpolation delay (ms). The
- *  client renders remote-player positions from this many ms ago. 100ms
- *  = 2 snapshots at 20Hz. Matches the Valorant default. */
-const INTERPOLATION_DELAY_MS = 100;
-
-/** PR 11.7.B / §2.4 — max age of a snapshot the client will accept
- *  without requesting a full-state resync (ms). Beyond this the client
- *  is too far behind and re-syncing is cheaper than lerping through
- *  the gap. */
-const MAX_SNAPSHOT_AGE_MS = 500;
+// -- Constants (canonical — sourced from protocol/constants.ts) ---
+//
+// PR 11.7.D2 / §1.2: SNAPSHOT_RATE_HZ / INTERPOLATION_DELAY_MS /
+// MAX_SNAPSHOT_AGE_MS MOVED to `protocol/constants.ts` (the canonical
+// source for both client + server; the TS module was extracted in
+// PR 11.7.D2.1). The previous mirror-of-server/constants.rs inlined
+// copies are gone — these names now come straight from the canonical
+// import above. The re-export at the bottom of this file is also
+// removed; importers should reach into `protocol/constants.ts`
+// directly.
 
 /** Ring buffer capacity per remote player. 8 snapshots = 400ms at
  *  20Hz — well over the 100ms interpolation delay + 500ms extrapolation
@@ -63,6 +67,20 @@ const MAX_SNAPSHOT_AGE_MS = 500;
 const RING_BUFFER_CAPACITY = 8;
 
 /** Per-player snapshot entry stored in the ring buffer. */
+/**
+ * PR 11.7.D2 / §3.10 — the per-player state returned from
+ * `Interpolator.tick(now)`. Mirrors the shape of
+ * `protocol/snapshot.PlayerState` but with a Babylon `Vector3`
+ * position (world-space, ready to feed into Havok setPosition)
+ * + an optional rotation (undefined until PR 11.7.E adds
+ * yaw/pitch to the snapshot wire).
+ */
+export interface RemotePlayerState {
+  playerId: number;
+  position: Vector3Type;
+  rotation: undefined; // reserved for PR 11.7.E
+}
+
 interface BufferedSnapshot {
   /** Snapshot arrival wall-clock (performance.now()). Used to derive
    *  "elapsed time since this snapshot" for extrapolation age checks
@@ -230,6 +248,20 @@ export class Interpolator {
   onSnapshot(snap: Snapshot, nowMs: number): void {
     for (const player of snap.players) {
       if (player.playerId === this.localPlayerId) continue;
+      // PR 11.7.D2.1 / FIX — skip placeholder ids (>= 1000).
+      // Pre-fix, brief windows where a peer connection had just
+      // arrived but hadn't yet been promoted via PositionUpdate
+      // would leave the snapshot including the placeholder id
+      // (e.g., 1001). The interpolator buffered it; `tick()`
+      // returned it as `states[0]`; the scene-side setPosition
+      // pinned the remote Havok body to the placeholder's last
+      // known position (always Position::ZERO since no physics
+      // body had been created yet) — so the remote rig froze at
+      // the world origin until promotion landed. Skipping
+      // placeholders at the buffer-write stage avoids the freeze
+      // entirely (the player's "real" id is buffered as soon as
+      // the next snapshot arrives post-promotion).
+      if (player.playerId >= 1000) continue;
       let buffer = this.buffers.get(player.playerId);
       if (!buffer) {
         buffer = new RingBuffer<BufferedSnapshot>(RING_BUFFER_CAPACITY);
@@ -340,8 +372,129 @@ export class Interpolator {
       extrapolationCount: this._extrapolationCount,
     };
   }
+
+  /**
+   * PR 11.7.D2 / §3.10 — per-frame sample. Returns the
+   * interpolated (or extrapolated, or fallback) state for every
+   * remote player at `renderTimestampMs`. The local player is
+   * excluded. Returns an empty array when no remote has been
+   * seen yet (very-first frames).
+   *
+   * This is the canonical consumer surface post-substrate-retirement:
+   *   - `scene.ts` render observer calls `interpolator.tick(now)`
+   *     each frame, reads the returned positions, and applies them
+   *     to `remoteController.havok.setPosition(...)` (the Havok
+   *     body is now a write-target only).
+   *   - Rewritten smokes call `interpolator.tick(now)` to query
+   *     the visual position vs the predicted position vs the
+   *     snapshot's authoritative position.
+   *
+   * For 2-player smokes there\'s exactly one remote player; for
+   * future multi-player the caller iterates the returned array.
+   *
+   * **Position convention**: Babylon\'s `(x, y, z)` with y = up.
+   * The snapshot wire uses `(positionX, positionY)` where X is the
+   * horizontal (server\'s Rapier x) and Y is the depth (server\'s
+   * Rapier y). The decoder maps them — see
+   * `protocol/snapshot.ts::PlayerState`. The interpolator returns
+   * the interpolated `(positionX, positionY, 0)` mapped to a
+   * Babylon `Vector3(x, z, 0)` — same as the existing
+   * `getInterpolatedStates` returns for the `positionX`/`positionY`
+   * fields.
+   *
+   * **Why not just expose `getInterpolatedStates`**: that method
+   * takes the latest `Snapshot` as a parameter (the caller must
+   * hold it). The new `tick()` reads the latest snapshot from
+   * its own per-player buffer\'s tail — the buffer\'s latest
+   * entry IS the most-recent snapshot, no external closure
+   * needed. This is what makes the scene-side wiring a one-liner.
+   */
+  tick(renderTimestampMs: number): RemotePlayerState[] {
+    const targetTime = renderTimestampMs - INTERPOLATION_DELAY_MS;
+    const nowMs = renderTimestampMs;
+    const out: RemotePlayerState[] = [];
+    for (const [playerId, buffer] of this.buffers) {
+      // Local player is never in this map (onSnapshot skips it),
+      // but be defensive.
+      if (playerId === this.localPlayerId) continue;
+      // PR 11.7.D2.1 / defense-in-depth — skip placeholder ids that
+      // somehow made it into the buffer (e.g., a stale placeholder
+      // from before this fix shipped). See `onSnapshot` comment.
+      if (playerId >= 1000) continue;
+      const latestArrived = this.latestArrivedAtMs.get(playerId);
+      const bufArr = buffer.toArray();
+      // Decide: lerp, extrapolate, or fallback.
+      let playerState: PlayerState;
+      if (bufArr.length < 2 || latestArrived === undefined) {
+        // Buffer starved. Extrapolate from the latest snapshot\'s
+        // position + velocity.
+        const lastSnap = bufArr.length > 0 ? bufArr[bufArr.length - 1] : null;
+        const anchor = lastSnap ? lastSnap.player : null;
+        if (anchor) {
+          const extrap = this.extrapolate(anchor, nowMs, latestArrived ?? nowMs);
+          if (extrap !== null) {
+            playerState = extrap;
+            this._starvationCount += 1;
+          } else if (lastSnap) {
+            playerState = lastSnap.player;
+          } else {
+            continue;
+          }
+        } else {
+          continue;
+        }
+      } else {
+        // Check snapshot age.
+        const ageMs = nowMs - latestArrived;
+        const lastSnap = bufArr[bufArr.length - 1];
+        if (ageMs > MAX_SNAPSHOT_AGE_MS) {
+          // Latest snapshot is too old to trust extrapolation.
+          // Return the snapshot verbatim.
+          this._extrapolationCount += 1;
+          playerState = lastSnap.player;
+        } else {
+          // Find bracketing pair.
+          const pair = findBracketing(bufArr, targetTime);
+          if (pair === null) {
+            playerState = lastSnap.player;
+          } else {
+            const [older, newer] = pair;
+            const dt = newer.arrivedAtMs - older.arrivedAtMs;
+            const t = dt > 0
+              ? Math.max(0, Math.min(1, (targetTime - older.arrivedAtMs) / dt))
+              : 0;
+            playerState = lerpPlayerState(older.player, newer.player, t);
+          }
+        }
+      }
+      // Convert from server (X, Y) horizontal-only to Babylon
+      // (x, y, z) world-space. Y = ground-up (CAPSULE.height / 2
+      // for the controller\'s spawn); the snapshot wire
+      // \'s positionY is depth (Z in Babylon).
+      // The Babylon Vector3 here is what Havok\'s setPosition
+      // expects (a world-space point).
+      const position = new Vector3(
+        playerState.positionX,
+        // Y is fixed at character capsule half-height; the
+        // snapshot\'s `positionY` is depth (server y axis),
+        // not vertical. The server\'s snapshot.rs defines
+        // the (x, y) → (Babylon x, Babylon z) mapping.
+        1.0,
+        playerState.positionY,
+      );
+      out.push({
+        playerId,
+        position,
+        // Rotation (yaw / pitch) on the wire is zero in
+        // PR 11.7.B (per server/src/snapshot.rs line 111-112:
+        // `yaw: 0.0, pitch: 0.0`). The interpolator returns
+        // undefined for rotation; the scene applies Havok\'s
+        // default rotation. PR 11.7.E wires yaw/pitch on the
+        // wire; the interpolated rotation will be added here.
+        rotation: undefined,
+      });
+    }
+    return out;
+  }
 }
 
-// Re-export for tests that want to mock the wire-side helpers without
-// importing the full protocol module.
-export { SNAPSHOT_RATE_HZ, INTERPOLATION_DELAY_MS, MAX_SNAPSHOT_AGE_MS };
