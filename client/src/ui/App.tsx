@@ -21,6 +21,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createScene, type SceneHandle } from "../engine/scene";
 import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
+import { DebugHud } from "./DebugHud";
 import { PauseMenu } from "./PauseMenu";
 // PR 11.7.D2 / §3.10 — WebRTCPeer + GgnetTransport imports REMOVED.
  // The P2P lockstep substrate is gone; see the header comment.
@@ -71,6 +72,27 @@ export function App() {
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
   const [engineLabel, setEngineLabel] = useState<"webgpu" | "webgl2" | null>(null);
+  // PR 11.7.D3 — Debug HUD visibility toggle (key: backtick `).
+  // Persists across renders via React state; the keydown listener is
+  // attached once at mount.
+  const [debugHudVisible, setDebugHudVisible] = useState(false);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // Backtick (the key above Tab on US keyboards). Also accept ~ via
+      // Shift+Backtick for convenience.
+      if (e.key === "`" || (e.shiftKey && e.key === "~")) {
+        e.preventDefault();
+        setDebugHudVisible((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  // Publish engineLabel to window so DebugHud can read it.
+  // (Effect runs after engineLabel updates.)
+  useEffect(() => {
+    if (engineLabel) (window as any).__engineLabel = engineLabel;
+  }, [engineLabel]);
   const [hud, setHud] = useState<HudState>({
     connectionStatus: "offline",
     frame: 0,
@@ -238,6 +260,8 @@ export function App() {
       {phase === "ready" && (
         <>
           <KeybindHud engineLabel={engineLabel} />
+          {/* PR 11.7.D3 — Debug HUD overlay. Toggle with ` key. */}
+          <DebugHud visible={debugHudVisible} />
           <BulletTimeChip active={hud.bulletTime} />
           {/* PR 11.7.D2 / §3.10 — PeerOverlay repurposed for server
               connection status (no peer). The overlay no longer

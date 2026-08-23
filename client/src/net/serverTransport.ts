@@ -152,6 +152,17 @@ export class ServerTransport {
     const wsPort = ports?.ws ?? 14434;
     this.wtUrl = `https://${host}:${wtPort}/rooms/${roomId}`;
     this.wsUrl = `ws://${host}:${wsPort}/rooms/${roomId}`;
+    // PR 11.7.D3 / known-issue — if the page is loaded over HTTPS, this
+    // ws:// URL is mixed-content-blocked. The local-dev canary serves
+    // plain WS only (not WSS); production must terminate TLS at a
+    // reverse proxy layer that flips ws:// → wss:// based on the page
+    // protocol. Tracked as a known issue.
+    if (typeof location !== "undefined" && location.protocol === "https:") {
+      console.warn(
+        `[ServerTransport] page is HTTPS but ws://${host}:${wsPort}/rooms/${roomId} is mixed-content-blocked. ` +
+        `Production needs a TLS-terminating reverse proxy; local-dev needs HTTP.`,
+      );
+    }
   }
 
   /**

@@ -51,6 +51,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
 
 const ROOM = process.env.TWO_TAB_FLOW_ROOM ?? "DEVBX";
+// Default to HTTP for now — local-dev canary serves plain WS, not
+// WSS. Production behind a TLS-terminating reverse proxy (Nginx /
+// Cloudflare / Tailscale Funnel at the proxy layer) serves the
+// page over HTTPS and the WS target becomes wss://. For local
+// dev with the dev cert, see tools/dev-https.sh (PR 11.7.D3 follow-on).
 const URL_A = process.env.TWO_TAB_FLOW_URL_A ?? "http://localhost:5174/";
 const URL_B = process.env.TWO_TAB_FLOW_URL_B ?? "http://localhost:5174/";
 const WT_PORT = Number(process.env.TWO_TAB_FLOW_WT_PORT ?? 14433);
@@ -263,7 +268,11 @@ async function main() {
   } else {
     log("Caller already booted canary+vite; using those.");
   }
-  // Spawn browser
+  // Spawn browser. PR 11.7.D3 — use Playwright's bundled Chromium
+  // (default), not the m5's google-chrome which is headless by
+  // default and lacks WebTransport anyway. The HTTP page works with
+  // either browser; this just keeps the walk-fire input behavior
+  // consistent with the rest of the smoke matrix.
   const browser = await chromium.launch({ headless: true });
   const ctxA = await browser.newContext({
     viewport: { width: 1024, height: 768 },

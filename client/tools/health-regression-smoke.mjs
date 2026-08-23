@@ -478,6 +478,50 @@ async function runSmoke() {
       // not to where the local rig drifted.
       const dxz = Math.hypot(pos.x - expectedSpawnX, pos.z);
       log(`POSITION: Tab A's view of remote = (${pos.x.toFixed(3)}, ${pos.y.toFixed(3)}, ${pos.z.toFixed(3)}) — expected SpawnX=${expectedSpawnX}`);
+      // PR 11.7.D3 — diagnostic dump when the respawn-position
+      // assertion fails. Captures:
+      //   - Havok position (live; this is what the smoke probe reads)
+      //   - state.position (often stale by design — see scene.ts)
+      //   - Snapshot's last-reported player-2 position (the
+      //     authoritative wire value driving the Havok update)
+      //   - Local rig position (where localPlayer drifted during fires)
+      //   - latestSnap's full player list (ghost connection detection)
+      // Does NOT change behavior on PASS; only logs on FAIL or near-FAIL.
+      const failureDiagnostic = await pageA.evaluate(() => {
+        const sess = window.__gameSession;
+        const remote = window.__remoteController;
+        const snapGetter = window.__latestSnap;
+        const snap = typeof snapGetter === "function" ? snapGetter() : null;
+        const lp = sess?.localController?.havok?.getPosition?.();
+        const rp = remote?.havok?.getPosition?.();
+        const sp = remote?.state?.position;
+        const players = snap?.players
+          ? Array.isArray(snap.players)
+            ? snap.players
+            : Array.from(snap.players.values?.() ?? [])
+          : [];
+        const player2 = players.find(
+          (p) => (p.id ?? p.playerId) === 2,
+        );
+        return {
+          remoteHavok: rp ? { x: rp.x, y: rp.y, z: rp.z } : null,
+          remoteStatePosition: sp ? { x: sp.x, y: sp.y, z: sp.z } : null,
+          snapshotPlayer2: player2
+            ? {
+                id: player2.id ?? player2.playerId,
+                x: player2.x,
+                y: player2.y,
+                z: player2.z,
+                hp: player2.hp,
+              }
+            : null,
+          snapshotPlayerIds: players.map((p) => p.id ?? p.playerId ?? "?"),
+          localHavok: lp ? { x: lp.x, y: lp.y, z: lp.z } : null,
+          frame: sess?.frame,
+          sessionReady: !!sess,
+        };
+      }).catch((e) => ({ error: String(e) }));
+      log(`DIAGNOSTIC: ${JSON.stringify(failureDiagnostic, null, 2)}`);
       if (dy > RESPAWN_SLACK_M) {
         errors.push(`[position-not-reset-Y] remote Y after respawn = ${pos.y.toFixed(3)}, expected within ${RESPAWN_SLACK_M}m of ${SPAWN_Y}`);
       }
