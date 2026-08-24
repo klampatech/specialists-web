@@ -46,6 +46,18 @@ function statusLabel(s: BulletHudProps["connectionStatus"]): string {
   }
 }
 
+// PR 11.7.D3 / UX fix — when the URL is missing ?server=, show
+// an actionable error instead of the generic "Offline" label.
+// Surfacing the actual cause in the HUD cuts debugging time
+// from "is it Chrome? network? my code?" to "I forgot the
+// URL param".
+function missingServerMessage(): string | null {
+  if (typeof window === "undefined") return null;
+  const flag = (window as unknown as {__missingServerParam?: boolean}).__missingServerParam;
+  if (!flag) return null;
+  return "URL missing ?server=…&localId=N&peerId=M (post-PR #50 retired P2P)";
+}
+
 /**
  * PR 7.1 fix (post-Kyle playtest): the HUD chip was missing `pointerEvents: none`,
  * which meant clicks landing inside the bottom-left ~80x100px HUD box never
@@ -78,7 +90,13 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
       <div>confirmed: {frame - 1}</div>
       <div style={{ opacity: 0.7 }}>repeated: {repeatedFrames}</div>
       <div data-testid="bullet-hud-status" style={{ opacity: 0.85 }}>
-        {statusLabel(connectionStatus)}{hasRemote ? "" : " (idle)"}
+        {missingServerMessage() ? (
+          <span style={{ color: "#f55" }}>
+            {missingServerMessage()}
+          </span>
+        ) : (
+          <>{statusLabel(connectionStatus)}{hasRemote ? "" : " (idle)"}</>
+        )}
       </div>
       <div data-testid="bullet-hud-hits" style={{ opacity: 0.95 }}>hits: {hits}</div>
       {/* PR 10: health pools + optional respawn countdown. The countdown

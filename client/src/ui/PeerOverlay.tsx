@@ -47,6 +47,13 @@ if (
 ) {
   const url = new URL(window.location.href);
   const serverParam = url.searchParams.get("server");
+  // PR 11.7.D3 / loud diagnostic — always log the parsed state on
+  // module load. Lets the user (and DevTools) see immediately
+  // whether the URL had the param, what was parsed, and whether
+  // the transport will be enabled. Was previously silent.
+  console.info(
+    `[PeerOverlay] boot: href=${url.href.slice(0, 120)}… serverParam=${serverParam ?? "<missing>"} forceServerTransport=${serverParam ? "true" : "false"}`,
+  );
   if (serverParam && serverParam.length > 0) {
     (window as unknown as {__forceServerTransport?: boolean}).__forceServerTransport = true;
     try {
@@ -80,6 +87,21 @@ if (
     } catch {
       // Malformed server URL — ignore, fall back to default path.
     }
+  } else {
+    // PR 11.7.D3 / fix — surface a hard error in the HUD if the
+    // page loaded WITHOUT ?server=. Post-substrate-retirement
+    // (PR #50), the lockstep P2P transport is gone; without
+    // ?server= the GameSession gets no transport and the HUD
+    // silently shows "Disconnected: (idle)" — looks like a bug
+    // but is really a missing URL param. Setting a window flag
+    // lets BulletHud render an actionable error instead.
+    (window as unknown as {__missingServerParam?: boolean}).__missingServerParam = true;
+    console.error(
+      "[PeerOverlay] URL is missing ?server=ws://...&localId=N&peerId=M. " +
+      "After PR #50 retired the lockstep P2P substrate, the page " +
+      "needs the ?server= param to know where to connect. " +
+      "Example: http://100.95.111.112:5174/?server=ws://100.95.111.112:14434/rooms/DEVBX&localId=1&peerId=2",
+    );
   }
 }
 
