@@ -10,8 +10,9 @@ const ROOM = "DEVBX";
 const WS_HOST = "100.95.111.112";
 const WS_PORT = 14434;
 const FRAME_INTERVAL_MS = 200;
-const WALK_MS = 3000;
-const FIRE_COUNT = 5;
+const WALK_MS = 1200; // Stop Tab A before it passes Tab B's camera (Tab B at -4)
+const FIRE_COUNT = 3;
+const RECORD_MS = 14000;
 const OUT_DIR = "/tmp/cdp-screencast-v2";
 mkdirSync(OUT_DIR, { recursive: true });
 
@@ -47,11 +48,14 @@ console.log("Both tabs have remoteController");
 
 await new Promise((r) => setTimeout(r, 1500));
 
-// Rotate cameras to face each other
-// Tab A (localId=1, x=-8) needs camera facing +X toward Tab B at x=-4
-// Empirically: __applyYawDelta(+π/2) = look +X
-await pageA.evaluate(() => window.__applyYawDelta?.(Math.PI / 2));
-await pageB.evaluate(() => window.__applyYawDelta?.(-Math.PI / 2));
+// Rotate cameras so both tabs frame each other.
+// Convention: yaw=0 → camera faces -Z, W moves -Z. yaw=+π/2 → camera faces -X, W moves -X. yaw=-π/2 → camera faces +X, W moves +X.
+// (Empirically verified via __applyYawDelta. The chase camera sits behind the player in the camera's forward direction.)
+// Tab A (localId=1, spawn x=-8) → rotate so W moves -X (away from Tab B). Tab B at x=-4 looking -X will see Tab A receding into distance.
+await pageA.evaluate(() => window.__applyYawDelta?.(Math.PI / 2)); // camera faces -X, W moves -X
+// Tab B (localId=2, spawn x=-4) → rotate so camera faces -X (toward Tab A's spawn at -8). Tab B stays still so we don't have to worry about its camera offset changing.
+await pageB.evaluate(() => window.__applyYawDelta?.(-Math.PI / 2)); // camera faces +X (toward Tab A's walk direction)
+
 await new Promise((r) => setTimeout(r, 500));
 
 // Verify
@@ -69,7 +73,6 @@ for (const [name, page] of [["A", pageA], ["B", pageB]]) {
 // Recording loop
 const frames = [];
 const recordingStart = Date.now();
-const RECORD_MS = 12000;
 
 const captureFrame = async () => {
   const [bufA, bufB] = await Promise.all([pageA.screenshot(), pageB.screenshot()]);

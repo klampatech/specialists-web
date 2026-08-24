@@ -1267,6 +1267,19 @@ export async function createScene(
             // wire are zero in PR 11.7.B per server snapshot.rs;
             // the remote rig renders with its default yaw).
             remoteCtrl.havok.setPosition(remoteState.position);
+            // PR 11.7.D3 / visual-rig fix — also copy to the
+            // visualRoot TransformNode via the public
+            // `setVisualPosition` method (visualRoot is private).
+            // Pre-fix, the render observer only updated Havok +
+            // state.position, but the visual mesh (TransformNode)
+            // was never touched. The remote controller's `update()`
+            // was retired (PR 11.7.D2 / §3.10), so the local-rig
+            // auto-sync (Havok → state.position → visualRoot.position)
+            // doesn't fire for the remote. Without this copy, the
+            // teal rig mesh stays at its spawn TransformNode even
+            // though the Havok body and state.position reflect the
+            // live snapshot.
+            remoteCtrl.setVisualPosition(remoteState.position);
             // PR 11.7.D2.1 / FIX — explicitly mirror the Havok position
             // onto `state.position`. Pre-fix, `state.position` was only
             // updated by `CharacterController.update()` (which reads
@@ -1572,3 +1585,4 @@ export async function createScene(
 
   return handle;
 }
+// HMR_TRIGGER_1787584071

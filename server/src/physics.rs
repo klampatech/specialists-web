@@ -683,11 +683,21 @@ impl PhysicsWorld {
         self.client_driven.insert(id);
         if let Some(handle) = self.body_handles.get(&id) {
             if let Some(body) = self.bodies.get_mut(*handle) {
-                body.set_next_kinematic_translation(vector![
-                    pos.x,
-                    CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS,
-                    pos.y
-                ]);
+                // PR 11.7.D3 / walk-mirror fix — use `set_translation`
+                // (immediate) instead of `set_next_kinematic_translation`
+                // (queued for next step). The client-driven body must
+                // reflect the client's reported position IMMEDIATELY
+                // so that the snapshot generator reads the new position
+                // before the next physics step runs. Pre-fix, snapshots
+                // reported the spawn position forever because
+                // `body.translation()` returns the OLD position until
+                // the next step consumes the queue, but the snapshot
+                // generator ran between the PositionUpdate handler and
+                // the next step.
+                body.set_translation(
+                    vector![pos.x, CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS, pos.y],
+                    true,
+                );
             }
         }
     }
