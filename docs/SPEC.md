@@ -747,6 +747,40 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 
 9. **Vite dev HTTPS via `VITE_HTTPS_KEY` + `VITE_HTTPS_CERT` env vars.** Same cert as canary. This is the new way to boot the dev server — `npx vite --port 5174` alone won't work anymore for any work touching the multiplayer surface.
 
+### 2026-08-24 — PR 11.7.D3 walk-mirror fix (server + visual rig)
+
+**Context.** PR #50 closed the lockstep substrate + multiplayer transport. But cross-tab walk-mirror (Tab A walks → Tab B's teal rig visually tracks) was broken. The HUD showed correct Havok positions in both tabs but the `visualRoot.position` TransformNode stayed at world origin (0,0,0) — the teal mesh never moved. Branch `feat/phase1-pr11.7.d3-debug-hud` (PR #51 candidate). 2 commits on top of PR #50.
+
+**The bug had two layers — a server bug and a client visual bug:**
+
+1. **Server bug** (`server/src/physics.rs::set_position`): used `body.set_next_kinematic_translation(vector)` which queues the position for the NEXT physics step. Server-side `physics.step()` is a no-op for client-driven bodies (the `client_driven: BTreeSet<PlayerId>` PR #50 carve-out), so the queued translation was never consumed. `body.translation()` returned the spawn position forever, snapshot reported `positionX=-8, positionY=0` regardless of what Tab A walked. **Fix:** `body.set_translation(vector, /* wake_up */ true)` (immediate write, no queueing). Server rebuild green; canary restarted; `snapshot-probe.mjs` confirms both tabs' `__latestSnap` now reports Tab A at the walked position (`x=-20.94, y=8.29`).
+
+2. **Client visual bug** (`client/src/engine/scene.ts:1315+`): the live render observer (the one that actually runs under React StrictMode) was calling `havok.setPosition` but missing `setVisualPosition` + `state.position.copyFrom`. The closure-bound observer at `scene.ts:1190+` had both calls (added in PR #50), but its `remoteCtrl` reference was disposed under StrictMode (the first `createScene` wins the sync-claim, the second gets disposed, but its observer is what runs). So Havok body moved, but the visualRoot TransformNode (the teal mesh's parent) didn't. **Fix:** added both `remoteCtrl.setVisualPosition(liveState.position)` and `remoteCtrl.state.position.copyFrom(liveState.position)` to the live hook. `CharacterController.setVisualPosition` is a new public method that wraps the private `visualRoot.position.copyFrom` (visualRoot is private to CharacterController).
+
+**Decisions durable for Phase 1+:**
+
+1. **`body.set_translation` (immediate) for client-driven bodies on the server.** `set_next_kinematic_translation` (queued) is only correct when the next physics step will consume the queue. For client-driven bodies that skip `step()`, only `set_translation` works. This is consistent with PR #50's `client_driven: BTreeSet<PlayerId>` carve-out — the server is now a position-tracking layer, not a simulation layer, for player movement.
+
+2. **All render observers that touch the remote rig MUST update `setVisualPosition` + `state.position.copyFrom` alongside `havok.setPosition`.** The closure-bound observer is a foot-gun under React StrictMode (the closure's remoteCtrl gets disposed). Live observers that resolve `remoteController` from `window.__gameSession` are the load-bearing path.
+
+3. **Smoke probe pattern for future cross-tab visual bugs:** write a probe that reads `havokPos`, `statePos`, `visualRootPos` on both tabs in a single tick. If any of the three is out of sync, the bug is in the render observer's mirror logic (Havok body and state and mesh all need explicit per-frame writes). This pattern is the basis for `client/tools/two-tab-observer.mjs`.
+
+**Evidence:**
+- `docs/screenshots/2026-08-23-multiplayer-validation/two-tab-multiplayer.gif` — regenerated GIF, Tab B's teal rig visibly moves from center-left (frame 5) to far-left edge (frame 15+) as Tab A walks.
+- `docs/screenshots/2026-08-23-multiplayer-validation/tab-B-frame5-early.png` + `tab-B-frame15-late.png` — side-by-side frame comparison.
+- `docs/screenshots/2026-08-23-multiplayer-validation/snapshot-probe-after-fix.log` — pre-fix vs post-fix snapshot probe output.
+- `client/tools/snapshot-probe.mjs` — server-snapshot state probe (5s).
+- `client/tools/two-tab-observer.mjs` — visual rig vs Havok vs state.position probe (10s, walks both tabs).
+- `client/tools/playwright-video.mjs` — paired Tab A + Tab B frame capture (16s, walks Tab A).
+- `client/tools/cdp-video.mjs` — alternative CDP-driven capture (Chrome 151 with `--remote-debugging-port=9224`).
+
+**Carry-forward:**
+- **Two-tab damage convergence** still needs recorded visual proof (HP drops in one tab reflected in the other). The data layer is verified by the 11.7.D2.1 smoke (`damage-server-hp-convergence-smoke`), but no GIF exists showing the HP HUD drop across tabs in a single recording.
+- **Walk TOWARD not AWAY from Tab B's camera** — current GIF shows Tab A walking in a direction that takes the teal rig OFF Tab B's screen. A recording with Tab A walking INTO Tab B's view (so the teal rig visibly grows larger) would be more visually compelling.
+- **`two-tab-manual-flow.mjs` should be re-run end-to-end with both fixes in place** to confirm 6/6 visible assertions pass.
+- **CI integration:** the manual-flow smoke is currently opt-in with `continue-on-error: true`. Once walk-mirror + visual rig are stable across 5 local runs, promote the smoke to blocking CI.
+- **PR #51** (WebTransport validation via Tailscale Funnel + debug HUD) is on the same branch (`feat/phase1-pr11.7.d3-debug-hud`) — should split before merge per the PR-size discipline established in PR #50.
+
 ---
 
 ## Known issues
@@ -771,6 +805,8 @@ PR #50 added `PhysicsWorld::set_position` + `client_driven: BTreeSet<PlayerId>` 
 ### StrictMode race fix publishes hook to `window.__liveInterpolatorTickHook` (carry-forward, 2026-08-23)
 
 The race fix is dev-mode-only (production doesn't have React StrictMode double-mount). If we delete StrictMode from the dev path, this window-publication becomes unnecessary. Tracked for review once the observability HUD lands and we have visibility into cross-tab rig visual correctness without relying on the dev-mode smoke probes.
+
+**UPDATE 2026-08-24**: The StrictMode double-mount is in fact the load-bearing case here — the LIVE observer at `scene.ts:1315+` is what actually runs in dev. Fix landed: both `setVisualPosition` + `state.position.copyFrom` are now in the LIVE observer. So the LIVE observer is now self-sufficient; the closure-bound observer at `scene.ts:1190+` is dead code under StrictMode (its `remoteCtrl` is disposed). **Recommendation**: delete the closure-bound observer in a follow-up PR, leaving only the LIVE observer. Tracked as a 5-line refactor.
 
 ---
 
@@ -857,3 +893,33 @@ Kyle's 2026-08-15 playtest signal: the Resume button works correctly; the residu
 - **Bundle delta: +1.06 kB raw (small, no new chunks).** The runtime additions (160 lines) + the gameSession additions (88 lines) + the DEV probe (24 lines) all compile into the existing `index-*.js` chunk. Production bundle grep `__lockstep\|ROLLBACK_CAP_FRAMES` returns ZERO matches — the DEV probe is tree-shaken, and `ROLLBACK_CAP_FRAMES` alias is unused in production paths (only referenced by the smoke via Vite's dev server). The names `isPaused` / `pausedFrames` / `totalPausedFrameCount` DO appear in production (9/9/3 matches) because the runtime class IS shipped — they're the names of the public getters and they exist alongside the lockstep engine regardless of whether the cap path ever fires. This is correct: production SHOULD pause on WAN drop.
 - **Codex partial completion, Evo re-verification as the standing gate.** Codex edited `ggrsRuntime.ts` + `gameSession.ts` + `scene.ts` and wrote the smoke, but was killed mid-task before running the verification gates or writing docs/CI. Evo re-verified from the worktree state: typecheck (clean), production build (2m 7s, exit 0), production-bundle grep (no `__lockstep` matches, +1.06 kB), smoke (7 assertions all green), and hand-traced the cap math against the actual code. The smoke's 1-tick-off values were caught and fixed during re-verification. **Pattern**: when codex is killed mid-task, treat the partial output as a draft and re-run ALL verification gates from the worktree.
 - **Codex runtime execution: one-shot `codex --yolo exec -o <file>` via herdr workspace+agent-start recipe.** The interactive `codex --yolo` recipe failed with "stdin is not a terminal" on this host (herdr version). The one-shot `codex exec` recipe worked cleanly via the same workspace + agent-start machinery. Switched from interactive to one-shot mid-task. Lesson: on hosts where herdr's TTY provision is broken, fall back to one-shot `codex --yolo exec` for codex dispatches — the herdr recipe is identical otherwise (workspace create, agent start with full-path wrapper, HERDR_* env vars in the wrapper).
+
+### 2026-08-24 — Walk-mirror server + visual rig fix, branch feat/phase1-pr11.7.d3-debug-hud @ 8dca53f
+
+**Two-bug walk-mirror fix shipped on branch `feat/phase1-pr11.7.d3-debug-hud`:**
+
+1. **Server `set_translation` (immediate) instead of `set_next_kinematic_translation` (queued)** — `server/src/physics.rs::set_position`. Queued translation was never consumed because server `physics.step()` skips client-driven bodies (PR #50 carve-out). `snapshot-probe.mjs` confirmed snapshot now reports walked positions.
+
+2. **LIVE render observer missing `setVisualPosition` + `state.position.copyFrom`** — `client/src/engine/scene.ts:1315+`. The closure-bound observer at `:1190+` had them (added in PR #50), but its `remoteCtrl` reference is disposed under React StrictMode, so the LIVE observer is what actually runs. Added both calls; `CharacterController.setVisualPosition()` is the new public wrapper around the private `visualRoot.position.copyFrom`.
+
+**Diagnostic pattern** (`client/tools/two-tab-observer.mjs`): probe reads `havokPos`, `statePos`, `visualRootPos` from both tabs each tick. If any of the three are out of sync, the bug is in the render observer's mirror logic. This pattern is load-bearing for the next cross-tab visual bug.
+
+**Smoke probes added (not yet wired to CI):**
+- `client/tools/snapshot-probe.mjs` — 5s server snapshot probe.
+- `client/tools/two-tab-observer.mjs` — 10s visual rig probe.
+- `client/tools/playwright-video.mjs` — 16s paired PNG capture → GIF.
+- `client/tools/cdp-video.mjs` — alternative CDP capture.
+
+**Evidence in `docs/screenshots/2026-08-23-multiplayer-validation/`:**
+- `two-tab-multiplayer.gif` (988KB) — regenerated, teal rig visibly moves.
+- `tab-B-frame5-early.png` / `tab-B-frame15-late.png` — frame comparison.
+- `tab-A-frame5-early.png` / `tab-A-frame15-late.png` — Tab A's view.
+- `snapshot-probe-after-fix.log` — server-side pre/post fix proof.
+
+**Carry-forward:**
+- Damage convergence visual proof (HP HUD drops in both tabs).
+- Walk TOWARD Tab B (so teal rig grows, not shrinks).
+- Run `two-tab-manual-flow.mjs` end-to-end with fixes.
+- Promote manual-flow smoke to blocking CI after 5 stable local runs.
+- Split PR #51 (debug HUD) from walk-mirror fix per PR #50's PR-size discipline.
+- Delete closure-bound observer at `scene.ts:1190+` (dead code under StrictMode).
