@@ -248,6 +248,17 @@ export class CharacterController {
     this.havok.setPosition(this.respawnPosition.clone());
     this.havok.setVelocity(Vector3.Zero());
     this.state.position.copyFrom(this.respawnPosition);
+    // PR 11.7.D3.1 / respawn-fix — also publish the respawn position to
+    // the visualRoot TransformNode. Pre-fix, the remote rig's visualRoot
+    // stayed at the world origin (0,0,0) through the death/respawn cycle
+    // because the snapshot-driven observer only called
+    // `havok.setPosition` and not `visualRoot.position.copyFrom`. The
+    // server's respawnPosition teleport + state.copyFrom was happening
+    // correctly, but the visual mesh didn't track. This wraps the same
+    // publish-the-position pattern the local rig's `update()` uses.
+    if (this.visualRoot) {
+      this.visualRoot.position.copyFrom(this.respawnPosition);
+    }
     this.state.hp = HEALTH.maxHp;
     this.state.respawningUntilMs = 0;
     this.stunt = "none";
@@ -263,6 +274,22 @@ export class CharacterController {
     this.havok.dynamicFriction = this.baseDynamicFriction;
     this.havok.staticFriction = 0;
     this.lastPlanarSpeed = 0;
+  }
+
+  /**
+   * PR 11.7.D3.1 / setVisualPosition — publish a world-space position
+   * directly to the visualRoot TransformNode without touching Havok.
+   * Used by the snapshot-driven observer in scene.ts to keep the
+   * visual mesh tracking the latest Havok-derived position each
+   * frame. Without this, the visualRoot stays at its initial world
+   * origin (0,0,0) because the retired `CharacterController.update()`
+   * path that used to copy Havok→state→visualRoot no longer runs for
+   * the remote rig (PR 11.7.D2 / §3.10 retired the P2P substrate).
+   */
+  public setVisualPosition(pos: Vector3): void {
+    if (this.visualRoot) {
+      this.visualRoot.position.copyFrom(pos);
+    }
   }
 
   /** Set the yaw the character should face (radians, 0 = +Z forward). */
