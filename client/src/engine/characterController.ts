@@ -439,21 +439,6 @@ export class CharacterController {
     this.stuntJustEntered = false;
   }
 
-  /**
-   * PR 11.7.D3 / walk-mirror visual fix — apply a position to the
-   * visual mesh WITHOUT calling Havok or running physics. Used by
-   * the snapshot-driven render observer on the remote controller
-   * (whose `update()` was retired in PR 11.7.D2). Pre-fix the observer
-   * only touched Havok + state.position, leaving the visualRoot
-   * TransformNode stuck at the spawn — the teal rig never moved even
-   * though the snapshot data was correct.
-   */
-  public setVisualPosition(pos: Vector3): void {
-    if (this.visualRoot) {
-      this.visualRoot.position.copyFrom(pos);
-    }
-  }
-
   /** Recompute which stunt is active based on input + timers. */
   private refreshStuntState(input: InputState, nowMs: number): void {
     // PR 8.1: gate wallrun entry on a cooldown after the previous
