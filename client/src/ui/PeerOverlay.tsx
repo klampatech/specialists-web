@@ -95,13 +95,26 @@ if (
     // silently shows "Disconnected: (idle)" — looks like a bug
     // but is really a missing URL param. Setting a window flag
     // lets BulletHud render an actionable error instead.
+    //
+    // PR 11.7.D3 / CI-fix — only emit the console.error when the
+    // page is actually requesting multiplayer transport. The HUD
+    // flag still fires so the user sees the actionable banner.
+    // The console.error was causing CI smokes (mouse-look, mouse-pitch,
+    // lockstep-rollback, spectator-camera, health-regression) to
+    // fail on `PAGE_ERRORS:` because they test single-player behaviors
+    // and don't pass `?server=`. Pre-#50 these smokes were P2P-aware;
+    // post-#50 they're single-player with multiplayer plumbing idle.
+    // The HUD shows the actionable error to real users; the console
+    // log was redundant noise.
     (window as unknown as {__missingServerParam?: boolean}).__missingServerParam = true;
-    console.error(
-      "[PeerOverlay] URL is missing ?server=ws://...&localId=N&peerId=M. " +
-      "After PR #50 retired the lockstep P2P substrate, the page " +
-      "needs the ?server= param to know where to connect. " +
-      "Example: http://100.95.111.112:5174/?server=ws://100.95.111.112:14434/rooms/DEVBX&localId=1&peerId=2",
-    );
+    if ((window as unknown as {__forceServerTransport?: boolean}).__forceServerTransport === true) {
+      console.error(
+        "[PeerOverlay] URL is missing ?server=ws://...&localId=N&peerId=M. " +
+        "After PR #50 retired the lockstep P2P substrate, the page " +
+        "needs the ?server= param to know where to connect. " +
+        "Example: http://100.95.111.112:5174/?server=ws://100.95.111.112:14434/rooms/DEVBX&localId=1&peerId=2",
+      );
+    }
   }
 }
 
