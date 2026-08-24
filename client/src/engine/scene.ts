@@ -1335,23 +1335,16 @@ export async function createScene(
               if (liveStates.length === 0) return;
               const liveState = liveStates[0];
               liveRemoteCtrl.havok.setPosition(liveState.position);
-              // PR 11.7.D2.1 / FIX — DO NOT mirror Havok → state.position.
-              // Pre-fix we did `remoteCtrl.state.position.copyFrom(...)`
-              // here to keep the public API honest (the smoke's
-              // `readRigPositions` probe reads state.position). But
-              // this also clobbers the controller's own writes —
-              // notably the respawn path in `tickRespawn`, which
-              // teleports the Havok body back to `respawnPosition`
-              // and stamps state.position. The interpolator's next
-              // tick would re-clobber the respawn with the
-              // pre-respawn snapshot value (a stale peer position),
-              // visually flashing the rig back to the wrong spot.
-              // The smoke probe now reads Havok directly via
-              // `__remoteController.havok.getPosition()` (see the
-              // tool) when it needs ground-truth. Trade-off: the
-              // smoke's `state.position` no longer mirrors Havok,
-              // but the visual rig stays correct.
-              // liveRemoteCtrl.state.position.copyFrom(liveState.position);
+              // PR 11.7.D3 / walk-mirror visual fix — the LIVE hook is
+              // what actually runs under React StrictMode (the
+              // closure-bound hook's remoteCtrl is disposed). Mirror
+              // the snapshot position onto the visualRoot
+              // TransformNode AND state.position so the rig visually
+              // tracks the snapshot, not just the Havok body. Without
+              // these two calls (which the closure-bound hook above
+              // DOES have), the visual mesh stays at world origin.
+              liveRemoteCtrl.setVisualPosition(liveState.position);
+              liveRemoteCtrl.state.position.copyFrom(liveState.position);
               // Debug hooks so the smoke's __lastInterpolatorTick +
               // __lastInterpolatorSetPosition stay populated when
               // the render observer is in a different scope from

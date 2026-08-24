@@ -10,9 +10,9 @@ const ROOM = "DEVBX";
 const WS_HOST = "100.95.111.112";
 const WS_PORT = 14434;
 const FRAME_INTERVAL_MS = 200;
-const WALK_MS = 1200; // Stop Tab A before it passes Tab B's camera (Tab B at -4)
+const WALK_MS = 2200; // Walk long enough for the snapshot interpolator buffer to drain and the visual rig to track
 const FIRE_COUNT = 3;
-const RECORD_MS = 14000;
+const RECORD_MS = 16000;
 const OUT_DIR = "/tmp/cdp-screencast-v2";
 mkdirSync(OUT_DIR, { recursive: true });
 
