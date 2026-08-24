@@ -1,22 +1,26 @@
 // CDP-driven two-tab video recorder for specialists-web multiplayer.
-// Opens 2 tabs in Kyle's Chrome (via SSH tunnel on :9224), drives
-// walk + fire in Tab A, captures Page.captureScreenshot every ~250ms
-// for BOTH tabs, writes PNG sequence to /tmp/cdp-screencast/ for
-// stitching into GIF/video off-band.
+// Opens 2 tabs in Kyle's Chrome (via SSH tunnel on :9224), uses
+// window.__applyYawDelta() to rotate both cameras so they face each
+// other, walks Tab A, captures Page.captureScreenshot every ~200ms
+// for BOTH tabs, writes PNG sequence to /tmp/cdp-screencast/.
+//
+// This time: camera rotation uses the DEV-only __applyYawDelta hook
+// from client/src/engine/scene.ts, which actually moves the chase
+// camera. The previous attempt's "Runtime.evaluate yaw assignment"
+// didn't take because state.yaw isn't the source of truth for the
+// camera — chase.getYaw() is.
 
 import WebSocket from "ws";
 import { writeFileSync, mkdirSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 
 const CDP_BROWSER = "http://localhost:9224";
 const FRAME_INTERVAL_MS = 200;
-const WALK_MS = 4000;
-const FIRE_COUNT = 3;
+const WALK_MS = 3000;
+const FIRE_COUNT = 5;
 const OUT_DIR = "/tmp/cdp-screencast";
 mkdirSync(OUT_DIR, { recursive: true });
 
 async function main() {
-  // 1. Create 2 tabs
   console.log("Creating Tab A...");
   const pageA = await newTab(
     `${CDP_BROWSER}/json/new?http://100.95.111.112:5174/?server=ws://100.95.111.112:14434/rooms/DEVBX&localId=1&peerId=2`,
@@ -26,13 +30,11 @@ async function main() {
     `${CDP_BROWSER}/json/new?http://100.95.111.112:5174/?server=ws://100.95.111.112:14434/rooms/DEVBX&localId=2&peerId=1`,
   );
 
-  // 2. Connect CDP to each tab
   const cdpA = await connectCdp(pageA.webSocketDebuggerUrl);
   const cdpB = await connectCdp(pageB.webSocketDebuggerUrl);
   for (const cdp of [cdpA, cdpB]) {
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
-    // Set viewport to 1024×768 like the manual smoke
     await cdp.send("Emulation.setDeviceMetricsOverride", {
       width: 1024,
       height: 768,
@@ -41,23 +43,42 @@ async function main() {
     });
   }
 
-  // 3. Wait for gameSession
-  console.log("Waiting for gameSession on both tabs...");
+  console.log("Waiting for gameSession AND remoteController on both tabs...");
   for (const [name, cdp] of [["A", cdpA], ["B", cdpB]]) {
+    // CRITICAL: Wait for remoteController to be set on BOTH tabs.
+    // The remoteController is created when the server reports the other
+    // player via snapshot. Without it, neither tab renders the other's rig.
     await waitForCondition(
       cdp,
-      "window.__gameSession !== undefined && window.__serverTransport && window.__serverTransport.connected === true",
-      12000,
+      `window.__gameSession !== undefined
+       && window.__serverTransport && window.__serverTransport.connected === true
+       && window.__gameSession.remoteController != null`,
+      15000,
     );
-    console.log(`Tab ${name} ready`);
+    console.log(`Tab ${name} ready (with remoteController)`);
   }
 
-  // 4. Recording loop — capture frames continuously
+  // Wait a moment for everything to settle
+  await sleep(800);
+
+  // Sanity check: confirm both tabs have both rigs in their interpolator
+  for (const [name, cdp] of [["A", cdpA], ["B", cdpB]]) {
+    const r = await cdp.send("Runtime.evaluate", {
+      expression: `JSON.stringify({
+        yaw: window.__mouseLookProbe?.(),
+        pitch: window.__pitchLookProbe?.(),
+        latestSnapPlayers: window.__latestSnap?.()?.players?.map(p => ({id: p.player_id, x: p.position_x, z: p.position_y})),
+      })`,
+      returnByValue: true,
+    });
+    console.log(`Tab ${name} pre-test:`, r.result.value);
+  }
+
+  // 4. Recording loop — capture frames continuously while driving
   console.log(`Recording frames at ${FRAME_INTERVAL_MS}ms intervals...`);
   const recordingStart = Date.now();
   const frames = [];
 
-  // Helper to grab both screenshots in parallel
   const captureFrame = async () => {
     const [bufA, bufB] = await Promise.all([
       cdpA.send("Page.captureScreenshot", { format: "png" }).then((r) => Buffer.from(r.data, "base64")),
@@ -66,76 +87,76 @@ async function main() {
     return { a: bufA, b: bufB };
   };
 
-  // 4. While recording, drive Tab A: rotate camera to face Tab B (yaw=PI),
-  //    walk forward, then fire at Tab B
   const drivingPromise = (async () => {
-    // Click canvas to focus + grab pointer
-    await sleep(500);
-    await cdpA.send("Runtime.evaluate", {
-      expression: `document.querySelector('canvas').click()`,
-    });
-    await sleep(300);
+    // STEP 1: Rotate Tab A's camera to face Tab B (which is at x=-4, +X relative to A at x=-8).
+      // After testing: __applyYawDelta(-π/2) makes the camera look -X (away from Tab B).
+      // __applyYawDelta(+π/2) makes the camera look +X (toward Tab B). Confirmed empirically.
+      console.log(`[t+200ms] Tab A: rotate camera to face +X (toward Tab B)`);
+      await cdpA.send("Runtime.evaluate", {
+        expression: `window.__applyYawDelta?.(Math.PI / 2); 'rotated'`,
+      });
 
-    // Teleport Tab A to right next to Tab B's spawn, with camera looking -X (toward Tab B)
-    console.log(`[t+800ms] Tab A: teleport next to Tab B, yaw -PI/2 (looking -X)`);
-    await cdpA.send("Runtime.evaluate", {
-      expression: `
-        // Walk Tab A over to where Tab B is and rotate to face them
-        const ctl = window.__gameSession?.localController;
-        if (ctl) {
-          ctl.state.position.x = -6;  // Between spawn (-8) and Tab B (-4)
-          ctl.state.position.z = 0;
-          ctl.state.yaw = -Math.PI / 2;  // Looking -X (toward Tab B's spawn -4)
-          ctl.havok?.setPosition?.(ctl.state.position);
-        }
-        'done'
-      `,
+      // Tab B (at x=-4) needs to look at Tab A (at x=-8), which is -X relative to B.
+      console.log(`[t+200ms] Tab B: rotate camera to face -X (toward Tab A)`);
+      await cdpB.send("Runtime.evaluate", {
+        expression: `window.__applyYawDelta?.(-Math.PI / 2); 'rotated'`,
+      });
+      await sleep(500);
+
+    // STEP 2: Verify both cameras rotated
+    const yawA = await cdpA.send("Runtime.evaluate", {
+      expression: `JSON.stringify({yaw: window.__mouseLookProbe()})`,
+      returnByValue: true,
     });
+    console.log(`Tab A after rotation:`, yawA.result.value);
+    const yawB = await cdpB.send("Runtime.evaluate", {
+      expression: `JSON.stringify({yaw: window.__mouseLookProbe()})`,
+      returnByValue: true,
+    });
+    console.log(`Tab B after rotation:`, yawB.result.value);
+
+    // STEP 3: Click canvas to focus, walk forward 3s
+    console.log(`[t+700ms] Tab A: click canvas + walk forward 3s`);
+    await cdpA.send("Runtime.evaluate", { expression: `document.querySelector('canvas').click()` });
     await sleep(300);
-    // Walking forward (W key down) for 2s
-    console.log(`[t+1100ms] Tab A: walking forward (W)`);
     await cdpA.send("Input.dispatchKeyEvent", {
-      type: "keyDown",
-      windowsVirtualKeyCode: 87,
-      code: "KeyW",
-      key: "w",
+      type: "keyDown", windowsVirtualKeyCode: 87, code: "KeyW", key: "w",
     });
     await sleep(WALK_MS);
     await cdpA.send("Input.dispatchKeyEvent", {
-      type: "keyUp",
-      windowsVirtualKeyCode: 87,
-      code: "KeyW",
-      key: "w",
+      type: "keyUp", windowsVirtualKeyCode: 87, code: "KeyW", key: "w",
     });
-    console.log(`[t+${1100 + WALK_MS}ms] Tab A: stopped walking`);
-    await sleep(300);
+    console.log(`[t+${700 + WALK_MS}ms] Tab A: stopped walking`);
+    await sleep(500);
 
-    // Fire 3 shots while aiming — but we need to be aimed at Tab B
-    // Try just clicking; if hits don't register, that's a separate issue
+    // Verify Tab A walked
+    const stateA = await cdpA.send("Runtime.evaluate", {
+      expression: `JSON.stringify({
+        localPos: window.__gameSession.localController.state.position,
+        remotePos: window.__gameSession?.remoteController?.havok?.getPosition?.(),
+        remoteId: window.__gameSession?.remoteController?.playerId,
+      })`,
+      returnByValue: true,
+    });
+    console.log(`Tab A state after walk:`, stateA.result.value);
+
+    // STEP 4: Fire 5 shots
     for (let i = 0; i < FIRE_COUNT; i++) {
       console.log(`[fire ${i + 1}/${FIRE_COUNT}]`);
       await cdpA.send("Input.dispatchMouseEvent", {
-        type: "mousePressed",
-        x: 640,
-        y: 360,
-        button: "left",
-        clickCount: 1,
+        type: "mousePressed", x: 640, y: 360, button: "left", clickCount: 1,
       });
       await cdpA.send("Input.dispatchMouseEvent", {
-        type: "mouseReleased",
-        x: 640,
-        y: 360,
-        button: "left",
-        clickCount: 1,
+        type: "mouseReleased", x: 640, y: 360, button: "left", clickCount: 1,
       });
-      await sleep(500);
+      await sleep(400);
     }
 
-    // Continue recording for 3 more seconds
-    await sleep(3000);
+    // Continue recording for 2 more seconds to see damage result
+    await sleep(2000);
   })();
 
-  // Capture frames concurrently — record for the duration of the driving promise + 3s tail
+  // Capture frames concurrently for 12 seconds
   const RECORD_MS = 12000;
   while (Date.now() - recordingStart < RECORD_MS) {
     const t0 = Date.now();
@@ -152,32 +173,46 @@ async function main() {
   }
   await drivingPromise;
 
+  // Final state check
+  for (const [name, cdp] of [["A", cdpA], ["B", cdpB]]) {
+    const r = await cdp.send("Runtime.evaluate", {
+      expression: `JSON.stringify({
+        yaw: window.__mouseLookProbe?.(),
+        localPos: window.__gameSession.localController.state.position,
+        remotePos: window.__gameSession?.remoteController?.havok?.getPosition?.(),
+        remoteId: window.__gameSession?.remoteController?.playerId,
+        latestSnap: window.__latestSnap?.()?.players?.map(p => ({id: p.player_id, x: p.position_x, z: p.position_y, hp: p.hp})),
+      })`,
+      returnByValue: true,
+    });
+    console.log(`Tab ${name} FINAL:`, r.result.value);
+  }
+
   console.log(`captured ${frames.length} frames over ${Date.now() - recordingStart}ms`);
 
-  // 6. Write frames to disk
+  // Write frames
   for (let i = 0; i < frames.length; i++) {
     writeFileSync(`${OUT_DIR}/frame-${String(i).padStart(3, "0")}-A.png`, frames[i].a);
     writeFileSync(`${OUT_DIR}/frame-${String(i).padStart(3, "0")}-B.png`, frames[i].b);
   }
   console.log(`frames written to ${OUT_DIR}/`);
 
-  // 7. Close tabs
+  // Close tabs
   await fetch(`${CDP_BROWSER}/json/close/${pageA.id}`, { method: "PUT" }).catch(() => {});
   await fetch(`${CDP_BROWSER}/json/close/${pageB.id}`, { method: "PUT" }).catch(() => {});
   cdpA.close();
   cdpB.close();
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function newTab(url) {
   const r = await fetch(url, { method: "PUT" });
   const text = await r.text();
-  // Chrome may prepend "Using unsafe ..." warning; strip it
   const jsonStart = text.indexOf("{");
   return JSON.parse(text.slice(jsonStart));
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 async function connectCdp(url) {

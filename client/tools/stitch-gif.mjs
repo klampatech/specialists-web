@@ -3,8 +3,8 @@ import { chromium } from "playwright";
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const FRAME_DIR = "/tmp/cdp-screencast";
-const OUT_GIF = "/tmp/cdp-screencast/composed.gif";
+const FRAME_DIR = "/tmp/cdp-screencast-v2";
+const OUT_GIF = "/tmp/cdp-screencast-v2/composed.gif";
 
 const files = readdirSync(FRAME_DIR)
   .filter((f) => f.endsWith("-A.png"))
