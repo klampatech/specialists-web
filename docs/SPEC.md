@@ -772,6 +772,40 @@ PR #50 added `PhysicsWorld::set_position` + `client_driven: BTreeSet<PlayerId>` 
 
 The race fix is dev-mode-only (production doesn't have React StrictMode double-mount). If we delete StrictMode from the dev path, this window-publication becomes unnecessary. Tracked for review once the observability HUD lands and we have visibility into cross-tab rig visual correctness without relying on the dev-mode smoke probes.
 
+### 2026-08-24 — PR 11.7.D3.1 implementation decisions (respawn teleport on snapshot HP edge)
+
+**Context.** PR #50 retired the lockstep P2P substrate which had a discrete `peer.on("respawn")` event that re-keyed + re-positioned the remote rig atomically. Post-#50, respawn is signaled only via the 20Hz server-authoritative snapshot stream (`Snapshot.players[i].hp` going `0 → 100`). The client observer reacted to position changes but NOT to HP transitions, so on respawn: (1) the Havok body stayed at the death position, (2) the visualRoot TransformNode stayed where it last was drawn, (3) the interpolator's per-frame setPosition re-clamped the rig to the stale pre-respawn snapshot. PR 11.7.D3.1 fixes this. Branch `feat/phase1-pr11.7.d3.1-respawn-snap`. 1 commit, 2 files, +84/-1.
+
+**The fix has two parts:**
+
+1. **`CharacterController.respawn()` enhanced to publish to `visualRoot`.** Pre-fix, `respawn()` set Havok + state.position + reset HP/stunt/yaw/pitch/friction. Post-fix, it also calls `this.visualRoot.position.copyFrom(this.respawnPosition)` so the visible mesh tracks the Havok teleport. The PR 11.7.D2 substrate retirement left `visualRoot` orphaned from the controller's state pipeline (the retired `CharacterController.update()` used to copy Havok→state→visualRoot; without it, the visualRoot would never update unless something explicitly publishes to it).
+
+2. **HP edge detector in the LIVE `onSnapshot` listener.** A `Map<PlayerId, previousHp>` closure variable tracks per-player HP across snapshots. On `prevHp <= 0 && currentHp === HEALTH.maxHp`, fire `liveRemoteCtrl.respawn(now)` which calls the enhanced `CharacterController.respawn()`. The `__lastInterpolatorSetPosition` window probe is also refreshed to the respawn position so the interpolator's next per-frame tick latches onto the new position instead of re-clamping to the stale pre-respawn snapshot value.
+
+**Why the HP edge detector (not a per-frame HP check).** The edge detector fires exactly once per respawn event — it's a state transition, not a continuous check. Per-frame HP comparison would fire `respawn()` every frame for as long as HP == 100, which would reset yaw/pitch/friction on every snapshot arrival (20Hz).
+
+**Why BEFORE `predictor.onSnapshot`/`interpolator.onSnapshot`.** The respawn teleport must take effect on this snapshot's frame so the predictor's reconciliation check and the interpolator's per-frame tick both see the new respawn position. If the edge fires AFTER the interpolator, the next render observer tick (which reads the interpolator's output) would re-clamp the rig to the stale pre-respawn position.
+
+**Why `__gameSession.remoteController` instead of the closure-bound `gameSession.remoteController`.** The LIVE observer at `scene.ts:1315+` resolves `liveSession` from `window.__gameSession` because React StrictMode disposes the closure's `gameSession` reference. The edge detector uses the same window-resolved pattern so it works under StrictMode.
+
+**Durable decisions for Phase 1+:**
+
+1. **Respawn is always signaled via snapshot HP edge.** Don't introduce alternate respawn paths (custom event, server-side RPC, etc.). One signal, one observer — keeps the architecture consistent with the rest of the post-#50 substrate retirement.
+
+2. **`CharacterController.respawn()` is the canonical reset primitive.** All state-resetting concerns (HP, position, velocity, stunt, yaw, pitch, friction) live in one place. The observer's edge detector is a thin trigger; it doesn't try to do any of the reset work itself. This keeps `CharacterController` as the single source of truth for character lifecycle state.
+
+3. **`visualRoot` MUST be published on every Havok position change.** Three places to update it: (a) `CharacterController.update()` for the local rig's per-frame physics-driven visual, (b) `CharacterController.respawn()` for the respawn teleport, (c) `CharacterController.setVisualPosition(pos)` for the snapshot-driven observer's per-frame visual publish. The retired `update()` path is the canonical example of how this works; the new paths replicate the same `visualRoot.position.copyFrom(pos)` call.
+
+**Verification.** `client/tools/health-regression-smoke.mjs` 3/3 PASS locally:
+- Assertion 1 PASS: initial HP = 100 (HUD)
+- Assertion 2 PASS: HP drained to 0 + respawn countdown visible
+- Assertion 3 PASS: HP restored to 100 + countdown cleared
+- Assertion 4 PASS: capsule centered at SPAWN_POSITION (-8, 0.9, 0) — the remote rig's new respawn position
+
+Vitest 25/25 PASS (no new tests added; the smoke covers the integration).
+
+**Carry-forward RESOLVED.** PR 11.7.D3's "Respawn doesn't teleport the remote rig" entry in HANDOFF.md and SPEC.md is closed by this PR.
+
 ---
 
 ## Open questions
