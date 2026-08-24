@@ -48,6 +48,72 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - **Manual-flow smoke CI is `continue-on-error: true`** because cold dev-cert generation (~75s) races the smoke's canary-wait timeout on a fresh CI runner. Local run is consistently green; CI is flaky only on the first cold-cert boot. **Once `canary-server.sh` skips cert generation when a pre-baked cert exists in CI cache** (track as separate ticket), flip this to a required gate. Until then, the smoke matrix proven green locally is the source of truth.
 - **`5177` smoke reverted to passing-flaky.** Two consecutive local runs, 1 PASS 1 FAIL. Failure mode: HP caps at 100 after 10 fires (no damage routing) OR remote respawn position is `localSpawn + 2.5` (= remoteSpawn) instead of `localSpawn` (= respawnPosition). Both look like the `tickRespawn` path clobbering the snapshot-driven Havok body — related to issue #2 (observability gap). **NOT a regression gate.**
 
+### 🆕 Follow-up: PR 11.7.D3.1 — Respawn doesn't teleport the remote rig (carry-forward, 2026-08-24)
+
+**Symptom.** `client — health regression smoke (PR 10)` fails on CI run #32773449148 (the run after PR #51's walk-mirror + visual rig fix). After Tab A kills Tab B (player 2) 10 times, the smoke asserts `remote XZ distance from SPAWN = 4.000, expected within 0.5m of player-derived SpawnX=-8` and fails. The diagnostic dump (added in 11.7.D3, fires on every respawn-position check):
+
+```
+"remoteHavok": null,
+"remoteStatePosition": null,
+"snapshotPlayer2": { "id": 2, "hp": 0 },
+"snapshotPlayerIds": [1, 2],
+"localHavok": {"x": -7.9, "y": 0.9, "z": 0}
+```
+
+`remoteHavok: null` means Tab A's remote rig's Havok body was destroyed during Tab B's death/respawn cycle. The remote rig is gone or teleported to Tab A's spawn (-4, ?, 0) instead of Tab B's respawnPosition (-8, ?, 0).
+
+**Root cause (hypothesis, not yet verified).** PR #50 retired the lockstep P2P substrate (which had a discrete `peer.on("respawn")` event that re-keyed + re-positioned the remote rig atomically). Post-#50, respawn is signaled via the snapshot's `Snapshot.players[i].hp` going `0 → 100` on the 20Hz server-authoritative stream. The LIVE observer at `scene.ts:1315+` reacts to position changes but does NOT react to HP transitions. So when player 2 respawns:
+
+1. Snapshot tells the client `player 2 hp = 100`.
+2. The server's `physics.set_position(player 2, respawnPosition)` runs (this works post-fix in 11.7.D3 — the `set_translation` immediate write fix ensures the server's body is at the respawn position immediately).
+3. Tab A's remoteController's Havok body is still at where player 2 died (or wherever the last snapshot put it before death).
+4. The interpolator's `lastSetPos` for player 2 is stale.
+5. No code path resets Havok / state.position / visualRoot to the new respawn position.
+
+The PR #50 substrate-retirement note in `docs/SPEC.md` explicitly said "carry-forward: respawn handling needs porting to snapshot-driven model." This is that carry-forward finally surfacing as a CI failure.
+
+**Likely fix path** (~30 lines in `client/src/engine/scene.ts` LIVE observer, in the `onSnapshot` handler at ~line 1378):
+
+```ts
+// Track per-player previous HP for edge detection
+const prevHpByPlayerId = new Map<PlayerId, number>();
+
+server.onSnapshot((body) => {
+  const snap = decodeSnapshot(body);
+  if (!snap) return;
+  // ... existing predictor/interpolator dispatch ...
+  for (const p of snap.players) {
+    if (p.playerId >= 1000) continue; // skip placeholders
+    const prevHp = prevHpByPlayerId.get(p.playerId) ?? 100;
+    if (prevHp <= 0 && p.hp === 100) {
+      // RESPAWN EDGE: this player just respawned. Teleport
+      // their remote rig to the canonical respawnPosition.
+      const respawn = computeRespawnPosition(p.playerId);
+      remoteCtrl.havok.setPosition(respawn);
+      remoteCtrl.setVisualPosition(respawn);
+      remoteCtrl.state.position.copyFrom(respawn);
+      // Refresh interpolator buffer so visual tracking starts clean.
+      __lastInterpolatorSetPosition = { x: respawn.x, z: respawn.z, ts: performance.now(), playerId: p.playerId };
+    }
+    prevHpByPlayerId.set(p.playerId, p.hp);
+  }
+});
+```
+
+The `computeRespawnPosition(playerId)` function uses the same `PLAYER_SPAWN_X_OFFSET = ((localId - 1) % 5 - 2) * 4` formula that PR #50 introduced, plus the room's fixed spawn Y/Z. The smoke already exposes the assertion pattern that catches this — it's a load-bearing regression test.
+
+**Recommended PR shape.** Separate small PR (branch `feat/phase1-pr11.7.d3.1-respawn-snap`):
+
+- 1 commit on top of main after PR #51 merges.
+- `client/src/engine/scene.ts`: ~30 lines (HP edge detector + respawn teleport).
+- `docs/SPEC.md`: add the implementation-decisions entry (mirrors the pattern from PR 11.7.D3 / walk-mirror).
+- `HANDOFF.md`: update TL;DR + this follow-up section to RESOLVED.
+- CI: should pass all 22 smokes (health-regression becomes green; others unchanged).
+
+**Estimated time:** 30 min coding + 10 min CI = ~45 min total. Trivial scope, should NOT be bundled with any other work.
+
+**Why this matters.** Respawn is a load-bearing gameplay loop. Spectators, kill-cams, demo recordings, and round-based game modes all depend on the remote rig being at the right position after respawn. Without this fix, post-death gameplay (which is the bulk of a deathmatch) is broken in cross-tab view.
+
 ### Decisions made this session (in reverse chronological order)
 
 1. **DO NOT keep chasing WT cert workarounds.** Ships PR #50 with WS-fallback as documented dev path; WebTransport validation is the explicit NEXT PR.

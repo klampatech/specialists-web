@@ -808,6 +808,43 @@ The race fix is dev-mode-only (production doesn't have React StrictMode double-m
 
 **UPDATE 2026-08-24**: The StrictMode double-mount is in fact the load-bearing case here — the LIVE observer at `scene.ts:1315+` is what actually runs in dev. Fix landed: both `setVisualPosition` + `state.position.copyFrom` are now in the LIVE observer. So the LIVE observer is now self-sufficient; the closure-bound observer at `scene.ts:1190+` is dead code under StrictMode (its `remoteCtrl` is disposed). **Recommendation**: delete the closure-bound observer in a follow-up PR, leaving only the LIVE observer. Tracked as a 5-line refactor.
 
+### Respawn doesn't teleport the remote rig (carry-forward, 2026-08-24, from PR 11.7.D3 CI run #32773449148)
+
+**Symptom.** `client — health regression smoke (PR 10)` fails on CI after Tab A kills Tab B (player 2) 10 times. After Tab B respawns, Tab A's view of the remote rig is at (-4, ?, 0) — Tab A's spawn position — instead of Tab B's `respawnPosition` (-8, ?, 0). The diagnostic dump shows:
+
+```
+"remoteHavok": null,
+"remoteStatePosition": null,
+"snapshotPlayer2": { "id": 2, "hp": 0 },
+"snapshotPlayerIds": [1, 2],
+"localHavok": {"x": -7.9, "y": 0.9, "z": 0}
+```
+
+`remoteHavok: null` means the remote rig's Havok body was destroyed during the death/respawn cycle. The smoke asserts `remote XZ distance from SPAWN = 4.000, expected within 0.5m of player-derived SpawnX=-8` — the assertion fails because the remote rig is gone or moved to the local spawn instead of the peer's respawnPosition.
+
+**Root cause (hypothesis, not yet verified).** PR #50 retired the lockstep P2P substrate (which handled respawn as a discrete "peer is back" event with position sync). Post-#50, respawn is signaled via `Snapshot.players[i].hp` going `0 → 100` on the server-authoritative stream. The client observer at `scene.ts:1315+` (LIVE) reacts to position changes but does NOT react to the HP `0 → 100` respawn event. The remote rig's Havok body isn't recreated at the new respawn position, and the interpolator's `lastSetPos` for that playerId doesn't get refreshed.
+
+**Likely fix path** (~30 lines in `client/src/engine/scene.ts` LIVE observer):
+
+1. Track per-player previous HP (a small `Map<PlayerId, number>`).
+2. On snapshot, if `currentHp === 100` AND `previousHp <= 0`, fire a respawn handler.
+3. Respawn handler: `remoteCtrl.havok.setPosition(respawnPosition)` + `remoteCtrl.setVisualPosition(respawnPosition)` + `remoteCtrl.state.position.copyFrom(respawnPosition)` + `__lastInterpolatorSetPosition = { ... respawnPosition, ts, playerId }`.
+5. Source `respawnPosition` from a per-player map (same PLAYER_SPAWN_X_OFFSET formula used in PR #50: `((localId - 1) % 5 - 2) * 4` for X-axis stagger, fixed Y and Z from the player's room entry point).
+
+**Related:** the lockstep-era `peer.on("respawn")` handler in `scene.ts` was deleted as part of PR #50's substrate retirement. The replacement (snapshot-driven HP edge detection) was not implemented. This is a known gap from PR #50 — the substrate retirement note in PR #50's section explicitly says "carry-forward: respawn handling needs porting to snapshot-driven model."
+
+**Smoke update path:** once the fix lands, `health-regression-smoke.mjs` should pass without `[XFAIL]` annotations. The smoke already exposes the failure with diagnostic dump — it's a load-bearing regression test for this gap.
+
+**Severity:** blocker for the "24-player scale + spectator-mode demos" goal — spectators can't watch players respawn correctly. NOT a blocker for shipping PR #51 (walk-mirror + visual rig fix is independently valuable, all other 21 smokes green).
+
+### CI surface for snapshot-driven edge detection (2026-08-24, follow-up to PR #51)
+
+**Symptom.** During PR #51's CI run (#32773449148), 6 smokes failed initially — 5 on `PAGE_ERRORS:` (the PeerOverlay URL-missing noise) and 1 (two-tab) on what turned out to be a flake. After the PeerOverlay fix landed, **21/22 pass**, with only the respawn-position smoke (above) remaining as a real bug.
+
+**Lesson.** The `PAGE_ERRORS:` capture in the smokes was working as designed — but the design was wrong for the post-#50 world where `?server=` is opt-in (smokes testing single-player behaviors don't pass it). The PeerOverlay console.error was added in 11.7.D3 as a dev-mode "helpful diagnostic" but it caused CI flake on legitimate single-player tests. The fix was to gate the console.error on `__forceServerTransport === true` (i.e., the page actually requested multiplayer transport but the URL was misconfigured). The HUD still gets the `__missingServerParam` flag so real users see the actionable banner.
+
+**Carry-forward.** For future `console.error` additions: if the error is meant for end-user debugging, prefer the HUD-overlay path (already proven). Reserve `console.error` for cases where the dev-tools console is the primary surface (e.g., wire-format mismatches). Smokes capture console.error as `PAGE_ERRORS:`; non-blocking dev-mode diagnostics should go through `console.info` or `console.warn` to avoid the same trap.
+
 ---
 
 ## Open questions
