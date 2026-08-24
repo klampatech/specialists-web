@@ -57,7 +57,7 @@ import {
   type CharacterController,
   type InputState,
 } from "./characterController";
-import { CAPSULE, WORLD_GRAVITY } from "./characterConfig";
+import { CAPSULE, HEALTH, WORLD_GRAVITY } from "./characterConfig";
 import { createInputListener, type InputListener } from "./inputListener";
 import { createGameSession, type GameSession } from "../game/gameSession";
 import { renderTracer } from "../game/combat";
@@ -1376,11 +1376,67 @@ export async function createScene(
           // drives the remote visual from the interpolator at that
           // point.)
           let latestSnap: import("../../../protocol/snapshot").Snapshot | null = null;
+          // PR 11.7.D3.1 / respawn-snap — HP edge detector for the
+          // snapshot-driven remote rig. PR 11.7.D2 retired the
+          // lockstep P2P substrate which had a discrete `peer.on("respawn")`
+          // event that re-keyed + re-positioned the remote rig atomically.
+          // Post-#50, respawn is signaled only via
+          // `Snapshot.players[i].hp` going `0 → 100` on the 20Hz
+          // server-authoritative stream. The LIVE observer reacts to
+          // position changes but does NOT react to HP transitions, so
+          // when a remote player respawns: (a) the Havok body stays at
+          // the death position, (b) the visualRoot stays where it last
+          // was drawn, and (c) the interpolator's per-frame setPosition
+          // re-clamps it to the stale pre-respawn snapshot position.
+          //
+          // The fix is a `Map<PlayerId, previousHp>` updated each tick;
+          // on `prevHp <= 0 && currentHp === 100`, fire `respawn()` on the
+          // remote controller which teleports Havok + visualRoot to the
+          // controller's `respawnPosition` (already canonical per
+          // PR 10.2's start-vs-respawn split).
+          const prevHpByPlayerId = new Map<number, number>();
           server.onSnapshot((body) => {
             const snap = decodeSnapshot(body);
             if (!snap) return;
             const now = performance.now();
             latestSnap = snap;
+            // HP edge detection — must run BEFORE the interpolator so
+            // the respawn teleport takes effect this frame and the
+            // interpolator's tick can latch onto the new position.
+            const liveGameSession = (window as unknown as {__gameSession?: GameSession}).__gameSession;
+            const liveRemoteCtrl = liveGameSession?.remoteController;
+            for (const p of snap.players) {
+              // Skip placeholder ids (1000+) — those are un-promoted
+              // connections waiting for their first DamageRequest.
+              if (p.playerId >= 1000) continue;
+              const prevHp = prevHpByPlayerId.get(p.playerId) ?? HEALTH.maxHp;
+              if (prevHp <= 0 && p.hp === HEALTH.maxHp) {
+                // Respawn edge. Teleport the remote rig to its canonical
+                // respawn position (CharacterController.respawn() does
+                // Havok + state.position + visualRoot + resets HP, stunt,
+                // yaw, pitch, friction). Pass `now` so the HUD's
+                // respawn countdown timer syncs.
+                if (liveRemoteCtrl) {
+                  liveRemoteCtrl.respawn(now);
+                  // Refresh the interpolator's per-frame buffer so the
+                  // visual tracking starts clean at the respawn position
+                  // (otherwise the next interpolator tick could re-clobber
+                  // the respawn with a stale pre-respawn snapshot value).
+                  if (typeof window !== "undefined") {
+                    const w = window as unknown as {
+                      __lastInterpolatorSetPosition?: {x: number; z: number; ts: number; playerId: number};
+                    };
+                    w.__lastInterpolatorSetPosition = {
+                      x: liveRemoteCtrl.respawnPosition.x,
+                      z: liveRemoteCtrl.respawnPosition.z,
+                      ts: now,
+                      playerId: p.playerId,
+                    };
+                  }
+                }
+              }
+              prevHpByPlayerId.set(p.playerId, p.hp);
+            }
             predictor.onSnapshot(snap, now);
             interpolator.onSnapshot(snap, now);
           });
