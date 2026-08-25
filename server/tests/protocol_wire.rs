@@ -254,3 +254,28 @@ fn pong_is_big_endian() {
     assert_eq!(&bytes[0..4], &[0x01, 0x02, 0x03, 0x04]);
     assert_eq!(&bytes[4..8], &[0x05, 0x06, 0x07, 0x08]);
 }
+
+// -- ReloadRequest (PR 11.7.E) ----------------------------------------
+
+#[test]
+fn reload_request_body_is_6_bytes() {
+    let req = ReloadRequest {
+        source_player_id: 0x5566,
+        event_id: 0xdeadbeef,
+    };
+    let bytes = encode_reload_request(&req);
+    assert_eq!(bytes.len(), RELOAD_REQUEST_BODY_SIZE);
+    assert_eq!(bytes.len(), 6);
+    assert_eq!(RELOAD_REQUEST_WIRE_SIZE, 7);
+}
+
+#[test]
+fn reload_request_roundtrip() {
+    let original = ReloadRequest {
+        source_player_id: 42,
+        event_id: 0xfeedface,
+    };
+    let bytes = encode_reload_request(&original);
+    let decoded = decode_reload_request(&bytes).expect("decode must succeed");
+    assert_eq!(original, decoded, "round-trip must preserve all fields");
+}

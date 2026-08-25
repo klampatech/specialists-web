@@ -59,6 +59,12 @@ import {
   encodePing,
   encodePositionUpdate,
 } from "../../../protocol/damage";
+// PR 11.7.E / §3.5 — ReloadRequest wire type. The client only
+// SENDS ReloadRequests (no inbound 0x09 dispatch — the server is
+// the sole source of post-reload state, carried by the next 20Hz
+// Snapshot fan-out). Encoder mirrors Rust `encode_reload_request`.
+import { encodeReloadRequest } from "../../../protocol/reload";
+import type { ReloadRequest } from "../../../protocol/reload";
 import { DISCRIMINATOR_SNAPSHOT } from "../../../protocol/snapshot";
 import type {
   DamageRequest,
@@ -214,6 +220,26 @@ export class ServerTransport {
   /** Send a DamageRequest. */
   sendDamageRequest(p: Uint8Array | DamageRequest): void {
     const bytes = p instanceof Uint8Array ? p : encodeDamageRequest(p);
+    this.sendRaw(bytes);
+  }
+
+  /**
+   * PR 11.7.E / §3.5 — send a typed `ReloadRequest` over the
+   * transport. The server validates (`damage_relay::
+   * validate_and_relay_reload`, 8 gates paralleling
+   * `validate_and_relay`) and on success mutates
+   * `room.players[source].ammo = PLAYER_MAX_AMMO`. The next 20Hz
+   * Snapshot broadcast (discriminator 0x07) carries the new ammo
+   * to every connected tab — no private ack packet.
+   *
+   * The caller is responsible for the `eventId` monotonicity
+   * (use `nextReloadEventId` from `net/damageBus.ts` for the
+   * canonical counter). Server-side `RELOAD_EVENT_ID_WINDOW = 64`
+   * allows tab reloads to recover without invalidating subsequent
+   * requests.
+   */
+  sendReloadRequest(p: Uint8Array | ReloadRequest): void {
+    const bytes = p instanceof Uint8Array ? p : encodeReloadRequest(p);
     this.sendRaw(bytes);
   }
 

@@ -304,6 +304,125 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
+  # PR 11.7.E / §3.5 — two-tab reload smoke (server-auth reload
+  # end-to-end). Mirrors client-damage-server-hp-convergence-smoke
+  # (same canary+vite boot on port 5191) but with reload mechanics
+  # instead of damage convergence. The smoke:
+  #   - opens TWO headless browser contexts against the SAME canary
+  #     room (DEVBX) with __forceServerTransport = true
+  #   - asserts both ServerTransports connect + snapshot stream live
+  #     with initial ammo = PLAYER_MAX_AMMO (=6) for player 1
+  #   - Tab A fires 2 shots; both tabs observe ammo drop to 4
+  #     (server-authoritative — the snapshot, NOT a local controller
+  #     field, is the source of truth)
+  #   - Tab A calls __gameSession.sendReloadRequest(1, eventId)
+  #     (DEV-gated probe) — wire 7-byte ReloadRequest (0x09 disc +
+  #     u16 BE source + u32 BE eventId)
+  #   - asserts both tabs snapshot reports ammo = 6 after ≤200ms
+  #     (server-side validate_and_relay_reload 8 gates validated,
+  #     room.players[1].ammo = PLAYER_MAX_AMMO mutated, 20Hz snapshot
+  #     fan-out carried the new ammo to every tab)
+  # The smoke is the integration gate for PR 11.7.E — wire format,
+  # validator, transport, snapshot fan-out, and HUD server-
+  # authoritative ammo read all exercised end-to-end.
+  client-damage-server-reload-smoke:
+    name: client — damage server reload smoke (PR 11.7.E, port 5191)
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (release)
+        run: cargo build --release --manifest-path server/Cargo.toml
+      - name: Test server (skip WebTransport integration)
+        run: cargo test --manifest-path server/Cargo.toml
+        env:
+          SKIP_WEBTRANSPORT_TEST: 1
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Boot canary server (ports 14433 + 14434)
+        run: |
+          nohup bash tools/canary-server.sh --port-wt 14433 --port-ws 14434             > /tmp/canary-server-reload.log 2>&1 &
+          echo $! > /tmp/canary-server-reload.pid
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+              echo "Canary server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+            echo "::error::Canary server did not become ready in 60s"
+            cat /tmp/canary-server-reload.log
+            exit 1
+          fi
+      - name: Boot Vite dev server (port 5191)
+        working-directory: client
+        run: |
+          nohup npm run dev -- --host 127.0.0.1 --port 5191 --strictPort             > /tmp/vite-5191-reload.log 2>&1 &
+          echo $! > /tmp/vite-5191-reload.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5191/ > /dev/null; then
+              echo "Vite (reload smoke) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5191/ > /dev/null; then
+            echo "::error::Vite (reload smoke) did not become ready in 60s"
+            cat /tmp/vite-5191-reload.log
+            exit 1
+          fi
+      - name: Run damage server reload smoke
+        working-directory: client
+        run: node tools/damage-server-reload-smoke.mjs
+        env:
+          RELOAD_SMOKE_URL: http://localhost:5191/
+          RELOAD_SMOKE_WT_PORT: 14433
+          RELOAD_SMOKE_WS_PORT: 14434
+          SMOKE_PNG: client/tools/damage-server-reload-smoke.png
+          # Canary + Vite are already booted by the steps above;
+          # the smoke just connects to them.
+          SMOKE_NO_BOOT: "1"
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: damage-server-reload-smoke-screenshot
+          path: client/tools/damage-server-reload-smoke.png
+          if-no-files-found: warn
+      - name: Tear down canary + Vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server-reload.pid ]]; then kill "$(cat /tmp/canary-server-reload.pid)" || true; fi
+          if [[ -f /tmp/vite-5191-reload.pid ]]; then kill "$(cat /tmp/vite-5191-reload.pid)" || true; fi
+          # Belt-and-suspenders: kill any stragglers on the known ports.
+          pkill -f canary-server.sh || true
+          pkill -f 'vite.*5191' || true
+          for port in 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   # Phase 0 / PR 2: headless smoke test of the Babylon scene.
   # Boots `npm run dev`, waits for the ready banner to disappear, captures a
   # screenshot, fails on any console error, and uploads the screenshot as a

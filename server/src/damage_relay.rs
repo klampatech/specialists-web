@@ -28,10 +28,11 @@
 
 use std::time::{Duration, Instant};
 
-use tracing::warn;
+use tracing::{debug, warn};
 
+use specialists_server::constants::{PLAYER_MAX_AMMO, RELOAD_RATE_LIMIT_MS};
 use specialists_server::hitscan::{chest_position, dual_pistol_damage, dual_pistol_hit, forward_from_yaw_pitch};
-use specialists_server::protocol::{DamageBroadcast, DamageRequest};
+use specialists_server::protocol::{DamageBroadcast, DamageRequest, ReloadRequest};
 use specialists_server::session::{PlayerId, Room, ServerFrame};
 
 /// Fire-rate cooldown for the dual-pistol (matches
@@ -66,6 +67,14 @@ pub const MELEE_DAMAGE: u8 = 25;
 /// The 50m pistol range would allow a "melee" hit from across
 /// the map — clearly wrong.
 pub const MELEE_MAX_RANGE_METERS: f32 = 1.5;
+/// PR 11.7.E / §3.5 — bounded window for the eventId monotonicity
+/// gate on `validate_and_relay_reload`. Mirrors
+/// `EVENT_ID_WINDOW` from the DamageRequest path — allows tab reloads
+/// (`nextReloadEventId` resets to 1) to recover without invalidating
+/// every subsequent request. The window is the SAME size (64) as the
+/// damage path because the rationale is identical (tab reload resets
+/// the counter; the server's `last_event_id_for_source` persists).
+pub const RELOAD_EVENT_ID_WINDOW: u32 = EVENT_ID_WINDOW;
 /// PR 11.6.D FIX 7: bounded window for the eventId monotonicity
 /// gate. Strict monotonicity (`req.event_id > last_event_id`) breaks
 /// when the client tab reloads (its `nextEventId` resets to 1) but
@@ -384,6 +393,153 @@ pub fn validate_and_relay(
     target_player.hp = target_player.hp.saturating_sub(amount);
 
     Some(bc)
+}
+
+/// PR 11.7.E / §3.5 — `validate_and_relay_reload`.
+///
+/// Validates a `ReloadRequest` from the client and, on success,
+/// mutates `room.players[source].ammo = PLAYER_MAX_AMMO`. The next
+/// 20Hz `Snapshot` broadcast (discriminator 0x07) carries the new
+/// ammo value to every connected tab — no outgoing packet from this
+/// function. The relay-shape returns `Option<()>` so the call site
+/// mirrors `validate_and_relay` (which returns `Option<DamageBroadcast>`).
+///
+/// 8 gates paralleling `validate_and_relay`:
+///   1. Source in room (`room.players.contains_key(&source_player_id)`).
+///   2. Connection PlayerId anti-spoof (validated at the transport
+///      dispatcher; the validator trusts the connection's claimed id).
+///   3. HP > 0 (no reload while dead — the §3.5 death gate).
+///   4. Ammo < max (no point reloading a full mag).
+///   5. Rate limit (`RELOAD_RATE_LIMIT_MS` since the previous reload).
+///   6. eventId monotonicity (bounded window, mirrors `validate_and_relay`'s
+///      EVENT_ID_WINDOW — allows tab reloads to recover).
+///   7. Sentinel (no source-type for reload — it's always source=0
+///      mode by definition; gate is a no-op but documented for symmetry
+///      with the damage validator's gate structure).
+///   8. Side-effect: on success, mutate `player.ammo = PLAYER_MAX_AMMO`,
+///      stamp `player.last_reload_at = Some(now)`, advance
+///      `last_event_id_for_source[source]` to `req.event_id` (saturating,
+///      mirrors `validate_and_relay`'s saturation semantics).
+pub fn validate_and_relay_reload(
+    req: &ReloadRequest,
+    connection_player_id: PlayerId,
+    room: &mut Room,
+    now: Instant,
+) -> Option<()> {
+    // --- Gate 1: source in room -----------------------------------------
+    let req_source = req.source_player_id;
+    if !room.players.contains_key(&req_source) {
+        warn!(
+            source = req_source,
+            "validate_and_relay_reload: rejected — source not in room",
+        );
+        return None;
+    }
+    // --- Gate 2: connection PlayerId anti-spoof ------------------------
+    // The transport dispatcher already validates this against
+    // `connection_state.claimed_player_id` and stamps the actual
+    // id on first DamageRequest. The validator receives the
+    // dispatcher-resolved id (which may equal req_source or the
+    // pre-DR placeholder) and asserts the room lookup matches.
+    if connection_player_id != req_source {
+        warn!(
+            connection_id = connection_player_id,
+            req_source = req_source,
+            "validate_and_relay_reload: rejected — connection PlayerId mismatch",
+        );
+        return None;
+    }
+
+    // --- Gate 3: HP > 0 ------------------------------------------------
+    if room.players[&req_source].hp == 0 {
+        warn!(
+            source = req_source,
+            "validate_and_relay_reload: rejected — source HP is 0 (dead)",
+        );
+        return None;
+    }
+
+    // --- Gate 4: ammo < max --------------------------------------------
+    if room.players[&req_source].ammo >= PLAYER_MAX_AMMO {
+        warn!(
+            source = req_source,
+            ammo = room.players[&req_source].ammo,
+            "validate_and_relay_reload: rejected — magazine already full",
+        );
+        return None;
+    }
+
+    // --- Gate 5: rate limit (1/sec per player) -------------------------
+    if let Some(last) = room.players[&req_source].last_reload_at {
+        let since_ms = now.duration_since(last).as_millis() as u64;
+        if since_ms < RELOAD_RATE_LIMIT_MS {
+            warn!(
+                source = req_source,
+                since_last_ms = since_ms,
+                rate_limit_ms = RELOAD_RATE_LIMIT_MS,
+                "validate_and_relay_reload: rejected — rate limit not elapsed",
+            );
+            return None;
+        }
+    }
+
+    // --- Gate 6: eventId bounded-window per source --------------------
+    // Mirrors `validate_and_relay`'s EVENT_ID_WINDOW logic exactly:
+    // accept within the window, reject only if `req.event_id +
+    // WINDOW < last_event_id`. The window allows tab reloads to
+    // recover without invalidating every subsequent request.
+    let last_event_id = room
+        .last_event_id_for_source
+        .get(&req_source)
+        .copied()
+        .unwrap_or(0);
+    if req.event_id.saturating_add(RELOAD_EVENT_ID_WINDOW) < last_event_id {
+        warn!(
+            source = req_source,
+            event_id = req.event_id,
+            last_event_id = last_event_id,
+            window = RELOAD_EVENT_ID_WINDOW,
+            "validate_and_relay_reload: rejected — eventId more than WINDOW behind last_event_id",
+        );
+        return None;
+    }
+
+    // --- Gate 7: sentinel (no source-type for reload) -------------------
+    // Reload is a mode-0-only concept (dual-pistol magazine refill).
+    // Melee has no ammo, so no reload. Future modes (3+) would carry
+    // their own reload rules — none exist in PR 11.7.E. Documented
+    // for symmetry with the damage validator's gate structure.
+
+    // --- Gate 8: side-effects on success -------------------------------
+    // Mutate ammo + stamp last_reload_at + advance last_event_id. The
+    // snapshot stream carries the new ammo on its next 20Hz tick.
+    let player = room
+        .players
+        .get_mut(&req_source)
+        .expect("gate 1 invariant violated — req_source not in room.players");
+    player.ammo = PLAYER_MAX_AMMO;
+    player.last_reload_at = Some(now);
+    // Saturating eventId stamp — mirrors validate_and_relay's
+    // semantics so a tab reload that resets the counter doesn't
+    // wrap the stored value backward.
+    let prev_event_id = room
+        .last_event_id_for_source
+        .get(&req_source)
+        .copied()
+        .unwrap_or(0);
+    let new_event_id = if req.event_id < prev_event_id {
+        prev_event_id
+    } else {
+        req.event_id
+    };
+    room.last_event_id_for_source.insert(req_source, new_event_id);
+    debug!(
+        source = req_source,
+        event_id = req.event_id,
+        new_ammo = player.ammo,
+        "validate_and_relay_reload: success",
+    );
+    Some(())
 }
 
 /// Encode a `DamageBroadcast` to on-the-wire bytes (discriminator
@@ -1031,5 +1187,217 @@ mod tests {
         // at (5,0) -> HIT.
         let result = validate_and_relay(&req, 1, &mut room, 400, Instant::now());
         assert!(result.is_some(), "with RTT=400ms, lag-comp must rewind to in-range frame");
+    }
+
+    // -- ReloadRequest (PR 11.7.E) --------------------------------------
+
+    /// Helper: build a passing ReloadRequest for player 1.
+    fn passing_reload_request() -> ReloadRequest {
+        ReloadRequest {
+            source_player_id: 1,
+            event_id: 1,
+        }
+    }
+
+    #[test]
+    fn validate_and_relay_reload_basic() {
+        // Happy path: ammo=3, alive, fresh rate-limit → reload to
+        // PLAYER_MAX_AMMO. The snapshot stream (not exercised here;
+        // see `validate_and_relay_reload_uses_snapshot_path` below)
+        // will carry the new ammo to clients.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().ammo = 3;
+        let req = passing_reload_request();
+        let result = validate_and_relay_reload(&req, 1, &mut room, Instant::now());
+        assert!(result.is_some(), "valid reload must succeed");
+        assert_eq!(
+            room.players[&1].ammo,
+            PLAYER_MAX_AMMO,
+            "reload must set ammo to PLAYER_MAX_AMMO",
+        );
+        assert!(
+            room.players[&1].last_reload_at.is_some(),
+            "reload must stamp last_reload_at",
+        );
+        assert_eq!(
+            room.last_event_id_for_source.get(&1).copied(),
+            Some(1),
+            "reload must advance last_event_id_for_source",
+        );
+    }
+
+    #[test]
+    fn validate_and_relay_reload_zero_ammo_state() {
+        // ammoless = full reload path. Magazine was empty (ammo=0),
+        // reload fills it to PLAYER_MAX_AMMO (not +1 — `ammo` is the
+        // absolute magazine count, not a delta).
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().ammo = 0;
+        let req = passing_reload_request();
+        let result = validate_and_relay_reload(&req, 1, &mut room, Instant::now());
+        assert!(result.is_some(), "reload from ammo=0 must succeed");
+        assert_eq!(room.players[&1].ammo, PLAYER_MAX_AMMO);
+    }
+
+    #[test]
+    fn validate_and_relay_reload_when_full() {
+        // Magazine already full → reject (no-op reload would waste
+        // the rate-limit window).
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().ammo = PLAYER_MAX_AMMO;
+        let req = passing_reload_request();
+        let result = validate_and_relay_reload(&req, 1, &mut room, Instant::now());
+        assert!(result.is_none(), "full magazine must reject reload");
+        // State must be unchanged (no eventId stamp, no last_reload_at).
+        assert_eq!(room.players[&1].ammo, PLAYER_MAX_AMMO);
+        assert!(room.players[&1].last_reload_at.is_none());
+        assert!(room.last_event_id_for_source.get(&1).is_none());
+    }
+
+    #[test]
+    fn validate_and_relay_reload_when_dead() {
+        // HP=0 → reject (can't reload while dead).
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().ammo = 2;
+        room.players.get_mut(&1).unwrap().hp = 0;
+        let req = passing_reload_request();
+        let result = validate_and_relay_reload(&req, 1, &mut room, Instant::now());
+        assert!(result.is_none(), "reload while dead must be rejected");
+        assert_eq!(room.players[&1].ammo, 2, "ammo must not change on dead-reload reject");
+    }
+
+    #[test]
+    fn validate_and_relay_reload_rate_limit() {
+        // Two reloads within RELOAD_RATE_LIMIT_MS: first succeeds,
+        // second rejected by the rate-limit gate.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().ammo = 2;
+        let now = Instant::now();
+        let req1 = passing_reload_request();
+        let result1 = validate_and_relay_reload(&req1, 1, &mut room, now);
+        assert!(result1.is_some(), "first reload must succeed");
+        // Second request 100ms later: rate-limit (1/sec) → reject.
+        let mut req2 = req1.clone();
+        req2.event_id = 2;
+        // Drain the magazine so gate 4 doesn't reject.
+        room.players.get_mut(&1).unwrap().ammo = 1;
+        let result2 = validate_and_relay_reload(
+            &req2,
+            1,
+            &mut room,
+            now + Duration::from_millis(100),
+        );
+        assert!(
+            result2.is_none(),
+            "second reload within RELOAD_RATE_LIMIT_MS must be rejected",
+        );
+        // Third request 1.5s later: rate-limit elapsed → succeed.
+        let mut req3 = req1.clone();
+        req3.event_id = 3;
+        room.players.get_mut(&1).unwrap().ammo = 1;
+        let result3 = validate_and_relay_reload(
+            &req3,
+            1,
+            &mut room,
+            now + Duration::from_millis(1500),
+        );
+        assert!(result3.is_some(), "reload after rate-limit window must succeed");
+    }
+
+    #[test]
+    fn validate_and_relay_reload_event_id_monotonic() {
+        // First reload stamps event_id=1. A subsequent reload with
+        // event_id=0 (within the bounded window) is ACCEPTED by the
+        // window (similar to the damage path); a reload with
+        // event_id far behind is REJECTED.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().ammo = 2;
+        let now = Instant::now();
+        let mut req_advance = passing_reload_request();
+        req_advance.event_id = 1000;
+        let result = validate_and_relay_reload(&req_advance, 1, &mut room, now);
+        assert!(result.is_some(), "first reload must succeed");
+        assert_eq!(
+            room.last_event_id_for_source.get(&1).copied(),
+            Some(1000),
+        );
+
+        // event_id=950 (50 behind 1000, within EVENT_ID_WINDOW=64) →
+        // accepted by the bounded window. Stored value stays at 1000
+        // (saturating, not wrapping).
+        let mut req_within = passing_reload_request();
+        req_within.event_id = 950;
+        room.players.get_mut(&1).unwrap().ammo = 1;
+        let result = validate_and_relay_reload(
+            &req_within,
+            1,
+            &mut room,
+            now + Duration::from_millis(1100),
+        );
+        assert!(result.is_some(), "drift within EVENT_ID_WINDOW must be accepted");
+        assert_eq!(
+            room.last_event_id_for_source.get(&1).copied(),
+            Some(1000),
+            "stored event_id must saturate, not wrap to a smaller value",
+        );
+
+        // event_id=885 (65 behind 1000, beyond WINDOW=64) → rejected.
+        let mut req_beyond = passing_reload_request();
+        req_beyond.event_id = 885;
+        room.players.get_mut(&1).unwrap().ammo = 1;
+        let result = validate_and_relay_reload(
+            &req_beyond,
+            1,
+            &mut room,
+            now + Duration::from_millis(2200),
+        );
+        assert!(result.is_none(), "drift beyond EVENT_ID_WINDOW must be rejected");
+    }
+
+    #[test]
+    fn validate_and_relay_reload_self_only() {
+        // Source not in room → reject (gate 1).
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().ammo = 2;
+        let mut req = passing_reload_request();
+        req.source_player_id = 99; // not in room
+        let result = validate_and_relay_reload(&req, 99, &mut room, Instant::now());
+        assert!(result.is_none(), "source not in room must be rejected");
+
+        // Connection PlayerId mismatch → reject (gate 2).
+        let mut req_ok = passing_reload_request();
+        let result = validate_and_relay_reload(
+            &req_ok,
+            2, // wrong connection id
+            &mut room,
+            Instant::now(),
+        );
+        assert!(
+            result.is_none(),
+            "connection PlayerId mismatch must be rejected",
+        );
+    }
+
+    #[test]
+    fn validate_and_relay_reload_uses_snapshot_path() {
+        // Post-reload, the snapshot's `players[i].ammo` for the
+        // source must equal PLAYER_MAX_AMMO. This pins the contract
+        // that the validator mutates the room state and the snapshot
+        // builder reads it. The actual snapshot encoding is tested
+        // in `server/tests/snapshot.rs`; this is the integration
+        // boundary.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().ammo = 0;
+        let req = passing_reload_request();
+        let result = validate_and_relay_reload(&req, 1, &mut room, Instant::now());
+        assert!(result.is_some(), "reload must succeed");
+        // Simulate the snapshot builder reading room state: the
+        // PlayerState struct the snapshot generator produces carries
+        // `ammo = room.players[id].ammo` (see `snapshot.rs::build_snapshot`).
+        let snap_ammo = room.players[&1].ammo;
+        assert_eq!(
+            snap_ammo, PLAYER_MAX_AMMO,
+            "post-reload snapshot must report ammo=PLAYER_MAX_AMMO for the source",
+        );
     }
 }
