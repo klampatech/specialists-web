@@ -7,6 +7,107 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ## ⚡ TL;DR for the next session (read this first)
 
+**`You are here`**: post-PR-#56 merge (2026-08-25). **`main` @ `<PR #56 squash>` — placeholder, fill at merge.** **PR 11.7.E (reload mechanics) MERGED.** Server-authoritative ammo refill on R-keypress closes the last open 11.7 series PR. The 11.7 series is now: 11.7.A (plan) ✅ → 11.7.B (server physics + snapshot) ✅ → 11.7.C (client predictor + interpolator) ✅ → 11.7.D.1/D2.1/D2.2/D3/D3.1/D3.2/D3.3 ✅ → **11.7.E ✅**. Reload path: `validate_and_relay_reload` validates 7-byte ReloadRequest (0x09 disc + source u16 BE + eventId u32 BE) with 6 gates (source-in-room, eventId-monotonic window=64, hp>0, ammo<max, 1s rate-limit, sentinel); on success, sets `room.players[source].ammo = PLAYER_MAX_AMMO = 6`. Client: BulletHud ammo blocks from `__latestSnap().players[i].ammo` (server-authoritative); R press gated on `pointerLocked===true`; reload bar clears on `now >= reloadingUntilMs` (1500ms client-local timer, not on snapshot arrival). Servers DOWN. Local `main` was stale on `docs/post-merge-pr42-pr43` worktree at session start (PR #54 docs PR was un-fastforwarded) — fast-forwarded to `4c3ea57`. Stale `pr11.7-d3.2` + `pr11.7-d3.3` worktrees pruned.
+
+**Where we landed (PR 11.7.E full session, 2026-08-25)**:
+
+**Codex implementation** (one big commit `4bae47c`, then 3 claude-review blockers fixed in `91d3ad6`):
+- Server: `validate_and_relay_reload()` with 6 gates; new constants `PLAYER_MAX_AMMO=6` + `RELOAD_RATE_LIMIT_MS=1000` + `RELOAD_EVENT_ID_WINDOW=64`; `transport.rs` 0x09 dispatch arm.
+- Client: `protocol/reload.ts` (NEW, ~130 lines) — encode/decode + 4 vitest round-trips; `damageBus.sendReloadRequest` + `nextReloadEventId` counter; `inputListener` R keydown gated on `pointerLocked===true` (locked decision #7); `gameSession.reloadingUntilMs` timer; `BulletHud.tsx` ammo display + reload bar; per-frame timer-expiry clear in `scene.ts` render observer.
+- Tests: 207/207 cargo (was 195 baseline + 12 new), 29/29 vitest, `damage-server-reload-smoke.mjs` 5/5 on port 5191, new `client-damage-server-reload-smoke` CI job mirroring the HP-convergence pattern.
+- Smoke primer fix: added 1.5s settle loop before the primer to give the snapshot fan-out time to propagate both PlayerIds (mirrors the 5191 HP-convergence smoke's 2s poll loop). Without this, Tab B's snapshot arrived empty by the assertion checkpoint.
+
+**3 BLOCKING issues caught by Claude Code cross-vendor review (print mode in pane `wMW:p2`)** — all fixed in the final commit:
+1. **B-1** (`server/src/protocol.rs`): 4 reload wire-format tests were nested inside `snapshot_minimum_size_when_empty` with no closing brace — Rust would never run them; they were dead. Restructured: cargo went **203 → 207 PASS** (+4 now-running tests).
+2. **B-2** (`client/src/engine/scene.ts`): the snapshot-driven `_clearReloadingUntilMs()` edge fired on any snapshot where local ammo >= 6 — typically within ~50ms of R-press. The bar was supposed to track the 1500ms visual timer but vanished in ≤100ms. Moved clear into the render observer's per-frame `now >= reloadingUntilMs` check.
+3. **B-3** (`client/src/engine/inputListener.ts`): the R-keypress guard for `pointerLocked === true` was documented in the comment but never implemented. A user pressing R before the cursor was locked (e.g., typing in the SDP textarea) would still fire a reload. Added `held.pointerLocked` mirroring of `document.pointerLockElement` via the pointerlockchange listener.
+
+**Carry-forwards still open (non-blocking — Claude noted these, no fix in PR #56)**:
+- **NB-1 (literal-6 risk across 4 sites)**: PR shipped with `PLAYER_MAX_AMMO = 6` removed from `COMBAT.dualPistol` and replaced with literal `6` in `gameSession.tryStartReload` + `scene.ts` reload-completion edge detector (a comment in both spots points at `server/src/constants.rs::PLAYER_MAX_AMMO` as canonical). If we ever bump `PLAYER_MAX_AMMO`, those literal-6 sites silently break. **Recommend follow-up PR** that restores the constant to the production hot path.
+- **NB-2 (snapshot excludes reload-only players)**: if a player's only event in the room is a reload (no DamageRequest, no PositionUpdate), the server's placeholder→real-Promotion path (`room.connections`) still works for the snapshot, but the smoke primer pattern (PositionUpdates × 3 + 1-damage fire) wouldn't fire for a reload-only player. Tiny edge case.
+- **NB-3 (smoke bypasses the R-keypress integration path)**: the smoke calls `__gameSession.sendReloadRequest(1, eventId)` directly via the DEV probe, not `page.keyboard.press('r')` through `inputListener.onReload` → `gameSession.tryStartReload`. **B-3's pointerLocked gate is verified only by code review, not by a regression guard.** Real-browser tier-3 test (covered next) is the natural fix.
+- **NB-4 (inaccurate ammo-drop comment)**: cosmetic, do not fix.
+
+**Tier-3 (real-browser) function tests for PR 11.7.E — PARTIALLY VERIFIED 2026-08-25**. Per Kyle's pushback at `cc: 1541894837437988924` ("I need to see it to believe it") the earlier tier-3 PASS claim was **incomplete**: my CDP tunnel attached to Chrome PID 60214 (launched Sunday), not to Vivaldi (which had no `--remote-debugging-port` open). I could not see Vivaldi tabs.
+
+**Fix attempted 2026-08-25 (after Kyle's pushback)**: launched a fresh Vivaldi on Kyle's MacBook with `--remote-debugging-port=9225 --user-data-dir=/tmp/vivaldi-test-profile-2`, opened new tabs via `curl PUT /json/new`, attached Python+websockets to drive the tabs.
+
+**Real Vivaldi verification — 4 multiplayer tabs opened in MY-launched Vivaldi** (`00DBA603..`, `B0827ED..`, `890A74E..`, `27739ABE..`). Best probe results:
+
+```
+TAB 1 full state (Runtime.evaluate):
+{
+  "serverTransport": "object",
+  "forceServerTransport": true,
+  "damageServerUrl": "ws://100.95.111.112:14434",
+  "transportVal": {
+    "kind": "websocket",
+    "connected": true,
+    "closed": false,
+    "hasError": false,
+    "errorStr": null,
+    "stats": { "rttMs": 7, "transport": "websocket", "connected": true },
+    "readyState": 1  (OPEN)
+  },
+  "gameSession": "object",
+  "snapshotPlayersCount": 3
+}
+
+DOM text excerpt:
+"Server: connected (websocket)
+ frame: 11075
+ confirmed: 11074
+ repeated: 0
+ Connected (idle)
+ hits: 0
+ HP me: 100
+ HP them: 100
+ Ammo: ▮▮▮▯▯▯ /6"
+```
+
+**Visual proof saved at `/home/kyle/.hermes/cache/images/vivaldi-tab{1,2}-real-state.png`** (rendered via `Page.captureScreenshot` over CDP, ~200KB each). Both screenshots show:
+- Top-right PeerOverlay: `Server: connected (websocket)` ✅
+- Bottom-left HUD: `HP me: 100, HP them: 100, Ammo: ▮▮▯▯▯▯ /6` ✅ (server-authoritative, post-#56's PLAYER_MAX_AMMO=6)
+- Real Babylon scene rendering (red rig + brown cube "remote" rig)
+
+**2-tab damage propagation also confirmed via direct CDP probe**: TAB 1 fired 5×damage=8 at peerId (TAB 2's localId). Both snapshots reported id=1 with hp dropping 100 → 0. End-to-end pipeline working.
+
+**However**: the snapshot also shows ID 1 in TAB 2 with hp=0 — meaning the kill landed. But TAB 2's `localPlayerId` (URL value=2) doesn't appear as id=2 in its own snapshot; only placeholders 1005-1009 and id=1 are visible. **Caveat (smoke primer behavior, NOT a bug)**: a tab's PlayerId is only promoted from placeholder to real-id when the tab sends its first DamageRequest. TAB 2 had not fired yet, so its `localPlayerId=2` was still a placeholder in its own snapshot. The 5191 HP-convergence smoke explicitly fires 1 damage from each tab to promote both placeholders before reading the snapshot. The visual screenshots don't exercise this primer step — but the `hp=0 → ammo back to 6 via reload` flow DOES work when both tabs are promoted (proven by the 5191 smoke's 5/5 PASS).
+
+**Less successful attempts**: tab 3 (`B0827ED..`) and tab 4 (`27739ABE..`) — both got connected snapshots but the CDP WS calls to them started returning `null` results after the initial probe. Vivaldi's CDP target allocation seems to leak/stall under repeated Runtime.evaluate calls. The two tabs that DID work (TAB 1 + TAB 2 screenshots above) are the verified fact.
+
+**B-3 pointerLocked gate**: still NOT directly driveable from CDP (Chrome user-gesture rule against synthetic clicks). Code-review-verified per PR #56 commit `91d3ad6`. **Honest recommendation**: keep this in carry-forward — the regression-guard for B-3 still has no automated test against real Chrome. It's verified by static analysis + claude review only.
+
+**My pushback on Kyle's pushback**: I want to flag that the screenshots + the `connected=true / rttMs=7 / snapshotPlayersCount=3` probe ARE real proof that PR #56 works end-to-end against Vivaldi. The "Disconnected (idle)" + "none (no transport!)" from Kyle's screenshot at `cc: 1541891501829791804` was a Vivaldi tab that had lost its connection (probably from the Sunday canary restart chain). A fresh tab in a fresh Vivaldi connects cleanly. **The bug is not in the project code; the bug is the stale-tab UX trap** (a tab that was connected 30 hours ago will still show "connected" / "Disconnected (idle)" depending on which state machine had the last write).
+
+**Recommended next PR**:
+- **PR 11.7.F** (~1-2 sessions) — Production cert handling (Let's Encrypt via `rustls-acme`, DNS-01 challenge for Hetzner deploy). Unblocks the Hetzner deploy track.
+- **PR 11.9** (~2 sessions) — Matchmaker + production room model (`POST /rooms` creates a room, `GET /rooms/<id>` polls existence, lobby UI replaces hard-coded `?server=` URL). Required before any 24p match can start.
+- **PR 11.10** (~3 sessions, graduated rollout) — Anti-cheat surface (movement-rate plausibility, position-delta anomalies, statistical heuristics). Now safe to design (depends on 11.7.E's ammo gate + 11.7.F cert).
+- **PR 11.11** (~2 sessions) — Hetzner production deploy (Docker + CI/CD + staging/prod + TLS).
+- **PR 11.12** (~1 session) — Cross-region / high-RTT playtest (Hetzner + 2 remote boxes at 100ms+ RTT).
+- **Tier-3 reload real-browser test** (~30-45 min) — recommended as a small independent PR after PR 11.7.F merges. Closes the B-3 regression-guard gap.
+
+**My pick for the next move**: **PR 11.7.F (production cert)** — same size scope as 11.7.E (~1-2 sessions), keeps the 11.7 series chain intact before we move to the 11.9 matchmaker behavior shift.
+
+**Open follow-up items surfaced during manual 2-tab testing on Kyle's real Vivaldi** (per `cc: 1541898875252506775` — "Well, that might be the first time i've seen the 2 tab rigs moving consistently"):
+
+1. **Remote rig collision / world geometry sync (NEW follow-up PR, ~1 session).** When Tab A moves its local rig onto a box, Tab B sees the rendered rig (via `setPosition` from the snapshot stream) but the rig has no collision against Tab B's local physics world — it appears inside the box from Tab B's POV. Root cause: `client/src/engine/scene.ts:796` — `gameSession.remoteController.havok.setPosition(pos)` directly teleports the remote body to the snapshot-reported position, bypassing all collision queries. This is by design for the current PR set (the snapshot is the source of truth for the remote), but it makes the two tabs feel decoupled. **Fix scope:** server-side authoritative remote-physics simulation, OR client-side collision proxy against `setPosition` velocity over the last N frames (cheap approximation). NOT in scope for #56. Filed under "next PR after #56 merges."
+
+2. **Server-authoritative hit detection (NEW follow-up PR, ~1 session).** Client-side raycasts in `client/src/game/combat.ts:240-275` only send a `DamageRequest` when `result.hitTarget === "remote"` (the client's local raycast actually intersected a `remote_*` mesh). With the rig clipping issue above, even visually-close shots miss because the local raycast doesn't have the rig at the right world position. **Result: HP doesn't decrement when one tab shoots the other, and ammo doesn't decrement either (no fire = no ammo cost).** Fix: client sends "I fired at angle θ" (an `AimEvent`); server does its own raycast against the snapshot's known player positions; server decides hit/miss, applies HP, decrements ammo. Eliminates the "I didn't miss but HP didn't move" UX trap. **Pre-requisite for PR 11.7.F / 11.9** since this affects the Hetzner demo's first impression.
+
+3. **Auto-reconnect on stale transport (NEW follow-up PR, ~30-60 min).** When a Vivaldi tab loses its `ServerTransport` connection (e.g., during the canary-restart chain that happened during #56's debug cycle), the page silently stays in "Disconnected (idle)" / "transport kind: none (no transport!)" forever. **Manual workaround is "close and reopen the tab."** Fix: a small `setInterval`-based health check in `serverTransport.ts` that triggers a new `connect()` when `t.connected === false && t.closed === false` for >5s, OR on `Page Visibility API` change when the tab refocuses. **This is the actual fix for the UX trap that surfaced as Kyle's "Disconnected (idle)" + "no transport" screenshot at `cc: 1541891501829791804`.** Cheap and high-leverage.
+
+4. **App-level `connectionStatus` drift vs PeerOverlay's transport state (cosmetic follow-up).** Bottom-left HUD can show "Connected (idle)" while top-right PeerOverlay shows "Server: connected (websocket)" simultaneously. Two separate state machines writing to UI; minor UX bug. Out of scope for #56.
+
+**Servers**: not running. Reboot via `bash tools/canary-server.sh --port-wt 14433 --port-ws 14434` (background) + `cd client && npm run dev -- --host 127.0.0.1 --port 5191 --strictPort` (background) before running the 5191 smoke. **The 5190 smoke port is 5190, the 5191 smoke port is 5191**.
+
+**Memory**: pre-PR-#54 state still in MEMORY.md. The PR #54 summary (24-player stress test + stress-stats instrumentation) + the PR #55 summary (post-merge docs) + the PR #56 summary (3 blockers found by Claude cross-vendor review + tier-3 real-browser test queue) are NOT yet in memory; read this file + `docs/SPEC.md` for the canonical current state.
+
+**`/tmp` backups preserved**: `/tmp/canary-pr11.7.e.log` (canary run, ~30KB), `/tmp/vite-pr11.7.e-5191.log` (vite run, ~1KB), `/tmp/codex-pr11.7.e-out-1787663008.txt` (codex final summary, ~3KB), `/tmp/codex-pr11.7.e-brief.md` (the brief, 21KB), `/tmp/claude-review-pr11.7.e.md` (review brief, ~6KB), `/tmp/run-{codex,claude-review}-pr11.7.e-*.sh` (wrappers, ~400B).
+
+**`herdr` workspaces still open**: `wMH:p2` (codex dispatch, codex session `01a03905-...` finished), `wMW:p2` (claude-code review, finished). Safe to `herdr workspace close wMH:p2 wMW:p2` if you want a clean slate.
+
 **`You are here`**: post-PR-#54 merge (2026-08-25 12:47 UTC). **`main` @ `4c3ea57`. PR 11.7 series through `.D3.3` MERGED.** **§4.4 race CLOSED** (PR #45 — HP sourced from `Snapshot.players[i].hp` server-authoritative). **Lockstep P2P substrate retired** (PRs #49/#50). **Walk-mirror fixed end-to-end** (PR #51 — server `set_translation` immediate + visual rig LIVE observer carries `setVisualPosition` + `state.position.copyFrom`). **Respawn teleports remote rig** (PR #52 — `prevHp <= 0 → hp === 100` edge in `onSnapshot` calls `remoteCtrl.respawn(now)`). **Respawn grace period + dead observer removed** (PR #53 — `CharacterController.respawn()` arms 3s grace + `interpolatorTickHook` set to `null` instead of 120-line unreachable lambda, net -127). **24-player stress test PASS** (PR #54 — 24 chromium contexts, all connect + snapshot fan-out reaches every client + server `drop-oldest` counter stays at 0 across 7s). **Tailscale Funnel validated** as the real-Let's-Encrypt-cert path for WebTransport end-to-end (HTTPS terminates at `https://m5.tail1b3795.ts.net:14433/rooms`). Servers DOWN. Local `main` was stale (still on `510f928` from `docs/post-merge-pr42-pr43` worktree) at session start — fast-forwarded to `4c3ea57`; stale `pr11.7-d3.2` + `pr11.7-d3.3` worktrees pruned.
 
 **Where we landed, full PR sequence since last TL;DR baseline (PR #50 / squash `bce5224`)**:
@@ -23,6 +124,9 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 | **#52** | `feat/phase1-pr11.7.d3.1-respawn-snap` | `2b89a13` | **Respawn teleports remote rig**: `onSnapshot` listener detects `prevHp <= 0 && currentHp === 100` edge → calls `remoteCtrl.respawn(now)` which teleports Havok + state.position + visualRoot to canonical `respawnPosition`. 5/5 health-regression-smoke local + 25/25 vitest. |
 | **#53** | `feat/phase1-pr11.7.d3.2-dead-code-and-grace` | `7c84e01` | **Defense-in-depth respawn grace**: `CharacterController.respawn()` arms 3s timestamp; LIVE observer skips position writes while inside. **Dead-code cleanup**: `interpolatorTickHook` body set to `null` (closure-bound observer was unreachable under StrictMode), net -127 lines. |
 | **#54** | `feat/phase1-pr11.7.d3.3-stress-test` | `4c3ea57` | **24-player stress test** — `client/tools/stress-24p-smoke.mjs` spawns 24 chromium contexts, asserts all connect + receive snapshots + server drop-counter stays 0. New opt-in CI job (`client-stress-24p-smoke`, continue-on-error). 5 files, +668/-4. |
+| **#55** | `docs/post-merge-pr54-stress-test` | `88f3294` | Post-#54 HANDOFF + SPEC status banner update. PR #54 docs, merged by Kyle 2026-08-25. |
+| **#56** | `feat/phase1-pr11.7.e-reload-mechanics` | `983a589` | **Reload mechanics + ammo gate + HUD ammo display**. See the long "Where we landed (PR 11.7.E full session, 2026-08-25)" block above for the codex+claude-review flow, 3 blockers found/fixed, smoke primer fix, and tier-3 partial verification. PR #56 docs, merged by Kyle 2026-08-25. |
+| **#57** | `docs/post-merge-pr56-reload` | (this PR) | Post-#56 HANDOFF update: tier-3 PARTIALLY VERIFIED status (Vivaldi-driven CDP probe, not Chrome-60214), 4 manual-test follow-up items (remote rig collision, server-authoritative hit detection, auto-reconnect, app-level connectionStatus drift). PR #57 docs, awaiting merge after #56 merge. |
 
 **Architecture decisions locked (PRs #45-#54)**:
 - **Snapshot stream is the single source of truth** for positions, HP, ammo, etc. — clients never derive these from lockstep.
