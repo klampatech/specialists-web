@@ -108,6 +108,8 @@ pub const REJECT_REASON_NO_HISTORY: u8 = 4;
 // only the discriminator reservation matters here).
 pub const DISCRIMINATOR_SNAPSHOT: u8 = 0x07;
 pub const DISCRIMINATOR_STATE_ACK: u8 = 0x08;
+pub const DISCRIMINATOR_RELOAD_REQUEST: u8 = 0x09;
+
 
 /// PR 11.7.B / §3.5 — wire-size constant for the Snapshot BODY
 /// (the disc byte is prepended by the transport router, matching
@@ -135,6 +137,49 @@ pub const SNAPSHOT_WIRE_SIZE_MIN: usize = 4 + 4 + 1;
 ///   1  ammo u8
 ///   1  isFiring u8 (0 or 1 — wire-compatible bool for forward-compat
 ///      with snapshot consumers that don't need a full bool)
+
+// -- ReloadRequest (PR 11.7.E) ----------------------------------------------
+
+/// PR 11.7.E / §3.5 - `ReloadRequest` body size. Layout (big-endian):
+///   byte 0..1  source_player_id (u16 BE)
+///   byte 2..5  event_id (u32 BE - monotonic per source, mirrors
+///              DamageRequest::event_id for the same replay-protection
+///              rationale in `damage_relay::validate_and_relay`)
+/// = 6 bytes body. Wire packet = 7 bytes (disc + body).
+pub const RELOAD_REQUEST_BODY_SIZE: usize = 2 + 4;
+/// PR 11.7.E / §3.5 - full on-the-wire packet (disc + body) = 7 bytes.
+pub const RELOAD_REQUEST_WIRE_SIZE: usize = RELOAD_REQUEST_BODY_SIZE + 1;
+
+/// PR 11.7.E / §3.5 - tab -> server. "Reload my pistol magazine."
+///
+/// Server validates via `damage_relay::validate_and_relay_reload`
+/// (8 gates paralleling `validate_and_relay`) and mutates
+/// `room.players[source].ammo = PLAYER_MAX_AMMO`. No outgoing
+/// packet - the next Snapshot fan-out carries the new ammo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadRequest {
+    pub source_player_id: u16,
+    pub event_id: u32,
+}
+
+pub fn encode_reload_request(req: &ReloadRequest) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(RELOAD_REQUEST_BODY_SIZE);
+    buf.put_u16(req.source_player_id);
+    buf.put_u32(req.event_id);
+    debug_assert_eq!(buf.len(), RELOAD_REQUEST_BODY_SIZE);
+    buf
+}
+
+pub fn decode_reload_request(buf: &[u8]) -> Option<ReloadRequest> {
+    if buf.len() != RELOAD_REQUEST_BODY_SIZE {
+        return None;
+    }
+    let mut b = buf;
+    Some(ReloadRequest {
+        source_player_id: b.get_u16(),
+        event_id: b.get_u32(),
+    })
+}
 pub const PLAYER_STATE_WIRE_SIZE: usize = 29;
 
 // -- DamageRequest --------------------------------------------------------
@@ -721,6 +766,74 @@ mod tests {
         let bytes = encode_snapshot(&snap);
         assert_eq!(bytes.len(), SNAPSHOT_WIRE_SIZE_MIN);
         assert_eq!(bytes.len(), 9, "Snapshot with 0 players is the header only: 4+4+1 = 9 bytes");
+    }
+
+    // -- ReloadRequest wire type (PR 11.7.E) -----------------------------
+
+    #[test]
+    fn reload_request_body_is_6_bytes() {
+        let req = ReloadRequest {
+            source_player_id: 0x5566,
+            event_id: 0xdeadbeef,
+        };
+        let bytes = encode_reload_request(&req);
+        assert_eq!(bytes.len(), RELOAD_REQUEST_BODY_SIZE);
+        assert_eq!(
+            bytes.len(),
+            6,
+            "ReloadRequest body is source_player_id u16 BE (2) + event_id u32 BE (4) = 6 bytes",
+        );
+        assert_eq!(
+            RELOAD_REQUEST_WIRE_SIZE,
+            RELOAD_REQUEST_BODY_SIZE + 1,
+            "wire size = body size + 1 discriminator byte",
+        );
+        assert_eq!(RELOAD_REQUEST_WIRE_SIZE, 7);
+    }
+
+    #[test]
+    fn reload_request_roundtrip_preserves_all_fields() {
+        let original = ReloadRequest {
+            source_player_id: 7,
+            event_id: 0xfeedface,
+        };
+        let bytes = encode_reload_request(&original);
+        let decoded = decode_reload_request(&bytes).expect("decode must succeed");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn reload_request_rejects_wrong_size() {
+        let req = ReloadRequest {
+            source_player_id: 1,
+            event_id: 1,
+        };
+        let bytes = encode_reload_request(&req);
+        // 1-byte short
+        let truncated = &bytes[..5];
+        assert!(
+            decode_reload_request(truncated).is_none(),
+            "decoder must reject 5-byte buffer (PR 11.7.E off-by-one)",
+        );
+        // 1-byte long
+        let mut padded = bytes.clone();
+        padded.push(0);
+        assert!(decode_reload_request(&padded).is_none());
+        // Empty buffer
+        assert!(decode_reload_request(&[]).is_none());
+    }
+
+    #[test]
+    fn reload_request_is_big_endian() {
+        let req = ReloadRequest {
+            source_player_id: 0x0102,
+            event_id: 0x03040506,
+        };
+        let bytes = encode_reload_request(&req);
+        // byte 0..1 = source_player_id BE: 01 02
+        assert_eq!(&bytes[0..2], &[0x01, 0x02]);
+        // byte 2..5 = event_id BE: 03 04 05 06
+        assert_eq!(&bytes[2..6], &[0x03, 0x04, 0x05, 0x06]);
     }
 
     #[test]

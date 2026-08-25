@@ -50,6 +50,13 @@ pub struct Player {
     /// `server_timestamp` — PR 11.7 wires that; for now we use the
     /// proxy below.
     pub last_ping_received_at: Option<Instant>,
+    /// PR 11.7.E / §3.5 — server-side per-player reload rate-limit
+    /// timestamp. The validator (`validate_and_relay_reload`) rejects
+    /// any reload request whose `last_reload_at` is within
+    /// `RELOAD_RATE_LIMIT_MS` of `now` (1/sec anti-spam). `None` means
+    /// "has never reloaded" — first reload always passes the rate-limit
+    /// gate.
+    pub last_reload_at: Option<Instant>,
 }
 
 impl Player {
@@ -60,6 +67,13 @@ impl Player {
             ammo: 0,
             last_fire_at: None,
             last_ping_received_at: None,
+            // PR 11.7.E / §3.5 — server-side per-player reload rate-limit
+            // timestamp. The validator (`validate_and_relay_reload`)
+            // rejects any reload request whose `last_reload_at` is
+            // within RELOAD_RATE_LIMIT_MS of `now` (1/sec anti-spam).
+            // `None` means "has never reloaded" — first reload always
+            // passes the rate-limit gate.
+            last_reload_at: None,
         }
     }
 }

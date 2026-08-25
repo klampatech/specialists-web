@@ -509,6 +509,13 @@ export async function createScene(
     // [-π/2, +π/2] so users see hard limits at the physical pitch
     // boundary (every FPS behavior).
     onPitchDelta: (delta) => chase.applyPitchDelta(delta),
+    // PR 11.7.E / §3.5 — R fires reload. Delegates to
+    // gameSession.tryStartReload() which gates on pointer-locked,
+    // alive, ammo<max, not-already-reloading, then sends the
+    // ReloadRequest and starts the client-local progress timer.
+    onReload: () => {
+      gameSession?.tryStartReload?.();
+    },
   }, canvas);  // PR 7.3: bind mouse handlers directly to the canvas so clicks
                // always reach the listener regardless of Babylon's attachControl
                // pointer-capture behavior.
@@ -585,6 +592,24 @@ export async function createScene(
         interpolatorTickHook?.(now);
       }
       gameSession.tick(state, deltaSeconds, now);
+      // PR 11.7.E / §3.5 — reload-bar timer expiry. The snapshot confirms
+      // the server has refilled ammo (typically within ~50ms of the
+      // ReloadRequest), but the HUD bar tracks the client-local 1500ms
+      // visual timer. Clearing on snapshot arrival made the bar disappear
+      // in ≤50ms (claude review B-2). Clear the timer here when the
+      // visual deadline expires — only if a reload is in flight.
+      try {
+        const reloadingUntilMs = (gameSession as unknown as {
+          getReloadingUntilMs?: () => number | null;
+        }).getReloadingUntilMs?.();
+        if (reloadingUntilMs !== null && reloadingUntilMs !== undefined && now >= reloadingUntilMs) {
+          (gameSession as unknown as {
+            _clearReloadingUntilMs?: () => void;
+          })._clearReloadingUntilMs?.();
+        }
+      } catch {
+        // gameSession may not expose the hook in production bundles; ignore.
+      }
       // PR 7: render tracers for any fire_hit / fire_miss events that were
       // generated since the last frame. consumeUnrenderedCombatEvents()
       // advances the internal cursor so we never draw a tracer twice.
@@ -1316,6 +1341,13 @@ export async function createScene(
             // interpolator's tick can latch onto the new position.
             const liveGameSession = (window as unknown as {__gameSession?: GameSession}).__gameSession;
             const liveRemoteCtrl = liveGameSession?.remoteController;
+                      // PR 11.7.E / §3.5 — reload completion detection moved to the
+            // client-local timer (see gameSession.tryStartReload's tick
+            // observer in scene.ts). The snapshot confirms the server
+            // side completed, but the HUD bar tracks the client-local
+            // 1500ms visual timer (which is what the player perceives as
+            // "reloading"). Clearing on every snapshot where ammo>=6 made
+            // the bar vanish in ≤50ms instead of the intended 1500ms.
             for (const p of snap.players) {
               // Skip placeholder ids (1000+) — those are un-promoted
               // connections waiting for their first DamageRequest.

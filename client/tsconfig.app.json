@@ -17,5 +17,6 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "../protocol/**/*.ts"]
+  "include": ["src", "../protocol/**/*.ts"],
+  "exclude": ["../protocol/**/*.test.ts"]
 }

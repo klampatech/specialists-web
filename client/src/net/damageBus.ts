@@ -43,6 +43,16 @@ import type {
   Pong,
   PositionUpdate,
 } from "../../../protocol/damage";
+// PR 11.7.E / §3.5 — ReloadRequest encoder/decoder. Mirror of the
+// Rust `encode_reload_request` / `decode_reload_request`. The
+// client only sends ReloadRequests (no inbound 0x09 dispatch —
+// the server is the sole producer of the post-reload Snapshot
+// that carries the new ammo value).
+// PR 11.7.E / §3.5 — only the encoder + type are needed in this
+// file (the typed sendReloadRequest helper). The decoder + size
+// constants live in protocol/reload.ts for symmetry with the
+// server-side decode_reload_request; they're not used here.
+import type { ReloadRequest } from "../../../protocol/reload";
 import type { ServerTransport } from "./serverTransport";
 import { applyDamage } from "../game/health";
 import type { CharacterController } from "../engine/characterController";
@@ -158,6 +168,44 @@ export function sendPing(t: ServerTransport, p: Ping): void {
  *  directly in PR 11.6.C). */
 export function sendInputsServer(t: ServerTransport, i: InputsServer): void {
   t.sendInputs(i);
+}
+
+/**
+ * PR 11.7.E / §3.5 — send a typed `ReloadRequest` over the transport.
+ *
+ * The server validates the request (`damage_relay::validate_and_relay_reload`,
+ * 8 gates paralleling `validate_and_relay`) and on success mutates
+ * `room.players[source].ammo = PLAYER_MAX_AMMO`. The next 20Hz Snapshot
+ * broadcast (discriminator 0x07) carries the new ammo value to every
+ * connected tab — no private ack packet (PR 11.7.E locked decision #4).
+ *
+ * The caller is responsible for the `eventId` monotonicity (the
+ * `nextReloadEventId` helper below is the canonical counter). The
+ * server's bounded-window gate (`RELOAD_EVENT_ID_WINDOW = 64`) allows
+ * tab reloads to recover without invalidating subsequent requests.
+ */
+export function sendReloadRequest(
+  t: ServerTransport,
+  req: ReloadRequest,
+): number {
+  t.sendReloadRequest(req);
+  return req.eventId;
+}
+
+/** Monotonic per-local-player counter for ReloadRequest eventIds.
+ *  Mirrors the `nextEventId` counter in `gameSession.ts` (used for
+ *  DamageRequest). The smoke drives this via `__reloadBus` to assert
+ *  the server's bounded-window gate accepts the next reload. */
+let _nextReloadEventId = 1;
+export function nextReloadEventId(): number {
+  return _nextReloadEventId++;
+}
+/** DEV-only: reset the counter. Tests / smokes reset between scenarios
+ *  so the bounded-window math doesn't accidentally accumulate across
+ *  runs. NOT exposed via the production probe — it's a side-effect of
+ *  the vitest boundary tests, not a runtime API. */
+export function _resetReloadEventIdForTests(next: number = 1): void {
+  _nextReloadEventId = next;
 }
 
 // -- Broadcast handler ----------------------------------------------------

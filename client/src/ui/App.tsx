@@ -62,6 +62,18 @@ interface HudState {
   /** PR 11.2: current locked viewMode (0 first-person, 1 over-shoulder).
    *  Drives the "return to <view>" subtitle on the Resume button. */
   viewMode: number;
+  /** PR 11.7.E / §3.5 — server-authoritative local ammo count.
+   *  Sourced from `__latestSnap().players[localPlayerId].ammo`
+   *  (NOT a local controller field — the snapshot is the single
+   *  source of truth, mirroring the HP pattern). Drives the
+   *  BulletHud ammo display ("▮▮▯▯▯ /6"). */
+  localAmmo: number;
+  /** PR 11.7.E / §3.5 — reload-progress timestamp
+   *  (`performance.now()`-relative) or `null` when idle. Drives
+   *  the BulletHud reload-progress bar. Cleared by the `__latestSnap`
+   *  listener in scene.ts when the snapshot reports
+   *  `localAmmo === PLAYER_MAX_AMMO`. */
+  reloadingUntilMs: number | null;
 }
 
 export function App() {
@@ -107,6 +119,11 @@ export function App() {
     isPointerLocked: false,
     everLocked: false,
     viewMode: 0,
+    // PR 11.7.E / §3.5 — initial ammo = PLAYER_MAX_AMMO (matches the
+    // server-side auto-register default). HUD reads server-authoritative
+    // ammo via __latestSnap; this is just the pre-first-snapshot value.
+    localAmmo: 6,
+    reloadingUntilMs: null,
   });
 
   // PR 11.7.D2 / §3.10 — WebRTC peer / __peer / __smokeSignal /
@@ -189,6 +206,19 @@ export function App() {
           // + respawn countdown. Cheap read — just two field accesses.
           const health = session.getHealthSnapshot();
           // chase already declared above
+          // PR 11.7.E / §3.5 — read local ammo + reload-progress
+          // for the HUD. Ammo is server-authoritative (sourced from
+          // the latest snapshot via `__latestSnap`); reload-progress
+          // is client-local (`gameSession.getReloadingUntilMs`).
+          // Both default to 0 / null when the snapshot / session
+          // hasn't initialized yet (first ~50ms of connection).
+          const snap = typeof window !== "undefined"
+            ? (window as unknown as {__latestSnap?: () => { players: Array<{ playerId: number; ammo: number }> } | null}).__latestSnap?.() ?? null
+            : null;
+          const localSnapPlayer = snap
+            ? snap.players.find((p) => p.playerId === session.localPlayerId)
+            : null;
+          const reloadingUntilMs = session.getReloadingUntilMs?.() ?? null;
           setHud((h) => ({
             ...h,
             frame: session.frame,
@@ -200,6 +230,8 @@ export function App() {
             remoteHp: health.remote.hp,
             localRespawningMs: health.local.respawningMs,
             remoteRespawningMs: health.remote.respawningMs,
+            localAmmo: localSnapPlayer ? localSnapPlayer.ammo : h.localAmmo,
+            reloadingUntilMs,
             isPointerLocked: chase.isPointerLocked,
             everLocked: chase.everLocked,
             viewMode: chase.viewMode,
@@ -279,6 +311,10 @@ export function App() {
             remoteHp={hud.remoteHp}
             localRespawningMs={hud.localRespawningMs}
             remoteRespawningMs={hud.remoteRespawningMs}
+            localAmmo={hud.localAmmo}
+            maxAmmo={6}
+            reloadingUntilMs={hud.reloadingUntilMs}
+            reloadProgressMs={1500}
           />
           {/* PR 11.2: pause / loadout menu overlay. Visible when the
               pointer is unlocked AND the user has locked at least once

@@ -47,6 +47,14 @@ export interface InputState {
   wallrunPressed: boolean;
   cameraTogglePressed: boolean;
   fireHeld: boolean; meleePressed: boolean; bulletTimeHeld: boolean;
+  /** PR 11.7.E / §3.5 — R-key rising-edge flag. Mirrors the other
+   *  one-shot flags (`jumpPressed`, `divePressed`, etc.). The
+   *  gameSession's `tick()` reads this and forwards it to
+   *  `reloadBus.sendReloadRequest` (after the pointer-locked +
+   *  alive + not-full-mag gates). NOT on the wire — reload is a
+   *  local-visual action that the server-authoritative ammo state
+   *  confirms via the next 20Hz Snapshot fan-out. */
+  reloadPressed?: boolean;
   /** PR 11.1: per-frame yaw in radians (0..2π). Sourced from the wire
    *  via `decodeInput` (bytes 2-3). The controller's `update()` applies
    *  it via `setYaw()` BEFORE projecting the character-relative WASD

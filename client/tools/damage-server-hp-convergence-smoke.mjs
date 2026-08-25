@@ -190,14 +190,26 @@ async function runSmoke() {
   // QUIC stack rejects self-signed certs even with --ignore-certificate-errors
   // (Chromium QUIC TLS verifier has its own gate). The canary server's
   // WebSocket fallback serves the same wire protocol.
-  const serverUrl = `ws://localhost:${WS_PORT}/rooms/DEVBX`;
+  //
+  // PR 11.7.E / FIX — unique room ID per smoke run. Pre-fix, this and
+  // the reload smoke shared `DEVBX`. CI boots the canary once and runs
+  // all 3 smokes sequentially against the SAME canary process —
+  // HP-convergence (run first) kills both players via the §4.4
+  // 100-damage kill path, leaving room state with `players[1].hp = 0`
+  // and `players[2].hp = 0`. The reload smoke (run second) then fails
+  // at reload Gate 3 ("source HP is 0 (dead)") because both players
+  // are dead. Now each smoke gets its own room per run.
+  const runId = Date.now();
+  const roomId = `HP_CONV_${runId}`;
+  const serverUrl = `ws://localhost:${WS_PORT}/rooms/${roomId}`;
+  log(`Smoke run ID = ${runId}, room = ${roomId}`);
   for (const [page, localId, peerId] of [[pageA, 1, 2], [pageB, 2, 1]]) {
     await page.addInitScript({
       content: `
           window.__forceServerTransport = true;
           window.__damageServerPorts = { wt: ${WT_PORT}, ws: ${WS_PORT} };
           window.__damageServerUrl = ${JSON.stringify(URL)};
-          window.__damageServerRoomId = "DEVBX";
+          window.__damageServerRoomId = "${roomId}";
           window.__localPlayerId = ${localId};
           window.__peerPlayerId = ${peerId};
         `,

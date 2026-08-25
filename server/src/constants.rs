@@ -105,3 +105,18 @@ pub const JUMP_IMPULSE: f32 = 5.5;
 /// 40 bytes = ~30KB per room at 24p. Used in
 /// `PositionHistory::should_store_frame`.
 pub const POSITION_HISTORY_STORE_HZ: u32 = 32;
+
+// PR 11.7.E / §3.5 — reload mechanics constants. Server is canonical for
+// PLAYER_MAX_AMMO; the client mirrors the value in
+// `client/src/engine/characterConfig.ts::COMBAT.dualPistol.PLAYER_MAX_AMMO`
+// so the HUD's reload-progress UI can render the bar before the first
+// snapshot arrives (initial render before server-authoritative state).
+/// Maximum ammo per magazine. Dual-pistol (the only reloadable weapon in
+/// PR 11.7.E) carries a 6-bullet magazine. Matches the client-side
+/// `COMBAT.dualPistol.PLAYER_MAX_AMMO` so the reload-progress bar
+/// fills exactly when the snapshot reports `ammo == PLAYER_MAX_AMMO`.
+pub const PLAYER_MAX_AMMO: u8 = 6;
+/// Minimum interval between reloads per player (server-side rate-limit).
+/// 1 reload per second per player — conservative anti-spam gate. Mirrors
+/// `client/src/engine/characterConfig.ts::COMBAT.dualPistol.lastReloadAtMinIntervalMs`.
+pub const RELOAD_RATE_LIMIT_MS: u64 = 1000;

@@ -27,7 +27,7 @@ pub mod session;
 pub mod snapshot;
 pub mod transport;
 
-pub use constants::{MAX_PLAYERS_PER_ROOM, PING_HZ, POSITION_UPDATE_HZ, TICK_RATE_HZ};
+pub use constants::{MAX_PLAYERS_PER_ROOM, PING_HZ, PLAYER_MAX_AMMO, POSITION_HISTORY_RETENTION_FRAMES, POSITION_HISTORY_STORE_HZ, POSITION_UPDATE_HZ, RECONCILIATION_THRESHOLD_M, INTERPOLATION_DELAY_MS, MAX_SNAPSHOT_AGE_MS, MAX_RECONCILIATION_SNAP_DISTANCE_M, RELOAD_RATE_LIMIT_MS, TICK_RATE_HZ, SNAPSHOT_RATE_HZ};
 pub use glam::Vec3;
 pub use hitscan::{
     chest_position, dual_pistol_damage, dual_pistol_hit, forward_from_yaw_pitch,
@@ -53,3 +53,9 @@ pub use protocol::{
 pub use connection_outbound::ConnectionOutbound;
 pub use session::{Player, PlayerId, Room, ServerFrame};
 pub use snapshot::SnapshotGenerator;
+
+// PR 11.7.E / §3.5 — ReloadRequest encoder/decoder/constants re-exports.
+pub use protocol::{
+    decode_reload_request, encode_reload_request, ReloadRequest,
+    DISCRIMINATOR_RELOAD_REQUEST, RELOAD_REQUEST_BODY_SIZE, RELOAD_REQUEST_WIRE_SIZE,
+};

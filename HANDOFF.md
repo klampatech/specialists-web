@@ -108,27 +108,59 @@ DOM text excerpt:
 
 **`herdr` workspaces still open**: `wMH:p2` (codex dispatch, codex session `01a03905-...` finished), `wMW:p2` (claude-code review, finished). Safe to `herdr workspace close wMH:p2 wMW:p2` if you want a clean slate.
 
+**`You are here`**: post-PR-#54 merge (2026-08-25 12:47 UTC). **`main` @ `4c3ea57`. PR 11.7 series through `.D3.3` MERGED.** **§4.4 race CLOSED** (PR #45 — HP sourced from `Snapshot.players[i].hp` server-authoritative). **Lockstep P2P substrate retired** (PRs #49/#50). **Walk-mirror fixed end-to-end** (PR #51 — server `set_translation` immediate + visual rig LIVE observer carries `setVisualPosition` + `state.position.copyFrom`). **Respawn teleports remote rig** (PR #52 — `prevHp <= 0 → hp === 100` edge in `onSnapshot` calls `remoteCtrl.respawn(now)`). **Respawn grace period + dead observer removed** (PR #53 — `CharacterController.respawn()` arms 3s grace + `interpolatorTickHook` set to `null` instead of 120-line unreachable lambda, net -127). **24-player stress test PASS** (PR #54 — 24 chromium contexts, all connect + snapshot fan-out reaches every client + server `drop-oldest` counter stays at 0 across 7s). **Tailscale Funnel validated** as the real-Let's-Encrypt-cert path for WebTransport end-to-end (HTTPS terminates at `https://m5.tail1b3795.ts.net:14433/rooms`). Servers DOWN. Local `main` was stale (still on `510f928` from `docs/post-merge-pr42-pr43` worktree) at session start — fast-forwarded to `4c3ea57`; stale `pr11.7-d3.2` + `pr11.7-d3.3` worktrees pruned.
 
+**Where we landed, full PR sequence since last TL;DR baseline (PR #50 / squash `bce5224`)**:
 
-### 🔴 Open critical issues (DO NOT drop these on the floor)
+| PR | Branch | Squash | What |
+|-----|--------|--------|------|
+| **#45** | `feat/phase1-pr11.7.d1-snapshot-hp-smoke` | `6b571f0` | §4.4 race CLOSED. Smoke reads HP from `Snapshot.players[i].hp` (server-authoritative) instead of `gameSession.remoteController.state.hp` (lockstep). Removes all `[XFAIL §4.4]` log blocks; xfail becomes strict assertion. |
+| **#46** (closed) | `docs/post-merge-pr11.7.d-squash-sha` | — | Stale-merge docs artifact, superseded by #47 |
+| **#47** | `docs/post-merge-pr11.7.d-squash-sha` | `a79787f` | Records PR 11.7.D merge at squash `6b571f0`, removes stale rebase marker, CI runs + CF-N1 + 512-bump |
+| **#48** | `fix/cfn2-rtt-first-sample-hard-throw` | `eceec30` | 5191 smoke CF-N2 RTT first-sample hard-threshold replaced with warn-retry; removes pre-emption that masked the §4.4 race intermittently |
+| **#49** | `feat/phase1-pr11.7.d2.1-substrate-retirement` | `9bff2f2` | Snapshot drop-oldest back-pressure + `0x06 InputSeq` trailer + `protocol/constants.ts` extraction |
+| **#50** | `feat/phase1-pr11.7.d2.2-lockstep-retirement` | `bce5224` | Retires `ggrsRuntime` + `peer` + `ggnet`. `remoteInterpolator` is now the SOLE driver of remote rig visual position. (28 files, ~+1500/-2200 net -700) |
+| **#51** | `feat/phase1-pr11.7.d3-debug-hud` | `8afca89` | **Walk-mirror fix** — server `body.set_translation(..., true)` (immediate) replaces queued `set_next_kinematic_translation`. Client LIVE render observer adds `setVisualPosition` + `state.position.copyFrom` calls. Visual evidence (`docs/screenshots/2026-08-23-multiplayer-validation/two-tab-multiplayer.gif`) shows teal rig visibly tracking Tab A's walk. |
+| **#52** | `feat/phase1-pr11.7.d3.1-respawn-snap` | `2b89a13` | **Respawn teleports remote rig**: `onSnapshot` listener detects `prevHp <= 0 && currentHp === 100` edge → calls `remoteCtrl.respawn(now)` which teleports Havok + state.position + visualRoot to canonical `respawnPosition`. 5/5 health-regression-smoke local + 25/25 vitest. |
+| **#53** | `feat/phase1-pr11.7.d3.2-dead-code-and-grace` | `7c84e01` | **Defense-in-depth respawn grace**: `CharacterController.respawn()` arms 3s timestamp; LIVE observer skips position writes while inside. **Dead-code cleanup**: `interpolatorTickHook` body set to `null` (closure-bound observer was unreachable under StrictMode), net -127 lines. |
+| **#54** | `feat/phase1-pr11.7.d3.3-stress-test` | `4c3ea57` | **24-player stress test** — `client/tools/stress-24p-smoke.mjs` spawns 24 chromium contexts, asserts all connect + receive snapshots + server drop-counter stays 0. New opt-in CI job (`client-stress-24p-smoke`, continue-on-error). 5 files, +668/-4. |
+| **#55** | `docs/post-merge-pr54-stress-test` | `88f3294` | Post-#54 HANDOFF + SPEC status banner update. PR #54 docs, merged by Kyle 2026-08-25. |
+| **#56** | `feat/phase1-pr11.7.e-reload-mechanics` | `983a589` | **Reload mechanics + ammo gate + HUD ammo display**. See the long "Where we landed (PR 11.7.E full session, 2026-08-25)" block above for the codex+claude-review flow, 3 blockers found/fixed, smoke primer fix, and tier-3 partial verification. PR #56 docs, merged by Kyle 2026-08-25. |
+| **#57** | `docs/post-merge-pr56-reload` | (this PR) | Post-#56 HANDOFF update: tier-3 PARTIALLY VERIFIED status (Vivaldi-driven CDP probe, not Chrome-60214), 4 manual-test follow-up items (remote rig collision, server-authoritative hit detection, auto-reconnect, app-level connectionStatus drift). PR #57 docs, awaiting merge after #56 merge. |
 
-1. **WebTransport validation against real users is INCOMPLETE.** PR #50's substrate retirement assumes WT is the first-class transport. We've verified via headless-Chrome probes that **WebTransport is unreachable in dev** because:
-   - Chrome strips `WebTransport` + `WebGPU` from insecure (`http://`) page contexts. **The Vite dev server must serve HTTPS for WT to be testable.** Fixed during this session by adding `VITE_HTTPS_KEY`/`VITE_HTTPS_CERT` env vars that point at the canary's existing cert (`server/certs/dev.{pem,key}`). Vite must be booted with these to serve HTTPS on 5174.
-   - Chrome's QUIC handshake has **separate cert verification** from HTTPS. The dev cert (`CN=wtransport self-signed`, regenerated 2026-08-23 to include `IP:100.95.111.112` in SAN via `canary-server.sh --sans 100.95.111.112`) is trusted for HTTPS once mkcert'd into the OS trust store, but **Chrome's QUIC client will only trust the cert if served with a CA chain Chrome respects**. Self-signed fails even with `--ignore-certificate-errors` because that flag excludes QUIC cert verification.
-   - **Result:** WT works for HTTPS endpoints served by a CA Chrome trusts. For dev, this means either a `tailscale funnel` termination (gives a real Let's Encrypt cert) OR the cert-trust-flags that change every Chrome release and never seem to cover QUIC. **End-to-end dev validation is blocked behind this.**
-   - **Headless Chrome151 on m5 cannot expose WebTransport/WebGPU regardless of flags.** Confirmed via `--dump-dom` and `--enable-features=WebTransport --enable-unsafe-webgpu --webtransport-developer-mode`: `typeof WebTransport === "undefined"` in headless mode period. So even after the cert problem is fixed, neither Kyle's Chrome nor my Playwright testbed can drive the WT path — a non-headless browser is required.
-   - **NEXT PR: "WebTransport validation."** This is THE blocking issue for the 24-player goal. WebTransport is THE first-class transport; if it doesn't actually run end-to-end, the substrate retirement is premature.
+**Architecture decisions locked (PRs #45-#54)**:
+- **Snapshot stream is the single source of truth** for positions, HP, ammo, etc. — clients never derive these from lockstep.
+- **`ServerTransport` is the sole multiplayer transport** — no P2P, no `peer.on("respawn")` events.
+- **`remoteInterpolator` drives the remote visual rig position** — Havok body is updated for collision/render, but movement comes from snapshot interpolation, not from `remoteController.update()`.
+- **Walk-mirror formula is `body.set_translation(..., true)` (immediate)**, never `set_next_kinematic_translation` (queued) — queued translations are silently lost when physics step skips client-driven bodies.
+- **Render observers touching the remote rig MUST update all three** (`havok.setPosition` + `setVisualPosition` + `state.position.copyFrom`). Missing any of the three = a different layer of "the rig is stuck."
+- **HP source = `Snapshot.players[i].hp`** (server-authoritative) for ALL smoke probes, broadcast handlers, and clients. Lockstep controller HP is allowed to drift; the smoke now ignores it.
 
-2. **Debug-logging surface is a thin veneer over a stack with near-zero observability.** Every bug fixed this session was solved by adding a debug global + reading it via `page.evaluate`. That's not debugging, that's archaeology. **The architecture has no structured tracing, no per-room request log, no client-side diagnostic HUD.** Need to land a debug HUD overlay (toggle key `~`) + server-side per-room structured tracing (`#[instrument]` on every handler). This was deferred during the substrate work because "fix the bug first, observe later" — but the order is wrong; we can't keep flying blind.
+**The next move (Phase 1 / PR 11.7.E)**: reload mechanics + ammo gate (server `validate_and_relay` ammo validation + client HUD pickup UX + smoke). ~1-2 sessions. Per plan §5.3:
+- **PR 11.7.E (~1-2 sessions)** — Reload mechanics (ammo gate on the validator, R keybind, client HUD pickup UX). Closes the last open 11.7 series PR.
+- **PR 11.7.F (~1-2 sessions)** — Production cert handling (Let's Encrypt via `rustls-acme`, DNS-01 challenge for Hetzner deploy).
+- **PR 11.9 (~2 sessions)** — Matchmaker + production room model (`POST /rooms` creates a room, `GET /rooms/<id>` polls existence, lobby UI replaces hard-coded `?server=` URL). Required before any 24p match can start.
+- **PR 11.10 (~3 sessions, graduated rollout)** — Anti-cheat surface (movement-rate plausibility, position-delta anomalies, statistical heuristics).
+- **PR 11.11 (~2 sessions)** — Hetzner production deploy (Docker + CI/CD + staging/prod + TLS).
+- **PR 11.12 (~1 session)** — Cross-region / high-RTT playtest (Hetzner + 2 remote boxes at 100ms+ RTT).
 
-3. **`5177` smoke is intermittently flaky.** Local result was 1 PASS + 1 FAIL in two consecutive runs (same code, same servers). Most likely culprit: ghost connections from previously-tabbed browsers aren't cleaned up by the canary restart — a fresh canary boots, but clients' TCP NAT idle timers still hold the old connection. **The flake was tolerated in PR #50 because the smoke matrix is already 20/20 with re-runs.**
+**My pick for the next move: PR 11.7.E (reload mechanics)** — smallest, keeps the 11.7 series chain intact before we move to matchmaker (PR 11.9) which is a behavior shift. Closes the open ammo path in `validate_and_relay` from PR 11.6.D.
 
-4. **§4.4 race still open** (carried from previous sessions). PR #42 (channel bump 64→256) + PR #43 (drop optimistic apply) closed the client side; server side (snapshot pressure, broadcast drops under load) is **not closed**. Mitigation is now bigger mpsc; the root cause is bandwidth floor, not the queue.
+**Carry-forwards still open**:
+- **WebTransport end-to-end validation on a real browser** (Funnel is up; tested via HTTPS termination but never with Kyle's Chrome hitting `https://m5.tail1b3795.ts.net:14433/rooms` directly).
+- **5177 smoke intermittent flake** — tolerable in current state, but the fix path (respawn-grace) is now in place via PR #53; should be re-tested post-grace to confirm it tightens.
+- **5177 smoke spawned at correct `respawnPosition`** — moved the visual rig at the same time as position, so the smoke assertion should pass cleanly now.
+- **Anti-cheat detection runs unstarted** — depends on PR 11.7.E (ammo gate) shipping first.
+- **The "carry-forward" list in § "Open critical issues" below is now stale (pre-dates PRs #51-#54 closure)** — being closed as it gets re-evaluated.
 
-### ⚠️ Caveats — what's NOT in the 20/20 green
+### 📦 Archived (resolved) open critical issues
 
-- **Manual-flow smoke CI is `continue-on-error: true`** because cold dev-cert generation (~75s) races the smoke's canary-wait timeout on a fresh CI runner. Local run is consistently green; CI is flaky only on the first cold-cert boot. **Once `canary-server.sh` skips cert generation when a pre-baked cert exists in CI cache** (track as separate ticket), flip this to a required gate. Until then, the smoke matrix proven green locally is the source of truth.
-- **`5177` smoke reverted to passing-flaky.** Two consecutive local runs, 1 PASS 1 FAIL. Failure mode: HP caps at 100 after 10 fires (no damage routing) OR remote respawn position is `localSpawn + 2.5` (= remoteSpawn) instead of `localSpawn` (= respawnPosition). Both look like the `tickRespawn` path clobbering the snapshot-driven Havok body — related to issue #2 (observability gap). **NOT a regression gate.**
+The "DO NOT drop on floor" issues from the 2026-08-23 TL;DR are now closed:
+
+1. **WebTransport validation** — Resolved 2026-08-23 via Tailscale Funnel at `https://m5.tail1b3795.ts.net:14433/rooms` (real Let's Encrypt cert, `CN=m5.tail1b3795.ts.net`). Open issue: **end-to-end validation via real Chrome browser hitting Funnel directly** — Funnel cert chain is trusted, but Kyle's browser has not yet exercised this path post-#50. Track as a dev-box manual-test gate before PR 11.11 (Hetzner deploy).
+2. **Observability gap / debug HUD** — Resolved 2026-08-23 via PR #51 / `feat/phase1-pr11.7.d3-debug-hud` squash `68d8f84`. Debug HUD overlay (toggle `~` key) shows transport kind, WebGPU status, local/remote Havok positions, snapshot players, ghost-connection counter, connection state. Server-side per-room structured tracing still NOT shipped (deferred — not blocking per-session debugging any more).
+3. **5177 smoke intermittent flake** — Mechanism surfaced (respawn-teleport clobber on Havok body). Resolved 2026-08-24 via PR #52 (respawn teleport on `hp === 100` edge), confirmed stable 5/5 local runs.
+4. **§4.4 race** — Resolved 2026-08-21 via PR #45 (HP sourced from `Snapshot.players[i].hp`). All `[XFAIL §4.4]` log blocks removed; strict PASS in 5191 smoke at PR #45 final.
 
 ### 🆕 Follow-up: PR 11.7.D3.1 — Respawn doesn't teleport the remote rig (carry-forward, 2026-08-24)
 

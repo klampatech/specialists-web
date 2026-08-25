@@ -38,6 +38,23 @@ export interface InputHooks {
    * menu / browser conflict.
    */
   onSpectatorToggle?: () => void;
+  /**
+   * PR 11.7.E / §3.5 — R fires this. Filtered for `!e.repeat` so
+   * auto-repeat doesn't auto-reload while held. The hook fires
+   * synchronously here; the host (`gameSession.ts`) gates the
+   * actual reload on:
+   *   - `pointerLocked === true` (no R-during-menu / R-during-text-typing)
+   *   - `isEditableTarget === false` (no R-in-textbox — already gated
+   *     above; this hook only fires AFTER the editable check passes)
+   *   - The local player's `hp > 0` (no reload while dead — handled
+   *     by the gameSession's `wasDead` check, not the input listener)
+   *   - The local player's `ammo < PLAYER_MAX_AMMO` (no reload on
+   *     full magazine — handled by the gameSession's
+   *     `ammoReachedMax` check)
+   *   - The dev-mode Debug HUD is closed (handled by the gameSession,
+   *     not the input listener — debug HUD state isn't owned here)
+   */
+  onReload?: () => void;
 }
 
 /** Returned by `createInputListener`. */
@@ -60,6 +77,16 @@ interface HeldState {
   fireHeld: boolean;
   meleePressed: boolean;
   bulletTimeHeld: boolean;
+  /** PR 11.7.E / §3.5 — R key rising-edge flag. The gameSession
+   *  reads this via the existing `read()` interface (see the
+   *  `state` builder in `read()` below); cleared on every read()
+   *  like the other one-shot flags. */
+  reloadPressed: boolean;
+  /** PR 11.7.E / §3.5 — pointer-locked state, persisted on HeldState
+   *  so the R-keypress handler can read it without crossing the hook
+   *  boundary. Mirrored from document.pointerLockElement via the
+   *  `pointerlockchange` listener above. */
+  pointerLocked: boolean;
 }
 
 const KEY_FORWARD = new Set(["w", "W", "ArrowUp"]);
@@ -80,7 +107,8 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
     divePressed: false,
     slideHeld: false,
     wallrunPressed: false,
-    cameraTogglePressed: false, fireHeld: false, meleePressed: false, bulletTimeHeld: false,
+    cameraTogglePressed: false, fireHeld: false, meleePressed: false, bulletTimeHeld: false, reloadPressed: false,
+    pointerLocked: false,
   };
 
   const isEditableTarget = (target: EventTarget | null): boolean => {
@@ -166,6 +194,31 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
       e.preventDefault();
       return;
     }
+    // PR 11.7.E / §3.5 + brief locked decision #7 — R fires the reload
+    // hook. Gated on THREE conditions:
+    //   (a) pointerLocked === true — R is a combat action, only valid
+    //       while the cursor is locked to the canvas (matches the
+    //       fire/melee gates at this same listener layer).
+    //   (b) !isEditableTarget(e.target) — guard against typing R in an
+    //       SDP/lobby textbox (uses the existing helper, see PR 11.2).
+    //   (c) !inDevDebugHud — R toggling the dev overlay would be a
+    //       chat-style no-op; don't fire reload in that branch.
+    // `!e.repeat` so holding R doesn't spam reloads (auto-repeat would
+    // otherwise fire multiple rising-edges per press). preventDefault'd
+    // because R is a common browser shortcut (refresh in some
+    // configurations) and we don't want a stray refresh during combat.
+    if (key === "r" || key === "R") {
+      if (!e.repeat) {
+        held.reloadPressed = held.reloadPressed ?? false;
+        const okToReload = (held.pointerLocked === true);
+        if (okToReload) {
+          hooks.onReload?.();
+          held.reloadPressed = true;
+        }
+      }
+      e.preventDefault();
+      return;
+    }
   };
 
   const onKeyUp = (e: KeyboardEvent): void => {
@@ -228,6 +281,12 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
   };
   const onPointerLockChange = () => {
     const locked = !!target && document.pointerLockElement === target;
+    // PR 11.7.E / §3.5 — mirror onto held.pointerLocked so the R-keypress
+    // handler can read it without crossing the hook boundary. The hook
+    // path (hooks.onPointerLockChange) fires the chase camera's
+    // first-person toggle; this mirror keeps the gate on the reload
+    // path locally consistent.
+    held.pointerLocked = locked;
     // PR 11.2.3 DEBUG: log every browser pointerlockchange event with
     // timestamp + the locked/unlocked result. Filter on "[PR-11.2.3-DEBUG]"
     // in DevTools to see only this trace.
@@ -308,7 +367,7 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
         divePressed: held.divePressed,
         slideHeld: held.slideHeld,
         wallrunPressed: held.wallrunPressed,
-        cameraTogglePressed: held.cameraTogglePressed, fireHeld: held.fireHeld, meleePressed: held.meleePressed, bulletTimeHeld: held.bulletTimeHeld,
+        cameraTogglePressed: held.cameraTogglePressed, fireHeld: held.fireHeld, meleePressed: held.meleePressed, bulletTimeHeld: held.bulletTimeHeld, reloadPressed: held.reloadPressed,
         // PR 11.1: yawRadians is populated by the scene.ts render loop
         // AFTER `read()` returns — scene pulls the latest yaw from the
         // chase camera and writes it onto the state object before
@@ -326,6 +385,10 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
       // per session. Clearing here keeps `meleePressed` true for exactly one
       // read() — same shape as jump/dive/wallrun/cameraToggle edges.
       held.meleePressed = false;
+      // PR 11.7.E: clear the reload rising-edge flag too (matches the
+      // existing one-shot-flag discipline for jump / dive / wallrun /
+      // cameraToggle / melee).
+      held.reloadPressed = false;
       return state;
     },
     dispose: () => {

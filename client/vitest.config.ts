@@ -16,7 +16,15 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: [
+      "src/**/*.test.ts",
+      // PR 11.7.E / §3.5 — protocol/ dir at repo root holds wire-
+      // format codec tests (mirroring the server's protocol_wire.rs
+      // round-trips). The path is RELATIVE TO REPO ROOT because
+      // vitest resolves the include globs from the project root
+      // (which is client/), and we need to escape one level.
+      "../protocol/**/*.test.ts",
+    ],
     // DamageBus tracks module-level state (pendingApplies,
     // recentlySettled). `isolate: false` + `forks: false` keeps
     // the module shared across the file's tests, which is what

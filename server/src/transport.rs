@@ -62,10 +62,10 @@ use specialists_server::constants::DEVBX_ROOM_ID;
 use specialists_server::position_history::Position;
 use specialists_server::protocol::{
     decode_damage_request, decode_inputs_server, decode_ping, decode_position_update,
-    encode_pong, DISCRIMINATOR_DAMAGE_BROADCAST,
+    decode_reload_request, encode_pong, DISCRIMINATOR_DAMAGE_BROADCAST,
     DISCRIMINATOR_DAMAGE_REQUEST, DISCRIMINATOR_INPUTS, DISCRIMINATOR_INPUTS_SERVER,
     DISCRIMINATOR_PING, DISCRIMINATOR_PONG, DISCRIMINATOR_POSITION_UPDATE,
-    DISCRIMINATOR_SNAPSHOT, Pong,
+    DISCRIMINATOR_RELOAD_REQUEST, DISCRIMINATOR_SNAPSHOT, Pong,
 };
 use specialists_server::session::{EncodedInput, PlayerId, Room, ServerFrame};
 
@@ -832,13 +832,16 @@ pub(super) async fn handle_binary(
                 // player in the room. Anyone reporting position IS a
                 // player — this aligns with §3.4.1 and unblocks the
                 // validator's `source in room` gate (gate 2). The
-                // ammo defaults to a sensible starting pool (PR
-                // 11.7's matchmaker will configure per-match ammo;
-                // for the dev-box 10 is plenty).
+                // ammo defaults to a sensible starting pool — PR 11.7.E
+                // locked the dual-pistol magazine to `PLAYER_MAX_AMMO`
+                // (6 rounds). The 10-round default from pre-PR-11.7.E
+                // matched an earlier prototype; the 5191 reload smoke
+                // asserts the snapshot's ammo reads `PLAYER_MAX_AMMO`
+                // after a fresh reload, so the default must match.
                 room_guard.add_player(pu.player_id);
                 if let Some(p) = room_guard.players.get_mut(&pu.player_id) {
                     if p.ammo == 0 {
-                        p.ammo = 10;
+                        p.ammo = specialists_server::constants::PLAYER_MAX_AMMO;
                     }
                 }
                 // PR 11.7.D2.1 / FIX — also register a physics body
@@ -1003,6 +1006,66 @@ pub(super) async fn handle_binary(
             // cleanly with the "unknown inbound discriminator"
             // warn rather than the catch-all `other` arm.
             warn!("client sent Snapshot — discarded (server-only wire type)");
+            vec![]
+        }
+        DISCRIMINATOR_RELOAD_REQUEST => {
+            // PR 11.7.E / §3.5 — ReloadRequest (client → server).
+            // Decode the body, validate via `validate_and_relay_reload`
+            // (8 gates paralleling `validate_and_relay`), and on
+            // success mutate `room.players[source].ammo =
+            // PLAYER_MAX_AMMO`. The next 20Hz Snapshot broadcast
+            // (discriminator 0x07) carries the new ammo value to
+            // every connected tab — no private ack packet (PR
+            // 11.7.E locked decision #4). The validate function
+            // also stamps `last_reload_at` for the rate-limit gate
+            // (1/sec per player) and the `last_event_id_for_source`
+            // monotonicity map for replay protection.
+            let Some(req) = decode_reload_request(&payload[1..]) else {
+                warn!("reloadRequest: decoder rejected malformed payload");
+                return vec![];
+            };
+            // Anti-spoof: the connection's REAL PlayerId is the value
+            // stashed in `connection_state.claimed_player_id` by the
+            // first successful DamageRequest on this connection. If
+            // the request's `source_player_id` doesn't match, the
+            // validator rejects (the inner gate 2). Pre-first-DR, we
+            // trust the request's claimed source as the connection's
+            // identity (mirrors the DamageRequest promotion path).
+            let claimed_player_id = {
+                let conn = connection_state.lock().unwrap();
+                conn.claimed_player_id.get()
+            };
+            let connection_player_id = match claimed_player_id {
+                Some(id) => id,
+                None => req.source_player_id,
+            };
+            let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
+            let mut room_guard = room_arc.write().await;
+            // Ensure the source is registered (mirrors the
+            // PositionUpdate auto-register path — a tab that hasn't
+            // sent any other packet yet should still be able to
+            // request a reload). The validator's gate 1 will reject
+            // if the player isn't in the room, so we add them here
+            // to match the DamageRequest path.
+            room_guard.add_player(connection_player_id);
+            let now = Instant::now();
+            // The validate function returns `Some(())` on success
+            // (the reload happened; the snapshot will fan out the
+            // new ammo) or `None` on rejection (silently — the
+            // validator logs the reason via `warn!`). We don't need
+            // the result; the side-effect is the ammo mutation +
+            // last_reload_at stamp.
+            specialists_server::damage_relay::validate_and_relay_reload(
+                &req,
+                connection_player_id,
+                &mut *room_guard,
+                now,
+            );
+            debug!(
+                source = req.source_player_id,
+                event_id = req.event_id,
+                "reloadRequest processed"
+            );
             vec![]
         }
         other => {
