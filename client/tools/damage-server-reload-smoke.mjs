@@ -4,7 +4,8 @@
 // Boots the canary server (WebTransport + WebSocket) + Vite on port
 // 5191, opens TWO headless browser contexts (each with its own
 // `?server=` URL param + `__forceServerTransport = true` init script)
-// connected to the SAME room (DEVBX), and asserts:
+// connected to a unique room per run (`RELOAD_<ts>` — see Room
+// Strategy below), and asserts:
 //
 //   1. Both tabs' `ServerTransport.connect()` resolve within 5s and
 //      the snapshot stream is live (player entries present).
@@ -203,14 +204,32 @@ async function runSmoke() {
   // --ignore-certificate-errors (Chromium QUIC TLS verifier has its own
   // gate). The canary server's WebSocket fallback serves the same wire
   // protocol.
-  const serverUrl = `ws://localhost:${WS_PORT}/rooms/DEVBX`;
+  //
+  // PR 11.7.E / FIX — unique room ID per smoke run. Pre-fix, every
+  // smoke (reload, HP-convergence, 24p stress, two-tab manual-flow)
+  // hardcoded `DEVBX`. CI boots the canary once and runs all 3 smokes
+  // sequentially against the SAME canary process — HP-convergence
+  // (run first) kills both players via the §4.4 100-damage kill path,
+  // leaving room state with `players[1].hp = 0` and `players[2].hp = 0`.
+  // The reload smoke (run second) then fails at reload Gate 3 ("source
+  // HP is 0 (dead)") because both players are dead. Local dev is also
+  // affected when the canary stays up across runs — any prior smoke's
+  // residual state leaks into the next.
+  //
+  // Room ID = `RELOAD_<run-start-timestamp>` so each invocation gets
+  // a fresh room. Players still get IDs 1+2 (the smoke's URL params
+  // drive promotion), but no stale state from prior smokes bleeds in.
+  const runId = Date.now();
+  const roomId = `RELOAD_${runId}`;
+  const serverUrl = `ws://localhost:${WS_PORT}/rooms/${roomId}`;
+  log(`Smoke run ID = ${runId}, room = ${roomId}`);
   for (const [page, localId, peerId] of [[pageA, 1, 2], [pageB, 2, 1]]) {
     await page.addInitScript({
       content: `
           window.__forceServerTransport = true;
           window.__damageServerPorts = { wt: ${WT_PORT}, ws: ${WS_PORT} };
           window.__damageServerUrl = ${JSON.stringify(URL)};
-          window.__damageServerRoomId = "DEVBX";
+          window.__damageServerRoomId = "${roomId}";
           window.__localPlayerId = ${localId};
           window.__peerPlayerId = ${peerId};
         `,
