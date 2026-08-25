@@ -302,27 +302,40 @@ async function runSmoke() {
     await sleep(SNAPSHOT_SETTLE_MS);
 
     // Read __latestSnap() from every tab + verify all 24 player IDs.
+    // PR 11.7.D3.3 / CI: with 24 tabs + a cold runner, some tabs'
+    // __latestSnap() window probe may be null briefly because the
+    // onSnapshot listener hasn't fired yet (first WS message takes
+    // a few seconds to round-trip on CI). Retry up to 10 times with
+    // 500ms backoff before declaring mismatch — gives the slowest
+    // tab's first snapshot a real chance to land.
     const snapshots = [];
+    const expectedIds = Array.from({ length: N_PLAYERS }, (_, i) => i + 1);
+    const maxRetries = 10;
     for (let i = 0; i < pages.length; i++) {
       const page = pages[i];
-      const snap = await page.evaluate(() => {
-        const s = window.__latestSnap ? window.__latestSnap() : null;
-        if (!s) return null;
-        return {
-          serverFrame: s.serverFrame ?? null,
-          playerIds: (s.players ?? []).map((p) => p.playerId).sort((a, b) => a - b),
-        };
-      });
+      const localId = i + 1;
+      let snap = null;
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        snap = await page.evaluate(() => {
+          const s = window.__latestSnap ? window.__latestSnap() : null;
+          if (!s) return null;
+          return {
+            serverFrame: s.serverFrame ?? null,
+            playerIds: (s.players ?? []).map((p) => p.playerId).sort((a, b) => a - b),
+          };
+        });
+        if (snap !== null) break;
+        await sleep(500);
+      }
       snapshots.push(snap);
     }
 
-    const expectedIds = Array.from({ length: N_PLAYERS }, (_, i) => i + 1);
     let assertion2ok = true;
     for (let i = 0; i < snapshots.length; i++) {
       const localId = i + 1;
       const snap = snapshots[i];
       if (!snap) {
-        fail(`tab ${localId}: snapshot is null`);
+        fail(`tab ${localId}: snapshot is null after ${maxRetries * 500}ms retry`);
         assertion2ok = false;
         break;
       }
