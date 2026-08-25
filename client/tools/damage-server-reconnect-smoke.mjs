@@ -260,14 +260,28 @@ async function main() {
 
   // Assertion 2: tab transitions to disconnected within STALE_THRESHOLD_MS
   // The ServerTransport's `wt.closed` / `ws.onclose` path runs near-instantly.
+  // We poll for up to 1s (with 50ms granularity) to absorb the
+  // microtask-scheduling race between the WS `error` event and the
+  // `close` event. Without this poll, a fast CI clock can hit the
+  // assertion before the close handler has fired.
   const disconnectedAt = Date.now();
-  const disconnectedState = await page.evaluate(() => {
+  let disconnectedState = await page.evaluate(() => {
     const t = window.__serverTransport;
     return {
       connected: t?.connected === true,
       closed: t?.closed === true,
     };
   });
+  while (Date.now() - disconnectedAt < 1_000 && (disconnectedState.connected || !disconnectedState.closed)) {
+    await sleep(50);
+    disconnectedState = await page.evaluate(() => {
+      const t = window.__serverTransport;
+      return {
+        connected: t?.connected === true,
+        closed: t?.closed === true,
+      };
+    });
+  }
   if (disconnectedState.connected || !disconnectedState.closed) {
     throw new Error(
       `Tab did not transition to disconnected after canary SIGKILL: ${JSON.stringify(disconnectedState)}`,

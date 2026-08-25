@@ -479,7 +479,7 @@ jobs:
           pkill -f 'vite.*5191' || true
           for port in 5191 14433 14434; do
             pids=$(lsof -ti:${port} 2>/dev/null || true)
-            if [[ -n "$pids\" ]]; then kill -9 $pids || true; fi
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
   # Phase 0 / PR 2: headless smoke test of the Babylon scene.

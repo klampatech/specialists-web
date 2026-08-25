@@ -256,6 +256,13 @@ export class ServerTransport {
       // a single rejection if BOTH transports fail).
       try {
         await this.connectWebTransport();
+        // PR 11.7+ / AutoReconnect (Claude review B1) — if the user
+        // invoked dispose() while this connect was awaiting, do NOT
+        // flip `this.connected = true`. The fresh transport handle is
+        // already torn down by close()/dispose() — re-opening state
+        // here would create the inconsistent
+        // `{closed:true, userClosed:true, connected:true}` triple.
+        if (this.userClosed || this.closed) return;
         this.activeKind = "webtransport";
         this.connected = true;
         this.startPingTimer();
@@ -267,6 +274,10 @@ export class ServerTransport {
       }
       try {
         await this.connectWebSocket();
+        // PR 11.7+ / AutoReconnect (Claude review B1) — same guard
+        // as the WT success path: a user-initiated dispose() that
+        // landed during the WS handshake must not flip connected=true.
+        if (this.userClosed || this.closed) return;
         this.activeKind = "websocket";
         this.connected = true;
         this.startPingTimer();
