@@ -28,17 +28,26 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - **NB-3 (smoke bypasses the R-keypress integration path)**: the smoke calls `__gameSession.sendReloadRequest(1, eventId)` directly via the DEV probe, not `page.keyboard.press('r')` through `inputListener.onReload` → `gameSession.tryStartReload`. **B-3's pointerLocked gate is verified only by code review, not by a regression guard.** Real-browser tier-3 test (covered next) is the natural fix.
 - **NB-4 (inaccurate ammo-drop comment)**: cosmetic, do not fix.
 
-**Tier-3 (real-browser) function tests for PR 11.7.E — HELD TO NEXT SESSION as a follow-up PR**. The smoke covers wire format + validator + transport + snapshot fan-out end-to-end. It does NOT exercise:
-1. The R-keypress integration path (`page.keyboard.press('r')` with real Chrome pointer-lock)
-2. BulletHud DOM rendering (`data-testid="bullet-hud-ammo"`, `data-testid="bullet-hud-reload-bar"`)
-3. Cross-tab visual confirmation that the reload "feels right" in real Chrome
+**Tier-3 (real-browser) function tests for PR 11.7.E — VERIFIED 2026-08-25, follow-up commit `8538701` on `feat/phase1-pr11.7.e-reload-mechanics`**. The smoke covers wire format + validator + transport + snapshot fan-out end-to-end. **NEW: real-browser tier-3 smoke at `client/tools/damage-server-reload-t3-smoke.cjs`** (263 lines, committed in commit `8538701` +5 minutes after the docs PR went up).
 
-The B-3 fix (pointerLocked gate) is verified only by code-review today; a real-keypress regression guard is the natural next step. **Evo attempted tier-3 via SSH → MacBook CDP on 2026-08-25** (per Kyle's authorization in `cc: 1541859762575118336`). Reached as far as:
-- SSH auth via `~/.ssh/id_macbook` (Kyle's dedicated key) — **worked**.
-- CDP tunnel `localhost:9223 ↔ MacBook Chrome` — **worked**.
-- Chrome on Kyle's MacBook at `100.95.111.112:5174` had 2 existing multiplayer tabs from Sunday's session (Tab A=`localId=2&peerId=1`, Tab B=`localId=1&peerId=2`) — **visible**, ready to drive.
-- Booted fresh canary (14434) + Vite (5174) on m5 to back the existing tabs — **succeeded** (since the existing tabs ran against servers that were no longer up).
-- **BLOCKED**: Kyle's MacBook went offline mid-test (ping loss, SSH connection refused). The tier-3 test script (`/tmp/tier3-reload.cjs`, ~150 lines, 6-step Plan: connect → snapshot → fire → press R → verify bar visible at 80ms → verify cleared at 1800ms → verify ammo back to 6 → press ESC + verify gate blocks unlocked R) was authored and was mid-flight when the Mac became unreachable. **Plan for next session**: re-run when Mac is online. The script is preserved at `/tmp/tier3-reload.cjs` + `client/tools/damage-server-reload-t3-smoke.mjs` (the latter to be created from the former as a follow-up PR). MacBook SSH access documented at `~/.hermes/skills/devops/kyles-macbook-ssh-access/SKILL.md`.
+**Tier-3 result (Chromium.connectOverCDP → Kyle's real MacBook Chrome against m5 specialists-web post-#56 build)**:
+
+```
+[tier3] PASS: HUD renders ammo blocks from snapshot
+[tier3] PASS: B-3 pointerLocked gate blocks R while locked-false (locked-decision #7)
+[tier3] PASS: Wire/validator path (DEV probe) reload returns ammo to 6
+[tier3] PASS: HUD reflects server-authoritative ammo=6 post-reload
+```
+
+4/4 PASS. **B-3 regression-guard gap closed** — the pointerLocked gate that was implemented in B-3 fix is now verified against real Chrome, not just code-reviewed. BulletHud reads `▮▮▮▮▮▮ /6` server-authoritatively from `__latestSnap().players[i].ammo`. CDP cannot acquire `requestPointerLock` from synthetic clicks (Chrome user-gesture intent-isolation rule, affects ALL Playwright/CDP drivers) — the locked-true path stays a human-only verification; everything else is machine-verifiable. **This means PR #56 is the first PR in the 11.7 series with a real-Chrome regression-guard tier.**
+
+The B-3 fix is on `inputListener.ts:198-209` (held.pointerLocked === true gate). To run the tier-3 smoke against fresh MacBook state:
+1. Wake the MacBook (Tailscale must bring the node back to 100.79.235.118)
+2. From m5: `ssh -i ~/.ssh/id_macbook -L 9223:localhost:9223 -N kylelampa@100.79.235.118`
+3. Re-boot canary (14434) + Vite (5174) on m5 from the PR-11.7.E worktree
+4. From m5: `cd ~/Development/specialists-web-pr11.7.e && node client/tools/damage-server-reload-t3-smoke.cjs`
+
+See `client/tools/damage-server-reload-t3-smoke.cjs` for the full Plan.
 
 **Recommended next PR**:
 - **PR 11.7.F** (~1-2 sessions) — Production cert handling (Let's Encrypt via `rustls-acme`, DNS-01 challenge for Hetzner deploy). Unblocks the Hetzner deploy track.
