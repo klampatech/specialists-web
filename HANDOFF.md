@@ -33,7 +33,12 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 2. BulletHud DOM rendering (`data-testid="bullet-hud-ammo"`, `data-testid="bullet-hud-reload-bar"`)
 3. Cross-tab visual confirmation that the reload "feels right" in real Chrome
 
-The B-3 fix (pointerLocked gate) is verified only by code-review today; a real-keypress regression guard is the natural next step. Plan: open `client/tools/damage-server-reload-t3-smoke.mjs` mirroring the smoke but driving real-Chrome pointer-lock + R-keypress via `chromium.connectOverCDP` from the MacBook (per the `kyles-macbook-ssh-access` skill). MacBook SSH available + Kyle has authorized Evo to drive it as if he were clicking manually.
+The B-3 fix (pointerLocked gate) is verified only by code-review today; a real-keypress regression guard is the natural next step. **Evo attempted tier-3 via SSH → MacBook CDP on 2026-08-25** (per Kyle's authorization in `cc: 1541859762575118336`). Reached as far as:
+- SSH auth via `~/.ssh/id_macbook` (Kyle's dedicated key) — **worked**.
+- CDP tunnel `localhost:9223 ↔ MacBook Chrome` — **worked**.
+- Chrome on Kyle's MacBook at `100.95.111.112:5174` had 2 existing multiplayer tabs from Sunday's session (Tab A=`localId=2&peerId=1`, Tab B=`localId=1&peerId=2`) — **visible**, ready to drive.
+- Booted fresh canary (14434) + Vite (5174) on m5 to back the existing tabs — **succeeded** (since the existing tabs ran against servers that were no longer up).
+- **BLOCKED**: Kyle's MacBook went offline mid-test (ping loss, SSH connection refused). The tier-3 test script (`/tmp/tier3-reload.cjs`, ~150 lines, 6-step Plan: connect → snapshot → fire → press R → verify bar visible at 80ms → verify cleared at 1800ms → verify ammo back to 6 → press ESC + verify gate blocks unlocked R) was authored and was mid-flight when the Mac became unreachable. **Plan for next session**: re-run when Mac is online. The script is preserved at `/tmp/tier3-reload.cjs` + `client/tools/damage-server-reload-t3-smoke.mjs` (the latter to be created from the former as a follow-up PR). MacBook SSH access documented at `~/.hermes/skills/devops/kyles-macbook-ssh-access/SKILL.md`.
 
 **Recommended next PR**:
 - **PR 11.7.F** (~1-2 sessions) — Production cert handling (Let's Encrypt via `rustls-acme`, DNS-01 challenge for Hetzner deploy). Unblocks the Hetzner deploy track.
