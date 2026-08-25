@@ -581,6 +581,69 @@ jobs:
             pids=$(lsof -ti:${port} 2>/dev/null || true)
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
+  # PR 11.7.D3.3 — 24-player stress smoke. Pushes the room to
+  # MAX_PLAYERS_PER_ROOM = 24 (server/src/constants.rs) and verifies
+  # the snapshot fan-out reaches all 24 tabs without saturating the
+  # per-connection outbound queue (drop-oldest counter stays at 0).
+  # Distinct from `client-two-tab-smoke` above (2 tabs) in that this
+  # is the canonical "does the architecture actually scale to the
+  # 24-player design goal?" gate.
+  # Memory budget: 24 headless chromium contexts = ~2.5GB. GitHub's
+  # ubuntu-latest has 7GB free, comfortable headroom.
+  # NOTE: opt-in (continue-on-error) — first run is a learning
+  # exercise. Once stable, flip to a required gate.
+  client-stress-24p-smoke:
+    name: client — 24-player stress smoke (PR 11.7.D3.3, opt-in)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Pre-build canary binary (avoid racing smoke's boot)
+        run: |
+          for port in 5174 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+          (cd ../server && cargo build --release --bin specialists-server)
+        env:
+          CARGO_TERM_COLOR: never
+      - name: Run 24-player stress smoke
+        # 5s snapshot settle (slow CI runners need the headroom) +
+        # 5s stats-interval overlap so we see at least 2-3 [stress-stats]
+        # lines in the canary log before the assertion runs.
+        run: node ./tools/stress-24p-smoke.mjs
+        env:
+          STRESS_24P_N: "24"
+          STRESS_24P_SNAPSHOT_SETTLE_MS: "5000"
+          CANARY_STATS_INTERVAL_MS: "3000"
+      - name: Tear down canary + Vite
+        if: always()
+        run: |
+          pkill -f canary-server.sh || true
+          pkill -f 'vite.*5174' || true
+          for port in 5174 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
   client-jump-smoke:
     name: client — jump regression smoke (PR 8)
     runs-on: ubuntu-latest

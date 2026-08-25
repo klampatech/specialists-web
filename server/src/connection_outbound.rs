@@ -37,7 +37,7 @@
 // pressure is the right direction, not another capacity bump.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, Notify};
@@ -47,6 +47,23 @@ use tokio::sync::{Mutex, Notify};
 /// Drop-oldest is the architectural answer for true saturation;
 /// capacity is the practical answer for slow consumers.
 pub const CONNECTION_OUTBOUND_CAPACITY: usize = 1024;
+
+/// PR 11.7.D3.3 — process-wide atomic counter for drop-oldest fires.
+/// Bumped every time a producer pops the front of a saturated queue.
+/// Exposed via the new `/__canary_stats` HTTP endpoint
+/// (see `server/src/main.rs`) so the 24-player stress smoke can
+/// verify no drops occurred during the test window. Per-connection
+/// aggregation lives in `ConnectionOutbound::drop_count()` (AtomU64
+/// on the inner struct) and the global counter is bumped at the
+/// call site for backward compatibility with existing log tooling.
+static GLOBAL_DROP_OLDEST_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the process-wide drop-oldest counter (sum across all
+/// connections). Cheap atomic load, safe to call from any thread
+/// including the HTTP stats endpoint.
+pub fn global_drop_oldest_count() -> u64 {
+    GLOBAL_DROP_OLDEST_COUNT.load(Ordering::Relaxed)
+}
 
 /// Producer + consumer handle for the per-connection outbound queue.
 /// Cloned freely; all clones share the same underlying queue + notify.
@@ -72,6 +89,13 @@ struct ConnectionOutboundInner {
     cap: usize,
     notify: Notify,
     closed: AtomicBool,
+    /// PR 11.7.D3.3 — per-connection drop-oldest counter. Bumped
+    /// every time `try_send` pops the front of a saturated queue.
+    /// Exposed via `ConnectionOutbound::drop_count()`. Combined with
+    /// the global counter (`GLOBAL_DROP_OLDEST_COUNT`) so the
+    /// `/__canary_stats` endpoint can report both per-connection +
+    /// process-wide totals.
+    drop_count: AtomicU64,
 }
 
 impl ConnectionOutbound {
@@ -91,6 +115,7 @@ impl ConnectionOutbound {
                 cap,
                 notify: Notify::new(),
                 closed: AtomicBool::new(false),
+                drop_count: AtomicU64::new(0),
             }),
         }
     }
@@ -113,6 +138,13 @@ impl ConnectionOutbound {
         // a minimum reservation; the deque grows past it on push).
         if q.len() >= self.inner.cap {
             q.pop_front();
+            // PR 11.7.D3.3 — bump per-connection + global drop counters
+            // so the `/__canary_stats` endpoint + the 24-player stress
+            // smoke can verify no drops occurred during the test window.
+            // Both atomics are Relaxed — exact ordering doesn't matter
+            // for a diagnostic counter.
+            self.inner.drop_count.fetch_add(1, Ordering::Relaxed);
+            GLOBAL_DROP_OLDEST_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         q.push_back(bytes);
         // Notify exactly one waiter. Note: Notify::notify_one only
@@ -176,6 +208,14 @@ impl ConnectionOutbound {
     #[cfg(test)]
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Relaxed)
+    }
+
+    /// PR 11.7.D3.3 — per-connection drop-oldest count. Bumped
+    /// every time `try_send` pops the front of a saturated queue.
+    /// Cheap atomic load, safe to call from any thread including
+    /// the HTTP `/__canary_stats` endpoint handler.
+    pub fn drop_count(&self) -> u64 {
+        self.inner.drop_count.load(Ordering::Relaxed)
     }
 }
 

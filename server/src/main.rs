@@ -24,6 +24,7 @@ use tracing_subscriber::EnvFilter;
 
 use specialists_server::transport::{run_server, RoomRegistry};
 use specialists_server::cert::DEFAULT_SANS;
+use specialists_server::connection_outbound::global_drop_oldest_count;
 
 #[derive(Debug, Default)]
 struct Args {
@@ -298,6 +299,17 @@ async fn main() -> ExitCode {
             interval.set_missed_tick_behavior(
                 tokio::time::MissedTickBehavior::Skip,
             );
+            // PR 11.7.D3.3 — log the global drop-oldest counter every
+            // 5 seconds so the 24-player stress smoke can grep for
+            // `[stress-stats]` lines and assert no drops occurred.
+            // (Avoids the cost of a dedicated HTTP endpoint while
+            // keeping the data path identical to what the smoke cares
+            // about.) Set CANARY_STATS_INTERVAL_MS=0 to disable.
+            let stats_interval_ms: u64 = std::env::var(
+                "CANARY_STATS_INTERVAL_MS",
+            ).ok().and_then(|s| s.parse().ok()).unwrap_or(5_000);
+            let mut last_stats = std::time::Instant::now();
+            let mut last_drops: u64 = 0;
             loop {
                 interval.tick().await;
                 let now_ms = start.elapsed().as_millis() as u64;
@@ -328,6 +340,23 @@ async fn main() -> ExitCode {
                             wire,
                         ).await;
                     }
+                }
+                // Periodic stats line — single info!() call per interval
+                // so the canary log doesn't get spammed.
+                if stats_interval_ms > 0
+                    && last_stats.elapsed().as_millis() as u64 >= stats_interval_ms
+                {
+                    let drops = global_drop_oldest_count();
+                    let delta = drops.saturating_sub(last_drops);
+                    info!(
+                        target: "stress_stats",
+                        drops_total = drops,
+                        drops_since_last = delta,
+                        interval_ms = stats_interval_ms,
+                        "[stress-stats] drop-oldest counter"
+                    );
+                    last_drops = drops;
+                    last_stats = std::time::Instant::now();
                 }
             }
         }
