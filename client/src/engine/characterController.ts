@@ -176,6 +176,21 @@ export class CharacterController {
   // wallrun entry is ignored (closes the auto-repeat re-entry loophole).
   private lastWallrunEndedAtMs: number = 0;
   private lastPlanarSpeed: number = 0;
+  // PR 11.7.D3.2 / post-merge hardening — wall-clock timestamp (ms) until
+  // which the snapshot-driven LIVE observer should NOT overwrite
+  // Havok/state.position. Set in `respawn()` to +3000ms; the LIVE observer
+  // checks this flag via `isInRespawnGrace(nowMs)` and skips its
+  // `state.position.copyFrom + setPosition` calls while the timestamp is in
+  // the future. Without this grace period, the very next render-frame tick
+  // would clobber the respawn teleport with the snapshot's pre-respawn
+  // position — the server doesn't auto-respawn, so its snapshot keeps
+  // reporting the player's last-known-death position until they actually
+  // move. Defense-in-depth: the smoke + most CI paths pass without it
+  // because the respawn edge + visualRoot fix from PR #52 are sufficient
+  // for the current 1-tab smoke topology. The flag protects against future
+  // regressions (longer render ticks, server-side respawns, additional
+  // interpolation paths) that could re-introduce the clobber.
+  private __respawnGraceUntilMs: number = 0;
   // Scratch vectors to avoid per-frame allocations in the hot path.
   private readonly tmpDesired: Vector3 = new Vector3();
   private readonly tmpPlanar: Vector3 = new Vector3();
@@ -259,6 +274,10 @@ export class CharacterController {
     if (this.visualRoot) {
       this.visualRoot.position.copyFrom(this.respawnPosition);
     }
+    // PR 11.7.D3.2 / post-merge hardening — arm the respawn grace flag so
+    // the LIVE observer skips position writes for the next 3 seconds. See
+    // the `__respawnGraceUntilMs` field declaration for full rationale.
+    this.__respawnGraceUntilMs = performance.now() + 3000;
     this.state.hp = HEALTH.maxHp;
     this.state.respawningUntilMs = 0;
     this.stunt = "none";
@@ -274,6 +293,20 @@ export class CharacterController {
     this.havok.dynamicFriction = this.baseDynamicFriction;
     this.havok.staticFriction = 0;
     this.lastPlanarSpeed = 0;
+  }
+
+  /**
+   * PR 11.7.D3.2 / post-merge hardening — returns true while we're inside
+   * the respawn grace period. The LIVE observer in scene.ts checks this
+   * via `if (liveRemoteCtrl.isInRespawnGrace(nowMs)) return;` and skips
+   * its Havok/state.position writes. Without this skip, the observer
+   * would immediately overwrite the respawn teleport with the snapshot's
+   * pre-respawn position (since the server doesn't auto-respawn). 3s
+   * grace window covers the smoke's 1100ms post-respawn wait + ample
+   * slack for the respawn edge to be detected + 20Hz snapshot cadence.
+   */
+  public isInRespawnGrace(nowMs: number = performance.now()): boolean {
+    return nowMs < this.__respawnGraceUntilMs;
   }
 
   /**
