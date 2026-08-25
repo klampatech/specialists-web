@@ -806,7 +806,7 @@ PR #50 added `PhysicsWorld::set_position` + `client_driven: BTreeSet<PlayerId>` 
 
 The race fix is dev-mode-only (production doesn't have React StrictMode double-mount). If we delete StrictMode from the dev path, this window-publication becomes unnecessary. Tracked for review once the observability HUD lands and we have visibility into cross-tab rig visual correctness without relying on the dev-mode smoke probes.
 
-**UPDATE 2026-08-24**: The StrictMode double-mount is in fact the load-bearing case here — the LIVE observer at `scene.ts:1315+` is what actually runs in dev. Fix landed: both `setVisualPosition` + `state.position.copyFrom` are now in the LIVE observer. So the LIVE observer is now self-sufficient; the closure-bound observer at `scene.ts:1190+` is dead code under StrictMode (its `remoteCtrl` is disposed). **Recommendation**: delete the closure-bound observer in a follow-up PR, leaving only the LIVE observer. Tracked as a 5-line refactor.
+**UPDATE 2026-08-24**: The StrictMode double-mount is in fact the load-bearing case here — the LIVE observer at `scene.ts:1315+` is what actually runs in dev. Fix landed: both `setVisualPosition` + `state.position.copyFrom` are now in the LIVE observer. So the LIVE observer is now self-sufficient; the closure-bound observer at `scene.ts:1190+` is dead code under StrictMode (its `remoteCtrl` is disposed). **RESOLVED 2026-08-24 by PR #53 / squash `7c84e01`** — closure-bound observer body replaced with `interpolatorTickHook = null` (kept the variable + the `?.(now)` fallback in the render observer for architectural-intent documentation). -127 lines, +38 lines of comments. Render observer's `if (liveHook) { ... } else { interpolatorTickHook?.(now) }` is now always-liveHook under StrictMode.
 
 ### 2026-08-24 — PR 11.7.D3.1 implementation decisions (respawn teleport on snapshot HP edge)
 
@@ -964,4 +964,36 @@ Kyle's 2026-08-15 playtest signal: the Resume button works correctly; the residu
 - Run `two-tab-manual-flow.mjs` end-to-end with fixes.
 - Promote manual-flow smoke to blocking CI after 5 stable local runs.
 - Split PR #51 (debug HUD) from walk-mirror fix per PR #50's PR-size discipline.
-- Delete closure-bound observer at `scene.ts:1190+` (dead code under StrictMode).
+- ~~Delete closure-bound observer at `scene.ts:1190+` (dead code under StrictMode).~~ **RESOLVED in PR #53.**
+
+### 2026-08-24 — PR 11.7.D3.2 post-merge hardening (PR #53 MERGED at squash `7c84e01`)
+
+**Two follow-up cleanups from the PR #51 / #52 work, landed as PR #53 (branch `feat/phase1-pr11.7.d3.2-dead-code-and-grace`, 1 commit, 2 files, +71/-127):**
+
+1. **Respawn grace period (defense-in-depth).** `CharacterController.respawn()` now arms `__respawnGraceUntilMs = performance.now() + 3000`; the LIVE observer at `scene.ts:1337` checks `if (liveRemoteCtrl.isInRespawnGrace(nowMs)) return;` and skips its `state.position.copyFrom + setPosition` writes while inside the grace.
+
+   **Why it's defense-in-depth, not a current bug:** the PR 11.7.D3.1 snapshot-driven respawn edge detector (PR #52) sets Havok + state.position + visualRoot to `respawnPosition` correctly on the `prevHp ≤ 0 && currentHp === HEALTH.maxHp` edge. Current smoke + CI paths don't trigger the clobber because the smoke's 1100ms post-respawn wait + the LIVE observer's per-frame cadence line up (smoke reads before the next observer frame fires in CI's faster headless tick rate). **However:** the server doesn't auto-respawn — its 20Hz snapshot keeps reporting the player's last-known-death position until they actually move. A future change (longer render tick, server-side respawn that snaps via snapshot, additional interpolation paths) would re-introduce the clobber. The 3s grace window covers any of those.
+
+   **Cost:** +33 lines on `CharacterController` (private field + public getter + 1-line arm in respawn()) + +13 lines on `scene.ts` (early return comment + check). Net +46 LOC for the gate logic.
+
+2. **Dead closure-bound observer removed** — see the `### 2026-08-24 — PR 11.7.D3 walk-mirror fix` section above for the original observation. The closure-bound `interpolatorTickHook` body at scene.ts:1190-1310 was unreachable under React StrictMode (its `remoteController` is disposed by the time the render observer fires). PR #53 sets `interpolatorTickHook = null` instead of the 120-line lambda. Render observer's fallback `if (liveHook) { ... } else { interpolatorTickHook?.(now) }` is now always-liveHook under StrictMode (window-published `__liveInterpolatorTickHook`). Variable + `?.(now)` call retained for architectural-intent documentation.
+
+   **Cost:** scene.ts -127 lines, +38 lines of comments. Net -89 LOC.
+
+**Why this PR existed in the first place:** the parent `feat/phase1-pr11.7.d3-debug-hud` branch had a commit (46c43dc) with the grace-period fix, but it was orphaned when PR #51 was squash-merged at 8afca89 from debf149 (the grace commit was on top, not in the squash). The squash DID include the SPEC.md content from the merge commit (PR 11.7.D3.1 docs + 'CI surface for snapshot-driven edge detection' section) — those are already in main. PR #53 re-applies the grace fix onto a clean main-based branch + adds the dead-code cleanup.
+
+**Verification (re-running the same gates from the squash-merged main):**
+- `tsc --noEmit -p tsconfig.app.json` exit 0
+- Vitest 25/25 PASS (no new tests — existing remoteInterpolator.test.ts covers the LIVE-observer contract sufficiently; a unit test for `isInRespawnGrace` would require Babylon NullEngine mocking which the vitest pipeline doesn't carry; smoke is cheaper)
+- health-regression-smoke.mjs 5/5 consecutive PASS locally
+- two-tab-smoke.mjs (ServerTransport) PASS locally
+- CI run #32793754127: **22/22 PASS** including:
+  - `client — health regression smoke (PR 10)` (was failing on PR #51; green on d3.2)
+  - `client — two-tab manual-flow smoke (PR 11.7.D2.1, opt-in)` (carry-forward from PR #51 also green now)
+  - `client — two-tab smoke (ServerTransport, PR 11.7.D2)` (full snapshot-driven walk-mirror validated)
+  - `client — typecheck + build` (Vite build clean after the -127 lines of dead code)
+  - `server — build + test (Rust, PR 11.6.B)`
+
+**Open follow-up (not closed):** if a future regression triggers the grace-period path (e.g., server-side respawn added), then writing a vitest unit test for `isInRespawnGrace(nowMs)` would be the right next step. Today it's defense-in-depth and the smoke coverage is sufficient — YAGNI.
+
+**Orphan worktree/branch cleanup:** parent `feat/phase1-pr11.7.d3-debug-hud` branch + `feat/phase1-pr11.7.d3.1-respawn-snap` branch + d3.1 worktree all pruned (force-deleted locally + remotely). All three's unique commits are merged via PR #51 (squash `8afca89`), PR #52 (squash `2b89a13`), or are now redundant with PR #53. Only `specialists-web-pr11.7-d3.2` worktree remains.

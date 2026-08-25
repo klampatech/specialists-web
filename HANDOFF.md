@@ -114,6 +114,27 @@ The `computeRespawnPosition(playerId)` function uses the same `PLAYER_SPAWN_X_OF
 
 **Why this matters.** Respawn is a load-bearing gameplay loop. Spectators, kill-cams, demo recordings, and round-based game modes all depend on the remote rig being at the right position after respawn. Without this fix, post-death gameplay (which is the bulk of a deathmatch) is broken in cross-tab view.
 
+### 🆕 2026-08-24 — PR #51 + #52 + #53 MERGED. Multiplayer walk-mirror + respawn-teleport ship complete. Next move = 24-player scale.
+
+**`You are here`**: end of session — 2026-08-24, post-PR #53 merge. **Three PRs landed in one day on `feat/phase1-pr11.7.d3-debug-hud` + two follow-up branches**, all MERGED into main:
+
+- **PR #51** MERGED at squash `8afca89` (branch `feat/phase1-pr11.7.d3-debug-hud`, ~18 commits). Walk-mirror fix (server `set_translation` instead of `set_next_kinematic_translation` in `server/src/physics.rs::set_position`; LIVE render observer at `client/src/engine/scene.ts:1315+` gets `setVisualPosition` + `state.position.copyFrom`). Plus the debug HUD overlay, CDP drive tools, and validation evidence (`docs/screenshots/2026-08-23-multiplayer-validation/two-tab-multiplayer.gif` shows teal rig moving).
+- **PR #52** MERGED at squash `2b89a13` (branch `feat/phase1-pr11.7.d3.1-respawn-snap`, 2 commits). Respawn teleport fix — `prevHpByPlayerId` HP-edge detector in `onSnapshot` listener; calls `liveRemoteCtrl.respawn(now)` on `0 → HEALTH.maxHp` transition; `CharacterController.respawn()` enhanced to publish to `visualRoot` TransformNode. Closes the post-#50 carry-forward from HANDOFF § "Respawn doesn't teleport the remote rig".
+- **PR #53** MERGED at squash `7c84e01` (branch `feat/phase1-pr11.7.d3.2-dead-code-and-grace`, 1 commit, 2 files, +71/-127). Dead closure-bound `interpolatorTickHook` observer body removed (-127 lines, was unreachable under React StrictMode). Respawn grace period (`__respawnGraceUntilMs` + `isInRespawnGrace(nowMs)`) added as defense-in-depth against future regression where server-side respawn would clobber via snapshot. **Squash merge timing quirk worth noting**: PR #51 was squash-merged from `debf149` (the conflict-resolved branch tip), so my subsequent push of the grace-period commit `46c43dc` got orphaned — that's why PR #53 exists.
+
+**Final CI state (PR #53, run `32793754127`)**: **22/22 PASS** including:
+- `client — health regression smoke (PR 10)` — was the only carry-forward failure on PR #51
+- `client — two-tab manual-flow smoke (PR 11.7.D2.1, opt-in)` — carry-forward from PR #51 also green
+- `client — two-tab smoke (ServerTransport, PR 11.7.D2)` — full snapshot-driven walk-mirror validated end-to-end
+- `client — typecheck + build` — Vite build clean after the -127 lines of dead code
+- `server — build + test (Rust, PR 11.6.B)`
+
+**Local verification**: tsc clean, vitest 25/25 PASS, health-regression-smoke.mjs 5/5 consecutive PASS, two-tab-smoke.mjs (ServerTransport) PASS.
+
+**Worktree/branch cleanup**: orphan `feat/phase1-pr11.7.d3-debug-hud` (parent of PR #51, had grace-period commit `46c43dc` orphaned when squash happened at `debf149`) + `feat/phase1-pr11.7.d3.1-respawn-snap` (parent of PR #52, fully merged) + `specialists-web-pr11.7-d3.1` worktree all pruned. Only `specialists-web-pr11.7-d3.2` worktree remains.
+
+**SPEC.md updates** (2026-08-24): marked the "delete closure-bound observer" carry-forward as RESOLVED at line 967 (deleted via PR #53) + added the PR 11.7.D3.2 post-merge section at end of file documenting the grace period rationale + dead-code cleanup.
+
 ### Decisions made this session (in reverse chronological order)
 
 1. **DO NOT keep chasing WT cert workarounds.** Ships PR #50 with WS-fallback as documented dev path; WebTransport validation is the explicit NEXT PR.
