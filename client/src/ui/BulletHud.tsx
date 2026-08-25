@@ -35,6 +35,22 @@ interface BulletHudProps {
   localRespawningMs: number;
   /** PR 10: same for the REMOTE controller. */
   remoteRespawningMs: number;
+  /** PR 11.7.E / §3.5 — current local ammo count (server-authoritative,
+   *  sourced from `__latestSnap().players[localPeerId].ammo`). */
+  localAmmo: number;
+  /** PR 11.7.E / §3.5 — magazine size. Mirrors
+   *  `COMBAT.dualPistol.PLAYER_MAX_AMMO` (server is canonical). */
+  maxAmmo: number;
+  /** PR 11.7.E / §3.5 — reload-progress timestamp (`performance.now()`-
+   *  relative) or `null` when idle. While non-null, the HUD renders a
+   *  fill-left-to-right progress bar normalized to
+   *  `reloadProgressMs` (see below). Cleared by `__latestSnap` when
+   *  the snapshot reports `local ammo === maxAmmo`. */
+  reloadingUntilMs: number | null;
+  /** PR 11.7.E / §3.5 — total reload animation duration in ms.
+   *  Mirrors `COMBAT.dualPistol.reloadMs`. The HUD uses this to
+   *  compute the fill ratio `(reloadingUntilMs - now) / reloadProgressMs`. */
+  reloadProgressMs: number;
 }
 
 function statusLabel(s: BulletHudProps["connectionStatus"]): string {
@@ -67,7 +83,7 @@ function missingServerMessage(): string | null {
  * file MUST keep `pointerEvents: "none"` (or `pointerEvents: "auto"` only on
  * the buttons it contains — but right now there are no buttons in the HUD).
  */
-export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, localHp, remoteHp, localRespawningMs, remoteRespawningMs }: BulletHudProps) {
+export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, localHp, remoteHp, localRespawningMs, remoteRespawningMs, localAmmo, maxAmmo, reloadingUntilMs, reloadProgressMs }: BulletHudProps) {
   return (
     <div
       data-testid="bullet-hud"
@@ -110,6 +126,59 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
       <div data-testid="bullet-hud-hp-remote" style={{ opacity: 0.95 }}>
         HP them: {remoteHp}{remoteRespawningMs > 0 ? ` (respawn ${remoteRespawningMs}ms)` : ""}
       </div>
+      {/* PR 11.7.E / §3.5 — ammo display (server-authoritative via
+          __latestSnap; mirrors the existing HP-them line pattern).
+          `▮` for a loaded chamber, `▯` for an empty one. Reads from
+          the snapshot's `local ammo` field; the HUD never reads a
+          local controller field (the controller doesn't carry ammo —
+          only the snapshot does, after PR 11.7.B's wire-format
+          stabilization). */}
+      <div data-testid="bullet-hud-ammo" style={{ opacity: 0.95 }}>
+        Ammo: {Array.from({ length: maxAmmo }, (_, i) => (i < localAmmo ? "▮" : "▯")).join("")} /{maxAmmo}
+      </div>
+      {/* PR 11.7.E / §3.5 — reload progress bar. Renders only while
+          `reloadingUntilMs !== null`. Fill ratio is
+          `(reloadingUntilMs - now) / reloadProgressMs`, clamped 0..1.
+          The bar's visible width tracks the client-local reload
+          timer (NOT the server's processing time — the server
+          completes the reload within one tick; the bar is purely
+          visual feedback for "I'm reloading right now"). Cleared
+          by the `__latestSnap` listener in scene.ts when the
+          snapshot reports `local ammo === maxAmmo`. */}
+      {reloadingUntilMs !== null && (() => {
+        const now = performance.now();
+        const remaining = Math.max(0, reloadingUntilMs - now);
+        const fillRatio = Math.max(0, Math.min(1, remaining / reloadProgressMs));
+        const barWidth = 80;
+        const filledWidth = Math.round(barWidth * fillRatio);
+        return (
+          <div data-testid="bullet-hud-reload-bar" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ opacity: 0.85 }}>Reload:</span>
+            <div
+              style={{
+                width: barWidth,
+                height: 6,
+                background: "rgba(230, 230, 230, 0.18)",
+                borderRadius: 2,
+                position: "relative",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  bottom: 0,
+                  right: 0,
+                  width: filledWidth,
+                  background: "#ffce5a",
+                  transition: "width 0.05s linear",
+                }}
+              />
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

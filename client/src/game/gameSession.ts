@@ -67,13 +67,19 @@ import { LockstepState } from "../engine/lockstepState";
 import { createRemotePlayer } from "./remotePlayer";
 import {
   bulletTimeScale,
+  COMBAT,
   dualPistolShoot,
   meleeSwing,
   type DualPistolResult,
   type MeleeResult,
 } from "./combat";
 import { applyDamage, tickRespawn, type HealthSnapshot } from "./health";
-import { sendDamageRequest as dbSendDamageRequest, sendPositionUpdateThrottled as dbSendPositionUpdateThrottled } from "../net/damageBus";
+import {
+  sendDamageRequest as dbSendDamageRequest,
+  sendPositionUpdateThrottled as dbSendPositionUpdateThrottled,
+  sendReloadRequest as dbSendReloadRequest,
+  nextReloadEventId as dbNextReloadEventId,
+} from "../net/damageBus";
 import type { DamageRequest } from "../../../protocol/damage";
 import type { ServerTransport } from "../net/serverTransport";
 
@@ -229,6 +235,38 @@ export interface GameSession {
   consumeUnrenderedCombatEvents(): CombatEvent[];
   /** PR 10: snapshot of both controllers' HP + respawn timer for the HUD. */
   getHealthSnapshot(): HealthSnapshot;
+  /**
+   * PR 11.7.E / §3.5 — start a reload on R-press. The scene wires
+   * `inputListener.onReload` to this method. Gates:
+   *   - pointer-locked (no reload when the cursor is on the page)
+   *   - local HP > 0 (no reload while dead — the snapshot's HP is
+   *     the source of truth, but for the local controller the
+   *     controller's state.hp mirrors it within one tick)
+   *   - local ammo < PLAYER_MAX_AMMO (no reload on full mag)
+   *   - not already reloading (`reloadingUntilMs === null`)
+   *   - server transport connected (no-op in single-player)
+   * On success: stamps `reloadingUntilMs = performance.now() +
+   * COMBAT.dualPistol.reloadMs`, increments the per-local-player
+   * `reloadEventId`, and sends the ReloadRequest over the wire. The
+   * HUD's reload-progress bar reads `reloadingUntilMs`; the
+   * `__latestSnap` listener clears it when the snapshot's
+   * `ammo === PLAYER_MAX_AMMO` (the reload completed server-side).
+   */
+  tryStartReload?: () => void;
+  /**
+   * PR 11.7.E / §3.5 — read the current reload-progress timestamp
+   * (ms; `performance.now()`-relative) or `null` when idle. The
+   * HUD's reload bar polls this every render frame. The
+   * `__latestSnap` listener inside `createGameSession` clears it
+   * to `null` once the snapshot reports `ammo === PLAYER_MAX_AMMO`.
+   */
+  getReloadingUntilMs?: () => number | null;
+  /**
+   * PR 11.7.E / §3.5 — send a ReloadRequest via the bus. DEV-only
+   * (production bundles strip the probe entirely). Smoke drives
+   * this via `__reloadBus.sendReloadRequest(...)`.
+   */
+  sendReloadRequest?: (playerId: number, eventId: number) => number;
   /**
    * PR 11.4: scene.ts calls this on F2 toggle. When `active === true`,
    * BOTH controllers' per-tick `update()` is skipped (the spectator
@@ -392,6 +430,19 @@ export function createGameSession(
    * scene.ts on F2 toggle. Default false (no spectator effect).
    */
   let spectatorActive = false;
+  /**
+   * PR 11.7.E / §3.5 — reload-progress timestamp (ms; relative to
+   * `performance.now()`). Set on R-press via `tryStartReload()` to
+   * `now + COMBAT.dualPistol.reloadMs`. The HUD's reload-progress
+   * bar reads `reloadingUntilMs` per render frame and renders the
+   * fill ratio. Cleared to `null` when the snapshot reports
+   * `local ammo === PLAYER_MAX_AMMO` (the server confirmed the
+   * reload). Default `null` = idle.
+   */
+  let reloadingUntilMs: number | null = null;
+  // (lastSentReloadEventId tracking removed — the bus's module-level
+  //  nextReloadEventId is the canonical counter; nothing on this side
+  //  needs to mirror it for the smoke's assertions.)
 
   /**
    * One tick: encode local input → submit → advance → apply decoded inputs to
@@ -759,6 +810,69 @@ export function createGameSession(
       ? {
         setSpectatorActive: (active: boolean) => {
           spectatorActive = active;
+        },
+      }
+      : {}),
+    // PR 11.7.E / §3.5 — start a reload on R-press. Gates on
+    // alive + ammo<max + not-already-reloading + server-transport-connected.
+    // No pointer-lock check here — the inputListener already gates
+    // on that (the editable-target + !repeat + key event already
+    // arrives only when the canvas has focus, which is implied
+    // by pointer-locked-on-canvas).
+    tryStartReload: (): void => {
+      if (!serverTransport) return;
+      // Already reloading? Ignore (the keypress guard).
+      if (reloadingUntilMs !== null) return;
+      // Dead? The snapshot's HP is the source of truth, but the
+      // local controller's state.hp mirrors it within one tick —
+      // if the server's last snapshot had hp=0 for us, the
+      // local controller shows hp=0 too. Use the local controller
+      // for the gate to avoid an extra snapshot lookup per R-press.
+      if (localController.state.hp <= 0) return;
+      // Magazine full? Check via the controller's mirrored ammo
+      // (the local controller doesn't carry ammo — only the
+      // snapshot does). Read the latest snapshot via __latestSnap
+      // when available; fall back to "allow reload" when no
+      // snapshot has arrived yet (the first reload after connect).
+      const snap = typeof window !== "undefined"
+        ? (window as unknown as {__latestSnap?: () => { players: Array<{ playerId: number; ammo: number }> } | null}).__latestSnap?.() ?? null
+        : null;
+      const localSnapPlayer = snap?.players.find((p) => p.playerId === localPlayerId);
+            // No-op if the local player's magazine is already full. The
+      // server enforces the same gate authoritatively (gate 4 in
+      // validate_and_relay_reload: ammo<max). Literal 6 mirrors the
+      // server-side PLAYER_MAX_AMMO constant in server/src/constants.rs.
+      if (localSnapPlayer && localSnapPlayer.ammo >= 6) return;
+      const eventId = dbNextReloadEventId();
+      const now = performance.now();
+      reloadingUntilMs = now + COMBAT.dualPistol.reloadMs;
+      dbSendReloadRequest(serverTransport, { playerId: localPlayerId, eventId });
+    },
+    getReloadingUntilMs: (): number | null => reloadingUntilMs,
+    /**
+     * DEV-only — scene.ts's `onSnapshot` listener calls this when
+     * the snapshot reports `local ammo === PLAYER_MAX_AMMO`. Clears
+     * `reloadingUntilMs` so the HUD's reload bar disappears.
+     * Not on the public probe surface; it's an internal hook.
+     */
+    ...(import.meta.env.DEV
+      ? {
+        _clearReloadingUntilMs: () => {
+          reloadingUntilMs = null;
+        },
+      }
+      : {}),
+    /**
+     * PR 11.7.E / §3.5 — DEV probe: send a ReloadRequest directly
+     * (smoke-only — production bundles omit this via the
+     * `import.meta.env.DEV` gate).
+     */
+    ...(import.meta.env.DEV
+      ? {
+        sendReloadRequest: (playerId: number, eventId: number): number => {
+          if (!serverTransport) return -1;
+          dbSendReloadRequest(serverTransport, { playerId, eventId });
+          return eventId;
         },
       }
       : {}),

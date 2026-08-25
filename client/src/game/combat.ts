@@ -79,6 +79,18 @@ export const COMBAT = {
     tracerColor: "#ffce5a",
     /** Maximum ray range in metres. Picked to comfortably exceed the demo map. */
     maxRangeMeters: 50,
+    // PR 11.7.E / §3.5 — reload mechanics tunables.
+    /** Time (ms) for the reload animation / progress bar to fill. The
+     *  server processes the ReloadRequest within one tick (≤16ms),
+     *  but the visible reload bar takes this long to fill so the player
+     *  has a meaningful "I'm reloading right now" indicator. Client-
+     *  local timer (PR 11.7.E locked decision #4). */
+    reloadMs: 1500,
+    /** Server-side rate limit, mirror of
+     *  `server/src/constants.rs::RELOAD_RATE_LIMIT_MS`. The HUD uses
+     *  this for the progress-bar duration, not for rate-limiting
+     *  (the server is authoritative for the rate-limit gate). */
+    lastReloadAtMinIntervalMs: 1000,
   },
   melee: {
     coneRadians: Math.PI / 3, // 60° total, ±30° from forward
