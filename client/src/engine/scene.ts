@@ -1171,12 +1171,12 @@ export async function createScene(
             () => gameSession.frame,
           );
           const interpolator = new Interpolator(localPlayerId);
-          // PR 11.7.D2 / §3.10 — interpolatorTickHook body. The
-          // hook is called per-frame from the render observer
-          // (BEFORE gameSession.tick). It samples the
-          // 100ms-lookback interpolated state for the REMOTE
-          // player (playerId !== localPlayerId) and applies the
-          // position to remoteController.havok via setPosition.
+          // PR 11.7.D2 / §3.10 — interpolatorTickHook body. The hook is called
+          // per-frame from the render observer (BEFORE gameSession.tick).
+          // It samples the 100ms-lookback interpolated state for the REMOTE
+          // player (playerId !== localPlayerId) and applies the position
+          // to remoteController.havok via setPosition.
+          //
           // The remote Havok body becomes a write-target — its
           // own physics integration (if any) is bypassed by
           // setPosition + the fact that gameSession.tick() no
@@ -1187,127 +1187,25 @@ export async function createScene(
           // returns null and we skip the setPosition (the remote
           // rig stays at its initial spawn). This matches the
           // pre-D2.2 behavior on first-connect.
-          interpolatorTickHook = (nowMs: number) => {
-            const states = interpolator.tick(nowMs);
-            // PR 11.7.D2.1 / debug — capture the latest tick call,
-            // regardless of whether states was empty. If we see
-            // frequent ticks with empty states, the interpolator's
-            // onSnapshot isn't buffering (or isn't being called).
-            // If we don't see ticks at all, the hook itself isn't
-            // being invoked by the render observer.
-            if (typeof window !== "undefined") {
-              const w = window as unknown as {
-                __lastInterpolatorTick?: { ts: number; statesCount: number };
-              };
-              w.__lastInterpolatorTick = { ts: performance.now(), statesCount: states.length };
-            }
-            // PR 11.7.D2.1 / debug — expose diagnostics to DevTools.
-            // Useful for diagnosing "remote rig not visible" / "both
-            // rigs at same position" issues in manual 2-tab tests.
-            if (typeof window !== "undefined") {
-              const w = window as unknown as {
-                __latestRemoteState?: { playerId: number; x: number; z: number; ts: number } | null;
-                __remoteStateCount?: number;
-                __rigPositions?: {
-                  localPos: { x: number; y: number; z: number } | null;
-                  remotePos: { x: number; y: number; z: number } | null;
-                  localEnabled: boolean | null;
-                  remoteEnabled: boolean | null;
-                };
-              };
-              w.__remoteStateCount = (w.__remoteStateCount ?? 0) + 1;
-              if (states.length > 0) {
-                const s = states[0];
-                w.__latestRemoteState = {
-                  playerId: s.playerId,
-                  x: s.position.x,
-                  z: s.position.z,
-                  ts: performance.now(),
-                };
-              }
-              // Refresh rig positions every 30 frames (~0.5s at 60Hz)
-              // to keep DevTools reads snappy without spamming the
-              // bridge.
-              if ((w.__remoteStateCount ?? 0) % 30 === 0) {
-                const sess = (window as unknown as {
-                  __gameSession?: {
-                    localController?: { state?: { position?: { x: number; y: number; z: number } } };
-                    remoteController?: { state?: { position?: { x: number; y: number; z: number } } };
-                    localModel?: { root?: { isEnabled?: () => boolean } };
-                    remoteModel?: { root?: { isEnabled?: () => boolean } };
-                  };
-                }).__gameSession;
-                w.__rigPositions = {
-                  localPos: sess?.localController?.state?.position
-                    ? { x: sess.localController.state.position.x, y: sess.localController.state.position.y, z: sess.localController.state.position.z }
-                    : null,
-                  remotePos: sess?.remoteController?.state?.position
-                    ? { x: sess.remoteController.state.position.x, y: sess.remoteController.state.position.y, z: sess.remoteController.state.position.z }
-                    : null,
-                  localEnabled: sess?.localModel?.root?.isEnabled?.() ?? null,
-                  remoteEnabled: sess?.remoteModel?.root?.isEnabled?.() ?? null,
-                };
-              }
-            }
-            if (states.length === 0) return;
-            const remoteCtrl = gameSession.remoteController;
-            // For the 2-player MVP: apply the FIRST remote player
-            //\'s interpolated position. (Multiple remote players
-            // would each need their own Havok body + rig; PR 11.7.D2
-            // keeps the single-remote-controller shape from PR 4.)
-            // Future multi-player work would iterate states and
-            // drive N remote controllers (one per non-local player).
-            const remoteState = states[0];
-            // `state.position` is the interpolated Vec3 in world
-            // space (Babylon convention: XZ = horizontal, Y =
-            // vertical). Apply via Havok setPosition; the
-            // visualRoot.position.copyFrom(pos) in
-            // characterController.ts publishes it to the mesh.
-            // We skip `state.rotation` for now (yaw/pitch on the
-            // wire are zero in PR 11.7.B per server snapshot.rs;
-            // the remote rig renders with its default yaw).
-            remoteCtrl.havok.setPosition(remoteState.position);
-            // PR 11.7.D3 / visual-rig fix — also copy to the
-            // visualRoot TransformNode via the public
-            // `setVisualPosition` method (visualRoot is private).
-            // Pre-fix, the render observer only updated Havok +
-            // state.position, but the visual mesh (TransformNode)
-            // was never touched. The remote controller's `update()`
-            // was retired (PR 11.7.D2 / §3.10), so the local-rig
-            // auto-sync (Havok → state.position → visualRoot.position)
-            // doesn't fire for the remote. Without this copy, the
-            // teal rig mesh stays at its spawn TransformNode even
-            // though the Havok body and state.position reflect the
-            // live snapshot.
-            remoteCtrl.setVisualPosition(remoteState.position);
-            // PR 11.7.D2.1 / FIX — explicitly mirror the Havok position
-            // onto `state.position`. Pre-fix, `state.position` was only
-            // updated by `CharacterController.update()` (which reads
-            // Havok → state.position), and since the remote
-            // controller's update() was retired (PR 11.7.D2 / §3.10)
-            // for the snapshot-driven visual, `state.position` stayed
-            // at the initial remote spawn forever. The smoke's
-            // `readRigPositions()` probe therefore reported the same
-            // stale value frame after frame even though the Havok
-            // body had been moving. Copying `remoteState.position`
-            // straight into `state.position` keeps the public API
-            // (gameSession.remoteController.state.position) honest.
-            remoteCtrl.state.position.copyFrom(remoteState.position);
-            // PR 11.7.D2.1 / debug — capture the latest setPosition
-            // for DevTools. Helps distinguish "interpolator ran but
-            // setPosition was a no-op" from "interpolator never ran."
-            if (typeof window !== "undefined") {
-              const w = window as unknown as {
-                __lastInterpolatorSetPosition?: { x: number; z: number; ts: number; playerId: number };
-              };
-              w.__lastInterpolatorSetPosition = {
-                x: remoteState.position.x,
-                z: remoteState.position.z,
-                ts: performance.now(),
-                playerId: remoteState.playerId,
-              };
-            }
-          };
+          //
+          // PR 11.7.D3.2 / DEAD CODE — the closure-bound hook body
+          // was removed because the LIVE observer (window-published
+          // `__liveInterpolatorTickHook` set below at the end of
+          // this IIFE) supersedes it under React StrictMode. The
+          // closure-bound path would call `setPosition` on a
+          // disposed `remoteController.havok` (scene.dispose →
+          // gameSession.dispose → remoteController.havok disposed)
+          // and silently no-op. The LIVE observer resolves the
+          // controller via `window.__gameSession?.remoteController`
+          // so it always sees the live (post-StrictMode-re-mount)
+          // controller. The render observer's `if (liveHook) ...
+          // else interpolatorTickHook?.(now)` fallback at line ~582
+          // is now always liveHook and the closure-bound path is
+          // dead. We retain the `interpolatorTickHook` variable +
+          // the `?.(now)` call for readability (it documents the
+          // architectural intent even though the path is never
+          // taken).
+          interpolatorTickHook = null;
           // PR 11.7.D2.1 / FIX — publish the LIVE remote-controller +
           // the interpolation tick body to the window slot. This
           // decouples the render observer from the createScene()
@@ -1334,6 +1232,19 @@ export async function createScene(
               const liveStates = liveInterpolator.tick(nowMs);
               if (liveStates.length === 0) return;
               const liveState = liveStates[0];
+              // PR 11.7.D3.2 / post-merge hardening — skip position
+              // writes during the respawn grace period (3s after
+              // `respawn()` fires). The server doesn't auto-respawn, so
+              // its snapshot keeps reporting the player's death position
+              // until they actually move. Without this skip, the LIVE
+              // observer would clobber the respawn teleport within
+              // ~16ms and the visual rig would snap back to the death
+              // position. The snapshot's buffer continues filling with
+              // new authoritative data; we just don't WRITE to the
+              // controller until the grace expires.
+              if (liveRemoteCtrl.isInRespawnGrace(nowMs)) {
+                return;
+              }
               liveRemoteCtrl.havok.setPosition(liveState.position);
               // PR 11.7.D3 / walk-mirror visual fix — the LIVE hook is
               // what actually runs under React StrictMode (the
