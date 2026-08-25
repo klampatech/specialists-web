@@ -305,9 +305,16 @@ async function runSmoke() {
     // listener is registered AFTER the server has already been
     // emitting snapshots for Tab A's session. The next 20Hz tick
     // (≤50ms) should reach Tab B once its listener is wired up.
+    // PR 11.7.D3.3 / parallel-load: bumped deadline from 1s → 5s.
+    // When the 24-player stress smoke runs in parallel on the same
+    // CI runner, Vite's first-frame load + WS handshake can take
+    // 3-4s under contention. 1s was too tight; 5s gives generous
+    // headroom without masking real bugs (a real 'snapshot never
+    // arrives' would fail after 5s, which is still the strong
+    // failure mode).
     for (const [page, label] of [[pageA, "A"], [pageB, "B"]]) {
       let primerCheck = null;
-      const deadline = Date.now() + 1000;
+      const deadline = Date.now() + 5000;
       while (Date.now() < deadline) {
         primerCheck = await page.evaluate(() => {
           const snap = window.__latestSnap ? window.__latestSnap() : null;
@@ -315,12 +322,12 @@ async function runSmoke() {
           return { snapIsNull: snap === null, hasEntries: entries.length > 0, entries };
         });
         if (primerCheck.hasEntries) break;
-        await sleep(50);
+        await sleep(150);
       }
       log(`Tab ${label} primer check: ${JSON.stringify(primerCheck)}`);
       if (!primerCheck.hasEntries) {
         throw new Error(
-          `Tab ${label} snapshot has no players after primer (waited 1s) — server snapshot stream not delivering. ` +
+          `Tab ${label} snapshot has no players after primer (waited 5s) — server snapshot stream not delivering. ` +
           `Snapshot was ${primerCheck.snapIsNull ? "null" : "non-null with empty players"}. ` +
           `Snapshot entries: ${JSON.stringify(primerCheck.entries)}`,
         );
