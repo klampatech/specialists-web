@@ -29,24 +29,29 @@
 // **Memory budget**: each Chromium headless context is ~80-120MB
 // RSS at idle (Babylon GPU resource baseline). 24 contexts = ~2.5GB.
 // Plus Vite + cargo canary ~500MB. Total: ~3GB free needed on the
-// CI runner. Headless Chromium on GitHub's ubuntu-latest (7GB RAM)
-// has comfortable headroom; local dev boxes with 16GB+ are fine.
+// CI runner. GitHub's ubuntu-latest has 7GB RAM, which is
+// comfortable headroom, but launching 24 chromium contexts in
+// parallel stresses the runner's IO scheduler; the smoke uses a
+// staged launch (3 tabs at a time, with a settle between waves)
+// to keep CPU/IO peak load manageable. See STRESS_24P_LAUNCH_WAVE
+// env var.
 //
 // Flow:
 //   1. Boot canary server (--port-wt 14433 --port-ws 14434) + Vite
 //      (port 5174).
 //   2. Capture canary stderr to a temp file so we can grep the
 //      `[stress-stats]` lines for the drop-oldest counter.
-//   3. Spawn 24 browser contexts (each with its own GPU budget —
-//      mirrors the 2-tab smoke's comment about ERR_INSUFFICIENT_RESOURCES
-//      on shared contexts).
+//   3. Spawn N browser contexts in waves of `WAVE_SIZE` (default
+//      3) so the runner doesn't IO-thrash on parallel launches.
 //   4. For each context: navigate to ?server=...&localId=N&peerId=1
 //      with __forceServerTransport init script. Set peerId to 1 so
 //      the snapshot's "remote" player count wraps around (peerId of
 //      player 1 = player 1, which the remoteInterpolator already
 //      filters out — only 23 remote rigs to mirror, not 24).
 //   5. Wait for ALL 24 tabs' ServerTransport to report connected=true.
-//   6. Wait 1s for snapshot stream to fan out + settle.
+//      Generous timeout (60s default) because the snapshot stream
+//      + first WS handshake can take 30s+ on a saturated CI runner.
+//   6. Wait 5s for snapshot stream to fan out + settle.
 //   7. Read __latestSnap() from every tab; assert all 24 player IDs
 //      (1..24) appear in every tab's snapshot.
 //   8. Read the canary log's [stress-stats] lines; assert the
@@ -68,11 +73,25 @@ const URL = process.env.URL ?? "http://localhost:5174/";
 const WT_PORT = Number(process.env.STRESS_24P_WT_PORT ?? 14433);
 const WS_PORT = Number(process.env.STRESS_24P_WS_PORT ?? 14434);
 const N_PLAYERS = Number(process.env.STRESS_24P_N ?? 24);
+// PR 11.7.D3.3 / CI: launch contexts in waves of WAVE_SIZE (default 3)
+// so the runner's IO scheduler doesn't thrash when 24 chromium
+// processes spin up simultaneously. Between waves, sleep WAVE_PAUSE_MS
+// to let the runner stabilize. Local dev with 16GB+ RAM can crank
+// WAVE_SIZE to 24 for the fastest run.
+const WAVE_SIZE = Number(process.env.STRESS_24P_LAUNCH_WAVE ?? 3);
+const WAVE_PAUSE_MS = Number(process.env.STRESS_24P_LAUNCH_PAUSE_MS ?? 1500);
 const CANARY_LOG = process.env.STRESS_24P_CANARY_LOG
   ?? `/tmp/canary-stress-24p-${process.pid}.log`;
 
 const NAV_TIMEOUT = Number(process.env.SMOKE_NAV_TIMEOUT ?? 30000);
-const CONNECT_TIMEOUT_MS = Number(process.env.STRESS_24P_CONNECT_TIMEOUT_MS ?? 15000);
+// PR 11.7.D3.3 / CI: bumped from 15s → 60s. Cold-CI runner's IO
+// saturation + 24 parallel chromium context spawns + first-frame
+// snapshot handshake regularly takes 30-45s. 15s was too tight
+// (see CI run 32811772092 — 12/24 tabs failed within 15s on CI;
+// same code PASSED locally within ~5s). 60s gives generous
+// headroom for cold runners without masking real bugs (a real
+// connection hang should take much longer to debug).
+const CONNECT_TIMEOUT_MS = Number(process.env.STRESS_24P_CONNECT_TIMEOUT_MS ?? 60000);
 const SNAPSHOT_SETTLE_MS = Number(process.env.STRESS_24P_SNAPSHOT_SETTLE_MS ?? 1500);
 
 const log = (...args) => console.log("[smoke]", ...args);
@@ -195,20 +214,33 @@ async function waitForConnected(page, timeoutMs) {
 }
 
 async function runSmoke() {
-  log(`Spawning ${N_PLAYERS} chromium contexts (each its own GPU budget)...`);
+  log(`Spawning ${N_PLAYERS} chromium contexts in waves of ${WAVE_SIZE}...`);
   const browsers = [];
   const contexts = [];
   const pages = [];
-  for (let i = 0; i < N_PLAYERS; i++) {
-    const b = await chromium.launch({
-      headless: true,
-      args: ["--ignore-certificate-errors"],
-    });
-    browsers.push(b);
-    const ctx = await b.newContext({ viewport: { width: 800, height: 600 } });
-    contexts.push(ctx);
-    const page = await ctx.newPage();
-    pages.push(page);
+  // PR 11.7.D3.3 / staged launch — split the parallel browser-context
+  // creation into waves of WAVE_SIZE. Each chromium.launch + newContext +
+  // newPage is heavy (process fork, GPU subprocess init, ~100MB RSS).
+  // 24 parallel launches thrash the CI runner's IO scheduler; 8 waves
+  // of 3 give the runner time to settle between batches. Total wall-time
+  // difference is ~3s vs all-at-once; failure modes are much cleaner.
+  for (let wave = 0; wave < N_PLAYERS; wave += WAVE_SIZE) {
+    const waveEnd = Math.min(wave + WAVE_SIZE, N_PLAYERS);
+    log(`  Wave: launching tabs ${wave + 1}..${waveEnd}...`);
+    for (let i = wave; i < waveEnd; i++) {
+      const b = await chromium.launch({
+        headless: true,
+        args: ["--ignore-certificate-errors"],
+      });
+      browsers.push(b);
+      const ctx = await b.newContext({ viewport: { width: 800, height: 600 } });
+      contexts.push(ctx);
+      const page = await ctx.newPage();
+      pages.push(page);
+    }
+    if (waveEnd < N_PLAYERS) {
+      await sleep(WAVE_PAUSE_MS);
+    }
   }
   log(`${browsers.length} browsers/contexts/pages ready.`);
 

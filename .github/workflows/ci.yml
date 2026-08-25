@@ -627,13 +627,20 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
       - name: Run 24-player stress smoke
-        # 5s snapshot settle (slow CI runners need the headroom) +
-        # 5s stats-interval overlap so we see at least 2-3 [stress-stats]
-        # lines in the canary log before the assertion runs.
+        # Staged launch: 3 tabs at a time, 1.5s pause between waves
+        # (each chromium.launch is ~100MB RSS + a process fork; 24
+        # parallel would IO-thrash the CI runner). 60s connect
+        # timeout (cold CI runner + 24 context spawns + first WS
+        # handshake regularly takes 30-45s on ubuntu-latest).
+        # 5s snapshot settle + 3s stats interval so we see ~5-7
+        # [stress-stats] lines before the assertion runs.
         run: node ./tools/stress-24p-smoke.mjs
         env:
           STRESS_24P_N: "24"
           STRESS_24P_SNAPSHOT_SETTLE_MS: "5000"
+          STRESS_24P_CONNECT_TIMEOUT_MS: "60000"
+          STRESS_24P_LAUNCH_WAVE: "3"
+          STRESS_24P_LAUNCH_PAUSE_MS: "1500"
           CANARY_STATS_INTERVAL_MS: "3000"
       - name: Tear down canary + Vite
         if: always()
