@@ -313,6 +313,35 @@ The `computeRespawnPosition(playerId)` function uses the same `PLAYER_SPAWN_X_OF
 Also carry-forward from PR 11.7.B/11.7.C: `0x06 InputSeq` trailer (wire-size 17→18 + `last_inputs_seq_per_source` in `validate_and_relay`), `protocol/constants.ts` extraction (5 constants currently inlined: `SNAPSHOT_RATE_HZ`, `RECONCILIATION_THRESHOLD_M`, `MAX_RECONCILIATION_SNAP_DISTANCE_M`, `INTERPOLATION_DELAY_MS`, `MAX_SNAPSHOT_AGE_MS`).
 
 ---
+
+## 2026-08-26 — PR #59 CI fix — `actions.cache@v4` → `actions/cache@v4` in aim-event smoke
+
+**TL;DR for #59 reviewer**: PR #59 was failing every push with GH's "workflow file issue" gate (zero jobs ran, 6 consecutive failures across `aad6c0f`/`62d2df8`/`c8e3cbd`). Root cause: the new `client-damage-server-aim-event-smoke` job in `.github/workflows/ci.yml` used `actions.cache@v4` (deprecated dotted form). GH's Actions validator rejects the dotted form. The 20 pre-existing `actions.cache@v4` references in OTHER jobs were tolerated (legacy alias) — the 21st introduction surfaced the issue.
+
+**Fix (commit `cf1e57a` on `feat/phase1-pr-aimevent`)**: single-line `actions.cache@v4` → `actions/cache@v4` in the new job only. actionlint binary installed locally at `/home/kyle/Development/specialists-web-pr-aimevent/actionlint` (use as pre-push gate next time). PR is `MERGEABLE`, the new smoke (`client — damage server aim-event smoke (PR #59, port 5191)`) **PASSED green on the first run after the fix** (job 98203563202 in run 32976749121).
+
+**⚠️ New blocker surfaced (NOT fixed by `cf1e57a` — separate concern)**: run 32976749121 had 4 pre-existing port-conflict failures (`Port 5190 already in use`, `bind TCP/14434: Address already in use`) on:
+- `client — health regression smoke (PR 10)` (runner 1000012135)
+- `client — damage server HP-convergence smoke (PR 11.6.D, port 5191)` (runner 1000012150)
+- `client — damage server reload smoke (PR 11.7.E, port 5191)` (runner 1000012151)
+- `client — damage server smoke (PR 11.6.C, port 5190)` (runner 1000012153)
+
+All 4 are **port-conflict-with-prior-job-stragglers** on the lampak self-hosted runner pool. The runners are separate VMs (different runner-name IDs) but all happened to land on machines with stale canary / vite processes bound to 5190/5191/14433/14434. The teardown `if: always()` + `pkill -f canary-server.sh || true` + `lsof -ti:${port}` catch loop is not aggressive enough — likely the parent `nohup bash tools/canary-server.sh` exits but child rust/cargo processes get orphaned.
+
+**Recommended follow-up PR (carry-forward, non-blocking for #59 merge)**: `chore(ci): pre-step port-freeup for all canary-using smokes`. Either:
+- (a) Add a pre-step `pkill -9 -f canary-server.sh; pkill -9 -f vite; lsof -ti:5190,5191,14433,14434 | xargs -r kill -9` at the top of every canary-using smoke before installing deps, OR
+- (b) Switch all canary-using smokes off self-hosted runners onto `runs-on: ubuntu-latest` (GH-hosted VMs are clean per job).
+
+Option (b) is the small-surface fix and addresses root cause. Option (a) is a 5-line patch but perpetuates the latent straggler problem on every other smoke that doesn't have a pre-step.
+
+**PR #59 status after `cf1e57a`**: 21/25 jobs PASS (incl. the new aim-event smoke). 4 failures are the port-conflict issue above, all pre-existing and unrelated to PR #59's delta. PR is still MERGEABLE; MacBook function-test verdict (cc: `1542042299767193610`) holds; CI rerun on a cleaner self-hosted runner should bring it all-green without further ci.yml changes.
+
+**Playtest status** ⚠️
+- **Still playable**: PR #59 MacBook function test (cc: `1542042299767193610`) PASSED all 4 phases on real Vivaldi Chrome 150.0.0.0 — Phase 1 connect ✅, Phase 2 hit (HP 100→88 BOTH tabs) ✅, Phase 3 ammo decrement ✅, Phase 4 miss path (ammo drops, no self-damage) ✅. Screenshots at `/home/kyle/.hermes/cache/images/aimevent-mac/1787723887-phase-{1,2,4}-{a,b}.png`.
+- **No new playtest this session**: change was a single-line ci.yml edit; no runtime behavior delta. MacBook validation holds.
+- **No new breaking change**: the only delta is a deprecated action reference → canonical reference. Behavior identical.
+
+---
 ## 2026-08-22 — PR 11.7.D2.2.1 follow-up — 3 lockstep smokes rewritten via ServerTransport
 
 
