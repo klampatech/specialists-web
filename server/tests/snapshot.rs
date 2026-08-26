@@ -416,6 +416,30 @@ fn snapshot_carries_yaw_pitch_as_zero_default() {
     assert_eq!(snap.players[0].pitch, 0.0);
 }
 
+/// PR AimEvent / §4.5 — once the `0x06 InputsServer` arm populates
+/// `Room.players[id].yaw_radians` / `.pitch_radians`, the snapshot
+/// MUST mirror those values (not the hardcoded 0.0 default). This
+/// catches the regression where `snapshot.rs::maybe_emit` reverts
+/// to hardcoded 0.0 (the bug PR #59 just fixed).
+#[test]
+fn snapshot_carries_yaw_pitch_populated_from_room() {
+    let mut room = empty_room();
+    register_connection(&mut room, 1);
+    // Simulate the 0x06 InputsServer arm capturing the client's
+    // last-reported yaw/pitch into Room.players[1].
+    {
+        let p = room.players.get_mut(&1).expect("player 1 in room");
+        p.yaw_radians = 1.234;
+        p.pitch_radians = -0.567;
+    }
+    let mut gen = SnapshotGenerator::new();
+    let snap = gen.maybe_emit(&room, 100).expect("emit");
+    // PR #59: snapshot MUST carry the populated yaw/pitch (not 0.0).
+    let p1 = snap.players.iter().find(|p| p.player_id == 1).expect("player 1 in snap");
+    assert!((p1.yaw - 1.234).abs() < 0.001, "yaw must mirror Room.players[1].yaw_radians (got {})", p1.yaw);
+    assert!((p1.pitch - (-0.567)).abs() < 0.001, "pitch must mirror Room.players[1].pitch_radians (got {})", p1.pitch);
+}
+
 /// PR 11.7.B — sanity check on the integration interval math:
 /// `Duration::from_millis(50)` = exactly 20Hz.
 #[test]

@@ -28,6 +28,7 @@ import {
   decodePing,
   decodePong,
   decodePositionUpdate,
+  encodeAimEvent,
   encodeDamageBroadcast,
   encodeDamageRequest,
   encodeInputsServer,
@@ -35,6 +36,7 @@ import {
   encodePositionUpdate,
 } from "../../../protocol/damage";
 import type {
+  AimEvent,
   DamageBroadcast,
   DamageReject,
   DamageRequest,
@@ -68,11 +70,13 @@ export {
   decodePing,
   decodePong,
   decodePositionUpdate,
+  encodeAimEvent,
   encodeDamageBroadcast,
   encodeDamageRequest,
   encodeInputsServer,
   encodePing,
   encodePositionUpdate,
+  DISCRIMINATOR_AIM_EVENT,
   DISCRIMINATOR_DAMAGE_BROADCAST,
   DISCRIMINATOR_DAMAGE_REJECT,
   DISCRIMINATOR_DAMAGE_REQUEST,
@@ -81,6 +85,7 @@ export {
   DISCRIMINATOR_PING,
   DISCRIMINATOR_PONG,
   DISCRIMINATOR_POSITION_UPDATE,
+  AIM_EVENT_WIRE_SIZE,
   DAMAGE_BROADCAST_WIRE_SIZE,
   DAMAGE_REJECT_WIRE_SIZE,
   DAMAGE_REQUEST_WIRE_SIZE,
@@ -130,6 +135,45 @@ export function sendDamageRequest(
 ): number {
   t.sendDamageRequest(req);
   return req.eventId;
+}
+
+/**
+ * PR #59 / §3.5 — send a typed `AimEvent` over the transport.
+ *
+ * Replaces the client-raycast-verified `DamageRequest` (PR 11.6.D).
+ * The client no longer picks against `remote_*` meshes; it sends
+ * its intent (yaw + pitch + frame + eventId) and the server runs
+ * `dual_pistol_hit` against snapshot-known positions for every
+ * OTHER player in the room.
+ *
+ * Fire-rate + ammo gates are enforced server-side; the client
+ * pre-checks (gating on `last_fire_at` + `ammo > 0`) to avoid
+ * spamming the wire. The `eventId` is monotonically incremented
+ * via `nextAimEventId()` below; the server applies a bounded-
+ * window check (EVENT_ID_WINDOW = 64) so tab reloads recover.
+ */
+export function sendAimEvent(
+  t: ServerTransport,
+  req: AimEvent,
+): number {
+  t.sendAimEvent(req);
+  return req.eventId;
+}
+
+/** Monotonic per-local-player counter for AimEvent eventIds.
+ *  Mirrors the `nextReloadEventId` counter (PR 11.7.E) and the
+ *  `nextEventId` counter in `gameSession.ts` (used for DamageRequest
+ *  in PR 11.6.D). Resets to 1 on tab reload; the server's bounded
+ *  window gate tolerates the reset. */
+let _nextAimEventId = 1;
+export function nextAimEventId(): number {
+  return _nextAimEventId++;
+}
+/** DEV-only: reset the counter. Tests / smokes reset between scenarios
+ *  so the bounded-window math doesn't accidentally accumulate across
+ *  runs. NOT exposed via the production probe. */
+export function _resetAimEventIdForTests(next: number = 1): void {
+  _nextAimEventId = next;
 }
 
 /** Send a typed `PositionUpdate` over the transport. */
@@ -345,8 +389,17 @@ export class DamageRequestQueue {
  *     `"confirm" | "revert" | "applied" | "ignored"`)
  */
 export interface DamageBusProbe {
-  /** PR 11.7.D: pure-send DamageRequest. No local apply. */
+  /** PR 11.7.D: pure-send DamageRequest. No local apply. DEPRECATED
+   *  in PR #59 — the AimEvent path (below) replaces it. Sending a
+   *  DamageRequest post-PR-#59 logs a deprecation warn on the
+   *  server and produces no damage. Kept on the probe surface for
+   *  B1→B2 migration symmetry; production callers should switch
+   *  to `sendAimEvent`. */
   sendDamageRequest: (req: DamageRequest) => number;
+  /** PR #59 / §3.5 — pure-send AimEvent. The client sends its
+   *  intent (yaw + pitch); the server runs the hitscan. Replaces
+   *  `sendDamageRequest`. */
+  sendAimEvent: (req: AimEvent) => number;
   /** Send a typed `PositionUpdate` through the live transport. */
   sendPositionUpdate: (pu: PositionUpdate) => void;
   /** PR 11.6.D / §3.10: throttled PositionUpdate sender. */
@@ -387,6 +440,7 @@ export interface DamageBusProbe {
   /** Re-export the typed encoder/decoder functions so the smoke can
    *  inspect wire bytes without re-importing `protocol/damage`. */
   encodeDamageRequest: typeof encodeDamageRequest;
+  encodeAimEvent: typeof encodeAimEvent;
   encodePositionUpdate: typeof encodePositionUpdate;
   encodePing: typeof encodePing;
   encodeDamageBroadcast: typeof encodeDamageBroadcast;
@@ -404,6 +458,7 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
       queue.push(req);
       return sendDamageRequest(t, req);
     },
+    sendAimEvent: (req: AimEvent) => sendAimEvent(t, req),
     sendPositionUpdate: (pu) => sendPositionUpdate(t, pu),
     sendPositionUpdateThrottled: (frameCounter, playerId, positionX, positionY) =>
       sendPositionUpdateThrottled(t, frameCounter, playerId, positionX, positionY),
@@ -431,6 +486,7 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
     applyBroadcast,
     pendingApplyCount: () => 0, // PR 11.7.D: no pending map. Removed in B3.
     encodeDamageRequest,
+    encodeAimEvent,
     encodePositionUpdate,
     encodePing,
     encodeDamageBroadcast,

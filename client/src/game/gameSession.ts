@@ -75,12 +75,12 @@ import {
 } from "./combat";
 import { applyDamage, tickRespawn, type HealthSnapshot } from "./health";
 import {
-  sendDamageRequest as dbSendDamageRequest,
+  sendAimEvent as dbSendAimEvent,
   sendPositionUpdateThrottled as dbSendPositionUpdateThrottled,
   sendReloadRequest as dbSendReloadRequest,
   nextReloadEventId as dbNextReloadEventId,
 } from "../net/damageBus";
-import type { DamageRequest } from "../../../protocol/damage";
+import type { AimEvent } from "../../../protocol/damage";
 import type { ServerTransport } from "../net/serverTransport";
 
 /** One combat event the HUD / tracer render can react to. */
@@ -422,7 +422,21 @@ export function createGameSession(
   /** PR 11.6.D — monotonic eventId counter for outbound DamageRequests.
    *  The server rejects stale eventIds (PR 11.6.D §3.4.1 gate 6).
    *  Start at 1 (0 is a sentinel — never used on the wire). */
-  let nextEventId = 1;
+  // PR #59: monotonic per-local-player counter for AimEvent
+  // eventIds. Reset on tab reload; the server's EVENT_ID_WINDOW
+  // gate tolerates the reset. (Replaces the pre-PR-#59
+  // `nextEventId` counter which was for DamageRequest; that
+  // path is REMOVED in PR #59.)
+  let nextAimEventIdLocal = 1;
+  // PR #59: client-side fire-rate cooldown stamp + ammo counter
+  // for the AimEvent pre-check (avoid spamming the wire when
+  // the server would reject). Both are cosmetic — the server is
+  // the source of truth and the snapshot stream carries the
+  // authoritative values. Initial ammo = 6 (matches
+  // `server/src/constants.rs::PLAYER_MAX_AMMO` and App.tsx's
+  // `<BulletHud maxAmmo={6} />`).
+  let lastFireMsLocal = 0;
+  let ammoCountLocal = 6;
   /**
    * PR 11.4: when true, BOTH controllers skip their per-tick
    * `update()` call (the spectator camera has absorbed the WASD keys,
@@ -570,6 +584,50 @@ export function createGameSession(
     // payload that would have told the peer you fired.
     const frameCombatEvents: CombatEvent[] = [];
     if (gameInput.fireHeld && !wasFiring) {
+      // PR #59 / §3.5 — server-authoritative hit detection.
+      //
+      // Pre-PR-#59 the local raycast (`dualPistolShoot`) gated
+      // whether a `DamageRequest` was sent. That path was
+      // vulnerable to the rig being at a position the local
+      // Havok query didn't know about (the snapshot stream
+      // carries Havok positions; the local physics world only
+      // knows `local_*` bodies). The raycast missed → no
+      // `DamageRequest` → HP didn't drop.
+      //
+      // PR #59 sends an `AimEvent` UNCONDITIONALLY on the rising
+      // edge of `fireHeld`. The server runs `dual_pistol_hit`
+      // against snapshot-known positions for every OTHER
+      // player in the room and emits `DamageBroadcast`(s) for
+      // hits. The local raycast is still used for the visual
+      // tracer (below) — the only client-side decision left
+      // is "show the tracer", not "did I hit".
+      //
+      // Fire-rate cooldown is enforced client-side to avoid
+      // spamming the wire; ammo is checked client-side too
+      // (purely cosmetic — the server is the source of truth).
+      const now = nowMs;
+      const cooldownOk =
+        now - lastFireMsLocal >= COMBAT.dualPistol.fireCooldownMs;
+      const ammoOk = ammoCountLocal > 0;
+      if (cooldownOk && ammoOk && serverTransport) {
+        const req: AimEvent = {
+          sourcePlayerId: localPlayerId,
+          yawRadians: gameInput.yawRadians ?? 0,
+          pitchRadians: gameInput.pitchRadians ?? 0,
+          frame: advanced.frame,
+          eventId: nextAimEventIdLocal++,
+        };
+        dbSendAimEvent(serverTransport, req);
+        // Stamp the local fire timestamp + decrement local ammo
+        // (snapshot stream carries the authoritative ammo on the
+        // next 20Hz tick; this is for immediate HUD feedback).
+        lastFireMsLocal = now;
+        ammoCountLocal = Math.max(0, ammoCountLocal - 1);
+      }
+      // Run the local raycast for the VISUAL tracer (and the
+      // HUD combat-event label: fire_hit vs fire_miss). The
+      // raycast verdict no longer gates whether damage is sent
+      // — the tracer draws regardless of hit/miss.
       const result: DualPistolResult = dualPistolShoot(
         gameInput,
         localController,
@@ -588,36 +646,6 @@ export function createGameSession(
         tracerTo: result.tracerTo,
         damage: result.damage,
       });
-      // PR 10: local fired → remote takes the damage.
-      // PR 11.6.D: when the server-auth transport is wired, send the
-      // DamageRequest via damageBus.sendDamageRequest (which sends +
-      // applies optimistically + tracks in pendingApplies for the
-      // confirm/revert path). Otherwise, fall back to the local-
-      // compute path (lockstep guarantees identical events on both
-      // clients — used by the 14 P2P smokes + PR 11.6.C smoke).
-      // PR 11.7.D2 / §3.10 fix: gate on `hitTarget === "remote"`
-      // instead of `result.hit`. Pre-fix, shooting crates / world
-      // geometry sent a DamageRequest (and the server applied it),
-      // making HP drop on every shot regardless of whether the peer
-      // was actually hit. result.damage is now 0 for non-peer hits
-      // (see combat.ts:dualPistolShoot), so the smoke path also
-      // needs to gate to avoid sending zero-amount requests.
-      if (result.hitTarget === "remote") {
-        if (serverTransport) {
-          const eventId = nextEventId++;
-          const req: DamageRequest = {
-            frame: advanced.frame,
-            sourcePlayerId: localPlayerId,
-            targetPlayerId: peerPlayerId,
-            source: 0, // fire
-            amount: result.damage,
-            eventId,
-          };
-          dbSendDamageRequest(serverTransport, req, remoteController, nowMs, localPlayerId, peerPlayerId);
-        } else {
-          applyDamage(remoteController, { source: "fire", amount: result.damage }, nowMs);
-        }
-      }
     }
     if (gameInput.meleePressed && !wasMelee) {
       const result: MeleeResult = meleeSwing(
@@ -631,23 +659,16 @@ export function createGameSession(
           kind: "melee_hit",
           damage: result.damage,
         });
-        // PR 10: melee hit also applies damage to the remote rig.
-        // PR 11.6.D: same server-auth-vs-local-compute fork as the
-        // fire path above (line 391).
-        if (serverTransport) {
-          const eventId = nextEventId++;
-          const req: DamageRequest = {
-            frame: advanced.frame,
-            sourcePlayerId: localPlayerId,
-            targetPlayerId: peerPlayerId,
-            source: 1, // melee
-            amount: result.damage,
-            eventId,
-          };
-          dbSendDamageRequest(serverTransport, req, remoteController, nowMs, localPlayerId, peerPlayerId);
-        } else {
-          applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
-        }
+        // PR #59 / §3.5: PR is FIRE-ONLY. The 0x01 DamageRequest
+        // wire type is REMOVED in PR #59; melee has no AimEvent
+        // equivalent yet (Phase 2 melee work adds a 0x0B
+        // MeleeEvent discriminator if needed). When the server-auth
+        // transport is wired, melee damage falls back to local-
+        // compute (applyDamage on the remote controller). The
+        // brief explicitly says melee is out of scope; this is
+        // the best-effort backward-compat path for the PR #59
+        // window.
+        applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
       }
     }
     wasFiring = gameInput.fireHeld;

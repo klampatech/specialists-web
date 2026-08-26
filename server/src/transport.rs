@@ -61,9 +61,9 @@ use specialists_server::cert::DEFAULT_SANS;
 use specialists_server::constants::DEVBX_ROOM_ID;
 use specialists_server::position_history::Position;
 use specialists_server::protocol::{
-    decode_damage_request, decode_inputs_server, decode_ping, decode_position_update,
-    decode_reload_request, encode_pong, DISCRIMINATOR_DAMAGE_BROADCAST,
-    DISCRIMINATOR_DAMAGE_REQUEST, DISCRIMINATOR_INPUTS, DISCRIMINATOR_INPUTS_SERVER,
+    decode_aim_event, decode_inputs_server, decode_ping, decode_position_update,
+    decode_reload_request, encode_pong, DISCRIMINATOR_AIM_EVENT,
+    DISCRIMINATOR_DAMAGE_BROADCAST, DISCRIMINATOR_DAMAGE_REQUEST, DISCRIMINATOR_INPUTS, DISCRIMINATOR_INPUTS_SERVER,
     DISCRIMINATOR_PING, DISCRIMINATOR_PONG, DISCRIMINATOR_POSITION_UPDATE,
     DISCRIMINATOR_RELOAD_REQUEST, DISCRIMINATOR_SNAPSHOT, Pong,
 };
@@ -574,22 +574,58 @@ pub(super) async fn handle_binary(
             payload.to_vec()
         }
         DISCRIMINATOR_DAMAGE_REQUEST => {
-            // PR 11.6.D: server-auth damage validation.
-            let Some(req) = decode_damage_request(&payload[1..]) else {
-                warn!("damageRequest: decoder rejected malformed payload");
+            // PR AimEvent / §3.5 — DEPRECATED. Pre-PR-#59 the
+            // client raycast-verified a hit on a remote_* mesh and
+            // sent the resulting DamageRequest (disc 0x01). That
+            // path is REMOVED in PR #59 — the server is now the
+            // sole hit-detection authority. The client sends an
+            // `AimEvent` (disc 0x0A) with its claimed yaw/pitch;
+            // the server's `validate_and_relay_aim` runs the
+            // raycast against snapshot-known positions.
+            //
+            // Any pre-PR-#59 client talking to a post-PR-#59 server
+            // gets this warn + zero damage (acceptable: clients are
+            // single-repo; the PR is a wire-format break by design).
+            // Wire-format compat: we KEEP the 0x01 discriminator
+            // reserved so the inbound dispatcher's `unknown
+            // discriminator` warn doesn't fire — just drop with
+            // a deprecation log.
+            warn!(
+                "client sent damageRequest (0x01) — deprecated, use AimEvent (0x0A); no damage applied",
+            );
+            vec![]
+        }
+        DISCRIMINATOR_AIM_EVENT => {
+            // PR AimEvent / §3.5 -- server-authoritative hit detection.
+            //
+            // The client no longer raycasts against remote_* meshes
+            // (which failed when the rig was at a position the local
+            // Havok query didn't know about -- see the PR #59 brief,
+            // Kyle's 2-tab Vivaldi test `cc: 1541898875252506775`).
+            // The client sends its intent (yaw + pitch + frame +
+            // eventId); the server runs `validate_and_relay_aim`
+            // against snapshot-known positions for every OTHER
+            // player in the room and emits `DamageBroadcast`(s) for
+            // hits. Fire-rate + ammo gates are enforced once for the
+            // whole event (outer gate); per-target hits just decide
+            // which `DamageBroadcast`s to emit (and which ammo to
+            // decrement on the source).
+            //
+            // **Anti-spoof**: the connection's REAL PlayerId is the
+            // value stashed in `connection_state.claimed_player_id`
+            // by the first successful inbound arm (PositionUpdate /
+            // Ping / AimEvent / ReloadRequest). Subsequent inbound
+            // arms MUST match the claimed id or the validator
+            // rejects (the inner gate 2). Before the first
+            // successful arm, we trust the request's claimed
+            // source_player_id as the connection's identity.
+            let Some(req) = decode_aim_event(&payload[1..]) else {
+                warn!("aimEvent: decoder rejected malformed payload");
                 return vec![];
             };
-            // FIX 8: anti-spoof — the connection's REAL PlayerId is
-            // the value stashed in `connection_state`.claimed_player_id
-            // by the first successful DamageRequest on this
-            // connection. Subsequent requests MUST claim the same
-            // PlayerId or the validator rejects (the inner gate 2).
-            // Before the first successful request, we trust the
-            // request's claimed source_player_id as the connection's
-            // identity (the validator stamps it on success).
-            // FIX 8: extract the connection's claimed identity
-            // BEFORE the await (the borrow is !Send — we drop it
-            // before touching the room registry).
+            // Extract the connection's claimed identity BEFORE the
+            // await (the borrow is !Send -- we drop it before
+            // touching the room registry).
             let claimed_player_id = {
                 let conn = connection_state.lock().unwrap();
                 match conn.check(req.source_player_id) {
@@ -598,7 +634,7 @@ pub(super) async fn handle_binary(
                         warn!(
                             claimed_player_id = claimed,
                             requested_player_id = requested,
-                            "damageRequest: rejected — connection identity mismatch",
+                            "aimEvent: rejected -- connection identity mismatch",
                         );
                         return vec![];
                     }
@@ -606,22 +642,16 @@ pub(super) async fn handle_binary(
             };
             let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
             let now = Instant::now();
-            // FIX 1: per-connection RTT proxy. Look up the source
-            // Player's `last_ping_received_at`; compute the wall-clock
-            // gap since then, double it (the pong hasn't arrived yet
-            // — the next ping from the client will have carried the
-            // round-trip — but until then, the gap is our best
-            // estimate of the half-RTT). Add a 16ms floor (the
-            // server tick) so we never advance backwards in time.
+            // Per-connection RTT proxy -- same shape as the PR
+            // 11.6.D's DamageRequest arm. Look up the source
+            // Player's `last_ping_received_at`; compute the
+            // wall-clock gap since then, double it, cap at
+            // MAX_RTT_MS (500ms).
             let client_rtt_ms = {
                 let room_guard = room_arc.read().await;
                 if let Some(player) = room_guard.players.get(&claimed_player_id) {
                     if let Some(last_ping) = player.last_ping_received_at {
                         let gap = now.duration_since(last_ping);
-                        // 2x the half-trip approximates the full
-                        // round-trip. The gap is capped at MAX_RTT_MS
-                        // (500ms) so a stale ping doesn't cause
-                        // pathological rewind into the distant past.
                         let rtt_ms = (gap.as_millis() as u32).saturating_mul(2);
                         rtt_ms.min(specialists_server::damage_relay::MAX_RTT_MS)
                     } else {
@@ -631,12 +661,23 @@ pub(super) async fn handle_binary(
                     0
                 }
             };
-            // Run the validator under a write lock. The lock is held
-            // for the duration of validate_and_relay (no .await
-            // inside), so the lock is released synchronously.
-            let bc_opt = {
+            // Run the AimEvent validator under a write lock. Returns
+            // a `Vec<DamageBroadcast>` (zero-or-more; one per hit
+            // target). An empty Vec means either the outer gates
+            // rejected (no fan-out, no ammo cost, no fire-rate
+            // consumed) or the event fired but no targets were in
+            // range (no fan-out, but fire-rate IS consumed per the
+            // brief's "missed shot still spends ammo" semantics --
+            // mirror of client-side `combat.ts:dualPistolShoot`).
+            //
+            // The validator's gate structure (8 gates paralleling
+            // the damage path): source-in-room, eventId-monotonic-
+            // window, fire-rate-cooldown, ammo > 0, hp > 0,
+            // yaw/pitch-in-range, frame-in-rewind-window, per-target
+            // lag-comp rewind + dual_pistol_hit + emit.
+            let broadcasts = {
                 let mut room_guard = room_arc.write().await;
-                specialists_server::damage_relay::validate_and_relay(
+                specialists_server::damage_relay::validate_and_relay_aim(
                     &req,
                     claimed_player_id,
                     &mut room_guard,
@@ -644,112 +685,82 @@ pub(super) async fn handle_binary(
                     now,
                 )
             };
-            let Some(bc) = bc_opt else {
-                // FIX 4: validator rejected. Emit a `DamageReject` back
-                // to the SOURCE tab only (NOT broadcast) so the
-                // source can revert its optimistic apply. The reject
-                // reason is 0 (fire-rate) — the most common cause in
-                // production. Granular reasons can be wired by
-                // changing `validate_and_relay` to return an enum;
-                // PR 11.6.D keeps the simpler Option-returning API.
+            // Empty Vec: validator rejected (outer gate failure) OR
+            // no targets in range. Either way: nothing to fan out,
+            // no connection promotion needed (the 0x06 InputServer
+            // arm does promotion; this arm just validates).
+            if broadcasts.is_empty() {
                 debug!(
                     source = req.source_player_id,
-                    target = req.target_player_id,
                     event_id = req.event_id,
-                    "damageRequest rejected by validate_and_relay",
+                    "aimEvent: no broadcasts (gate rejected or no targets in range)",
                 );
-                // For the reject, send it to the source's
-                // connection. We need to find the sender for
-                // `claimed_player_id` (which may be the
-                // placeholder_id if the connection hasn't been
-                // promoted yet).
-                let reject_bytes = specialists_server::damage_relay::relay_reject(
-                    req.event_id,
-                    specialists_server::protocol::REJECT_REASON_FIRE_RATE,
-                );
-                let room_guard = room_arc.read().await;
-                let outbound = room_guard.connections
-                    .get(&claimed_player_id)
-                    .or_else(|| room_guard.connections.get(&placeholder_player_id));
-                if let Some(outbound) = outbound {
-                    let _ = outbound.try_send(reject_bytes).await;
-                }
                 return vec![];
-            };
-            // PR 11.6.D: re-register the connection under the
-            // request's claimed PlayerId. The connection started
-            // registered with a unique placeholder PlayerId
-            // (assigned by `next_placeholder_player_id` at
-            // handshake time); this is the first time we know its
-            // real PlayerId. Subsequent requests from this
-            // connection will find the connection registered under
-            // its real PlayerId.
-            //
-            // FIX 8: also stamp the connection's claimed identity
-            // (if not already set). The next request from this
-            // connection will be checked against this identity.
-            //
+            }
+            // PR 11.6.D pattern: re-register the connection under
+            // the request's claimed PlayerId (placeholder -> real).
             // We do this AFTER validation succeeds so a rejected
             // request doesn't promote a phantom connection. The
             // connection's placeholder_id is passed in by the
             // listener loop.
             //
-            // Idempotency note: if the connection was already
-            // re-registered (e.g., on a retry of the same
-            // `DamageRequest`), the placeholder_id entry is gone —
-            // we fall through without re-registering. The
-            // source_player_id entry remains in place.
+            // Idempotency: if the connection was already promoted
+            // (via an earlier PositionUpdate or Ping arm), the
+            // placeholder entry is gone -- we fall through without
+            // re-registering. The source_player_id entry stays.
             {
                 let mut room_guard = room_arc.write().await;
                 if let Some((_, sender)) = room_guard.connections.remove_entry(&placeholder_player_id) {
                     // Only insert if `source_player_id` doesn't
-                    // already have a sender (defensive — prevents
+                    // already have a sender (defensive -- prevents
                     // clobbering an existing connection under the
                     // same PlayerId).
                     room_guard.connections.entry(claimed_player_id).or_insert(sender);
                 }
                 connection_state.lock().unwrap().stamp_actual(claimed_player_id);
             }
-            // FIX 8: stamp the connection's claimed identity so
-            // subsequent requests from this connection can be
-            // checked against it. Idempotent — `check` already
-            // matched, so this is just a record.
+            // Stamp the connection's claimed identity so subsequent
+            // inbound arms can be checked against it. Idempotent.
             connection_state.lock().unwrap().stamp(claimed_player_id);
 
-            // Encode the broadcast once. The listener loop fans it out
-            // to every connection in the room (including the source —
-            // optimistic apply on the source matches the broadcast).
-            let wire_bytes = specialists_server::damage_relay::relay_broadcast(&bc);
-            // Fan out to every connection in the room. PR 11.7.D2:
-            // uses the `ConnectionOutbound::try_send` drop-oldest path
-            // (same as broadcast_snapshot) so damage broadcasts
-            // receive the same back-pressure treatment as snapshots.
-            // Pre-D2, this was the same "channel full / closed" warn
-            // surface that CF-N1 was tracking; drop-oldest closes
-            // the underlying saturation.
+            // Fan out each `DamageBroadcast` to every connection in
+            // the room. PR 11.7.D2: uses the
+            // `ConnectionOutbound::try_send` drop-oldest path (same
+            // as `broadcast_snapshot` and the PR 11.6.D damage
+            // arm), so damage broadcasts receive the same
+            // back-pressure treatment as snapshots.
+            //
+            // Mirror the old 0x01 DamageRequest arm: encode the
+            // first broadcast once, fan out to every connection
+            // (via outbound mpsc), AND return the wire_bytes as the
+            // direct reply so the inbound loop's "fallback direct
+            // send" path also writes the broadcast back to the
+            // sender (belt-and-suspenders; the outbound mpsc should
+            // already have it).
+            let first_wire_bytes = specialists_server::damage_relay::relay_broadcast(&broadcasts[0]);
             {
                 let room_guard = room_arc.read().await;
                 let n_conns = room_guard.connections.len();
-                for (player_id, outbound) in room_guard.connections.iter() {
-                    if let Err(()) = outbound.try_send(wire_bytes.clone()).await {
-                        warn!(
+                for bc in &broadcasts {
+                    let wire_bytes = specialists_server::damage_relay::relay_broadcast(bc);
+                    for (player_id, outbound) in room_guard.connections.iter() {
+                        if let Err(()) = outbound.try_send(wire_bytes.clone()).await {
+                            warn!(
+                                target_player_id = *player_id,
+                                "aimEvent->damageBroadcast fan-out: outbound closed (connection dying)",
+                            );
+                            continue;
+                        }
+                        debug!(
                             target_player_id = *player_id,
-                            "damageBroadcast fan-out: outbound closed (connection dying)",
+                            n_conns = n_conns,
+                            origin_event_id = bc.origin_event_id,
+                            "aimEvent->damageBroadcast enqueued",
                         );
-                        continue;
                     }
-                    debug!(
-                        target_player_id = *player_id,
-                        n_conns = n_conns,
-                        "damageBroadcast enqueued",
-                    );
                 }
             }
-            // Return the encoded bytes so the inbound loop's "fallback
-            // direct send" path also writes the broadcast back to the
-            // sender (belt-and-suspenders; the outbound mpsc should
-            // already have it). WebTransport's listener does the same.
-            wire_bytes
+            first_wire_bytes
         }
         DISCRIMINATOR_DAMAGE_BROADCAST => {
             // PR 11.6.D: the server is the SOLE producer of
@@ -954,6 +965,29 @@ pub(super) async fn handle_binary(
             let mut input_bytes: EncodedInput = [0u8; 12];
             let copy_len = inputs.encoded_input.len().min(12);
             input_bytes[..copy_len].copy_from_slice(&inputs.encoded_input[..copy_len]);
+            // PR AimEvent / Section 3.5 - capture yaw/pitch from
+            // the input bitmask's bytes 2-5 (little-endian u16 each,
+            // matching `client/src/net/inputBitmask.ts`'s encoding).
+            // The decoded yaw/pitch feed `Room.players[id].yaw_radians
+            // / .pitch_radians`, which the snapshot reads for the
+            // `PlayerState.yaw` / `.pitch` slots and the AimEvent
+            // validator reads for lag-comp rewind to the per-player
+            // pose at the AimEvent's frame.
+            //
+            // Yaw: bytes 2-3 LE u16 → [0, 2π) radians.
+            //   yaw_rad = (bits / YAW_BITS_SCALE)
+            //   YAW_BITS_SCALE = 65535 / (2π) ≈ 10430.4
+            // Pitch: bytes 4-5 LE u16 → [-π/2, +π/2] radians.
+            //   pitch_rad = (bits / PITCH_BITS_SCALE) - π/2
+            //   PITCH_BITS_SCALE = 65535 / π ≈ 20861.9
+            // Both scales match `client/src/net/inputBitmask.ts`
+            // (YAW_BITS_SCALE / PITCH_BITS_SCALE constants). We
+            // compute in f32 to match the snapshot's wire format
+            // (yaw / pitch are f32 BE on the wire).
+            let yaw_bits = u16::from_le_bytes([input_bytes[2], input_bytes[3]]);
+            let pitch_bits = u16::from_le_bytes([input_bytes[4], input_bytes[5]]);
+            let yaw_radians: f32 = (yaw_bits as f32) * (1.0 / 10430.4);  // 65535 / (2pi)
+            let pitch_radians: f32 = (pitch_bits as f32) * (1.0 / 20861.9) - (std::f32::consts::PI / 2.0);  // 65535 / pi
             // Best-effort player_id resolution: in PR 11.6.C there's no
             // join handshake, so we use the first byte of the input
             // blob as a placeholder. PR 11.6.D replaces this with a
@@ -985,6 +1019,20 @@ pub(super) async fn handle_binary(
                 room_guard
                     .last_inputs_seq_per_source
                     .insert(player_id, stamped);
+                // PR AimEvent / Section 3.5 - capture yaw/pitch into
+                // the player's persistent state. Auto-registers the
+                // player (mirrors the PositionUpdate path) so a tab
+                // that's only sending InputsServer (no other inbound)
+                // still gets its yaw/pitch reflected in the snapshot.
+                // The auto-register only adds the player to
+                // `room.players`; the snapshot's HP/ammo slots keep
+                // their defaults (HP=100, ammo=0) until the first
+                // PositionUpdate promotes the player.
+                room_guard.add_player(player_id);
+                if let Some(p) = room_guard.players.get_mut(&player_id) {
+                    p.yaw_radians = yaw_radians;
+                    p.pitch_radians = pitch_radians;
+                }
                 room_guard.push_input(player_id, frame, input_bytes);
             }
             debug!(
@@ -1183,7 +1231,7 @@ mod tests {
     use super::*;
     use specialists_server::connection_outbound::ConnectionOutbound;
     use specialists_server::protocol::{
-        decode_damage_broadcast, decode_pong, encode_damage_request, encode_ping,
+        decode_damage_broadcast, decode_pong, encode_aim_event, encode_ping,
         encode_position_update, PositionUpdate,
     };
 
@@ -1213,12 +1261,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_damage_request_returns_broadcast() {
+    async fn dispatch_aim_event_returns_broadcast() {
         let rooms = fresh_rooms();
-        // PR 11.6.D: validate_and_relay needs players + ammo +
+        // PR #59: validate_and_relay_aim needs players + ammo +
         // position history to accept the request. Seed the room with
         // both players (source=7, target=9), ammo on the source, and
-        // a recorded position so the lag-comp snapshot succeeds.
+        // recorded positions so the lag-comp snapshot succeeds.
         {
             let room_arc = rooms.read().await.get(specialists_server::constants::DEVBX_ROOM_ID).unwrap().clone();
             let mut room_guard = room_arc.write().await;
@@ -1227,29 +1275,33 @@ mod tests {
             room_guard.players.get_mut(&7).unwrap().ammo = 10;
             room_guard.record_position(
                 7,
-                0xdeadbeef,
+                10,
                 specialists_server::Position { x: 0.0, y: 0.0 },
             );
             room_guard.record_position(
                 9,
-                0xdeadbeef,
+                10,
                 specialists_server::Position { x: 5.0, y: 0.0 },
             );
+            // Advance the room's server frame so the AimEvent's
+            // `req.frame = 10` is within MAX_LOOKAHEAD_FRAMES (16).
+            room_guard.next_server_frame = 10;
         }
 
-        // Encode a DamageRequest, prefix with the discriminator,
-        // expect a DamageBroadcast reply that the server emits via
-        // `damage_relay::relay_broadcast`.
-        let req = specialists_server::protocol::DamageRequest {
-            frame: 0xdeadbeef,
+        // Encode an AimEvent, prefix with the discriminator,
+        // expect a DamageBroadcast reply (the server's hitscan
+        // raycast at the recorded positions hits the target at 5m).
+        let req = specialists_server::protocol::AimEvent {
             source_player_id: 7,
-            target_player_id: 9,
-            source: 0, // fire
-            amount: 12,
+            // yaw=PI/2 fires along +X axis where the target at (5,0) lives.
+            // yaw=0 fires along +Z (per hitscan::forward_from_yaw_pitch).
+            yaw_radians: std::f32::consts::FRAC_PI_2,
+            pitch_radians: 0.0,
+            frame: 10,
             event_id: 0xcafebabe,
         };
-        let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
-        payload.extend(encode_damage_request(&req));
+        let mut payload = vec![DISCRIMINATOR_AIM_EVENT];
+        payload.extend(encode_aim_event(&req));
 
         let reply = handle_binary(&payload, &rooms, 0, ConnectionState::new(0) /* placeholder */).await;
 
@@ -1258,14 +1310,30 @@ mod tests {
         assert_eq!(reply[0], DISCRIMINATOR_DAMAGE_BROADCAST);
         let bc = decode_damage_broadcast(&reply[1..]).expect("decode broadcast");
         assert_eq!(bc.source_player_id, req.source_player_id);
-        assert_eq!(bc.target_player_id, req.target_player_id);
-        assert_eq!(bc.source, req.source);
-        assert_eq!(bc.amount, req.amount);
+        assert_eq!(bc.target_player_id, 9);
         assert_eq!(bc.origin_event_id, req.event_id);
-        // PR 11.6.D: server_frame + server_seq are now wired (room
-        // fields, starting at 0).
-        assert_eq!(bc.server_frame, 0);
+        // server_frame + server_seq are wired (room fields). We
+        // advanced next_server_frame to 10 in the setup so the
+        // frame validity gate passes; the broadcast carries that
+        // value as server_frame.
+        assert_eq!(bc.server_frame, 10);
         assert_eq!(bc.server_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_damage_request_emits_deprecation_warning() {
+        // PR #59: the 0x01 DamageRequest wire type is REMOVED from
+        // the production path. Sending it now produces a deprecation
+        // warning and an empty reply (no DamageBroadcast).
+        //
+        // We construct the raw bytes directly (no DamageRequest
+        // struct since the type was deleted in PR #59).
+        let rooms = fresh_rooms();
+        // 1-byte disc 0x01 + 13 fake body bytes (any length).
+        let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
+        payload.extend(vec![0u8; 13]);
+        let reply = handle_binary(&payload, &rooms, 0, ConnectionState::new(0)).await;
+        assert!(reply.is_empty(), "deprecated 0x01 must produce no reply");
     }
 
     #[tokio::test]

@@ -97,20 +97,37 @@ impl SnapshotGenerator {
                 .position(*player_id)
                 .unwrap_or(Position::ZERO);
             let vel: [f32; 2] = room.physics.velocity(*player_id);
-            // Yaw/pitch aren't on the wire yet (the wire is 2D
-            // per §3.5; yaw/pitch are in the Snapshot for PR
-            // 11.7.E's weapon switch logic). For now default to
-            // 0.0 — the existing client uses Havok WASM, which
-            // supplies yaw/pitch locally; the server's snapshot
-            // doesn't carry them this PR.
+            // PR AimEvent / §3.5 — yaw/pitch are now sourced from
+            // Room.players[id].yaw_radians / .pitch_radians
+            // (server-side mirror of the client's last-reported
+            // intent, captured by the 0x06 InputServer inbound arm
+            // at transport.rs). The default 0.0 (set in
+            // session.rs::Player::new) is what the snapshot reports
+            // until the first input packet arrives — matches the
+            // pre-PR-#59 hardcoded 0.0 so existing smokes don't
+            // regress.
+            //
+            // Pre-PR-#59 these slots were hardcoded 0.0; the wire
+            // carried no yaw/pitch. The PR #59 motivation for
+            // populating them: the server's lag-comp hit-test
+            // (validate_and_relay_aim) needs to know each player's
+            // pose at the AimEvent's frame for the rewind. The
+            // snapshot's yaw/pitch slots are read by the same
+            // snapshot stream that drives the visual + predictor +
+            // interpolator — they carry the client-claimed intent.
+            let (yaw, pitch) = room
+                .players
+                .get(player_id)
+                .map(|p| (p.yaw_radians, p.pitch_radians))
+                .unwrap_or((0.0, 0.0));
             player_states.push(PlayerState {
                 player_id: *player_id,
                 position_x: pos.x,
                 position_y: pos.y,
                 velocity_x: vel[0],
                 velocity_y: vel[1],
-                yaw: 0.0,
-                pitch: 0.0,
+                yaw,
+                pitch,
                 hp,
                 ammo,
                 is_firing: 0, // PR 11.7.E wires the fire bit

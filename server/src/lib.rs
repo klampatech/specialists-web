@@ -38,15 +38,15 @@ pub use position_history::{
 };
 pub use physics::PhysicsWorld;
 pub use protocol::{
-    decode_damage_broadcast, decode_damage_request, decode_inputs_server, decode_ping,
-    decode_pong, decode_position_update, decode_snapshot, encode_damage_broadcast,
-    encode_damage_request, encode_inputs_server, encode_ping, encode_pong,
-    encode_position_update, encode_snapshot, DamageBroadcast, DamageRequest, InputsServer,
-    Ping, Pong, PlayerState, PositionUpdate, Snapshot, DISCRIMINATOR_DAMAGE_BROADCAST,
-    DISCRIMINATOR_DAMAGE_REJECT, DISCRIMINATOR_DAMAGE_REQUEST, DISCRIMINATOR_INPUTS,
-    DISCRIMINATOR_INPUTS_SERVER, DISCRIMINATOR_PING, DISCRIMINATOR_PONG,
-    DISCRIMINATOR_POSITION_UPDATE, DISCRIMINATOR_SNAPSHOT, DISCRIMINATOR_STATE_ACK,
-    DAMAGE_BROADCAST_WIRE_SIZE, DAMAGE_REJECT_BODY_SIZE, DAMAGE_REQUEST_WIRE_SIZE,
+    decode_aim_event, decode_damage_broadcast, decode_inputs_server, decode_ping,
+    decode_pong, decode_position_update, decode_snapshot, encode_aim_event,
+    encode_damage_broadcast, encode_inputs_server, encode_ping, encode_pong,
+    encode_position_update, encode_snapshot, AimEvent, DamageBroadcast, InputsServer,
+    Ping, Pong, PlayerState, PositionUpdate, Snapshot, AIM_EVENT_BODY_SIZE,
+    AIM_EVENT_WIRE_SIZE, DISCRIMINATOR_AIM_EVENT, DISCRIMINATOR_DAMAGE_BROADCAST,
+    DISCRIMINATOR_INPUTS, DISCRIMINATOR_INPUTS_SERVER, DISCRIMINATOR_PING,
+    DISCRIMINATOR_PONG, DISCRIMINATOR_POSITION_UPDATE, DISCRIMINATOR_SNAPSHOT,
+    DISCRIMINATOR_STATE_ACK, DAMAGE_BROADCAST_WIRE_SIZE, DAMAGE_REJECT_BODY_SIZE,
     INPUTS_SERVER_WIRE_SIZE, PING_WIRE_SIZE, PONG_WIRE_SIZE, PLAYER_STATE_WIRE_SIZE,
     POSITION_UPDATE_WIRE_SIZE, SNAPSHOT_WIRE_SIZE_MIN,
 };

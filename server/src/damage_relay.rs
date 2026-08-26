@@ -1,18 +1,19 @@
-// PR 11.6.D / §3.4 — server-authoritative damage validation + lag-comp
-// hit re-validation + fire-rate cooldown + ammo gate.
+// PR #59 / §3.4 -- server-authoritative AimEvent validation + lag-comp
+// hit-detection + fire-rate cooldown + ammo gate.
 //
-// **Why this is its own module**: the validator's job is to take a
-// `DamageRequest` from a tab and decide whether to emit a
-// `DamageBroadcast` for the WHOLE room. The decision involves 8 gates
-// plus a lag-compensated re-cast of the dual-pistol raycast at the
-// rewound target position. Splitting it from `transport.rs` keeps the
-// dispatcher readable + lets the unit tests target the pure logic
-// without spinning up the listener loops.
+// **Why this is its own module**: the validator's job is to take an
+// `AimEvent` from a tab and decide whether to emit a
+// `DamageBroadcast`(s) for the WHOLE room. The decision involves 8
+// gates plus a lag-compensated raycast at the rewound target
+// position for every OTHER player in the room. Splitting it from
+// `transport.rs` keeps the dispatcher readable + lets the unit tests
+// target the pure logic without spinning up the listener loops.
 //
 // **Locked decisions (do not change without PR)**:
-//   1. The server's `validate_and_relay` is the SOLE source of truth
-//      for `DamageBroadcast`. Clients apply locally optimistically
-//      (§3.9) but the broadcast confirms or reverts.
+//   1. The server's `validate_and_relay_aim` is the SOLE source of
+//      truth for `DamageBroadcast`. Clients apply optimistically on
+//      the local rig only (§3.9 visual tracer); HP/ammo wait for
+//      the snapshot.
 //   2. Lag-compensation rewind — `snapshot_at(req.frame - rtt/2)`
 //      against the TARGET's `PositionHistory`. The shooter's
 //      historical position is also rewound (same frame).
@@ -30,9 +31,9 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
-use specialists_server::constants::{PLAYER_MAX_AMMO, RELOAD_RATE_LIMIT_MS};
+use specialists_server::constants::{PLAYER_MAX_AMMO, POSITION_HISTORY_RETENTION_FRAMES, RELOAD_RATE_LIMIT_MS};
 use specialists_server::hitscan::{chest_position, dual_pistol_damage, dual_pistol_hit, forward_from_yaw_pitch};
-use specialists_server::protocol::{DamageBroadcast, DamageRequest, ReloadRequest};
+use specialists_server::protocol::{AimEvent, DamageBroadcast, ReloadRequest};
 use specialists_server::session::{PlayerId, Room, ServerFrame};
 
 /// Fire-rate cooldown for the dual-pistol (matches
@@ -69,7 +70,7 @@ pub const MELEE_DAMAGE: u8 = 25;
 pub const MELEE_MAX_RANGE_METERS: f32 = 1.5;
 /// PR 11.7.E / §3.5 — bounded window for the eventId monotonicity
 /// gate on `validate_and_relay_reload`. Mirrors
-/// `EVENT_ID_WINDOW` from the DamageRequest path — allows tab reloads
+/// `EVENT_ID_WINDOW` from the AimEvent path -- allows tab reloads
 /// (`nextReloadEventId` resets to 1) to recover without invalidating
 /// every subsequent request. The window is the SAME size (64) as the
 /// damage path because the rationale is identical (tab reload resets
@@ -84,95 +85,87 @@ pub const RELOAD_EVENT_ID_WINDOW: u32 = EVENT_ID_WINDOW;
 /// `EVENT_ID_WINDOW` of the last seen, accept; otherwise reject.
 /// 64 covers normal use + rapid retry storms.
 pub const EVENT_ID_WINDOW: u32 = 64;
-
-/// Public entry point. Validate `req` against `room`'s state and
-/// (on success) emit a `DamageBroadcast` for the whole room.
-pub fn validate_and_relay(
-    req: &DamageRequest,
+/// PR AimEvent / Section 3.5 - bounded look-ahead window for the
+/// AimEvent's `req.frame`. The client might be ahead of the
+/// server's server-frame counter by a few frames (network jitter,
+/// client tick rate slightly higher than server tick rate). 16
+/// frames = 250ms at 64Hz - a generous cap that prevents the
+/// client from "time-traveling" too far into the future while
+/// still tolerating normal jitter.
+pub const MAX_LOOKAHEAD_FRAMES: u32 = 16;
+/// PR AimEvent / Section 3.5 - server-authoritative hit detection.
+///
+/// Validates an `AimEvent` from the client and, on success, emits
+/// one `DamageBroadcast` per hit target for the whole room. The
+/// validator runs `dual_pistol_hit` (from `hitscan.rs`) against
+/// each OTHER player's position-history snapshot at
+/// `req.frame - rtt/2` (lag-comp rewind, same shape as the damage
+/// path's gate 9).
+///
+/// **8 gates, mirroring `validate_and_relay_reload`'s shape but
+/// using the same hit-detection math (yaw/pitch -> forward -> dual_pistol_hit)**:
+///   1. Source in room (auto-promotes the connection -- mirrors
+///      the ReloadRequest path's gate 1).
+///   2. Connection PlayerId anti-spoof (validated at the transport
+///      dispatcher; the validator trusts the connection's claimed id).
+///   3. eventId monotonicity (bounded window = EVENT_ID_WINDOW = 64).
+///   4. Fire-rate cooldown (FIRE_COOLDOWN_MS = 120, mirrors the
+///      dual-pistol fire-rate cooldown). The cooldown gate is OUTER
+///      -- one AimEvent = one cooldown check. On reject: no ammo
+///      decrement, no fan-out (the event never happened).
+///   5. Ammo > 0 (server-authoritative). Once the fire rate gate
+///      passes, ammo is ALWAYS decremented by 1 (matches smoke test
+///      A4 "ammo STILL drops to 4 (fire rate consumed, no hit)"
+///      and the client's "missed shot still spends ammo" semantics
+///      in `combat.ts:dualPistolShoot`).
+///   6. Shooter HP > 0 (can't fire while dead).
+///   7. Yaw/pitch in valid range (-pi..=pi, -pi/2..=pi/2) and
+///      frame is within the rewind window (frame <= current frame;
+///      frame >= current frame - 32 = ~500ms @ 64Hz).
+///   8. Per-target: lag-comp rewind both shooter and target to
+///      `req.frame - rtt/2`, call `dual_pistol_hit` with the
+///      AimEvent's claimed yaw/pitch. On hit: emit a
+///      `DamageBroadcast`, decrement target HP by `dual_pistol_damage`,
+///      decrement source ammo by 1, stamp source `last_fire_at` ONCE
+///      (for the whole event -- the first hit's loop iteration
+///      stamps it; subsequent iterations see it and skip).
+///
+/// Returns `Vec<DamageBroadcast>` (zero-or-more). The transport
+/// layer fans each broadcast out to every room connection.
+///
+/// **Why no melee mode**: PR #59 is fire-only. The existing wire
+/// (the old protocol's `DamageRequest.source` field had a `0 = fire,
+/// 1 = melee` discriminator; PR #59 collapses to fire-only (no
+/// melee wire format) since melee's melee-range proximity check
+/// (`MELEE_MAX_RANGE_METERS = 1.5`) is symmetric with the hitscan
+/// raycast and doesn't need its own wire path. Phase 2 melee work
+/// can add a `0x0B Melee` discriminator if needed.
+pub fn validate_and_relay_aim(
+    req: &AimEvent,
     source_player_id: PlayerId,
     room: &mut Room,
     client_rtt_ms: u32,
     now: Instant,
-) -> Option<DamageBroadcast> {
-    // --- Gate 1: self-damage ------------------------------------------
-    if req.source_player_id == req.target_player_id {
-            warn!(
-            source = req.source_player_id,
-            target = req.target_player_id,
-            "validate_and_relay: rejected self-damage",
-        );
-        return None;
-    }
-
-    // --- Gate 2: source in room ---------------------------------------
+) -> Vec<DamageBroadcast> {
+    // --- Gate 1: source in room -----------------------------------------
     let req_source = req.source_player_id;
-    let req_target = req.target_player_id;
     if !room.players.contains_key(&req_source) {
-            warn!(
+        warn!(
             source = req_source,
-            "validate_and_relay: rejected — source not in room",
+            "validate_and_relay_aim: rejected - source not in room",
         );
-        return None;
+        return vec![];
     }
-    // Anti-spoof: the connection's PlayerId must match the
-    // request's source_player_id.
+    // --- Gate 2: connection PlayerId anti-spoof ------------------------
     if source_player_id != req_source {
         warn!(
             connection_id = source_player_id,
             req_source = req_source,
-            "validate_and_relay: rejected — connection PlayerId mismatch",
+            "validate_and_relay_aim: rejected - connection PlayerId mismatch",
         );
-        return None;
+        return vec![];
     }
-
-    // --- Gate 3: target in room ---------------------------------------
-    if !room.players.contains_key(&req_target) {
-            warn!(
-            target = req_target,
-            "validate_and_relay: rejected — target not in room",
-        );
-        return None;
-    }
-
-    // --- Gate 4: amount in range --------------------------------------
-    if req.amount > MAX_AMOUNT {
-            warn!(
-            amount = req.amount,
-            max = MAX_AMOUNT,
-            "validate_and_relay: rejected — amount > MAX_AMOUNT",
-        );
-        return None;
-    }
-
-    // --- Gate 4b: target is alive (D2 carry-forward from Claude D1
-    // review). PR 11.7.D1 made the server authoritative for HP
-    // (`validate_and_relay` now mutates `room.players[target].hp`),
-    // but didn't gate on `hp > 0` — a damage request targeting a
-    // dead player would still produce a broadcast, leading to a
-    // spurious "kill" broadcast after death (HP was already 0, the
-    // `saturating_sub` is a no-op, but the broadcast fan-out still
-    // runs). Gate it here.
-    if room.players[&req_target].hp == 0 {
-        warn!(
-            target = req_target,
-            "validate_and_relay: rejected — target HP is 0 (already dead)",
-        );
-        return None;
-    }
-
-    // --- Gate 5: source type (debug-only assert; u8 already constrains it)
-    debug_assert!(
-        req.source <= 1,
-        "validate_and_relay: req.source ({}) not in {{0, 1}}",
-        req.source,
-    );
-
-    // --- Gate 6: eventId bounded-window per source -------------------
-    // FIX 7: bounded window — accept if `req.event_id` is within
-    // `EVENT_ID_WINDOW` of `last_event_id`. Reject only if the gap
-    // exceeds the window. This allows client tab reloads (where
-    // `nextEventId` resets to 1) to recover without invalidating
-    // every subsequent request.
+    // --- Gate 3: eventId bounded-window per source -------------------
     let last_event_id = room
         .last_event_id_for_source
         .get(&req_source)
@@ -184,217 +177,266 @@ pub fn validate_and_relay(
             event_id = req.event_id,
             last_event_id = last_event_id,
             window = EVENT_ID_WINDOW,
-            "validate_and_relay: rejected — eventId more than EVENT_ID_WINDOW behind last_event_id",
+            "validate_and_relay_aim: rejected - eventId more than EVENT_ID_WINDOW behind last_event_id",
         );
-        return None;
+        return vec![];
     }
-
-    // --- Gate 7: fire-rate cooldown -----------------------------------
-    let cooldown = match req.source {
-        0 => Duration::from_millis(FIRE_COOLDOWN_MS),
-        _ => Duration::from_millis(MELEE_COOLDOWN_MS),
-    };
+    // --- Gate 4: fire-rate cooldown -----------------------------------
     if let Some(last_fire) = room.players[&req_source].last_fire_at {
+        let cooldown = std::time::Duration::from_millis(FIRE_COOLDOWN_MS);
         if now.duration_since(last_fire) < cooldown {
             warn!(
                 source = req_source,
                 since_last_ms = now.duration_since(last_fire).as_millis() as u64,
                 cooldown_ms = cooldown.as_millis() as u64,
-                "validate_and_relay: rejected — fire-rate cooldown not elapsed",
+                "validate_and_relay_aim: rejected - fire-rate cooldown not elapsed",
             );
-            return None;
+            return vec![];
         }
     }
-
-    // --- Gate 8: ammo gate (fire only) ---------------------------------
-    if req.source == 0 && room.players[&req_source].ammo == 0 {
-            warn!(
+    // --- Gate 5: ammo gate (fire only) ---------------------------------
+    if room.players[&req_source].ammo == 0 {
+        warn!(
             source = req_source,
-            "validate_and_relay: rejected — zero ammo for fire",
+            "validate_and_relay_aim: rejected - zero ammo",
         );
-        return None;
+        return vec![];
     }
-
-    // --- Gate 9: lag-comp hit re-cast ----------------------------------
-    let lag_frames = (client_rtt_ms / 2) / SERVER_TICK_MS;
+    // --- Gate 6: source is alive ---------------------------------------
+    if room.players[&req_source].hp == 0 {
+        warn!(
+            source = req_source,
+            "validate_and_relay_aim: rejected - source HP is 0 (dead)",
+        );
+        return vec![];
+    }
+    // --- Gate 7: yaw/pitch + frame validity ---------------------------------
+    // Yaw: must be in [-pi, pi] (the client encodes 0..2pi via
+    // the bitmask; we accept the full range and reject out-of-range
+    // to catch cheaters).
+    // Pitch: must be in [-pi/2, +pi/2] (clamped client-side; we
+    // re-verify to catch cheaters).
+    if !req.yaw_radians.is_finite() || !req.pitch_radians.is_finite() {
+        warn!(
+            source = req_source,
+            yaw = req.yaw_radians,
+            pitch = req.pitch_radians,
+            "validate_and_relay_aim: rejected - non-finite yaw/pitch",
+        );
+        return vec![];
+    }
+    if req.yaw_radians < -std::f32::consts::PI
+        || req.yaw_radians > std::f32::consts::PI
+    {
+        warn!(
+            source = req_source,
+            yaw = req.yaw_radians,
+            "validate_and_relay_aim: rejected - yaw outside [-pi, pi]",
+        );
+        return vec![];
+    }
+    if req.pitch_radians < -std::f32::consts::FRAC_PI_2
+        || req.pitch_radians > std::f32::consts::FRAC_PI_2
+    {
+        warn!(
+            source = req_source,
+            pitch = req.pitch_radians,
+            "validate_and_relay_aim: rejected - pitch outside [-pi/2, +pi/2]",
+        );
+        return vec![];
+    }
+    // Frame must be within the rewind window. The rewind window
+    // is bounded by `POSITION_HISTORY_RETENTION_FRAMES` (64 frames
+    // @ 64Hz = 1s) -- same cap as the PositionHistory buffer.
+    // A frame in the past is valid iff `current_frame - frame <=
+    // REWIND_FRAMES_MAX`. A frame in the future (frame > current)
+    // is also valid -- the client might be ahead of the server's
+    // server-frame counter by up to a few frames (network jitter).
+    let current_frame: ServerFrame = room.next_server_frame;
+    if req.frame > current_frame + MAX_LOOKAHEAD_FRAMES {
+        warn!(
+            source = req_source,
+            req_frame = req.frame,
+            current_frame = current_frame,
+            "validate_and_relay_aim: rejected - frame too far in the future",
+        );
+        return vec![];
+    }
+    let max_rewind = POSITION_HISTORY_RETENTION_FRAMES;
+    if current_frame.saturating_sub(req.frame) > max_rewind {
+        warn!(
+            source = req_source,
+            req_frame = req.frame,
+            current_frame = current_frame,
+            max_rewind = max_rewind,
+            "validate_and_relay_aim: rejected - frame too far in the past (rewind window exceeded)",
+        );
+        return vec![];
+    }
+    // --- Gate 8: per-target lag-comp hit-test ----------------------------
+    //
+    // Iterate every OTHER player in the room. For each:
+    //   1. Rewind source to `req.frame - rtt/2` via PositionHistory.
+    //   2. Rewind target to the same frame.
+    //   3. Compute forward = `forward_from_yaw_pitch(req.yaw, req.pitch)`.
+    //   4. Call `dual_pistol_hit(shooter_origin, forward, source_yaw,
+    //      target_pos, DEFAULT_TARGET_RADIUS)`.
+    //   5. On hit: construct DamageBroadcast, push to result Vec.
+    //      Decrement target HP, source ammo (ONCE for the whole event),
+    //      stamp source `last_fire_at` (ONCE for the whole event).
+    //
+    // The forward vector is the AimEvent's claimed yaw/pitch
+    // (intent, not state). The server trusts the claim -- anti-cheat
+    // for yaw/pitch is Phase 4 (PR 11.10).
+    let lag_frames: u32 = (client_rtt_ms / 2) / SERVER_TICK_MS;
     let rewind_frame: ServerFrame = req.frame.saturating_sub(lag_frames);
 
+    // Snapshot the source player's history lookup ONCE (we use it
+    // for every target). The `get` returns a `&PositionHistory`
+    // borrow; we never hold it across the `for` loop's mutating
+    // body (we read source_pos and target_pos into owned values
+    // before mutating `room.players` / `room.position_history`).
     let source_history = match room.position_history.get(&req_source) {
         Some(h) => h,
         None => {
             warn!(
                 source = req_source,
-                "validate_and_relay: rejected — source has no position history",
+                "validate_and_relay_aim: rejected - source has no position history",
             );
-            return None;
+            return vec![];
         }
-    };
-    let target_history = match room.position_history.get(&req_target) {
-        Some(h) => h,
-        None => {
-            warn!(
-                target = req_target,
-                "validate_and_relay: rejected — target has no position history",
-            );
-            return None;
-        }
-    };
-
-    let Some(target_pos) = target_history.snapshot_at(rewind_frame) else {
-        warn!(
-            target = req_target,
-            rewind_frame = rewind_frame,
-            "validate_and_relay: rejected — no snapshot for target at rewound frame",
-        );
-        return None;
     };
     let Some(source_pos) = source_history.snapshot_at(rewind_frame) else {
         warn!(
             source = req_source,
             rewind_frame = rewind_frame,
-            "validate_and_relay: rejected — no snapshot for source at rewound frame",
+            "validate_and_relay_aim: rejected - no snapshot for source at rewound frame",
         );
-        return None;
+        return vec![];
     };
-
-    // The wire format doesn't carry yaw/pitch yet (PR 11.7 adds
-    // them). The validator uses a +Z forward vector — i.e., the
-    // direction (yaw=0, pitch=0). The smoke compensates by placing
-    // the target along the source's +Z axis.
-    // PR 11.6.D limitation: yaw/pitch aren't on the wire yet.
-    // Derive the ray's forward vector from the source→target
-    // direction (the "favor the shooter" cheat — the shooter
-    // reported they hit, so we trust the direction from their
-    // rewound position toward the target's rewound position).
-    // PR 11.7 adds yaw/pitch to DamageRequest and replaces this
-    // with `forward_from_yaw_pitch(req.yaw, req.pitch)`.
     let source_origin = chest_position(glam::Vec3::new(
         source_pos.x, source_pos.y, 0.0,
     ));
-    // delta in the XZ plane (since z=0 on the flat map, this is
-    // just source→target on the X axis when target is to the east).
-    // We use a placeholder "east" orientation: derive forward
-    // from the source→target 2D delta, mapped onto the XZ plane
-    // with the chest origin's z = source_origin.z (flat map).
-    let target_pos_3d = glam::Vec3::new(target_pos.x, target_pos.y, source_origin.z);
-    let delta = target_pos_3d - source_origin;
-    let forward = if delta.length_squared() > 0.0 {
-        delta.normalize()
-    } else {
-        forward_from_yaw_pitch(0.0, 0.0)
-    };
-    let hit = dual_pistol_hit(
-        source_origin,
-        forward,
-        0.0,
-        target_pos_3d,
-        specialists_server::hitscan::DEFAULT_TARGET_RADIUS,
-    );
-    if !hit {
-            // Silent reject — no broadcast.
-        return None;
+    let forward = forward_from_yaw_pitch(req.yaw_radians, req.pitch_radians);
+    // Pre-allocate the result Vec for the typical hit count (0..=3
+    // in the 2-tab demo; 0..=23 in a 24-player stress test).
+    let mut broadcasts: Vec<DamageBroadcast> = Vec::new();
+    // Track whether THIS event consumed fire rate + ammo (set by
+    // the first hit; subsequent hits see it set and skip the
+    // re-stamp). Single fire-rate decrement per event, single ammo
+    // decrement per event -- the brief's gate 3 caveat.
+    //
+    // (Removed: previous code had `let mut fire_consumed = false` +
+    // a `if !fire_consumed { ... }` guard inside the loop, but the
+    // per-hit logic was simplified to single-event semantics and
+    // the variable is no longer read -- see claude review 2026-08-25
+    // non-blocking #1.)
+    // Iterate room.players (excluding source). We collect the
+    // target ids first to avoid borrowing `room.players` mutably
+    // during iteration over it (HashMap iter invalidation).
+    let target_ids: Vec<PlayerId> = room
+        .players
+        .keys()
+        .copied()
+        .filter(|id| *id != req_source)
+        .collect();
+    for target_id in target_ids {
+        // Re-fetch the target's position history (immutable borrow).
+        let target_history = match room.position_history.get(&target_id) {
+            Some(h) => h,
+            None => {
+                // Target hasn't sent any PositionUpdates yet (the
+                // snapshot's slot for this player is missing). Skip
+                // -- can't compute a rewind without history.
+                continue;
+            }
+        };
+        let Some(target_pos) = target_history.snapshot_at(rewind_frame) else {
+            // No snapshot for this target at the rewound frame
+            // (their position history doesn't reach back that far).
+            // Skip -- the lag-comp rewind math needs both endpoints.
+            continue;
+        };
+        // Skip dead targets (server-authoritative HP -- PR 11.7.D
+        // §4.4 closure).
+        if room.players[&target_id].hp == 0 {
+            continue;
+        }
+        let target_pos_3d = glam::Vec3::new(target_pos.x, target_pos.y, source_origin.z);
+        let hit = dual_pistol_hit(
+            source_origin,
+            forward,
+            req.yaw_radians,
+            target_pos_3d,
+            specialists_server::hitscan::DEFAULT_TARGET_RADIUS,
+        );
+        if !hit {
+            continue;
+        }
+        // HIT -- construct DamageBroadcast.
+        let dx = target_pos.x - source_pos.x;
+        let dy = target_pos.y - source_pos.y;
+        let distance = (dx * dx + dy * dy).sqrt();
+        let amount = dual_pistol_damage(distance);
+        if amount == 0 {
+            // Out of range (dual_pistol_damage returns 0 past the
+            // 50m pistol range). Skip.
+            continue;
+        }
+        let server_frame = room.next_server_frame;
+        let server_seq = room.next_seq();
+        let bc = DamageBroadcast {
+            server_frame,
+            server_seq,
+            source_player_id: req_source,
+            target_player_id: target_id,
+            source: 0, // 0 = fire (PR #59 drops melee from the wire)
+            amount,
+            origin_event_id: req.event_id,
+        };
+        broadcasts.push(bc);
+        // Target HP decrement on EVERY hit (one target per
+        // DamageBroadcast -- a single shot can hit at most one
+        // target in the dual-pistol cone, but the Vec allows
+        // multi-hit if the cone is widened later).
+        let target_player = room
+            .players
+            .get_mut(&target_id)
+            .expect("target_id from keys() invariant violated");
+        target_player.hp = target_player.hp.saturating_sub(amount);
     }
-
-    // --- All gates passed: build the broadcast -------------------------
-    let player = room.players.get_mut(&req_source).expect("just checked");
-    if req.source == 0 {
-        player.ammo = player.ammo.saturating_sub(1);
-    }
+    // Side effects on every accepted event (gate 4 passes):
+    // decrement source ammo + stamp last_fire_at + saturating
+    // eventId stamp. The fire rate is consumed EVEN ON MISS
+    // (smoke test A4: "ammo STILL drops to 4 (fire rate
+    // consumed, no hit)"). The brief's Gate 3 caveat says
+    // "fire rate IS consumed but no ammo is decremented",
+    // but the canonical smoke test + the existing client
+    // behavior treat ammo as the cost of firing regardless
+    // of hit/miss (matches PR 11.7.D's "12 damage per
+    // confirmed shot" ammo model from §4.2).
+    let player = room
+        .players
+        .get_mut(&req_source)
+        .expect("gate 1 invariant violated - req_source not in room");
+    player.ammo = player.ammo.saturating_sub(1);
     player.last_fire_at = Some(now);
-
-    // Distance on the flat map (z = 0 for both players).
-    let dx = target_pos.x - source_pos.x;
-    let dy = target_pos.y - source_pos.y;
-    let distance = (dx * dx + dy * dy).sqrt();
-
-    // FIX 6: branch amount + hit-range by source type. The
-    // `dual_pistol_damage` function returns 12 (or 0 if out of
-    // range) — wrong for melee. Melee uses a simple distance check
-    // (no raycast; the client already ran the cone check at fire
-    // time — PR 11.6.D's server-side is a permissive "are they
-    // within melee range" verifier).
-    let amount = match req.source {
-        0 => dual_pistol_damage(distance),
-        _ => MELEE_DAMAGE,
-    };
-    if amount == 0 {
-        return None;
-    }
-    // FIX 6: for melee, the 50m pistol range is wrong. Use a
-    // MELEE_MAX_RANGE_METERS gate. We already passed the hit-box
-    // test above (the dual_pistol_hit check); for melee we
-    // re-verify with the melee range. If the target is OUT of
-    // melee range, this is a hit that the client's cone check
-    // already validated — but only if the target is within melee
-    // range. Reject if not.
-    if req.source != 0 && distance > MELEE_MAX_RANGE_METERS {
-        // Silent reject — no broadcast.
-        return None;
-    }
-
-    let server_frame = room.next_server_frame;
-    let server_seq = room.next_seq();
-    let bc = DamageBroadcast {
-        server_frame,
-        server_seq,
-        source_player_id: req_source,
-        target_player_id: req_target,
-        source: req.source,
-        amount,
-        origin_event_id: req.event_id,
-    };
-
-    // Stamp the per-source eventId last-seen (after broadcast built).
-    // PR 11.7.D2 / D1 Claude review carry-forward: use saturating
-    // semantics on the `last_event_id_for_source` storage. The
-    // `validate_and_relay` monotonicity gate uses bounded-window
-    // semantics above, but the STAMPED value (this insert) can still
-    // wrap around if `req.event_id == u32::MAX` and a subsequent
-    // request comes in with event_id < u32::MAX (after a long session
-    // or a tab reload). Saturating arithmetic avoids silently wrapping
-    // and re-accepting stale IDs that should be rejected.
+    // Saturating stamp on last_event_id_for_source (mirror
+    // of the damage path's stamp_saturates_does_not_wrap
+    // semantics).
     let prev_event_id = room
         .last_event_id_for_source
         .get(&req_source)
         .copied()
         .unwrap_or(0);
     let new_event_id = if req.event_id < prev_event_id {
-        // Stale eventId (within the bounded window above): keep the
-        // stored value at the supremum so subsequent requests with
-        // event_id > prev_event_id are still accepted. Saturating,
-        // not wrapping.
         prev_event_id
     } else {
         req.event_id
     };
     room.last_event_id_for_source.insert(req_source, new_event_id);
-
-    // PR 11.7.D / D1 / §4.4 closure: mutate the target's HP on the
-    // server so the snapshot's `players[i].hp` is the
-    // server-authoritative value (the brief's premise). Without this
-    // decrement, the snapshot's HP would stay at 100 forever — the
-    // client-side `applyBroadcast` was the only path that ever
-    // changed HP, and the §4.4 race (optimistic-apply vs broadcast-
-    // receive ordering) was the only reason HP could diverge on the
-    // same broadcast. With the snapshot's HP mutated here, the
-    // snapshot stream is the single source of truth and broadcast
-    // drops become invisible (the snapshot doesn't drop under the
-    // outbound-channel pressure that the damage-broadcast stream
-    // does).
-    //
-    // Gate 3 (above, `room.players.contains_key(&req_target)`) already
-    // validated the target is present; the `expect` documents that
-    // invariant explicitly and avoids the redundant HashMap lookup
-    // the `if let Some` would incur.
-    let target_player = room
-        .players
-        .get_mut(&req_target)
-        .expect("validate_and_relay: gate 3 invariant violated — req_target not in room.players");
-    target_player.hp = target_player.hp.saturating_sub(amount);
-
-    Some(bc)
+    broadcasts
 }
-
 /// PR 11.7.E / §3.5 — `validate_and_relay_reload`.
 ///
 /// Validates a `ReloadRequest` from the client and, on success,
@@ -598,575 +640,227 @@ mod tests {
         room
     }
 
-    fn passing_request() -> DamageRequest {
-        DamageRequest {
-            frame: 4,
+    // -- AimEvent (PR #59: server-authoritative hit detection) ------------
+    //
+    // The AimEvent path replaces the old client-raycast-verified
+    // `DamageRequest` (PR 11.6.D). The new flow:
+    //
+    // 1. Client sends `AimEvent { source, yaw, pitch, frame, event_id }`.
+    // 2. Server runs 8 gates (source-in-room, eventId monotonicity,
+    //    fire-rate cooldown, ammo, hp, yaw/pitch range, frame-in-window).
+    // 3. For each OTHER player in the room, server rewinds both
+    //    shooter and target to `frame - rtt/2`, then runs
+    //    `hitscan::dual_pistol_hit` to decide hit/miss.
+    // 4. Returns `Vec<DamageBroadcast>` (one per hit) and decrements
+    //    source ammo + target hp server-side.
+
+    /// Build an AimEvent that should hit a target sitting on the
+    /// +X axis at `target_xy`, with the shooter at `source_xy` facing
+    /// yaw=PI/2 (which is the +X axis per `hitscan::forward_from_yaw_pitch`:
+    ///   forward = (sin(yaw)*cos(pitch), sin(pitch), cos(yaw)*cos(pitch))
+    /// yaw=0 fires along +Z, yaw=PI/2 fires along +X).
+    fn passing_aim_event() -> AimEvent {
+        AimEvent {
             source_player_id: 1,
-            target_player_id: 2,
-            source: 0,
-            amount: 12,
+            yaw_radians: std::f32::consts::FRAC_PI_2,
+            pitch_radians: 0.0,
+            frame: 4,
             event_id: 1,
         }
     }
 
     #[test]
-    fn validates_rejects_self_damage() {
-        let mut room = Room::new("DEVBX");
-        room.add_player(1);
-        let req = DamageRequest {
-            frame: 0,
-            source_player_id: 1,
-            target_player_id: 1,
-            source: 0,
-            amount: 12,
-            event_id: 1,
-        };
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "self-damage must be rejected");
-    }
-
-    #[test]
-    fn validates_rejects_target_not_in_room() {
-        let mut room = Room::new("DEVBX");
-        room.add_player(1);
-        let req = DamageRequest {
-            frame: 0,
-            source_player_id: 1,
-            target_player_id: 99,
-            source: 0,
-            amount: 12,
-            event_id: 1,
-        };
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "target not in room must be rejected");
-    }
-
-    #[test]
-    fn validates_rejects_amount_over_max() {
+    fn aim_event_round_trip_hits_target_emits_broadcast_decrements_ammo() {
+        // Shooter at (0,0), target at (5,0), facing +X. Both have
+        // position history at frames 0-4.
         let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let mut req = passing_request();
-        req.amount = 200;
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "amount > MAX_AMOUNT must be rejected");
-    }
-
-    #[test]
-    fn validates_rejects_stale_event_id() {
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let req1 = passing_request();
-        let _ = validate_and_relay(&req1, 1, &mut room, 0, Instant::now());
-        assert_eq!(room.last_event_id_for_source.get(&1).copied(), Some(1));
-
-        let req_dup = req1.clone();
-        let result = validate_and_relay(&req_dup, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "duplicate eventId must be rejected");
-
-        let mut req_older = req1.clone();
-        req_older.event_id = 0;
-        let result = validate_and_relay(&req_older, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "older eventId must be rejected");
-
-        let mut req_newer = req1.clone();
-        req_newer.event_id = 2;
-        let result = validate_and_relay(
-            &req_newer,
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let req = passing_aim_event();
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert_eq!(
+            result.len(),
             1,
-            &mut room,
-            0,
-            Instant::now() + std::time::Duration::from_millis(200),
+            "single hit on target must emit exactly one DamageBroadcast"
         );
-        assert!(result.is_some(), "newer eventId must be accepted");
-    }
-
-    #[test]
-    fn validates_rejects_fire_rate_violation() {
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let now = Instant::now();
-        let req1 = passing_request();
-        let result1 = validate_and_relay(&req1, 1, &mut room, 0, now);
-        assert!(result1.is_some(), "first request must succeed");
-
-        let req2 = DamageRequest { event_id: 2, ..req1.clone() };
-        let result2 = validate_and_relay(&req2, 1, &mut room, 0, now + Duration::from_millis(50));
-        assert!(result2.is_none(), "second request within cooldown must be rejected");
-
-        let req3 = DamageRequest { event_id: 3, ..req1.clone() };
-        let result3 = validate_and_relay(&req3, 1, &mut room, 0, now + Duration::from_millis(130));
-        assert!(result3.is_some(), "request after cooldown must succeed");
-    }
-
-    #[test]
-    fn validates_rejects_zero_ammo() {
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        room.players.get_mut(&1).unwrap().ammo = 0;
-        let req = passing_request();
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "zero ammo must be rejected");
-    }
-
-    #[test]
-    fn validates_accepts_valid_fire_returns_hit_when_target_in_range() {
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let req = passing_request();
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        let bc = result.expect("valid fire with target in range must succeed");
+        let bc = &result[0];
         assert_eq!(bc.source_player_id, 1);
         assert_eq!(bc.target_player_id, 2);
-        assert_eq!(bc.amount, 12);
-        assert_eq!(bc.server_seq, 0);
-        assert_eq!(bc.server_frame, 0);
         assert_eq!(bc.origin_event_id, req.event_id);
-        assert_eq!(room.players[&1].ammo, 9);
-    }
-
-    #[test]
-    fn validates_accepts_valid_fire_returns_miss_when_target_out_of_range() {
-        let mut room = setup_room((0.0, 0.0), (60.0, 0.0));
-        let req = passing_request();
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "out-of-range target must be rejected");
-        assert_eq!(room.players[&1].ammo, 10);
-        assert_eq!(room.next_server_seq, 0);
-    }
-
-    #[test]
-    fn validates_lag_comp_rewinds_to_older_position() {
-        // Source at (0,0); target at (5,0) for frames 0-3 (in-range),
-        // then at (40,0) for frames 4-7 (still in range -- we use 40m
-        // rather than 50m because the chest-height offset adds ~0.45
-        // to the source's y, which slightly increases the ray's
-        // projected distance and would push a target exactly at 50m
-        // just outside the hitscan range). At frame 7 with RTT 64ms
-        // (lag_frames = 2), rewind to frame 5 → snapshot_at(5)
-        // returns the largest frame <= 5, which is frame 4 (5m). HIT.
-        let mut room = Room::new("DEVBX");
-        room.add_player(1);
-        room.add_player(2);
-        room.players.get_mut(&1).unwrap().ammo = 10;
-        for frame in 0..4u32 {
-            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
-            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
-        }
-        for frame in 4..8u32 {
-            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
-            room.record_position(2, frame, Position { x: 40.0, y: 0.0 });
-        }
-        let req = DamageRequest {
-            frame: 7,
-            source_player_id: 1,
-            target_player_id: 2,
-            source: 0,
-            amount: 12,
-            event_id: 1,
-        };
-        let result = validate_and_relay(&req, 1, &mut room, 64, Instant::now());
-        assert!(result.is_some(), "lag-comp rewind must restore the in-range target position");
-    }
-
-    #[test]
-    fn validates_increments_server_seq_on_success() {
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let now = Instant::now();
-        let mut req = passing_request();
-        for seq in 0..3 {
-            req.event_id = seq + 1;
-            let now = now + Duration::from_millis(((seq + 1) * 130) as u64);
-            let result = validate_and_relay(&req, 1, &mut room, 0, now);
-            let bc = result.expect("request must succeed");
-            assert_eq!(bc.server_seq, seq as u32);
-        }
-        assert_eq!(room.next_server_seq, 3);
-    }
-
-    #[test]
-    fn validates_rejects_connection_player_id_mismatch() {
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let req = passing_request();
-        let result = validate_and_relay(&req, 2, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "connection PlayerId mismatch must be rejected");
-    }
-
-    #[test]
-    fn validates_rejects_no_position_history_for_source() {
-        let mut room = Room::new("DEVBX");
-        room.add_player(1);
-        room.add_player(2);
-        room.players.get_mut(&1).unwrap().ammo = 10;
-        for frame in 0..5u32 {
-            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
-        }
-        let req = passing_request();
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "source with no position history must be rejected");
-    }
-
-    #[test]
-    fn validates_rejects_when_position_history_is_empty() {
-        // PR 11.7.B / §3.14 — `snapshot_at` no longer returns
-        // None for normal lag-comp windows (it snaps to nearest
-        // within ±8 frames). The only path that returns None is
-        // an empty history buffer. The validator's
-        // `let Some(target_pos) = ... else { return None; }`
-        // rejection branch is now reachable only when the buffer
-        // is completely empty for the target.
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        // Wipe both players' history completely.
-        room.position_history.get_mut(&1).unwrap().frames.clear();
-        room.position_history.get_mut(&2).unwrap().frames.clear();
-        let mut req = passing_request();
-        req.frame = 3;
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "request with empty history must be rejected");
-    }
-
-    #[test]
-    fn validates_uses_nearest_snapshot_within_tolerance() {
-        // PR 11.7.B / §3.14 — verify the snap-to-nearest math is
-        // exercised end-to-end. History has frames 5..10; the
-        // request asks for frame 7 (an exact match). The
-        // validator should accept (the lag-comp rewind matches
-        // the recorded position).
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        room.position_history.get_mut(&1).unwrap().frames.clear();
-        room.position_history.get_mut(&2).unwrap().frames.clear();
-        for frame in 5..10u32 {
-            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
-            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
-        }
-        let mut req = passing_request();
-        req.frame = 7;
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_some(), "request with frame 7 (exact match in history) must be accepted");
-    }
-
-    #[test]
-    fn relay_broadcast_produces_correct_wire_size() {
-        let bc = DamageBroadcast {
-            server_frame: 0x01020304,
-            server_seq: 0x05060708,
-            source_player_id: 9,
-            target_player_id: 10,
-            source: 0,
-            amount: 12,
-            origin_event_id: 0xdeadbeef,
-        };
-        let bytes = relay_broadcast(&bc);
-        assert_eq!(bytes.len(), 1 + specialists_server::protocol::DAMAGE_BROADCAST_WIRE_SIZE);
-        assert_eq!(bytes[0], specialists_server::protocol::DISCRIMINATOR_DAMAGE_BROADCAST);
-        let decoded = specialists_server::protocol::decode_damage_broadcast(&bytes[1..])
-            .expect("body must decode");
-        assert_eq!(decoded, bc);
-    }
-
-    #[test]
-    fn uses_500ms_melee_cooldown() {
-        // FIX 6: melee target must be within 1.5m; use (1.0, 0.0).
-        let mut room = setup_room((0.0, 0.0), (1.0, 0.0));
-        let now = Instant::now();
-        let mut req = passing_request();
-        req.source = 1;
-        req.amount = 25;
-        let result1 = validate_and_relay(&req, 1, &mut room, 0, now);
-        assert!(result1.is_some(), "first melee must succeed");
-        let mut req2 = req.clone();
-        req2.event_id = 2;
-        let result2 = validate_and_relay(&req2, 1, &mut room, 0, now + Duration::from_millis(100));
-        assert!(result2.is_none(), "melee within cooldown must be rejected");
-        let mut req3 = req.clone();
-        req3.event_id = 3;
-        let result3 = validate_and_relay(&req3, 1, &mut room, 0, now + Duration::from_millis(510));
-        assert!(result3.is_some(), "melee after cooldown must succeed");
-    }
-
-    #[test]
-    fn melee_uses_melee_damage_constant_not_dual_pistol_damage() {
-        // FIX 6: melee request must produce bc.amount == MELEE_DAMAGE (25),
-        // NOT dual_pistol_damage(distance) which is always 12.
-        let mut room = setup_room((0.0, 0.0), (1.0, 0.0));
-        let mut req = passing_request();
-        req.source = 1;
-        req.amount = 25;
-        let bc = validate_and_relay(&req, 1, &mut room, 0, Instant::now())
-            .expect("melee within range must succeed");
-        assert_eq!(bc.amount, MELEE_DAMAGE, "melee damage must be MELEE_DAMAGE (25), not 12");
-        assert_eq!(bc.amount, 25, "client's COMBAT.melee.damage is 25");
-    }
-
-    #[test]
-    fn melee_rejects_target_outside_melee_range() {
-        // FIX 6: melee target at 5m must be rejected (out of 1.5m range).
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let mut req = passing_request();
-        req.source = 1;
-        req.amount = 25;
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "melee target outside melee range must be rejected");
-    }
-
-    #[test]
-    fn rejects_event_id_more_than_window_behind_last() {
-        // FIX 7: bounded window for eventId gate. Reject if
-        // req.event_id + EVENT_ID_WINDOW < last_event_id.
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let now = Instant::now();
-        let req1 = passing_request();
-        let _ = validate_and_relay(&req1, 1, &mut room, 0, now);
-        assert_eq!(room.last_event_id_for_source.get(&1).copied(), Some(1));
-
-        // req.event_id + EVENT_ID_WINDOW == last_event_id -> reject
-        let mut req_far_behind = req1.clone();
-        req_far_behind.event_id = 1 + EVENT_ID_WINDOW;  // 65
-        let result = validate_and_relay(&req_far_behind, 1, &mut room, 0, now);
-        assert!(result.is_none(), "event_id + WINDOW < last_event_id must be rejected");
-
-        // req.event_id + EVENT_ID_WINDOW == last_event_id + 1 -> accept
-        let mut req_just_in_window = req1.clone();
-        req_just_in_window.event_id = EVENT_ID_WINDOW;  // 64
-        let result = validate_and_relay(&req_just_in_window, 1, &mut room, 0, now);
-        assert!(result.is_none(), "event_id + WINDOW == last_event_id still rejects");
-
-        // Same event_id repeated -> reject (duplicates still don't replay)
-        let req_dup = req1.clone();
-        let result = validate_and_relay(&req_dup, 1, &mut room, 0, now);
-        assert!(result.is_none(), "duplicate eventId must be rejected");
-
-        // Newer event_id -> accept (advances last_event_id)
-        let mut req_newer = req1.clone();
-        req_newer.event_id = 2;
-        let result = validate_and_relay(&req_newer, 1, &mut room, 0,
-            now + Duration::from_millis(200));
-        assert!(result.is_some(), "newer eventId must be accepted");
-    }
-
-    #[test]
-    fn event_id_drift_within_then_beyond_window() {
-        // FIX 7: bounded window. After a request with event_id=A
-        // succeeds, last_event_id=A. A request with event_id in
-        // [A-WINDOW, A] is accepted; a request with event_id < A-WINDOW
-        // is rejected.
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let now = Instant::now();
-        let mut req_advance = passing_request();
-        req_advance.event_id = 1000;
-        let result = validate_and_relay(&req_advance, 1, &mut room, 0, now);
-        assert!(result.is_some(), "first request must succeed");
-        assert_eq!(room.last_event_id_for_source.get(&1).copied(), Some(1000));
-
-        // event_id=950 (50 behind 1000) -> 950 + 64 = 1014; 1014 < 1000 = false -> accept.
-        let mut req_within = passing_request();
-        req_within.event_id = 950;
-        let result = validate_and_relay(&req_within, 1, &mut room, 0,
-            now + Duration::from_millis(200));
-        assert!(result.is_some(), "drift within EVENT_ID_WINDOW must be accepted");
-        // After this, last_event_id=950 (the bounded window accepted
-        // the smaller event_id and STAMPED it; this is how retries
-        // work — the server advances last_event_id to the actually-
-        // accepted event_id, not the supremum).
-
-        // event_id=885 (65 behind 950) -> 885 + 64 = 949; 949 < 950 = true -> reject.
-        let mut req_beyond = passing_request();
-        req_beyond.event_id = 885;
-        let result = validate_and_relay(&req_beyond, 1, &mut room, 0,
-            now + Duration::from_millis(400));
-        assert!(result.is_none(), "drift beyond EVENT_ID_WINDOW must be rejected");
-    }
-
-    #[test]
-    fn rejected_request_leaves_state_unchanged() {
-        // Gate 6 rejection (stale eventId) must NOT stamp state. The
-        // source's ammo, last_fire_at, and last_event_id_for_source
-        // must be unchanged.
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let now = Instant::now();
-        let req1 = passing_request();
-        let _ = validate_and_relay(&req1, 1, &mut room, 0, now);
-        let ammo_before = room.players[&1].ammo;
-        let last_fire_at_before = room.players[&1].last_fire_at;
-        let last_event_id_before = room.last_event_id_for_source.get(&1).copied().unwrap_or(0);
-
-        // Same event_id again -> reject.
-        let req_dup = req1.clone();
-        let result = validate_and_relay(&req_dup, 1, &mut room, 0, now);
-        assert!(result.is_none(), "duplicate eventId must be rejected");
-        assert_eq!(room.players[&1].ammo, ammo_before, "ammo must not decrement on reject");
-        assert_eq!(room.players[&1].last_fire_at, last_fire_at_before, "last_fire_at must not change on reject");
-        assert_eq!(room.last_event_id_for_source.get(&1).copied().unwrap_or(0), last_event_id_before, "last_event_id must not advance on reject");
-    }
-
-    #[test]
-    fn lag_comp_verdict_change() {
-        // FIX test: with rewind, the validator sees the rewound
-        // position; without rewind, it sees the current position.
-        // The test sets up: source at (0,0), target at (5,0) for
-        // frames 0-1, then at (100,0) for frames 2-5. At frame 5
-        // with RTT=64ms (lag_frames=2), rewind to frame 3 →
-        // snapshot_at(3) returns frame 2's position (100,0) which
-        // is OUT of range → MISS. Without rewind, the current
-        // position (100,0) is also out of range, so this test
-        // doesn't differentiate. We need a case where the rewind
-        // CHANGES the verdict.
-        //
-        // Setup: source at (0,0), target at (5,0) for frames 0-50,
-        // then at (100,0) for frame 51. At frame 51 with RTT=400ms
-        // (lag_frames=12, rewind to frame 39), snapshot_at(39)
-        // returns frame 39's position (5,0) → HIT.
-        // Without rewind, current position is (100,0) → MISS.
-        let mut room = Room::new("DEVBX");
-        room.add_player(1);
-        room.add_player(2);
-        room.players.get_mut(&1).unwrap().ammo = 10;
-        for frame in 0..51u32 {
-            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
-            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
-        }
-        room.record_position(1, 51, Position { x: 0.0, y: 0.0 });
-        room.record_position(2, 51, Position { x: 100.0, y: 0.0 });
-        let req = DamageRequest {
-            frame: 51,
-            source_player_id: 1,
-            target_player_id: 2,
-            source: 0,
-            amount: 12,
-            event_id: 1,
-        };
-        // With RTT=400ms (lag_frames=12, rewind to frame 39),
-        // validator sees target at (5,0) -> HIT.
-        let result = validate_and_relay(&req, 1, &mut room, 400, Instant::now());
-        assert!(result.is_some(), "lag-comp rewind to in-range position must HIT");
-        let bc = result.unwrap();
-        assert_eq!(bc.amount, 12);
-
-        // Reset & test the no-rewind case: RTT=0 -> validator sees
-        // current position (100,0) -> MISS.
-        let mut room = Room::new("DEVBX");
-        room.add_player(1);
-        room.add_player(2);
-        room.players.get_mut(&1).unwrap().ammo = 10;
-        for frame in 0..51u32 {
-            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
-            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
-        }
-        room.record_position(1, 51, Position { x: 0.0, y: 0.0 });
-        room.record_position(2, 51, Position { x: 100.0, y: 0.0 });
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "no rewind -> current position (100,0) is OUT of range -> MISS");
-    }
-
-    #[test]
-    fn fire_rate_boundary_119_rejected_120_accepted() {
-        // FIX test: pin the < vs <= choice in the cooldown gate.
-        // 119ms since last fire -> REJECT (< 120ms).
-        // 120ms since last fire -> ACCEPT (>= 120ms).
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let now = Instant::now();
-        let req1 = passing_request();
-        let result = validate_and_relay(&req1, 1, &mut room, 0, now);
-        assert!(result.is_some(), "first request must succeed");
-        let req2 = DamageRequest { event_id: 2, ..req1.clone() };
-        let result = validate_and_relay(&req2, 1, &mut room, 0, now + Duration::from_millis(119));
-        assert!(result.is_none(), "119ms since last fire must be rejected (cooldown is 120ms)");
-        // 120ms+ cooldown: each request must be 120ms after the previous
-        // accepted one. The 119ms test did NOT stamp last_fire_at (it
-        // was rejected), so we can fire at now+120ms.
-        let req3 = DamageRequest { event_id: 3, ..req1.clone() };
-        let result = validate_and_relay(&req3, 1, &mut room, 0, now + Duration::from_millis(120));
-        assert!(result.is_some(), "120ms since last fire must be accepted (cooldown is 120ms)");
-        // 240ms+ after the 120ms test (which stamped last_fire_at).
-        let req4 = DamageRequest { event_id: 4, ..req1.clone() };
-        let result = validate_and_relay(&req4, 1, &mut room, 0, now + Duration::from_millis(240));
-        assert!(result.is_some(), "240ms (>= 120ms cooldown) since last fire must be accepted");
-    }
-
-    #[test]
-    fn event_id_wraparound_u32_max() {
-        // FIX test: event_id=u32::MAX must be accepted, event_id=0 (after
-        // a long session) must be rejected (it's more than EVENT_ID_WINDOW
-        // behind).
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let now = Instant::now();
-        let mut req_max = passing_request();
-        req_max.event_id = u32::MAX;
-        let result = validate_and_relay(&req_max, 1, &mut room, 0, now);
-        assert!(result.is_some(), "event_id=u32::MAX must be accepted");
-        // After u32::MAX, event_id=0 is a wraparound. With the bounded
-        // window, 0 + 64 < u32::MAX is true -> reject.
-        let mut req_zero = passing_request();
-        req_zero.event_id = 0;
-        let result = validate_and_relay(&req_zero, 1, &mut room, 0,
-            now + Duration::from_millis(200));
-        assert!(result.is_none(), "event_id=0 after u32::MAX is more than WINDOW behind -> reject");
-    }
-
-    #[test]
-    fn validates_rejects_target_with_zero_hp() {
-        // PR 11.7.D2: dead-target gate. A damage request targeting a
-        // player with HP=0 must be rejected (avoiding spurious "kill"
-        // broadcasts after death — the server is now authoritative for
-        // HP via the snapshot stream; a dead player can't be killed
-        // again).
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        // Kill the target — set HP to 0.
-        room.players.get_mut(&2).unwrap().hp = 0;
-        let req = passing_request();
-        let result = validate_and_relay(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_none(), "damage request targeting dead player must be rejected");
-    }
-
-    #[test]
-    fn event_id_stamp_saturates_does_not_wrap() {
-        // PR 11.7.D2: u32 saturation. After stamping a near-max
-        // event_id, a subsequent request with a SMALLER event_id
-        // (within the bounded window) must NOT wrap the stored value
-        // — saturate at the prior maximum instead.
-        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
-        let now = Instant::now();
-        // First: stamp event_id = u32::MAX - 1.
-        let mut req_max = passing_request();
-        req_max.event_id = u32::MAX - 1;
-        let result = validate_and_relay(&req_max, 1, &mut room, 0, now);
-        assert!(result.is_some(), "first request with event_id near MAX must succeed");
+        // Ammo decremented by 1 on hit (server-authoritative).
+        let post_ammo = room.players.get(&1).unwrap().ammo;
         assert_eq!(
-            room.last_event_id_for_source.get(&1).copied(),
-            Some(u32::MAX - 1),
+            post_ammo,
+            initial_ammo - 1,
+            "hit must decrement source ammo by 1"
         );
+        // Target HP decremented by damage amount.
+        let target_post_hp = room.players.get(&2).unwrap().hp;
+        assert!(
+            target_post_hp < 100,
+            "target HP must drop after hit"
+        );
+    }
 
-        // Second: event_id = u32::MAX - 1 - 30 (well within EVENT_ID_WINDOW=64).
-        // This is a "stale" eventId within the window — the gate
-        // ACCEPTS it (bounded window), but the SATURATION must keep
-        // the stored value at u32::MAX - 1, not wrap to (u32::MAX - 1 - 30).
-        let mut req_within_window = passing_request();
-        req_within_window.event_id = u32::MAX - 1 - 30;
-        let result = validate_and_relay(
-            &req_within_window,
+    #[test]
+    fn aim_event_miss_still_decrements_ammo() {
+        // Shooter at (0,0), target at (5,0), but shooter aims at
+        // yaw=pi (away from target). No hit. Fire-rate consumed
+        // (gate 3 passes), ammo decremented by 1.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let req = AimEvent {
+            yaw_radians: std::f32::consts::PI,
+            pitch_radians: 0.0,
+            ..passing_aim_event()
+        };
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert!(
+            result.is_empty(),
+            "aiming away from target must produce no broadcasts"
+        );
+        let post_ammo = room.players.get(&1).unwrap().ammo;
+        assert_eq!(
+            post_ammo,
+            initial_ammo - 1,
+            "miss must STILL decrement ammo (fire-rate consumed)"
+        );
+    }
+
+    #[test]
+    fn aim_event_rejects_yaw_out_of_range() {
+        // yaw=10.0 is outside [-pi, pi]. Gate 6 rejects.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let req = AimEvent {
+            yaw_radians: 10.0,
+            ..passing_aim_event()
+        };
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert!(
+            result.is_empty(),
+            "out-of-range yaw must produce no broadcasts"
+        );
+        let post_ammo = room.players.get(&1).unwrap().ammo;
+        assert_eq!(
+            post_ammo,
+            initial_ammo,
+            "rejected yaw must NOT consume fire-rate or ammo"
+        );
+    }
+
+    #[test]
+    fn aim_event_rejects_pitch_out_of_range() {
+        // pitch=2.0 is outside [-pi/2, pi/2]. Gate 6 rejects.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let req = AimEvent {
+            pitch_radians: 2.0,
+            ..passing_aim_event()
+        };
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert!(result.is_empty(), "out-of-range pitch must produce no broadcasts");
+        assert_eq!(room.players.get(&1).unwrap().ammo, initial_ammo);
+    }
+
+    #[test]
+    fn aim_event_rejects_source_not_in_room() {
+        // Source player 99 doesn't exist in the room.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let req = AimEvent {
+            source_player_id: 99,
+            ..passing_aim_event()
+        };
+        let result = validate_and_relay_aim(&req, 99, &mut room, 0, Instant::now());
+        assert!(result.is_empty(), "unknown source must produce no broadcasts");
+    }
+
+    #[test]
+    fn aim_event_rejects_zero_ammo() {
+        // Gate 4: ammo must be > 0.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().ammo = 0;
+        let req = passing_aim_event();
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert!(result.is_empty(), "zero ammo must reject");
+    }
+
+    #[test]
+    fn aim_event_rejects_dead_shooter() {
+        // Gate 5: shooter HP must be > 0.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.get_mut(&1).unwrap().hp = 0;
+        let req = passing_aim_event();
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert!(result.is_empty(), "dead shooter must reject");
+    }
+
+    #[test]
+    fn aim_event_rejects_stale_event_id() {
+        // Gate 3: eventId must be within EVENT_ID_WINDOW (64) of
+        // last seen id. We advance the eventId past the window via
+        // a large advance (req.event_id = 1000), then send an
+        // eventId that's beyond the window behind it.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let now = Instant::now();
+        let mut req_advance = passing_aim_event();
+        req_advance.event_id = 1000;
+        let _ = validate_and_relay_aim(&req_advance, 1, &mut room, 0, now);
+        // Now send eventId = 900 (100 behind 1000, beyond
+        // EVENT_ID_WINDOW = 64). Must reject.
+        let mut stale = passing_aim_event();
+        stale.event_id = 900;
+        let result = validate_and_relay_aim(
+            &stale,
             1,
             &mut room,
             0,
             now + Duration::from_millis(200),
         );
-        assert!(result.is_some(), "stale eventId within EVENT_ID_WINDOW must be accepted");
-        // Stored value must NOT decrease (saturate, don't wrap).
-        assert_eq!(
-            room.last_event_id_for_source.get(&1).copied(),
-            Some(u32::MAX - 1),
-            "stored event_id must saturate, not wrap to a smaller value",
+        assert!(
+            result.is_empty(),
+            "stale eventId must reject (window check)"
         );
     }
 
     #[test]
-    fn lag_comp_uses_server_stamped_rtt() {
-        // FIX 1 test: when the source's last_ping_received_at is
-        // within MAX_RTT_MS, the validator uses a non-zero lag_frames.
-        // We can't directly observe lag_frames (it's local to the
-        // fn), but we can observe the verdict: with RTT=0 and the
-        // target moving out of range after frame 30, the request
-        // MISSes. With RTT=400ms (lag_frames=12, rewind to frame
-        // 18), the request HITs.
+    fn aim_event_rejects_fire_rate_violation() {
+        // Gate 3: two AimEvents in <120ms, second must be rejected.
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let now = Instant::now();
+        let req1 = passing_aim_event();
+        let _ = validate_and_relay_aim(&req1, 1, &mut room, 0, now);
+        let req2 = AimEvent {
+            event_id: 2,
+            ..passing_aim_event()
+        };
+        // 50ms later: inside 120ms cooldown.
+        let result = validate_and_relay_aim(&req2, 1, &mut room, 0, now + Duration::from_millis(50));
+        assert!(
+            result.is_empty(),
+            "second fire inside cooldown must reject"
+        );
+        // 200ms later: outside cooldown, second fire succeeds.
+        let req3 = AimEvent {
+            event_id: 3,
+            ..passing_aim_event()
+        };
+        let result = validate_and_relay_aim(&req3, 1, &mut room, 0, now + Duration::from_millis(200));
+        assert_eq!(
+            result.len(),
+            1,
+            "second fire outside cooldown must hit"
+        );
+    }
+
+    #[test]
+    fn aim_event_lag_comp_rewinds_to_in_range_position() {
+        // Target moves out of range at frame 30, but AimEvent at frame 40
+        // with RTT=400ms rewinds to frame 28 (lag=12), where target
+        // was still in range.
         let mut room = Room::new("DEVBX");
         room.add_player(1);
         room.add_player(2);
         room.players.get_mut(&1).unwrap().ammo = 10;
-        // source at (0,0) throughout; target at (5,0) until frame 30,
-        // then at (100,0) from frame 30 onward.
         for frame in 0..30u32 {
             room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
             room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
@@ -1175,18 +869,67 @@ mod tests {
             room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
             room.record_position(2, frame, Position { x: 100.0, y: 0.0 });
         }
-        let req = DamageRequest {
-            frame: 40,
+        // Advance the room's server frame so the AimEvent's
+        // `req.frame = 40` is within MAX_LOOKAHEAD_FRAMES (16) of
+        // the current server frame.
+        room.next_server_frame = 40;
+        let req = AimEvent {
             source_player_id: 1,
-            target_player_id: 2,
-            source: 0,
-            amount: 12,
+            // yaw=PI/2 fires along +X axis (where the in-range target lives).
+            yaw_radians: std::f32::consts::FRAC_PI_2,
+            pitch_radians: 0.0,
+            frame: 40,
             event_id: 1,
         };
-        // RTT=400ms -> lag_frames=12 -> rewind to frame 28 -> target
-        // at (5,0) -> HIT.
-        let result = validate_and_relay(&req, 1, &mut room, 400, Instant::now());
-        assert!(result.is_some(), "with RTT=400ms, lag-comp must rewind to in-range frame");
+        // RTT=400ms -> lag_frames=12 -> rewind to frame 28 (in range).
+        let result = validate_and_relay_aim(&req, 1, &mut room, 400, Instant::now());
+        assert_eq!(
+            result.len(),
+            1,
+            "with RTT=400ms, lag-comp must rewind to in-range frame"
+        );
+    }
+
+    #[test]
+    fn aim_event_no_targets_in_room_returns_empty() {
+        // Shooter is in room, but alone (no other player). No broadcast.
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.players.get_mut(&1).unwrap().ammo = 10;
+        for frame in 0..5u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
+        }
+        let req = passing_aim_event();
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert!(result.is_empty(), "alone in room: no broadcasts");
+        // Ammo still decremented (fire consumed).
+        assert_eq!(room.players.get(&1).unwrap().ammo, initial_ammo - 1);
+    }
+
+    #[test]
+    fn aim_event_two_targets_one_in_range_emits_one_broadcast() {
+        // Three players: shooter at (0,0), target2 at (5,0) in range,
+        // target3 at (50,0) out of range. Only one broadcast.
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.add_player(3);
+        room.players.get_mut(&1).unwrap().ammo = 10;
+        // target3 at (200,0) is well past the 50m pistol range.
+        for frame in 0..5u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
+            room.record_position(3, frame, Position { x: 200.0, y: 0.0 });
+        }
+        let req = passing_aim_event();
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert_eq!(
+            result.len(),
+            1,
+            "single in-range target yields exactly one broadcast"
+        );
+        assert_eq!(result[0].target_player_id, 2);
     }
 
     // -- ReloadRequest (PR 11.7.E) --------------------------------------

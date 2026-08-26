@@ -7,7 +7,7 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#58 readiness (2026-08-25). **`main` @ `85d00c2` (post-#57).** **PR #57 (docs/post-merge-pr56-reload) MERGED** at `e903a13` (2026-08-25). **PR #58 OPEN, MERGEABLE** (branch `feat/phase1-pr-auto-reconnect`, 3 commits) — **AUTO-RECONNECT ON STALE TRANSPORT**. Closes the "stale tab" UX trap from `cc: 1541898875252506775` (Kyle's manual 2-tab Vivaldi test): when the canary restarts mid-session, every connected tab used to silently stay in "Disconnected (idle)" / "transport kind: none (no transport!)" forever. Now: `userClosed` flag distinguishes user-initiated `close()` (terminal, no retry) from server-initiated drops (transient, retry with exponential backoff 1s→2s→4s...capped at 30s, plus a Page Visibility API listener for `visibilitychange → visible` immediate retry). New `dispose()` method = pre-PR `close()` semantics (used by PauseMenu "Disconnect Peer" + DebugHud "Force reconnect"). New smoke `damage-server-reconnect-smoke.mjs` 4/4 PASS; **verified end-to-end on real Vivaldi on Kyle's MacBook** (cc: `1541925638850609314`) — all 4 phases PASS in 3.7s clock time, B2 dispose() fix verified live. Claude cross-vendor review caught 2 BLOCKING bugs (B1 connect()-race during dispose(), B2 close()-vs-dispose() at PauseMenu + DebugHud) — both fixed. Servers DOWN. Recommended next: **PR AimEvent** (server-authoritative hit detection, ~1 session) — root-cause fix for "HP didn't move when I shot" from same cc. Then PR vitest-connectionStatus-drift. Defer: remote rig collision (blue rig clips through boxes), circuit-breaker for auto-reconnect after N consecutive failures.
+**`You are here`**: post-PR-#59 readiness (2026-08-26). **`main` @ `468a135d` (post-#58 auto-reconnect).** **PR #58 (auto-reconnect on stale transport) MERGED** at `468a135` (2026-08-26, per `cc: 1542021891957592074`). **PR #59 OPEN, MERGEABLE** (branch `feat/phase1-pr-aimevent`, 1 squashed commit `aad6c0f`) — **AIMEvent — SERVER-AUTHORITATIVE HIT DETECTION**. Closes the "HP didn't move when I shot" UX trap from `cc: 1541898875252506775` (Kyle's 2-tab Vivaldi test). New wire type `AimEvent` (disc `0x0A`, **19 bytes** = 1 disc + 2 u16 source + 4 f32 yaw + 4 f32 pitch + 4 u32 frame + 4 u32 eventId). Server runs `hitscan::dual_pistol_hit` against snapshot-known positions (per-target lag-comp rewind to `req.frame - rtt/2`). Snapshot now carries yaw + pitch from `Room.players[id]` (was hardcoded 0.0 pre-#59). 8-gate validator with monotonic eventId window. Smoke 4/4 PASS locally, **MacBook function test ALL 4 PHASES PASS** on real Vivaldi Chrome 150.0.0.0 (cc: `1542042299767193610`): Phase 1 connect ✅, Phase 2 hit (HP 100→88 on BOTH tabs) ✅, Phase 3 ammo decrement ✅, Phase 4 miss path (ammo drops, no self-damage) ✅ — screenshots at `/home/kyle/.hermes/cache/images/aimevent-mac/1787723887-phase-{1,2,4}-{a,b}.png`. Claude cross-vendor review: 0 BLOCKING, 3 non-blocking (all fixed in `62d2df8`, consolidated into `aad6c0f` via rebase), 5 nits deferred to follow-ups. Follow-ups deferred: **(1)** 0x06 InputsServer `DEVBX_ROOM_ID` hardcode blocks per-tab yaw/pitch population (smoke verified schema but not values); **(2)** server-side hit detection refinement (hitbox lag-comp, multi-bullet support); **(3)** lag-comp rewind across sparse position history; **(4)** anti-cheat on yaw/pitch (Phase 4 PR 11.10); **(5)** melee path (`0x0B MeleeEvent` future PR). Servers DOWN. Recommended next: **PR vitest connectionStatus-drift** (cosmetic, ~30 min — peer-overlay/App.HUD state-machine divergence) or **PR fix-0x06-per-tab-room** (clears the InputsServer room hardcode, blocks proper yaw/pitch propagation). Defer: remote rig collision (blue rig clips through boxes — listed in HANDOFF but the PR AimEvent work didn't address it).
 
 **Where we landed (PR 11.7.E full session, 2026-08-25)**:
 
@@ -311,6 +311,35 @@ The `computeRespawnPosition(playerId)` function uses the same `PLAYER_SPAWN_X_OF
 **The next move** (PR 11.7.D2 — gated on PR 11.7.D merge): lockstep substrate retirement (`ggrsRuntime`, `peer`, `ggnet` P2P transport) + 4 lockstep smokes rewritten via `ServerTransport` + snapshots + 5177 health-regression smoke explicit retire / convert decision. Same `coding-task-routing` orchestration as D1. ~2-3h wall, split if codex stalls at the 90-min mark (memory: Codex 4-for-4 burn-trace on PR 11.6.D).
 
 Also carry-forward from PR 11.7.B/11.7.C: `0x06 InputSeq` trailer (wire-size 17→18 + `last_inputs_seq_per_source` in `validate_and_relay`), `protocol/constants.ts` extraction (5 constants currently inlined: `SNAPSHOT_RATE_HZ`, `RECONCILIATION_THRESHOLD_M`, `MAX_RECONCILIATION_SNAP_DISTANCE_M`, `INTERPOLATION_DELAY_MS`, `MAX_SNAPSHOT_AGE_MS`).
+
+---
+
+## 2026-08-26 — PR #59 CI fix — `actions.cache@v4` → `actions/cache@v4` in aim-event smoke
+
+**TL;DR for #59 reviewer**: PR #59 was failing every push with GH's "workflow file issue" gate (zero jobs ran, 6 consecutive failures across `aad6c0f`/`62d2df8`/`c8e3cbd`). Root cause: the new `client-damage-server-aim-event-smoke` job in `.github/workflows/ci.yml` used `actions.cache@v4` (deprecated dotted form). GH's Actions validator rejects the dotted form. The 20 pre-existing `actions.cache@v4` references in OTHER jobs were tolerated (legacy alias) — the 21st introduction surfaced the issue.
+
+**Fix (commit `cf1e57a` on `feat/phase1-pr-aimevent`)**: single-line `actions.cache@v4` → `actions/cache@v4` in the new job only. actionlint binary installed locally at `/home/kyle/Development/specialists-web-pr-aimevent/actionlint` (use as pre-push gate next time). PR is `MERGEABLE`, the new smoke (`client — damage server aim-event smoke (PR #59, port 5191)`) **PASSED green on the first run after the fix** (job 98203563202 in run 32976749121).
+
+**⚠️ New blocker surfaced (NOT fixed by `cf1e57a` — separate concern)**: run 32976749121 had 4 pre-existing port-conflict failures (`Port 5190 already in use`, `bind TCP/14434: Address already in use`) on:
+- `client — health regression smoke (PR 10)` (runner 1000012135)
+- `client — damage server HP-convergence smoke (PR 11.6.D, port 5191)` (runner 1000012150)
+- `client — damage server reload smoke (PR 11.7.E, port 5191)` (runner 1000012151)
+- `client — damage server smoke (PR 11.6.C, port 5190)` (runner 1000012153)
+
+All 4 are **port-conflict-with-prior-job-stragglers** on the lampak self-hosted runner pool. The runners are separate VMs (different runner-name IDs) but all happened to land on machines with stale canary / vite processes bound to 5190/5191/14433/14434. The teardown `if: always()` + `pkill -f canary-server.sh || true` + `lsof -ti:${port}` catch loop is not aggressive enough — likely the parent `nohup bash tools/canary-server.sh` exits but child rust/cargo processes get orphaned.
+
+**Recommended follow-up PR (carry-forward, non-blocking for #59 merge)**: `chore(ci): pre-step port-freeup for all canary-using smokes`. Either:
+- (a) Add a pre-step `pkill -9 -f canary-server.sh; pkill -9 -f vite; lsof -ti:5190,5191,14433,14434 | xargs -r kill -9` at the top of every canary-using smoke before installing deps, OR
+- (b) Switch all canary-using smokes off self-hosted runners onto `runs-on: ubuntu-latest` (GH-hosted VMs are clean per job).
+
+Option (b) is the small-surface fix and addresses root cause. Option (a) is a 5-line patch but perpetuates the latent straggler problem on every other smoke that doesn't have a pre-step.
+
+**PR #59 status after `cf1e57a`**: 21/25 jobs PASS (incl. the new aim-event smoke). 4 failures are the port-conflict issue above, all pre-existing and unrelated to PR #59's delta. PR is still MERGEABLE; MacBook function-test verdict (cc: `1542042299767193610`) holds; CI rerun on a cleaner self-hosted runner should bring it all-green without further ci.yml changes.
+
+**Playtest status** ⚠️
+- **Still playable**: PR #59 MacBook function test (cc: `1542042299767193610`) PASSED all 4 phases on real Vivaldi Chrome 150.0.0.0 — Phase 1 connect ✅, Phase 2 hit (HP 100→88 BOTH tabs) ✅, Phase 3 ammo decrement ✅, Phase 4 miss path (ammo drops, no self-damage) ✅. Screenshots at `/home/kyle/.hermes/cache/images/aimevent-mac/1787723887-phase-{1,2,4}-{a,b}.png`.
+- **No new playtest this session**: change was a single-line ci.yml edit; no runtime behavior delta. MacBook validation holds.
+- **No new breaking change**: the only delta is a deprecated action reference → canonical reference. Behavior identical.
 
 ---
 ## 2026-08-22 — PR 11.7.D2.2.1 follow-up — 3 lockstep smokes rewritten via ServerTransport
