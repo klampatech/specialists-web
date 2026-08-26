@@ -453,7 +453,7 @@ jobs:
         working-directory: client
         run: npm ci
       - name: Cache Playwright browsers
-        uses: actions.cache@v4
+        uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
