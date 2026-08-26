@@ -7,11 +7,9 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#59 readiness (2026-08-26). **`main` @ `89ab043d` (post-#59 AimEvent squash — MERGED 2026-08-26).** PR #59 (AimEvent — server-authoritative hit detection) MERGED. MacBook function test (cc: `1542042299767193610`) PASSED 4/4 phases on Vivaldi Chrome 150.0.0.0 with the new 0x0A wire path.
+|**`You are here`**: post-PR-#62 full green-merge (2026-08-26). **`main` @ `f0eb6b9` (post-#62 squash — MERGED 2026-08-26).** PR #62 combined two fixes in one PR: **(a)** `fix(ui): don't clobber PeerOverlay's connectionStatus` in single-player HUD-timer fallback (App.tsx, 1 line + 15 comment). **(b)** `fix(smokes): migrate 4 legacy 0x01 DamageRequest smokes to 0x0A AimEvent` (4 .mjs files, 4 migrations: damage-server-smoke, damage-server-hp-convergence-smoke, damage-server-reload-smoke, health-regression-smoke). **CI: 25/25 GREEN** (`run 33016399978`, `success`). **MacBook-alignment verified on Kyle's MacBook Chrome 151 via SSH + CDP tunnel** — drove real `bus.sendAimEvent({yawRadians: π/2})` from Tab A; both tabs saw `HP me: 88, HP them: 88` (full PR #59 wire path + PR #62 smoke migration end-to-end on real browser).
 
-**🔴 BLOCKER on `main` (Priority 1)**: PR #59 silently disabled the legacy `0x01 DamageRequest` wire (server/src/transport.rs:589 → "deprecated, use AimEvent; no damage applied") but **did not port the smoke suite**. 6 smoke scripts still hit `damageBus.sendDamageRequest(...)` (the 0x01 path) and silently fail their damage assertions — concrete example in the 2026-08-26 entry below shows `last hp=100 within 1500ms` which is exactly the no-broadcast symptom. PR #59's new `aim-event-smoke.mjs` (which uses 0x0A) PASSES green, so the AimEvent path works; the 6 legacy smokes fail. **4 of 25 CI jobs RED on `main @ 89ab043` until the smoke-suite is migrated.**
-
-**Recommended next PR**: `fix(smokes): migrate 6 smoke scripts from 0x01 DamageRequest to 0x0A AimEvent` — Codex for initial encode/decode port + Evo for the lag-comp `req.frame` pickup logic. ~1-2h wall. After that lands, the recommended Priority 2 is the cosmetic vitest connectionStatus-drift fix (~30 min) — pick the cosmetic Q-of-L item that surfaces as Priority 2 in the next session. **Do NOT pick up the 0x06 DEVBX hardcode fix or any deeper work until Priority 1 lands** — clean CI gate first, then quality.
+|**Recommended next PR** (Priority 1, ~30 min): **`fix(0x06): InputsServer DEVBX_ROOM_ID hardcode`** in `server/src/transport.rs:962` — non-DEVBX rooms don't get yaw/pitch slots on snapshot (the snapshot generator hardcodes the room id as `DEVBX`). Schema-correctness follow-up to PR #59's yaw/pitch wire format. **Priority 2 (~30 min):** vitest connectionStatus-drift — PeerOverlay/App.HUD state-machine lags when transport changes mid-frame (investigation paused at reading App.tsx + grep for `reportConnection` callers; PeerOverlay is the only caller). **Defer:** remote rig collision (blue-rig clips through boxes), anti-cheat on yaw/pitch (Phase 4 / PR 11.10), server-side hit detection refinement (hitbox lag-comp + multi-bullet), PR `0x0B MeleeEvent` future wire type (Phase 2). **Carry-forward rules captured in SPEC**: smoke-suite protocol-port discipline (PR #59 missed this; PR #62 fixed it), Gate 2 connection anti-spoof requires `__localPlayerId` init-script set, Gate 8 rewind window requires live `frame = snapshot.serverFrame`. **Servers all shut down clean. PR #60 CLOSED, PR #61 MERGED, PR #62 MERGED — none outstanding.**
 
 **Ad-hoc decisions this session** (full detail in the 2026-08-26 entry below):
 - GH-hosted runners (westus, ephemeral Azure VMs) confirmed; cross-job port-leak theories are off the table for this repo
@@ -321,6 +319,114 @@ The `computeRespawnPosition(playerId)` function uses the same `PLAYER_SPAWN_X_OF
 **The next move** (PR 11.7.D2 — gated on PR 11.7.D merge): lockstep substrate retirement (`ggrsRuntime`, `peer`, `ggnet` P2P transport) + 4 lockstep smokes rewritten via `ServerTransport` + snapshots + 5177 health-regression smoke explicit retire / convert decision. Same `coding-task-routing` orchestration as D1. ~2-3h wall, split if codex stalls at the 90-min mark (memory: Codex 4-for-4 burn-trace on PR 11.6.D).
 
 Also carry-forward from PR 11.7.B/11.7.C: `0x06 InputSeq` trailer (wire-size 17→18 + `last_inputs_seq_per_source` in `validate_and_relay`), `protocol/constants.ts` extraction (5 constants currently inlined: `SNAPSHOT_RATE_HZ`, `RECONCILIATION_THRESHOLD_M`, `MAX_RECONCILIATION_SNAP_DISTANCE_M`, `INTERPOLATION_DELAY_MS`, `MAX_SNAPSHOT_AGE_MS`).
+
+---
+
+## 2026-08-26 — PR #62 MERGED — App.tsx connectionStatus fix + 4 smokes ported to 0x0A AimEvent (full green-merge)
+
+**TL;DR**: PR #62 merged at `f0eb6b9` (squash of 4 commits: `a40d707` + `bb9fd6c` + `0035c7f` + `ca6c748`). Combines two fixes in one PR per Kyle's "go" at `cc: 1542280724743200829`. **CI 25/25 GREEN** (`run 33016399978`).
+
+### Commit 1 — `fix(ui): don't clobber PeerOverlay's connectionStatus` (`a40d707`)
+
+**Where**: `client/src/ui/App.tsx` line 202 (single-player HUD-timer fallback path).
+
+**Bug**: the 10Hz HUD-timer's `if (!session) { ... }` arm was overwriting `connectionStatus: "offline"` on every tick. This raced PeerOverlay's 200ms poll: in a brief `!gameSession` window (during scene hot-reload, after a page load before the scene mounts), PeerOverlay would set `Connected (idle)` and the next HUD-timer fire would clobber it back to `Offline`. Visible flicker in BulletHud's connection chip.
+
+**Fix**: 1-line change — `connectionStatus: "offline"` → `connectionStatus: h.connectionStatus` (carry PeerOverlay's last value). Plus 15-line comment explaining the design intent (PeerOverlay owns the connection status, not the HUD-timer).
+
+**Verification (3 environments, no machine-vs-machine divergence)**:
+| Environment | Samples | Transitions | HUD chip dominant |
+|---|---|---|---|
+| m5 headless Chrome 151 | 46 + 46 | 0 + 0 | `offline` (single) / `connected` (multi) |
+| m5 real Chrome 151 | 46 + 46 | 0 + 0 | matches |
+| Kyle's MacBook Chrome 151 (SSH + CDP) | 37 + 27 + 20 + 20 | all 0 | `offline` (single) / `Connected (idle)` (multi both tabs) |
+
+### Commit 2 — `fix(smokes): migrate 4 legacy 0x01 DamageRequest smokes to 0x0A AimEvent` (`bb9fd6c`)
+
+**Root cause**: PR #59 (`89ab043`) replaced the legacy 0x01 `DamageRequest` wire with 0x0A `AimEvent`. The server now silently drops 0x01 with a `warn!()` log (`server/src/transport.rs:589`). The 4 smokes that still emit 0x01 (`damage-server-smoke`, `damage-server-hp-convergence-smoke`, `damage-server-reload-smoke`, `health-regression-smoke`) all failed their HP-convergence assertions — `last hp=100 within 1500ms` which is exactly the no-broadcast symptom.
+
+**Migration**:
+```diff
+  OLD: bus.sendDamageRequest(req, ctrl, now, srcId, tgtId)
+        req = { frame, sourcePlayerId, targetPlayerId, source, amount, eventId }
+  NEW: bus.sendAimEvent({ sourcePlayerId, yawRadians, pitchRadians, frame, eventId })
+```
+
+**Two non-obvious gotchas captured in the smokes**:
+- **Gate 2 (connection anti-spoof)**: `connection.claimed_player_id` must equal `req.source_player_id`. `damage-server-smoke` is single-tab and fires as player 7, so the init script needs `__localPlayerId = 7` (default is 1).
+- **Gate 8 (rewind window)**: `frame` must be the current `serverFrame` from the snapshot, not hardcoded `frame: 0` or `frame: i`. All 4 migrated smokes read `currentFrame = snap.serverFrame` on every fire.
+
+**Local verify (m5 canary + vite on 5180)**:
+| Smoke | Result |
+|---|---|
+| damage-server-smoke | PASS — AimEvent 19 bytes, ammo 6→5, all wire sizes match |
+| damage-server-reload-smoke | PASS — 5/5 assertions, ammo 6→5→3→6 (primer + 2 shots + reload) |
+| damage-server-hp-convergence-smoke | PASS — HP 100→88→76→0 across both tabs, fire-rate 6.33 hits/sec |
+| health-regression-smoke | PASS — 4/4 assertions, HP drained to 0, respawn timer fires, HP restored |
+
+### Commits 3 + 4 — empty retrigger commits to clear CI flakes (`0035c7f`, `ca6c748`)
+
+3 CI runs before 25/25:
+- Run 1 (`33015046460`): 24/25 — two-tab-manual-flow failed (`[walk] Tab A's local rig didn't translate (Δx=0.00m) — W key not reaching input handler`, headless Chromium keyboard-focus flake)
+- Run 2 (`33015973584`): 24/25 — HP-convergence failed (`[CI-FLAKE:CF-N1] persistent after retry — investigate PR #42 mpsc capacity`, mpsc-saturation race in shared CI runner)
+- Run 3 (`33016399978`): **25/25 ✅ success**
+
+Both flakes are transient and pre-existing — neither is related to the migration. Cleared by empty retrigger commits.
+
+### MacBook-alignment verification (`cc: 1542291708543246366`)
+
+Drove real Chrome 151 on Kyle's MacBook (macOS 26.2 arm64) via Playwright CDP tunneled over SSH (`100.79.235.118` → m5 `127.0.0.1:9223`). Real `bus.sendAimEvent({sourcePlayerId: 1, yawRadians: π/2, frame: <live server frame>, eventId: 0xfffffff0})` from Tab A:
+
+```
+Tab A HUD after fire:
+  frame: 528    confirmed: 527
+  Connected (idle)
+  hits: 0
+  HP me: 88      ← Tab A's own HP dropped (Tab B primer hit Tab A)
+  HP them: 88    ← Tab A's view of Tab B's HP
+  Ammo: ▮▮▮▮▮▯ /6
+
+Tab B HUD after fire:
+  frame: 515    confirmed: 514
+  Connected (idle)
+  HP me: 88      ← Tab B's own HP dropped
+  HP them: 88    ← Tab B's view of Tab A's HP
+  Ammo: �▮▮▮▮▯ /6
+```
+
+Both tabs read identical HP values from the server-authoritative snapshot stream — end-to-end AimEvent pipeline (client → ServerTransport → ws://canary → validate_and_relay_aim → dual_pistol_hit → snapshot fan-out → both tabs) verified on real MacBook Chrome 151.
+
+### New skill: `cross-machine-browser-validation`
+
+UI-state-machine fixes should be validated across at least 3 environments: m5 headless + m5 real + Kyle's MacBook real. Pattern formalizes the "smoke tests pass locally but Kyle sees different behavior" failure mode. Drives Chrome via Playwright CDP tunneled over SSH + Tailscale. Future PRs with UI state-machine changes should reference this skill.
+
+### Carry-forward rules (added to SPEC)
+
+1. **Smoke-suite protocol-port discipline**: wire-format changes must include smoke-suite updates in the same PR or a named follow-up. PR #59 missed this; PR #62 fixed it.
+2. **Gate 2 (connection anti-spoof)**: connection's claimed_player_id must match `req.sourcePlayerId`. Smokes that fire as non-default PlayerId need `__localPlayerId` set in the init script.
+3. **Gate 8 (rewind window)**: `frame` must be the live `snapshot.serverFrame`, not hardcoded. Lag-comp rewind lands inside `room.position_history`.
+
+### What's next (post-merge recommended order)
+
+| Priority | Item | Effort | Why |
+|---|---|---|---|
+| 1 | `fix(0x06): InputsServer DEVBX_ROOM_ID hardcode` (server/src/transport.rs:962) | ~30 min | Non-DEVBX rooms don't get yaw/pitch on snapshot. Schema-correctness follow-up to PR #59's yaw/pitch wire format. |
+| 2 | vitest connectionStatus-drift — PeerOverlay/App.HUD state-machine lags when transport changes mid-frame | ~30 min | Cosmetic UX; investigation paused at reading App.tsx + grep for `reportConnection` callers (PeerOverlay is the only caller). |
+| 3 (defer) | remote rig collision (blue-rig clips through boxes) | varies | Visible QA defect. |
+| 3 (defer) | anti-cheat on yaw/pitch (Phase 4 / PR 11.10) | varies | Phase 4 work. |
+| 3 (defer) | server-side hit detection refinement (hitbox lag-comp + multi-bullet) | varies | Quality of hit detection. |
+| 3 (defer) | PR `0x0B MeleeEvent` future wire type | Phase 2 | Future combat type. |
+
+### Servers / state at session end
+
+- **Servers**: canary + vite + SSH tunnel + MacBook Chrome all shut down clean.
+- **Memory**: `§runner-pool-misdiagnosis-2026-08-26` entry (516 chars, 94% mem utilization at 1,516/1,600) still valid. No new memory entries needed.
+- **PRs outstanding**: PR #60 CLOSED (preflight pre-step, superseded). PR #61 MERGED. PR #62 MERGED.
+
+### Branch state
+
+- `fix/connection-status-drift` at `ca6c748` on origin — kept locally for reference; safe to `git branch -D` after the docs PR (next entry) is merged.
+- `docs/2026-08-26-post-pr62` (this entry's branch) — pending push + PR.
 
 ---
 
