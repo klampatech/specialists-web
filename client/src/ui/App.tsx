@@ -182,9 +182,24 @@ export function App() {
             // (pointer lock, everLocked, viewMode) but skip the
             // multiplayer-only reads (HP, repeated frames, combat
             // events, bullet time).
+            //
+            // PR 11.7.D3+ / fix: `connectionStatus` is OWNED by
+            // PeerOverlay (it polls `__serverTransport.getStats()`
+            // at 200ms and reports up via `onStatusChange`). The
+            // 10Hz HUD-timer MUST NOT clobber it back to "offline"
+            // — pre-fix, every timer tick during multiplayer would
+            // race PeerOverlay and reset the chip to "Offline"
+            // whenever this single-player-fallback branch ran
+            // (e.g. between scene init and gameSession mount, or
+            // any future scene re-init). Root cause: this branch
+            // treated `connectionStatus` like the other
+            // multiplayer-only fields that DO need a reset to
+            // defaults in single-player mode. Use `h.connectionStatus`
+            // as the carrier so PeerOverlay's last-reported value
+            // persists.
             setHud((h) => ({
               ...h,
-              connectionStatus: "offline",
+              connectionStatus: h.connectionStatus,
               frame: 0,
               repeatedFrames: 0,
               hasRemote: false,
