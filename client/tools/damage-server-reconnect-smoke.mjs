@@ -394,7 +394,7 @@ async function main() {
   );
 
   await browser.close();
-  log("OK — damage-server-reconnect-smoke passed (4/4 assertions).");
+  log("OK — damage server reconnect smoke passed (4/4 assertions).");
 
   // Tear down canary + vite
   if (canaryProc) {
@@ -403,6 +403,13 @@ async function main() {
   if (viteProc) {
     try { await killProcess(viteProc); } catch { /* swallow */ }
   }
+
+  // Explicit exit: the canary + vite tee writers + subprocess stdout
+  // streams keep the event loop alive after main() returns, which
+  // causes the smoke to hang on CI indefinitely (4/4 PASS in 75s,
+  // then "in_progress" for 77 minutes before being killed by the
+  // workflow timeout).
+  process.exit(0);
 }
 
 main().catch((err) => {
