@@ -16,7 +16,7 @@
 // **What this smoke verifies now**:
 //   1. Initial REMOTE HP = 100 (read from Tab A's snapshot,
 //      server-authoritative).
-//   2. Fire 10 damage requests via `damageBus.sendDamageRequest` from
+//   2. Fire 10 AimEvents via `damageBus.sendAimEvent` from
 //      Tab A (each 12 dmg, total 120 > 100) → REMOTE HP (Tab B) drops
 //      to 0, Tab A's HUD respawn countdown visible.
 //   3. After RESPAWN_WAIT_MS (1.1s, the documented respawn timer + slack),
@@ -48,9 +48,11 @@
 //   - Boots canary server + Vite on port 5177 (default port per the
 //     pre-D2.2 convention).
 //   - Uses `__forceServerTransport=true` + URL `?server=` flag.
-//   - Sends damage via `damageBus.sendDamageRequest(...)` (the
-//     ServerTransport wire path) rather than via the P2P combat
-//     events / dual-pistol raycast.
+//   - Sends damage via `damageBus.sendAimEvent(...)` (the
+//     ServerTransport wire path — AimEvent / 0x0A per PR #59) rather
+//     than via the P2P combat events / dual-pistol raycast or the
+//     legacy `sendDamageRequest` (which the server silently drops
+//     post-#59 with a `warn!()`).
 //   - Asserts remote HP via the snapshot stream (the
 //     server-authoritative source — same pattern as 5191's
 //     §4.4-closure rewrite). The legacy P2P HUD chip's
@@ -376,43 +378,63 @@ async function runSmoke() {
 
     // ---- Step 3: fire enough damage to push remote HP to 0 -----------------
     // Tab A is the firer (playerId=1), Tab B is the target (playerId=2).
-    // Damage flows via damageBus.sendDamageRequest → ServerTransport →
-    // server validate_and_relay → broadcast → both tabs' broadcast
-    // handlers apply damage to their respective remoteController.
+    // Damage flows via damageBus.sendAimEvent → ServerTransport → server
+    // validate_and_relay_aim → snapshot fan-out with new HP → both
+    // tabs' HUD readers apply damage to their respective remoteController.
     //
-    // PR 11.6.D §3.4.2 — eventId MUST be strictly monotonic per source.
-    // We pick a random base < 0xfffffff0 so eventId + N stays under u32
-    // (matches 5191's primer carry-forward).
+    // PR #59 / §3.5 — AimEvent (0x0A) replaces legacy DamageRequest (0x01).
+    // The server runs `dual_pistol_hit` against snapshot-known positions
+    // for every OTHER player in the room. We aim yaw=PI/2 (forward = +X)
+    // from Tab A's local spawn (-8) toward Tab B's local spawn (-4) —
+    // a delta of +4 on X, well within DEFAULT_TARGET_RADIUS (~1m).
+    //
+    // PR #59 / §3.5 / Gate 3 — eventId MUST be strictly monotonic per
+    // source. PR #59 / §3.5 / Gate 6 — fire requires the firer to have
+    // position history (the rewind reads `room.position_history`). Both
+    // tabs' PositionUpdate seeding above already populated the history
+    // ring; each AimEvent uses the CURRENT server frame from the snapshot
+    // (not a hardcoded frame=0) so the rewind lands inside the ring.
+    //
+    // PR 11.6.D §3.4.2 — pick a random eventId base < 0xfffffff0 so
+    // eventId + N stays under u32 (matches 5191's primer carry-forward).
     const eventIdBase = Math.floor(Math.random() * 0xfffffff0);
-    log(`Firing ${HITS_TO_KILL} damage requests from Tab A (eventId base=${eventIdBase}, target=playerId=2)...`);
+    log(`Firing ${HITS_TO_KILL} AimEvents from Tab A at Tab B (eventId base=${eventIdBase}, yaw=PI/2 forward +X, target=playerId=2)...`);
     for (let i = 0; i < HITS_TO_KILL; i++) {
-      const fireResult = await pageA.evaluate(({eventId, frame}) => {
+      const fireResult = await pageA.evaluate(async ({eventId}) => {
         const bus = window.__damageBus;
         const session = window.__gameSession;
         if (!session) return {ok: false, reason: "no __gameSession"};
         if (!bus) return {ok: false, reason: "no __damageBus"};
-        const targetController = session.remoteController;
+        // PR #59 / §3.5 / Gate 8 — fire's `frame` MUST be the current
+        // server frame (snapshot.serverFrame) so the server's rewind
+        // lands inside `room.position_history` for both source and
+        // target. Pre-fix used hardcoded `frame: i`; post-fix reads
+        // the live server frame so lag-comp math is always inside
+        // the ring buffer.
+        const snap = window.__latestSnap ? window.__latestSnap() : null;
+        const currentFrame = snap ? snap.serverFrame : 0;
         try {
-          bus.sendDamageRequest({
-            frame,
+          bus.sendAimEvent({
             sourcePlayerId: 1,
-            targetPlayerId: 2,
-            source: 0, // fire
-            amount: 12, // DUAL_PISTOL_DAMAGE
+            yawRadians: Math.PI / 2, // forward = +X axis where Tab B spawns
+            pitchRadians: 0.0,
+            frame: currentFrame,
             eventId,
-          }, targetController, performance.now(), 1, 2);
-          return {ok: true};
+          });
+          return {ok: true, frame: currentFrame};
         } catch (e) {
           return {ok: false, reason: e?.message ?? String(e)};
         }
-      }, {eventId: eventIdBase + i + 1, frame: i});
+      }, {eventId: eventIdBase + i + 1});
       if (!fireResult.ok) {
         errors.push(`[fire-${i + 1}] ${fireResult.reason}`);
       }
-      // 150ms gap between fires so the HUD chip + snapshot reflect each
-      // HP drop before the next fire lands. Without this gap CI's slower
-      // tick rate can let the respawn window slip through the poll.
-      await pageA.waitForTimeout(150);
+      // 200ms gap between fires so the HUD chip + snapshot reflect each
+      // HP drop before the next fire lands, AND so the server's 120ms
+      // fire-rate cooldown elapses (AimEvent's gate 7). Without this
+      // gap CI's slower tick rate can let the respawn window slip
+      // through the poll.
+      await pageA.waitForTimeout(200);
       const cur = await readHpA();
       log(`  fire ${i + 1}: remote HUD HP=${cur.remote}${cur.remoteRespawning > 0 ? ` (respawn ${cur.remoteRespawning}ms)` : ""}`);
       if (cur.remote === 0 && cur.remoteRespawning > 0) break;

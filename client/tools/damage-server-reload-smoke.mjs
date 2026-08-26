@@ -340,21 +340,30 @@ async function runSmoke() {
     // DamageRequest primer — both tabs fire 1-damage shots at each
     // other. Forces connection promotion AND populates the snapshot
     // with both playerIds.
+    //
+    // PR #59 / §3.5 — replaced by AimEvent (0x0A) primer. Each tab
+    // sends a single AimEvent at yaw=PI/2 (forward = +X) toward the
+    // other tab. Tab A at local spawn (-8) aims +X (toward Tab B's
+    // spawn -4); Tab B at local spawn (-4) aims -X (toward Tab A's
+    // spawn -8) using yaw=-PI/2.
     const primerEventA = Math.floor(Math.random() * 0xfffffff0);
     const primerEventB = Math.floor(Math.random() * 0xfffffff0);
     const primerResultA = await pageA.evaluate(async ({eventId}) => {
       const bus = (window).__damageBus;
       const session = (window).__gameSession;
       if (!bus || !session) return {ok: false, reason: "missing bus/session"};
+      // Read CURRENT server frame so the rewind lands inside the
+      // position_history ring (AimEvent's Gate 8).
+      const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+      const currentFrame = snap ? snap.serverFrame : 0;
       try {
-        bus.sendDamageRequest({
-          frame: 0,
+        bus.sendAimEvent({
           sourcePlayerId: 1,
-          targetPlayerId: 2,
-          source: 0, // fire (mode 0 = dual-pistol)
-          amount: 1, // minimal — 1 HP drop + 1 ammo decrement per tab
+          yawRadians: Math.PI / 2, // forward = +X where Tab B spawns
+          pitchRadians: 0.0,
+          frame: currentFrame,
           eventId,
-        }, session.remoteController, performance.now(), 1, 2);
+        });
         return {ok: true};
       } catch (e) {
         return {ok: false, reason: String(e)};
@@ -367,15 +376,16 @@ async function runSmoke() {
       const bus = (window).__damageBus;
       const session = (window).__gameSession;
       if (!bus || !session) return {ok: false, reason: "missing bus/session"};
+      const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+      const currentFrame = snap ? snap.serverFrame : 0;
       try {
-        bus.sendDamageRequest({
-          frame: 0,
+        bus.sendAimEvent({
           sourcePlayerId: 2,
-          targetPlayerId: 1,
-          source: 0,
-          amount: 1,
+          yawRadians: -Math.PI / 2, // forward = -X where Tab A spawns
+          pitchRadians: 0.0,
+          frame: currentFrame,
           eventId,
-        }, session.remoteController, performance.now(), 2, 1);
+        });
         return {ok: true};
       } catch (e) {
         return {ok: false, reason: String(e)};
@@ -449,26 +459,25 @@ async function runSmoke() {
       if (!bus || !session || !t) return { ok: false, reason: "missing bus/session/transport" };
       const sent = [];
       for (let i = 0; i < count; i++) {
-        // Re-resolve the target controller on every iteration — under
+        // Re-resolve the current frame on every iteration — under
         // React StrictMode the closure-captured session may be disposed
         // and replaced; the live session is always on window.__gameSession.
         const liveSession = (window).__gameSession;
-        const targetController = liveSession ? liveSession.remoteController : null;
+        if (!liveSession) return { ok: false, reason: "lost __gameSession" };
+        // Read CURRENT server frame so the AimEvent's rewind lands
+        // inside the position_history ring. The legacy DamageRequest
+        // path used hardcoded frame=0; AimEvent's Gate 8 rejects
+        // frames outside the rewind window.
+        const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+        const currentFrame = snap ? snap.serverFrame : 0;
         try {
-          bus.sendDamageRequest(
-            {
-              frame: i,
-              sourcePlayerId: 1,
-              targetPlayerId: 2,
-              source: 0, // fire (mode 0 = dual-pistol)
-              amount: 12, // DUAL_PISTOL_DAMAGE
-              eventId: baseEventId + i,
-            },
-            targetController,
-            performance.now(),
-            1,
-            2
-          );
+          bus.sendAimEvent({
+            sourcePlayerId: 1,
+            yawRadians: Math.PI / 2, // forward = +X where Tab B spawns
+            pitchRadians: 0.0,
+            frame: currentFrame,
+            eventId: baseEventId + i,
+          });
           sent.push({ i, eventId: baseEventId + i });
         } catch (e) {
           sent.push({ i, error: String(e) });

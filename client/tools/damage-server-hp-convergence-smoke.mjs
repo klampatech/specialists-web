@@ -438,20 +438,32 @@ async function runSmoke() {
     // (`eventId` not strictly monotonic after wrap).
     const primerEventA = Math.floor(Math.random() * 0xfffffff0);
     const primerEventB = Math.floor(Math.random() * 0xfffffff0);
+    // PR #59 / §3.5 — AimEvent (0x0A) primer replaces legacy
+    // DamageRequest (0x01) primer. Each tab fires one AimEvent at
+    // the other tab (yaw=PI/2 vs -PI/2). Both tabs aim at the same
+    // hitbox plane — the other's local spawn, ~4m away on the X
+    // axis (Player 1 spawn = -8, Player 2 spawn = -4).
+    //
+    // PR #59 / §3.5 / Gate 8 — fire's `frame` MUST be the current
+    // server frame so the rewind lands inside `room.position_history`.
     const primerResultA = await pageA.evaluate(async ({eventId}) => {
       const bus = (window).__damageBus;
       const session = (window).__gameSession;
-      if (!session) return {ok: false, reason: "no __gameSession"};
-      const targetController = session.remoteController;
-      bus.sendDamageRequest({
-        frame: 0,
-        sourcePlayerId: 1, // Tab A
-        targetPlayerId: 2, // Tab B
-        source: 0, // fire
-        amount: 12, // DUAL_PISTOL_DAMAGE
-        eventId,
-      }, targetController, performance.now(), 1, 2);
-      return {ok: true};
+      if (!bus || !session) return {ok: false, reason: "no bus/session"};
+      const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+      const currentFrame = snap ? snap.serverFrame : 0;
+      try {
+        bus.sendAimEvent({
+          sourcePlayerId: 1, // Tab A
+          yawRadians: Math.PI / 2, // forward = +X where Tab B spawns
+          pitchRadians: 0.0,
+          frame: currentFrame,
+          eventId,
+        });
+        return {ok: true};
+      } catch (e) {
+        return {ok: false, reason: String(e)};
+      }
     }, {eventId: primerEventA});
     if (!primerResultA.ok) {
       throw new Error(`Tab A primer fire failed: ${primerResultA.reason}`);
@@ -459,17 +471,21 @@ async function runSmoke() {
     const primerResultB = await pageB.evaluate(async ({eventId}) => {
       const bus = (window).__damageBus;
       const session = (window).__gameSession;
-      if (!session) return {ok: false, reason: "no __gameSession"};
-      const targetController = session.remoteController;
-      bus.sendDamageRequest({
-        frame: 0,
-        sourcePlayerId: 2, // Tab B
-        targetPlayerId: 1, // Tab A
-        source: 0, // fire
-        amount: 12, // DUAL_PISTOL_DAMAGE
-        eventId,
-      }, targetController, performance.now(), 2, 1);
-      return {ok: true};
+      if (!bus || !session) return {ok: false, reason: "no bus/session"};
+      const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+      const currentFrame = snap ? snap.serverFrame : 0;
+      try {
+        bus.sendAimEvent({
+          sourcePlayerId: 2, // Tab B
+          yawRadians: -Math.PI / 2, // forward = -X where Tab A spawns
+          pitchRadians: 0.0,
+          frame: currentFrame,
+          eventId,
+        });
+        return {ok: true};
+      } catch (e) {
+        return {ok: false, reason: String(e)};
+      }
     }, {eventId: primerEventB});
     if (!primerResultB.ok) {
       throw new Error(`Tab B primer fire failed: ${primerResultB.reason}`);
@@ -509,33 +525,36 @@ async function runSmoke() {
     // eventId greater than primerEventA. Use primerEventA + 1 to satisfy
     // the gate without touching the random distribution.
     const eventId = primerEventA + 1;
-    const damageAmount = 12; // DUAL_PISTOL_DAMAGE
-    const fireResult = await pageA.evaluate(async ({eventId, targetId, amount}) => {
+    const fireResult = await pageA.evaluate(async ({eventId, targetId}) => {
       const bus = (window).__damageBus;
       const session = (window).__gameSession;
-      if (!session) return {ok: false, reason: "no __gameSession"};
-      const targetController = session.remoteController;
-      // PR 11.7.D / §4.4 closure: read the pre-fire HP from the snapshot
-      // (server-authoritative) rather than the lockstep controller. The
-      // controller's HP is updated by the same broadcast stream we are
-      // trying to verify, so reading it as the baseline races against
-      // itself. The snapshot's HP is the same value the server just
-      // fan-out'd — fresh, authoritative, and unaffected by broadcast
-      // drops (the snapshot stream doesn't drop under outbound-channel
-      // pressure the way damage broadcasts do).
+      if (!bus || !session) return {ok: false, reason: "no bus/session"};
+      // PR #59 / §3.5 / Gate 8 — fire's `frame` MUST be the current
+      // server frame so the rewind lands inside the position_history
+      // ring. Hardcoded `frame: 0` would be rejected once the room
+      // ticks past the rewind window (POSITION_HISTORY_RETENTION_FRAMES
+      // ≈ 64 frames at 64Hz = ~1s).
       const snap = (window).__latestSnap ? (window).__latestSnap() : null;
       const entry = snap ? snap.players.find((p) => p.playerId === targetId) : null;
       const targetHpBefore = entry ? entry.hp : null;
-      bus.sendDamageRequest({
-        frame: 0,
-        sourcePlayerId: 1, // Tab A
-        targetPlayerId: targetId,
-        source: 0, // fire
-        amount,
-        eventId,
-      }, targetController, performance.now(), 1, targetId);
-      return {ok: true, sent: true, targetHpBefore};
-    }, {eventId, targetId: 2, amount: damageAmount});
+      const currentFrame = snap ? snap.serverFrame : 0;
+      try {
+        // PR #59 / §3.5 — AimEvent (0x0A) replaces DamageRequest (0x01).
+        // The server runs `dual_pistol_hit` against all OTHER players
+        // in the room; `targetPlayerId` is no longer carried on the
+        // wire. We aim yaw=PI/2 (forward = +X) at Tab B's local spawn.
+        bus.sendAimEvent({
+          sourcePlayerId: 1, // Tab A
+          yawRadians: Math.PI / 2,
+          pitchRadians: 0.0,
+          frame: currentFrame,
+          eventId,
+        });
+        return {ok: true, sent: true, targetHpBefore};
+      } catch (e) {
+        return {ok: false, reason: String(e)};
+      }
+    }, {eventId, targetId: 2});
     if (fireResult.targetHpBefore === null) {
       throw new Error(
         `Tab A pre-fire snapshot missing for target player (no __latestSnap entry for playerId=2). ` +
@@ -545,7 +564,7 @@ async function runSmoke() {
     if (!fireResult.ok) {
       throw new Error(`Tab A send failed: ${fireResult.reason}`);
     }
-    log(`Assertion 2 PASS: Tab A sent damage request (target HP before=${fireResult.targetHpBefore}).`);
+    log(`Assertion 2 PASS: Tab A sent AimEvent (target HP before=${fireResult.targetHpBefore}).`);
 
     // ---- 3. HP convergence (broadcast-arrival check + cross-tab match).
     // PR 11.7.D: assertion 3 used to poll `(window).__lastBroadcast`
@@ -643,20 +662,22 @@ async function runSmoke() {
       const start = Date.now();
       let sent = 0;
       while (Date.now() - start < timeoutMs) {
-        // PR 11.6.D fix4 (smoke-side): re-resolve the target
-        // controller on every iteration. The broadcast handler
-        // resolves the LATEST `__gameSession` on every call
-        // (under React StrictMode the first scene() call's
-        // gameSession may be disposed and replaced by a
-        // second-mount's gameSession mid-spam — see
-        // `makeBroadcastHandler` in scene.ts). Caching
-        // `targetController` outside the loop would point at
-        // the disposed session and the spam's damage
-        // requests would target a controller the broadcasts
-        // never touch, breaking the post-spam HP convergence
-        // check with a 12-HP (one broadcast's worth) gap.
+        // PR 11.6.D fix4 (smoke-side): re-resolve the live session
+        // on every iteration. The broadcast handler resolves the
+        // LATEST `__gameSession` on every call (under React StrictMode
+        // the first scene() call's gameSession may be disposed and
+        // replaced by a second-mount's gameSession mid-spam — see
+        // `makeBroadcastHandler` in scene.ts).
+        //
+        // PR #59 / §3.5 — AimEvent replaces DamageRequest. The server
+        // runs `dual_pistol_hit` against all OTHER players in the
+        // room; spam aims yaw=PI/2 at Tab B's local spawn.
         const session = (window).__gameSession;
-        const targetController = session.remoteController;
+        if (!session) return { sent, reason: "lost __gameSession" };
+        // Read CURRENT server frame on every fire so the AimEvent's
+        // rewind lands inside the position_history ring (Gate 8).
+        const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+        const currentFrame = snap ? snap.serverFrame : 0;
         // PR 11.6.D / §3.4.2 — eventId MUST be strictly monotonic
         // per source. Random IDs are rejected by the server as
         // stale; the smoke therefore bumps a local counter starting
@@ -665,14 +686,13 @@ async function runSmoke() {
         // gate we want to exercise here).
         const eventId = baseEventId + 1 + sent;
         try {
-          bus.sendDamageRequest({
-            frame: sent,
+          bus.sendAimEvent({
             sourcePlayerId: 1,
-            targetPlayerId: 2,
-            source: 0,
-            amount: 12,
+            yawRadians: Math.PI / 2, // forward = +X where Tab B spawns
+            pitchRadians: 0.0,
+            frame: currentFrame,
             eventId,
-          }, targetController, performance.now(), 1, 2);
+          });
         } catch {
           // ignore — too many in flight
         }
