@@ -57,6 +57,18 @@ pub struct Player {
     /// "has never reloaded" — first reload always passes the rate-limit
     /// gate.
     pub last_reload_at: Option<Instant>,
+    /// PR AimEvent / Section 3.5 - server-side mirror of the
+    /// client's last-reported yaw in radians (range -pi..=pi). The
+    /// snapshot stream reads this field for the per-player yaw slot
+    /// (the snapshot's PlayerState.yaw field); the 0x06 InputServer
+    /// inbound arm updates it on every packet the client sends at
+    /// 32Hz throttle. Default 0.0 until the client sends its first
+    /// input packet.
+    pub yaw_radians: f32,
+    /// PR AimEvent / Section 3.5 - server-side mirror of the
+    /// client's last-reported pitch in radians (range -pi/2..=pi/2).
+    /// Same semantics as `yaw_radians` (snapshot slot + 0x06 update).
+    pub pitch_radians: f32,
 }
 
 impl Player {
@@ -74,6 +86,14 @@ impl Player {
             // `None` means "has never reloaded" — first reload always
             // passes the rate-limit gate.
             last_reload_at: None,
+            // PR AimEvent / Section 3.5 - default 0.0 (yaw/pitch are
+            // client-side intents, captured from the 0x06 InputServer
+            // arm the first time the client sends its input bitmask).
+            // Until the first input packet, the snapshot's yaw/pitch
+            // slots report 0.0 (mirrors the pre-PR-#59 behavior —
+            // see snapshot.rs::build_snapshot's prior hardcoded 0.0).
+            yaw_radians: 0.0,
+            pitch_radians: 0.0,
         }
     }
 }

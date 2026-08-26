@@ -43,6 +43,16 @@ pub const DISCRIMINATOR_PONG: u8 = 0x05;
 /// NEW §1.2 — server-relayed inputs for PR 11.7 handoff. PR 11.6.B
 /// buffers but does not process.
 pub const DISCRIMINATOR_INPUTS_SERVER: u8 = 0x06;
+/// PR AimEvent / Section 3.5 - `0x0A` discriminator. PR #59 replaces the
+/// client-side `DamageRequest` (0x01) raycast-verified path with the
+/// server-authoritative `AimEvent` path: the client sends its intent
+/// (yaw + pitch + frame + eventId); the server runs
+/// `damage_relay::validate_and_relay_aim` against snapshot-known
+/// positions for every other player and emits `DamageBroadcast`(s)
+/// for hits. The 0x01 path is REMOVED in PR #59 - clients sending
+/// 0x01 get a `warn!("deprecated, use AimEvent (0x0A)")` and no
+/// damage. Single source of truth.
+pub const DISCRIMINATOR_AIM_EVENT: u8 = 0x0A;
 /// PR 11.6.D FIX 4: server sends a DamageReject back to the source
 /// tab only (NOT broadcast) when the validator rejects a
 /// DamageRequest. The reject is privacy-scoped to the source's
@@ -64,6 +74,22 @@ pub const DISCRIMINATOR_DAMAGE_REJECT: u8 = 0x0C;
 /// 1). The constants MUST stay in sync with the TS body sizes.
 pub const DAMAGE_REQUEST_WIRE_SIZE: usize = 14;
 pub const DAMAGE_BROADCAST_WIRE_SIZE: usize = 18;
+/// PR AimEvent / Section 3.5 - body size of the AimEvent (the
+/// disc byte is prepended by the transport router, matching the
+/// DamageBroadcast convention). Body = 2 (source_player_id u16 BE) +
+/// 4 (yaw_radians f32 BE) + 4 (pitch_radians f32 BE) + 4 (frame
+/// u32 BE) + 4 (event_id u32 BE) = 18 bytes. On-the-wire packet =
+/// disc + body = 1 + 18 = 19 bytes.
+///
+/// Math: 1 (disc) + 2 (u16) + 4 (f32) + 4 (f32) + 4 (u32) + 4 (u32)
+/// = 19. (No target_player_id field — the server iterates all
+/// OTHER players in the room.) Earlier memos had a 21B estimate;
+/// the 19B number is the actual layout (the 21B count included a
+/// redundant target_player_id u16 = 2B).
+pub const AIM_EVENT_BODY_SIZE: usize = 2 + 4 + 4 + 4 + 4;
+/// PR AimEvent / Section 3.5 - full on-the-wire packet (disc + body)
+/// = 19 bytes.
+pub const AIM_EVENT_WIRE_SIZE: usize = AIM_EVENT_BODY_SIZE + 1;
 pub const POSITION_UPDATE_WIRE_SIZE: usize = 14;
 pub const PING_WIRE_SIZE: usize = 4;
 pub const PONG_WIRE_SIZE: usize = 8;
@@ -182,43 +208,59 @@ pub fn decode_reload_request(buf: &[u8]) -> Option<ReloadRequest> {
 }
 pub const PLAYER_STATE_WIRE_SIZE: usize = 29;
 
-// -- DamageRequest --------------------------------------------------------
+// -- AimEvent (PR AimEvent, replaces DamageRequest) -----------------------
 
-/// Tab → Server. "I think this damage happened."
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DamageRequest {
-    pub frame: u32,
+/// PR AimEvent / Section 3.5 - Tab → Server. "I fired at this yaw +
+/// pitch; tell me who I hit."
+///
+/// The client no longer runs the local raycast against the remote
+/// mesh (which failed whenever the rig was at a position the local
+/// Havok query didn't know about — see the PR #59 brief, Kyle's
+/// 2-tab Vivaldi test ). The server runs
+///  against the snapshot-known
+/// positions for every OTHER player in the room and emits
+/// (s) for hits.
+///
+/// The wire format does NOT carry a  field — the
+/// server iterates all OTHER players and runs 
+/// against each. This keeps the wire packet small (19 bytes vs the
+/// 21-byte layout that included a target_player_id would require).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AimEvent {
     pub source_player_id: u16,
-    pub target_player_id: u16,
-    /// `0` = fire, `1` = melee (per §3.5).
-    pub source: u8,
-    pub amount: u8,
+    pub yaw_radians: f32,
+    pub pitch_radians: f32,
+    pub frame: u32,
     pub event_id: u32,
 }
 
-pub fn encode_damage_request(req: &DamageRequest) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(DAMAGE_REQUEST_WIRE_SIZE);
-    buf.put_u32(req.frame);
+pub fn encode_aim_event(req: &AimEvent) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(AIM_EVENT_BODY_SIZE);
     buf.put_u16(req.source_player_id);
-    buf.put_u16(req.target_player_id);
-    buf.put_u8(req.source);
-    buf.put_u8(req.amount);
+    buf.put_f32(req.yaw_radians);
+    buf.put_f32(req.pitch_radians);
+    buf.put_u32(req.frame);
     buf.put_u32(req.event_id);
-    debug_assert_eq!(buf.len(), DAMAGE_REQUEST_WIRE_SIZE);
+    debug_assert_eq!(
+        buf.len(),
+        AIM_EVENT_BODY_SIZE,
+        "encode_aim_event: produced {} bytes, expected {}",
+        buf.len(),
+        AIM_EVENT_BODY_SIZE,
+    );
     buf
 }
 
-pub fn decode_damage_request(buf: &[u8]) -> Option<DamageRequest> {
-    if buf.len() != DAMAGE_REQUEST_WIRE_SIZE {
+pub fn decode_aim_event(buf: &[u8]) -> Option<AimEvent> {
+    if buf.len() != AIM_EVENT_BODY_SIZE {
         return None;
     }
     let mut b = buf;
-    Some(DamageRequest {
-        frame: b.get_u32(),
+    Some(AimEvent {
         source_player_id: b.get_u16(),
-        target_player_id: b.get_u16(),
-        source: b.get_u8(),
-        amount: b.get_u8(),
+        yaw_radians: b.get_f32(),
+        pitch_radians: b.get_f32(),
+        frame: b.get_u32(),
         event_id: b.get_u32(),
     })
 }
@@ -647,18 +689,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn damage_request_is_14_bytes() {
-        let req = DamageRequest {
-            frame: 0x11223344,
+    fn aim_event_is_19_bytes() {
+        // PR AimEvent / Section 3.5 - AimEvent wire size:
+        //   1 (disc) + 2 (source_player_id u16 BE)
+        //   + 4 (yaw_radians f32 BE)
+        //   + 4 (pitch_radians f32 BE)
+        //   + 4 (frame u32 BE)
+        //   + 4 (event_id u32 BE) = 19 bytes.
+        // Pin the math: 1+2+4+4+4+4 = 19 (NOT 21 — the
+        // target_player_id field that would push it to 21 is not
+        // on the wire; the server iterates all OTHER players).
+        let req = AimEvent {
             source_player_id: 0x5566,
-            target_player_id: 0x7788,
-            source: 0,
-            amount: 25,
+            yaw_radians: 0.5,
+            pitch_radians: -0.25,
+            frame: 0xdeadbeef,
+            event_id: 0xcafef00d,
+        };
+        let bytes = encode_aim_event(&req);
+        assert_eq!(bytes.len(), AIM_EVENT_BODY_SIZE);
+        assert_eq!(bytes.len(), 18, "AimEvent body is 18 bytes (2+4+4+4+4)");
+        assert_eq!(AIM_EVENT_WIRE_SIZE, 19, "wire size = body size + 1 disc byte");
+    }
+
+    #[test]
+    fn aim_event_roundtrip_preserves_all_fields() {
+        let original = AimEvent {
+            source_player_id: 7,
+            yaw_radians: 1.5707963,  // pi/2
+            pitch_radians: -0.5,
+            frame: 0x01020304,
             event_id: 0xdeadbeef,
         };
-        let bytes = encode_damage_request(&req);
-        assert_eq!(bytes.len(), DAMAGE_REQUEST_WIRE_SIZE);
-        assert_eq!(bytes.len(), 14);
+        let bytes = encode_aim_event(&original);
+        let decoded = decode_aim_event(&bytes).expect("decode must succeed");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn aim_event_rejects_wrong_size() {
+        let req = AimEvent {
+            source_player_id: 1,
+            yaw_radians: 0.0,
+            pitch_radians: 0.0,
+            frame: 1,
+            event_id: 1,
+        };
+        let bytes = encode_aim_event(&req);
+        // Truncate to 17 bytes (off-by-many).
+        assert!(decode_aim_event(&bytes[..17]).is_none());
+        // Pad 1 byte.
+        let mut padded = bytes.clone();
+        padded.push(0);
+        assert!(decode_aim_event(&padded).is_none());
+        // Empty buffer.
+        assert!(decode_aim_event(&[]).is_none());
+    }
+
+    #[test]
+    fn aim_event_is_big_endian() {
+        let req = AimEvent {
+            source_player_id: 0x0102,
+            yaw_radians: 0.0,  // not asserted (f32 BE bits depend on platform)
+            pitch_radians: 0.0,
+            frame: 0x03040506,
+            event_id: 0x0708090a,
+        };
+        let bytes = encode_aim_event(&req);
+        // byte 0..1 = source_player_id BE: 01 02
+        assert_eq!(&bytes[0..2], &[0x01, 0x02]);
+        // byte 10..13 = frame BE: 03 04 05 06
+        assert_eq!(&bytes[10..14], &[0x03, 0x04, 0x05, 0x06]);
+        // byte 14..17 = event_id BE: 07 08 09 0a
+        assert_eq!(&bytes[14..18], &[0x07, 0x08, 0x09, 0x0a]);
     }
 
     #[test]

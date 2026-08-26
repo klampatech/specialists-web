@@ -50,6 +50,14 @@ export const DISCRIMINATOR_PONG = 0x05;
 /** NEW §1.2 — server-routed inputs for PR 11.7 handoff. PR 11.6.B
  *  buffers but does not process. */
 export const DISCRIMINATOR_INPUTS_SERVER = 0x06;
+/** PR #59 / §3.5 -- server-authoritative hit detection. The
+ *  client sends an `AimEvent` (its intent: yaw + pitch + frame +
+ *  eventId) every LMB press; the server runs `dual_pistol_hit`
+ *  against snapshot-known positions for every OTHER player in the
+ *  room and emits `DamageBroadcast`(s) for hits. Replaces the
+ *  client-raycast-verified `DamageRequest` (0x01) path -- PR #59
+ *  drops the 0x01 path entirely. */
+export const DISCRIMINATOR_AIM_EVENT = 0x0A;
 // PR 11.7.B: bumped from 0x07 to 0x0C. The brief locks
 // DISCRIMINATOR_SNAPSHOT = 0x07 and the plan §3.5 reserves 0x07-0x0B
 // for PR 11.7 types (Snapshot/StateAck/InputSeq/ReloadRequest/
@@ -72,6 +80,12 @@ export const PONG_BODY_SIZE = 8;
 /** PR 11.6.D FIX 4: body size of `DamageReject` (event_id u32 BE +
  *  reason u8 = 5 bytes). Wire-format stable — server `ca9f177`. */
 export const DAMAGE_REJECT_BODY_SIZE = 5;
+/** PR #59 / §3.5 — body size of `AimEvent`. Body = 2 (source_player_id
+ *  u16 BE) + 4 (yaw_radians f32 BE) + 4 (pitch_radians f32 BE) +
+ *  4 (frame u32 BE) + 4 (event_id u32 BE) = 18 bytes. No
+ *  `target_player_id` field on the wire — the server iterates all
+ *  OTHER players in the room. */
+export const AIM_EVENT_BODY_SIZE = 2 + 4 + 4 + 4 + 4;
 /** PR 11.6.D FIX 4: reject reason codes. Wire-format stable —
  *  mirror of `server/src/protocol.rs::REJECT_REASON_*`. New codes
  *  may be added without breaking older clients (they just log
@@ -120,6 +134,9 @@ export const INPUTS_SERVER_BODY_SIZE = INPUTS_SERVER_WIRE_SIZE - 1;
 /** PR 11.7.B: `0x0C` discriminator + u32 event_id BE + reason u8 = 6 bytes total.
  *  Bumped from 0x07 (PR 11.6.D) so 0x07 is free for Snapshot. */
 export const DAMAGE_REJECT_WIRE_SIZE = DAMAGE_REJECT_BODY_SIZE + 1;
+/** PR #59 / §3.5 — full on-the-wire packet (disc + body) = 19 bytes.
+ *  `AIM_EVENT_BODY_SIZE + 1`. */
+export const AIM_EVENT_WIRE_SIZE = AIM_EVENT_BODY_SIZE + 1;
 
 // -- Wire-format interfaces (mirror of server/src/protocol.rs) ------------
 
@@ -261,6 +278,37 @@ export interface DamageReject {
   eventId: number;
   /** 0 = fire-rate, 1 = ammo, 2 = eventId, 3 = lag-miss, 4 = no-history. */
   reason: number;
+}
+
+/**
+ * PR #59 / §3.5 — Tab → Server. "I fired at this yaw + pitch on
+ * this frame." Replaces `DamageRequest` (PR 11.6.D) — the server is
+ * now the sole hit-detection authority.
+ *
+ * Wire layout (19 bytes — see `AIM_EVENT_WIRE_SIZE`):
+ *   byte 0        discriminator 0x0A
+ *   byte 1..2     sourcePlayerId (u16 BE)
+ *   byte 3..6     yawRadians (f32 BE)
+ *   byte 7..10    pitchRadians (f32 BE)
+ *   byte 11..14   frame (u32 BE)
+ *   byte 15..18   eventId (u32 BE)
+ *
+ * No `targetPlayerId` — the server iterates all OTHER players in
+ * the room. Mirrors the Rust `AimEvent` in `server/src/protocol.rs`.
+ */
+export interface AimEvent {
+  sourcePlayerId: number;
+  /** Yaw (radians, [-PI, PI]) at the moment of the click. Server
+   *  trusts this claim (anti-cheat is Phase 4 / PR 11.10). */
+  yawRadians: number;
+  /** Pitch (radians, [-PI/2, PI/2]) at the moment of the click. */
+  pitchRadians: number;
+  /** Server frame at the moment of the click. The server uses this
+   *  for lag-comp rewind (`frame - rtt/2`). */
+  frame: number;
+  /** Monotonic per-tab counter (resets on tab reload; the server
+   *  applies a bounded window of tolerance). */
+  eventId: number;
 }
 
 // -- Encoder / decoder pair ----------------------------------------------
@@ -539,5 +587,43 @@ export function decodeDamageReject(buf: Uint8Array): DamageReject | null {
   return {
     eventId: dv.getUint32(0, false),
     reason: dv.getUint8(4),
+  };
+}
+
+/** Encode an `AimEvent` to a 19-byte wire-format `Uint8Array`
+ *  (discriminator 0x0A + 18-byte body). Mirrors the Rust
+ *  `encode_aim_event` body layout byte-for-byte.
+ *
+ *  Layout (matches the wire-format table in the JSDoc above):
+ *    [disc 1B][source u16 BE 2B][yaw f32 BE 4B][pitch f32 BE 4B]
+ *    [frame u32 BE 4B][event_id u32 BE 4B] = 19 bytes total. */
+export function encodeAimEvent(req: AimEvent): Uint8Array {
+  const bytes = concatBytes([
+    new Uint8Array([DISCRIMINATOR_AIM_EVENT]), // disc 0x0A
+    u16BE(req.sourcePlayerId),                  // BE u16 sourcePlayerId
+    f32BE(req.yawRadians),                      // BE f32 yawRadians
+    f32BE(req.pitchRadians),                    // BE f32 pitchRadians
+    u32BE(req.frame),                           // BE u32 frame
+    u32BE(req.eventId),                         // BE u32 eventId
+  ]);
+  console.assert(
+    bytes.length === AIM_EVENT_WIRE_SIZE,
+    `encodeAimEvent: expected ${AIM_EVENT_WIRE_SIZE} bytes, got ${bytes.length}`,
+  );
+  return bytes;
+}
+
+/** Decode an 18-byte body buffer (discriminator already stripped)
+ *  to an `AimEvent`. Returns null on size mismatch. Mirrors the
+ *  Rust `decode_aim_event` exactly. */
+export function decodeAimEvent(buf: Uint8Array): AimEvent | null {
+  if (buf.length !== AIM_EVENT_BODY_SIZE) return null;
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  return {
+    sourcePlayerId: dv.getUint16(0, false),
+    yawRadians: dv.getFloat32(2, false),
+    pitchRadians: dv.getFloat32(6, false),
+    frame: dv.getUint32(10, false),
+    eventId: dv.getUint32(14, false),
   };
 }

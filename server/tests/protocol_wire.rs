@@ -1,63 +1,107 @@
-// PR 11.6.B / §3.5 — bytes-on-wire size assertions + round-trip tests.
+// PR 11.6.B / §3.5 -- bytes-on-wire size assertions + round-trip tests.
 //
 // This is the regression guard from the PR 11.6.A wire-format
 // off-by-one bug (original draft claimed 8/13 bytes for damage;
 // actual 14/18). Every encoder ends with a `debug_assert_eq!` AND
 // these integration tests assert the same thing again at the
 // crate boundary. If the wire format drifts, BOTH the inline
-// asserts AND this test fire — same data, two layers of safety.
+// asserts AND this test fire -- same data, two layers of safety.
 
 use specialists_server::*;
 
-// -- DamageRequest -----------------------------------------------------
+// -- AimEvent (PR #59) -----------------------------------------------
 
 #[test]
-fn damage_request_is_14_bytes() {
-    let req = DamageRequest {
-        frame: 0x11223344,
+fn aim_event_is_19_bytes() {
+    // PR #59 / §3.5: wire size = 1 (disc) + 2 (source u16) +
+    // 4 (yaw f32) + 4 (pitch f32) + 4 (frame u32) + 4 (event_id u32)
+    // = 19 bytes. `encode_aim_event` returns the 18-byte body
+    // (no disc); the transport router prepends the disc byte.
+    let req = AimEvent {
         source_player_id: 0x5566,
-        target_player_id: 0x7788,
-        source: 0, // fire
-        amount: 25,
-        event_id: 0xdeadbeef,
+        yaw_radians: 0.123,
+        pitch_radians: -0.456,
+        frame: 0xdeadbeef,
+        event_id: 0x12345678,
     };
-    let bytes = encode_damage_request(&req);
-    assert_eq!(bytes.len(), DAMAGE_REQUEST_WIRE_SIZE);
-    assert_eq!(bytes.len(), 14, "DamageRequest must be 14 bytes on the wire");
+    let body = encode_aim_event(&req);
+    assert_eq!(body.len(), AIM_EVENT_BODY_SIZE);
+    assert_eq!(body.len(), 18, "AimEvent body must be 18 bytes (2+4+4+4+4)");
+    // Wire size = body + disc.
+    let mut wire = Vec::with_capacity(AIM_EVENT_WIRE_SIZE);
+    wire.push(DISCRIMINATOR_AIM_EVENT);
+    wire.extend(body);
+    assert_eq!(wire.len(), AIM_EVENT_WIRE_SIZE);
+    assert_eq!(wire.len(), 19, "AimEvent must be 19 bytes on the wire");
 }
 
 #[test]
-fn damage_request_roundtrip() {
-    let original = DamageRequest {
-        frame: 0x12345678,
+fn aim_event_roundtrip_preserves_all_fields() {
+    let original = AimEvent {
         source_player_id: 7,
-        target_player_id: 9,
-        source: 1, // melee
-        amount: 100,
-        event_id: 0xfeedface,
+        yaw_radians: 1.5707963, // pi/2
+        pitch_radians: -0.5,
+        frame: 0xfeedface,
+        event_id: 0x01020304,
     };
-    let bytes = encode_damage_request(&original);
-    let decoded = decode_damage_request(&bytes).expect("decode must succeed");
-    assert_eq!(original, decoded, "round-trip must preserve all fields");
+    let bytes = encode_aim_event(&original);
+    let decoded = decode_aim_event(&bytes).expect("decode must succeed");
+    assert_eq!(decoded.source_player_id, original.source_player_id);
+    assert_eq!(decoded.yaw_radians.to_bits(), original.yaw_radians.to_bits());
+    assert_eq!(decoded.pitch_radians.to_bits(), original.pitch_radians.to_bits());
+    assert_eq!(decoded.frame, original.frame);
+    assert_eq!(decoded.event_id, original.event_id);
 }
 
 #[test]
-fn damage_request_rejects_wrong_size() {
-    let req = DamageRequest {
-        frame: 1,
+fn aim_event_rejects_wrong_size() {
+    let req = AimEvent {
         source_player_id: 1,
-        target_player_id: 2,
-        source: 0,
-        amount: 10,
-        event_id: 3,
+        yaw_radians: 0.0,
+        pitch_radians: 0.0,
+        frame: 1,
+        event_id: 1,
     };
-    let bytes = encode_damage_request(&req);
-    // Trim to 13 bytes (the off-by-one case).
-    let truncated = &bytes[..13];
+    let bytes = encode_aim_event(&req);
+    // Body is 18 bytes; trim to 17 to test the off-by-one rejection.
+    let truncated = &bytes[..17];
     assert!(
-        decode_damage_request(truncated).is_none(),
-        "decoder must reject 13-byte buffer (PR 11.6.A's off-by-one case)"
+        decode_aim_event(truncated).is_none(),
+        "decoder must reject 17-byte body buffer (off-by-one case)"
     );
+    // Empty payload.
+    assert!(decode_aim_event(&[]).is_none());
+}
+
+#[test]
+fn aim_event_is_big_endian() {
+    // §3.5: AimEvent wire layout = [disc][source u16 BE][yaw f32 BE]
+    // [pitch f32 BE][frame u32 BE][event_id u32 BE]. Total 19 bytes.
+    let req = AimEvent {
+        source_player_id: 0x0506,
+        yaw_radians: 0.0,    // f32 bits = 0x00000000
+        pitch_radians: 0.0,  // f32 bits = 0x00000000
+        frame: 0x01020304,
+        event_id: 0x0a0b0c0d,
+    };
+    let body = encode_aim_event(&req);
+    // AimEvent on-the-wire = disc + 18-byte body = 19 bytes total.
+    let mut bytes = Vec::with_capacity(19);
+    bytes.push(DISCRIMINATOR_AIM_EVENT);
+    bytes.extend(&body);
+    assert_eq!(bytes.len(), 19, "AimEvent wire size = 19");
+    // byte 0 = disc 0x0A
+    assert_eq!(bytes[0], DISCRIMINATOR_AIM_EVENT);
+    // byte 1..2 = source_player_id BE: 05 06
+    assert_eq!(&bytes[1..3], &[0x05, 0x06]);
+    // byte 3..6 = yaw f32 BE (0.0 = 00 00 00 00)
+    assert_eq!(&bytes[3..7], &[0x00, 0x00, 0x00, 0x00]);
+    // byte 7..10 = pitch f32 BE (0.0 = 00 00 00 00)
+    assert_eq!(&bytes[7..11], &[0x00, 0x00, 0x00, 0x00]);
+    // byte 11..14 = frame BE: 01 02 03 04
+    assert_eq!(&bytes[11..15], &[0x01, 0x02, 0x03, 0x04]);
+    // byte 15..18 = event_id BE: 0a 0b 0c 0d
+    assert_eq!(&bytes[15..19], &[0x0a, 0x0b, 0x0c, 0x0d]);
 }
 
 // -- DamageBroadcast -------------------------------------------------
@@ -175,7 +219,7 @@ fn pong_roundtrip() {
 
 #[test]
 fn inputs_server_is_21_bytes() {
-    // PR 11.7.D2 / §1.2: wire size 17 → 21 (added u32 last_inputs_seq trailer).
+    // PR 11.7.D2 / §1.2: wire size 17 -> 21 (added u32 last_inputs_seq trailer).
     let payload = InputsServer {
         frame: 0xdeadbeef,
         encoded_input: vec![0u8; 12],
@@ -208,8 +252,8 @@ fn inputs_server_rejects_wrong_size() {
         last_inputs_seq: 0,
     };
     let bytes = encode_inputs_server(&payload);
-    // Truncate to 15 bytes (off-by-many — 21 - 6 = 15, the post-disc body
-    // starts at byte 1, so 15 bytes is 14 bytes of body — clearly too short).
+    // Truncate to 15 bytes (off-by-many -- 21 - 6 = 15, the post-disc body
+    // starts at byte 1, so 15 bytes is 14 bytes of body -- clearly too short).
     assert!(decode_inputs_server(&bytes[..15]).is_none());
     // Wrong discriminator.
     let mut bad = bytes.clone();
@@ -221,28 +265,9 @@ fn inputs_server_rejects_wrong_size() {
 //
 // §3.5 of the plan is unambiguous: damage/position/rtt wire formats
 // are big-endian. Lockstep input bytes 2-5 (yaw/pitch) are
-// little-endian on the CLIENT side — that's a different wire format
+// little-endian on the CLIENT side -- that's a different wire format
 // on a different code path. These tests pin the BE contract for the
 // server side.
-
-#[test]
-fn damage_request_is_big_endian() {
-    let req = DamageRequest {
-        frame: 0x01020304,
-        source_player_id: 0x0506,
-        target_player_id: 0x0708,
-        source: 0,
-        amount: 0,
-        event_id: 0,
-    };
-    let bytes = encode_damage_request(&req);
-    // byte 0..3 = frame BE: 01 02 03 04
-    assert_eq!(&bytes[0..4], &[0x01, 0x02, 0x03, 0x04]);
-    // byte 4..5 = source_player_id BE: 05 06
-    assert_eq!(&bytes[4..6], &[0x05, 0x06]);
-    // byte 6..7 = target_player_id BE: 07 08
-    assert_eq!(&bytes[6..8], &[0x07, 0x08]);
-}
 
 #[test]
 fn pong_is_big_endian() {

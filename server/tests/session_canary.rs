@@ -173,47 +173,45 @@ async fn router_dispatches_position_update_writes_history() {
     assert_eq!(snapshot.y, -3.25);
 }
 
-/// PR 11.6.D: wire-format a `damageRequest`, hand it to the live
-/// dispatcher, assert that `damage_relay::validate_and_relay` accepts
-/// the request and produces a `DamageBroadcast` reply matching the
-/// request fields. The validator requires players + ammo + position
-/// history — seeded below.
+/// PR #59: wire-format an `AimEvent`, hand it to the live
+/// dispatcher, assert that `damage_relay::validate_and_relay_aim`
+/// accepts the request and produces a `DamageBroadcast` reply
+/// matching the request fields. The validator requires players +
+/// ammo + position history -- seeded below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn router_dispatches_damage_request_returns_broadcast() {
+async fn router_dispatches_aim_event_returns_broadcast() {
     use specialists_server::protocol::{
-        decode_damage_broadcast, encode_damage_request, DamageRequest,
-        DISCRIMINATOR_DAMAGE_BROADCAST, DISCRIMINATOR_DAMAGE_REQUEST,
+        decode_damage_broadcast, encode_aim_event, AimEvent,
+        DISCRIMINATOR_AIM_EVENT, DISCRIMINATOR_DAMAGE_BROADCAST,
     };
     use transport::{handle_binary, RoomRegistry};
 
     let rooms: RoomRegistry = RoomRegistry::default();
     seed_room_for_validator(&rooms, 7, Some(9), (0.0, 0.0), Some((5.0, 0.0))).await;
-    let req = DamageRequest {
-        frame: 1, // any frame 0..3 has a snapshot
+    let req = AimEvent {
         source_player_id: 7,
-        target_player_id: 9,
-        source: 0, // fire
-        amount: 12,
+        // yaw=PI/2 fires along +X axis where the target at (5,0) lives.
+        // yaw=0 fires along +Z (per hitscan::forward_from_yaw_pitch).
+        yaw_radians: std::f32::consts::FRAC_PI_2,
+        pitch_radians: 0.0,
+        frame: 1, // any frame 0..3 has a snapshot
         event_id: 0xcafebabe,
     };
-    let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
-    payload.extend(encode_damage_request(&req));
+    let mut payload = vec![DISCRIMINATOR_AIM_EVENT];
+    payload.extend(encode_aim_event(&req));
 
     let reply = handle_binary(&payload, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
     assert_eq!(
         reply.len(),
         1 + specialists_server::DAMAGE_BROADCAST_WIRE_SIZE,
-        "damageRequest reply must be 1+18 bytes (disc + body)"
+        "AimEvent reply must be 1+18 bytes (disc + body)"
     );
     assert_eq!(reply[0], DISCRIMINATOR_DAMAGE_BROADCAST);
     let bc = decode_damage_broadcast(&reply[1..]).expect("decode broadcast");
     assert_eq!(bc.source_player_id, req.source_player_id);
-    assert_eq!(bc.target_player_id, req.target_player_id);
-    assert_eq!(bc.source, req.source);
-    assert_eq!(bc.amount, req.amount);
+    assert_eq!(bc.target_player_id, 9);
     assert_eq!(bc.origin_event_id, req.event_id);
-    // PR 11.6.D: server_frame + server_seq are now real values from
-    // Room (both start at 0).
+    // server_frame + server_seq are wired (room fields, start at 0).
     assert_eq!(bc.server_frame, 0);
     assert_eq!(bc.server_seq, 0);
 }
@@ -270,69 +268,73 @@ async fn seed_room_for_validator(
     }
 }
 
-/// Validator rejects self-damage when both endpoints are the same
-/// player. The dispatcher sees the reject (no reply bytes).
+/// PR #59: validator rejects an AimEvent when the source has zero
+/// ammo. The dispatcher sees the reject (no reply bytes).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn validator_rejects_self_damage_in_room() {
+async fn validator_rejects_zero_ammo_in_room() {
     use specialists_server::protocol::{
-        encode_damage_request, DamageRequest, DISCRIMINATOR_DAMAGE_REQUEST,
+        encode_aim_event, AimEvent, DISCRIMINATOR_AIM_EVENT,
     };
     use transport::{handle_binary, RoomRegistry};
 
     let rooms: RoomRegistry = RoomRegistry::default();
-    seed_room_for_validator(&rooms, 7, Some(7), (0.0, 0.0), Some((0.0, 0.0))).await;
-    let req = DamageRequest {
-        frame: 1,
+    seed_room_for_validator(&rooms, 7, Some(9), (0.0, 0.0), Some((5.0, 0.0))).await;
+    // Zero out the source's ammo.
+    {
+        let room_arc = rooms.read().await.get(specialists_server::constants::DEVBX_ROOM_ID).unwrap().clone();
+        let mut room_guard = room_arc.write().await;
+        room_guard.players.get_mut(&7).unwrap().ammo = 0;
+    }
+    let req = AimEvent {
         source_player_id: 7,
-        target_player_id: 7, // self-damage!
-        source: 0,
-        amount: 12,
+        yaw_radians: std::f32::consts::FRAC_PI_2,
+        pitch_radians: 0.0,
+        frame: 1,
         event_id: 1,
     };
-    let mut payload = vec![DISCRIMINATOR_DAMAGE_REQUEST];
-    payload.extend(encode_damage_request(&req));
+    let mut payload = vec![DISCRIMINATOR_AIM_EVENT];
+    payload.extend(encode_aim_event(&req));
     let reply = handle_binary(&payload, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
-    assert!(reply.is_empty(), "self-damage must produce no broadcast reply");
+    assert!(reply.is_empty(), "zero ammo must produce no broadcast reply");
 }
 
-/// Validator rejects requests that violate the fire-rate cooldown.
+/// PR #59: validator rejects an AimEvent that violates the
+/// fire-rate cooldown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validator_rejects_fire_rate_violation_in_room() {
     use specialists_server::protocol::{
-        encode_damage_request, DamageRequest, DISCRIMINATOR_DAMAGE_REQUEST,
+        encode_aim_event, AimEvent, DISCRIMINATOR_AIM_EVENT,
     };
     use transport::{handle_binary, RoomRegistry};
 
     let rooms: RoomRegistry = RoomRegistry::default();
     seed_room_for_validator(&rooms, 7, Some(9), (0.0, 0.0), Some((5.0, 0.0))).await;
     // First request succeeds.
-    let req1 = DamageRequest {
-        frame: 1,
+    let req1 = AimEvent {
         source_player_id: 7,
-        target_player_id: 9,
-        source: 0,
-        amount: 12,
+        yaw_radians: std::f32::consts::FRAC_PI_2,
+        pitch_radians: 0.0,
+        frame: 1,
         event_id: 1,
     };
-    let mut payload1 = vec![DISCRIMINATOR_DAMAGE_REQUEST];
-    payload1.extend(encode_damage_request(&req1));
+    let mut payload1 = vec![DISCRIMINATOR_AIM_EVENT];
+    payload1.extend(encode_aim_event(&req1));
     let reply1 = handle_binary(&payload1, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
-    assert!(!reply1.is_empty(), "first request must produce a broadcast");
+    assert!(!reply1.is_empty(), "first AimEvent must produce a broadcast");
 
-    // Second request with a fresh eventId but no time elapsed —
+    // Second request with a fresh eventId but no time elapsed --
     // inside the 120ms cooldown.
-    let req2 = DamageRequest {
-        frame: 1,
+    let req2 = AimEvent {
         source_player_id: 7,
-        target_player_id: 9,
-        source: 0,
-        amount: 12,
+        yaw_radians: std::f32::consts::FRAC_PI_2,
+        pitch_radians: 0.0,
+        frame: 1,
         event_id: 2,
     };
-    let mut payload2 = vec![DISCRIMINATOR_DAMAGE_REQUEST];
-    payload2.extend(encode_damage_request(&req2));
+    let mut payload2 = vec![DISCRIMINATOR_AIM_EVENT];
+    payload2.extend(encode_aim_event(&req2));
     let reply2 = handle_binary(&payload2, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
-    assert!(reply2.is_empty(), "second request within cooldown must produce no broadcast");
+    assert!(reply2.is_empty(), "second AimEvent within cooldown must produce no broadcast");
 }
 
 // -- Dev-box-only WebTransport integration -------------------------
@@ -776,27 +778,22 @@ fn coyote_time_deny_after_window() {
     );
 }
 
-/// PR 11.7.B / §3.14 — the lag-comp rewind continues to work
+/// PR 11.7.B / §3.14 -- the lag-comp rewind continues to work
 /// when the PositionHistory is fed by the physics tick instead
-/// of client PositionUpdate. The existing `validate_and_relay`
-/// (PR 11.6.D) reads `PositionHistory::snapshot_at(req.frame -
-/// lag_frames)`; with the snap-to-nearest change, the rewind
-/// now snaps to the closest recorded frame within ±8 instead
-/// of the largest <= target.
+/// of client PositionUpdate. PR #59 swapped `validate_and_relay`
+/// for `validate_and_relay_aim`; the underlying PositionHistory
+/// logic is the same.
 #[test]
 fn hitscan_rewinds_through_rapier_history_mid_air() {
-    use specialists_server::damage_relay::validate_and_relay;
+    use specialists_server::damage_relay::validate_and_relay_aim;
     use specialists_server::position_history::Position;
-    use specialists_server::protocol::DamageRequest;
+    use specialists_server::protocol::AimEvent;
     use specialists_server::session::Room;
 
     // 2-player room. Source and target are both at the origin
-    // XZ. The source fires at frame 100 with a 50ms lag (2
-    // frames). The lag-comp rewind targets frame 98; the
-    // PositionHistory has frames 95..101 stored (mid-air,
-    // 32Hz storage). The validator should accept the hit
-    // (target is within the dual-pistol cone of fire at frame
-    // 98 too — both at the same position).
+    // XZ. The source fires at frame 100 with RTT=0 (no rewind).
+    // The validator should accept the hit (target is at the same
+    // position as the source -- in the cone of fire at frame 100).
     let mut room = Room::new("DEVBX");
     room.add_player(1);
     room.add_player(2);
@@ -805,21 +802,23 @@ fn hitscan_rewinds_through_rapier_history_mid_air() {
         room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
         room.record_position(2, frame, Position { x: 0.0, y: 0.0 });
     }
-    let req = DamageRequest {
-        frame: 100,
+    // Advance next_server_frame so req.frame=100 is within the
+    // MAX_LOOKAHEAD_FRAMES (16) window.
+    room.next_server_frame = 100;
+    let req = AimEvent {
         source_player_id: 1,
-        target_player_id: 2,
-        source: 0, // fire
-        amount: 12,
+        yaw_radians: std::f32::consts::FRAC_PI_2,
+        pitch_radians: 0.0,
+        frame: 100,
         event_id: 1,
     };
-    let result = validate_and_relay(
+    let result = validate_and_relay_aim(
         &req, 1, &mut room, 0,
         std::time::Instant::now(),
     );
     assert!(
-        result.is_some(),
-        "lag-comp rewind against Rapier-fed PositionHistory must accept a same-position hit"
+        !result.is_empty(),
+        "AimEvent with same-position target must produce a broadcast"
     );
 }
 

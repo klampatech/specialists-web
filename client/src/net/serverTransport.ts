@@ -54,6 +54,7 @@ import {
   DISCRIMINATOR_PING,
   DISCRIMINATOR_PONG,
   DISCRIMINATOR_POSITION_UPDATE,
+  encodeAimEvent,
   encodeDamageRequest,
   encodeInputsServer,
   encodePing,
@@ -67,6 +68,7 @@ import { encodeReloadRequest } from "../../../protocol/reload";
 import type { ReloadRequest } from "../../../protocol/reload";
 import { DISCRIMINATOR_SNAPSHOT } from "../../../protocol/snapshot";
 import type {
+  AimEvent,
   DamageRequest,
   InputsServer,
   Ping,
@@ -305,9 +307,32 @@ export class ServerTransport {
     this.listeners.inputs.push(f);
   }
 
-  /** Send a DamageRequest. */
+  /** Send a DamageRequest. PR #59: DEPRECATED -- the server
+   *  returns a `warn!` and no damage for any pre-PR-#59 client
+   *  sending a 0x01 DamageRequest. Production callers should
+   *  switch to `sendAimEvent` (below). Kept here so pre-PR-#59
+   *  smokes don't immediately break -- the deprecation is the
+   *  wire-format break. */
   sendDamageRequest(p: Uint8Array | DamageRequest): void {
     const bytes = p instanceof Uint8Array ? p : encodeDamageRequest(p);
+    this.sendRaw(bytes);
+  }
+
+  /**
+   * PR #59 / §3.5 -- send a typed `AimEvent` over the transport.
+   * Replaces the client-raycast-verified `DamageRequest` (PR
+   * 11.6.D): the client sends its intent (yaw + pitch + frame
+   * + eventId) and the server runs `dual_pistol_hit` against
+   * snapshot-known positions for every OTHER player in the
+   * room.
+   *
+   * Fire-rate + ammo gates are enforced server-side; the client
+   * pre-checks (gating on `last_fire_at` + `ammo > 0`) to avoid
+   * spamming the wire. The `eventId` is monotonically incremented
+   * via `nextAimEventId()` from `net/damageBus.ts`.
+   */
+  sendAimEvent(p: Uint8Array | AimEvent): void {
+    const bytes = p instanceof Uint8Array ? p : encodeAimEvent(p);
     this.sendRaw(bytes);
   }
 
