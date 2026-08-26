@@ -191,6 +191,12 @@ async function runSmoke() {
       window.__damageServerPorts = { wt: ${WT_PORT}, ws: ${WS_PORT} };
       window.__damageServerUrl = ${JSON.stringify(URL)};
       window.__damageServerRoomId = "DEVBX";
+      // PR #59 / §3.5 — AimEvent's Gate 2 (validate_and_relay_aim) requires
+      // the connection's claimed_player_id == req.source_player_id. The
+      // connection claims a player id on its FIRST successful damage fire,
+      // defaulting to the value of __localPlayerId. Single-tab smokes that
+      // fire as player 7 must set this explicitly (the default is 1).
+      window.__localPlayerId = 7;
     `,
   });
 
@@ -253,60 +259,102 @@ async function runSmoke() {
       throw new Error(`RTT invalid: ${statsAfterPing.rttMs}`);
     }
 
-    // ---- 3. DamageRequest → DamageBroadcast (PR 11.6.D / §3.4 server-auth) ----
-    // PR 11.6.D: the server now VALIDATES the request (gates: source +
-    // target in room, amount<=100, fire-rate cooldown, ammo gate,
-    // eventId monotonicity, lag-comp hit re-validation). The smoke
-    // must seed the room (send a PositionUpdate FIRST so source 7 is
-    // in the room) before the DamageRequest will pass validation.
-    const damageReq = {
-      frame: 0xdeadbeef,
-      sourcePlayerId: 7,
-      targetPlayerId: 9,
-      source: 0,
-      amount: 12,
-      eventId: 0xcafef00d,
-    };
-    // Seed: send PositionUpdate for source 7 + target 9 at frame 0
-    // so they're registered in the room + have position history.
+    // ---- 3. AimEvent → server-validated fire (PR #59 / §3.5 server-auth) ----
+    // PR #59: legacy DamageRequest (0x01) was removed. The server now
+    // accepts only AimEvent (0x0A) — a client-intent packet carrying
+    // yaw + pitch + frame + eventId. The server runs `dual_pistol_hit`
+    // against snapshot-known positions for every OTHER player in the
+    // room, emitting a DamageBroadcast only on hit.
+    //
+    // Single-tab migration note: with only one connection in the room,
+    // `dual_pistol_hit` has no candidates and returns no hit broadcast.
+    // The single-tab smoke verifies the wire path end-to-end via two
+    // observable side-effects: (a) the snapshot's ammo for the firing
+    // player decrements by 1 (fire rate consumed even on miss per
+    // §3.5 missed-shot semantics), and (b) the wire encoder produces
+    // a 19-byte AimEvent. The cross-tab fan-out (broadcast delivery to
+    // both tabs) is covered by the dedicated `damage-server-aim-event-smoke`.
+    //
+    // PR #59 / §3.5 / Gate 6 — fire requires the firer to have position
+    // history (server rewind validation). Send a PositionUpdate for the
+    // firer's playerId BEFORE the AimEvent so the server has at least one
+    // snapshot frame to rewind to.
+    const baselineAmmo = await page.evaluate(() => {
+      const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+      const e = snap ? snap.players.find((p) => p.playerId === 7) : null;
+      return e ? e.ammo : null;
+    });
+    if (baselineAmmo === null) {
+      throw new Error("pre-fire snapshot missing playerId=7 (single-tab ammo baseline)");
+    }
+    // Seed position history for player 7 (the firer).
     await page.evaluate(() => {
       const t = (window).__serverTransport;
       t.sendPositionUpdate({serverFrame: 0, playerId: 7, positionX: 0.0, positionY: 0.0});
-      t.sendPositionUpdate({serverFrame: 0, playerId: 9, positionX: 5.0, positionY: 0.0});
     });
-    // Small delay so the server's writer applies both before our
-    // DamageRequest arrives.
     await sleep(50);
-    const bcResult = await page.evaluate(async ({ req, timeoutMs }) => {
-      const t = (window).__serverTransport;
+    const aimEventId = 0xcafef00d;
+    const aimFireResult = await page.evaluate(({ eventId }) => {
       const bus = (window).__damageBus;
-      return await new Promise((resolveP) => {
-        const t_p = setTimeout(() => resolveP({ ok: false, reason: "timeout" }), timeoutMs);
-        t.onDamageBroadcast((body) => {
-          clearTimeout(t_p);
-          const bc = bus.decodeDamageBroadcast(body);
-          resolveP({ ok: !!bc, bc });
+      const t = (window).__serverTransport;
+      if (!bus) return { ok: false, reason: "no __damageBus" };
+      const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+      const currentFrame = snap ? snap.serverFrame : 0;
+      try {
+        bus.sendAimEvent({
+          sourcePlayerId: 7,
+          yawRadians: Math.PI / 2, // arbitrary; no targets in room
+          pitchRadians: 0.0,
+          frame: currentFrame,
+          eventId,
         });
-        bus.sendDamageRequest(req);
-      });
-    }, { req: damageReq, timeoutMs: BROADCAST_TIMEOUT_MS });
-    if (!bcResult.ok || !bcResult.bc) {
-      throw new Error(`onDamageBroadcast did not return a valid broadcast within ${BROADCAST_TIMEOUT_MS}ms: ${bcResult.reason}`);
+        // Also probe the underlying transport directly to confirm
+        // the wire encoder + transport send path are healthy post-#59.
+        const wireBytes = bus.encodeAimEvent({
+          sourcePlayerId: 7,
+          yawRadians: Math.PI / 2,
+          pitchRadians: 0.0,
+          frame: currentFrame,
+          eventId: eventId + 1,
+        });
+        return { ok: true, wireSize: wireBytes.length };
+      } catch (e) {
+        return { ok: false, reason: String(e) };
+      }
+    }, { eventId: aimEventId });
+    if (!aimFireResult.ok) {
+      throw new Error(`sendAimEvent failed: ${aimFireResult.reason}`);
     }
-    const bc = bcResult.bc;
-    log(`DamageBroadcast received: ${JSON.stringify(bc)}`);
-    if (bc.sourcePlayerId !== damageReq.sourcePlayerId) {
-      throw new Error(`sourcePlayerId mismatch: ${bc.sourcePlayerId} != ${damageReq.sourcePlayerId}`);
+    if (aimFireResult.wireSize !== 19) {
+      throw new Error(`AimEvent wire size = ${aimFireResult.wireSize} (expected 19: 1 disc + 18 body)`);
     }
-    if (bc.targetPlayerId !== damageReq.targetPlayerId) {
-      throw new Error(`targetPlayerId mismatch: ${bc.targetPlayerId} != ${damageReq.targetPlayerId}`);
+    log(`AimEvent sent (wire=${aimFireResult.wireSize} bytes, eventId=0x${aimEventId.toString(16)})`);
+
+    // Poll the snapshot for the ammo decrement (server-side fire rate
+    // always consumes one ammo per accepted fire, even if no other
+    // player is in range for `dual_pistol_hit`).
+    const ammoStart = Date.now();
+    let postAmmo = null;
+    while (Date.now() - ammoStart < BROADCAST_TIMEOUT_MS) {
+      postAmmo = await page.evaluate(({ sourceId }) => {
+        const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+        const e = snap ? snap.players.find((p) => p.playerId === sourceId) : null;
+        return e ? e.ammo : null;
+      }, { sourceId: 7 });
+      if (postAmmo !== null && postAmmo < baselineAmmo) break;
+      await sleep(50);
     }
-    if (bc.amount !== damageReq.amount) {
-      throw new Error(`amount mismatch: ${bc.amount} != ${damageReq.amount}`);
+    if (postAmmo === null) {
+      throw new Error(`post-fire snapshot missing playerId=7 ammo`);
     }
-    if (bc.originEventId !== damageReq.eventId) {
-      throw new Error(`originEventId mismatch: ${bc.originEventId} != ${damageReq.eventId}`);
+    if (postAmmo !== baselineAmmo - 1) {
+      throw new Error(
+        `post-fire ammo for player 7 = ${postAmmo} (expected ${baselineAmmo - 1}). ` +
+        `Server's validate_and_relay_aim either rejected the AimEvent or the ammo ` +
+        `decrement didn't land in the snapshot fan-out.`,
+      );
     }
+    log(`Assertion 3 PASS: AimEvent accepted, snapshot ammo ${baselineAmmo} → ${postAmmo} (single-tab fan-out).`);
 
     // ---- 4. PositionUpdate — no reply ----
     const puResult = await page.evaluate(async ({ timeoutMs }) => {
@@ -418,6 +466,19 @@ async function runSmoke() {
     const wireSizes = await page.evaluate(() => {
       const bus = (window).__damageBus;
       return {
+        // PR #59 / §3.5 — AimEvent (0x0A) replaces legacy DamageRequest (0x01).
+        // The TS encoder still exports `encodeDamageRequest` for round-trip
+        // tests in protocol/damage.test.ts, but the smoke only asserts the
+        // server-side damage wire type (AimEvent). DamageRequest encoder is
+        // included as a regression check on the codec itself, not as an
+        // assertion that the server accepts it (it doesn't, post-#59).
+        aimEvent: bus.encodeAimEvent({
+          sourcePlayerId: 1,
+          yawRadians: 0.0,
+          pitchRadians: 0.0,
+          frame: 1,
+          eventId: 1,
+        }).length,
         damageRequest: bus.encodeDamageRequest({
           frame: 1, sourcePlayerId: 1, targetPlayerId: 2,
           source: 0, amount: 1, eventId: 1,
@@ -436,12 +497,17 @@ async function runSmoke() {
       };
     });
     log(`Wire sizes: ${JSON.stringify(wireSizes)}`);
-    // PR 11.6.C review fix B2: every TS encoder prefixes the
-    // discriminator, so the wire sizes are body+1. PR 11.7.D2 adds
-    // the lastInputsSeq trailer to inputsServer — wire size grows
-    // from 17 to 21 (+4 bytes for the u32 BE lastInputsSeq trailer).
-    // The others stay at body+1.
-    const EXPECTED = { damageRequest: 15, damageBroadcast: 19, positionUpdate: 15, ping: 5, inputsServer: 21 };
+    // PR #59: AimEvent wire = 1 disc + 18 body = 19 bytes
+    //   (1 byte 0x0A disc + 2 u16 BE source_player_id +
+    //    4 f32 BE yaw_radians + 4 f32 BE pitch_radians +
+    //    4 u32 BE frame + 4 u32 BE event_id)
+    // The legacy DamageRequest (15 bytes) + DamageBroadcast (19 bytes)
+    // encoders remain on the bus for round-trip tests + server-emit
+    // compatibility, but the SERVER no longer accepts DamageRequest
+    // (rejected with a `warn!()` log per server/src/transport.rs:589).
+    // PR 11.7.D2 / §3.5 — `lastInputsSeq` trailer makes inputsServer
+    // wire size 21 (was 17 pre-D2).
+    const EXPECTED = { aimEvent: 19, damageRequest: 15, damageBroadcast: 19, positionUpdate: 15, ping: 5, inputsServer: 21 };
     for (const [k, v] of Object.entries(EXPECTED)) {
       if (wireSizes[k] !== v) {
         throw new Error(`Wire size mismatch for ${k}: got ${wireSizes[k]}, expected ${v}`);
