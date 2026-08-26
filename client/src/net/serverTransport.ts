@@ -119,6 +119,16 @@ const PING_INTERVAL_MS = 1000;
  *  server hanging mid-stream. 5s matches the server-side heartbeat. */
 const WT_INBOUND_STREAM_READ_TIMEOUT_MS = 5000;
 
+// PR 11.7+ / AutoReconnect — health-check + reconnect-backoff constants.
+// Reconnect triggers when `this.connected` is false for at least
+// STALE_THRESHOLD_MS (server may be mid-restart). After the first
+// failed retry, RECONNECT_BACKOFF_MS doubles per attempt up to
+// RECONNECT_BACKOFF_MAX_MS, then stays at the cap. This bounds
+// retry pressure when the server is genuinely down.
+const RECONNECT_STALE_THRESHOLD_MS = 2_000;
+const RECONNECT_BACKOFF_MS = 1_000;
+const RECONNECT_BACKOFF_MAX_MS = 30_000;
+
 export class ServerTransport {
   private readonly wtUrl: string;
   private readonly wsUrl: string;
@@ -131,6 +141,40 @@ export class ServerTransport {
   private lastPingSentAt: number | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
+  // PR 11.7+ / AutoReconnect — separates the two reasons `close()` may
+  // have flipped `this.closed`:
+  //   - `closed` (the existing field) stays true after `close()` runs.
+  //   - `userClosed` is set ONLY when the caller invoked `close()` as
+  //     a terminal teardown (e.g., page unload, smoke teardown). The
+  //     auto-reconnect health-check skips retry attempts when this is
+  //     true. For server-initiated drops (`wt.closed` resolves,
+  //     `ws.onclose` fires) `userClosed` remains false and the
+  //     health-check will retry.
+  // Also tracks the timestamp of the last disconnect so the
+  // health-check can apply RECONNECT_STALE_THRESHOLD_MS grace before
+  // the first retry (avoids hammering a server that's mid-restart).
+  private userClosed = false;
+  private lastDisconnectAt: number | null = null;
+  // Backoff state: doubles after each failed attempt up to the cap.
+  // Reset to RECONNECT_BACKOFF_MS on a successful reconnect.
+  private reconnectBackoffMs = RECONNECT_BACKOFF_MS;
+  private reconnectHealthCheckTimer: ReturnType<typeof setInterval> | null = null;
+  // Tracks an in-flight reconnect attempt so the health-check doesn't
+  // stack multiple parallel `connect()` calls (the connect path
+  // already rejects on re-entry, but a second microtask-scheduled
+  // attempt before the first resolves would lose the race).
+  private reconnecting = false;
+  // PR 11.7+ / AutoReconnect — the health-check uses a single
+  // `setTimeout` whose period is `reconnectBackoffMs` (which doubles
+  // after failed attempts). The function is reassigned in
+  // `startAutoReconnect` so it can close over the `tick` closure;
+  // declared here as a no-op default so TypeScript sees the field
+  // shape before `startAutoReconnect` runs.
+  private scheduleNextHealthCheckTick: () => void = () => {
+    /* replaced in startAutoReconnect on first disconnect */
+  };
+  // Cache the visibility listener so we can remove it on `close()`.
+  private onVisibilityChange: (() => void) | null = null;
   private onWsMessage: ((ev: MessageEvent) => void) | null = null;
   private onWsClose: (() => void) | null = null;
 
@@ -175,33 +219,77 @@ export class ServerTransport {
    * Open the transport. Tries WebTransport first, falls back to
    * WebSocket on any failure. Resolves when EITHER transport is ready
    * for send/receive. Rejects only if BOTH fail.
+   *
+   * PR 11.7+ / AutoReconnect — `connect()` is now idempotent across
+   * server-initiated disconnects. After a drop the field
+   * `this.closed` is true; on retry the health-check calls `connect()`
+   * again, which now resets `this.closed = false` (NOT when the caller
+   * invoked `close()` deliberately — that's gated on `userClosed`,
+   * which throws here as before).
    */
   async connect(): Promise<void> {
-    if (this.connected) return;
-    if (this.closed) throw new Error("ServerTransport: already closed");
-    // Try WebTransport first. If it fails (constructor exception or
-    // ready rejection), fall back to WebSocket. We catch and swallow
-    // the WT failure here so the caller sees a single resolution (or
-    // a single rejection if BOTH transports fail).
-    try {
-      await this.connectWebTransport();
-      this.activeKind = "webtransport";
-      this.connected = true;
-      this.startPingTimer();
+    if (this.connected) {
+      // Already connected (e.g., the health-check fired while a sibling
+      // mount reconnected via `connect()` directly). Treat as success.
       return;
-    } catch (wtErr) {
-      // eslint-disable-next-line no-console
-      console.warn(`[ServerTransport] WebTransport failed, falling back to WebSocket: ${wtErr}`);
     }
+    if (this.userClosed) {
+      throw new Error("ServerTransport: already closed (userClosed=true; use a new instance to reconnect)");
+    }
+    // PR 11.7+ / AutoReconnect — reset the `closed` flag for retry.
+    // The auto-reconnect health-check is the only legitimate caller
+    // here after a server-initiated drop; resetting is safe.
+    if (this.closed) this.closed = false;
+    // PR 11.7+ / AutoReconnect — guard against stacked parallel
+    // `connect()` calls. A microtask race could fire this twice before
+    // the first resolves; without this guard the second call would
+    // spawn a duplicate WebTransport constructor (which throws
+    // synchronously on URL parse failure, but only after we've already
+    // leaked `wt.ready` listeners). The flag flips back to false in
+    // the success/failure branches below.
+    if (this.reconnecting) return;
+    this.reconnecting = true;
     try {
-      await this.connectWebSocket();
-      this.activeKind = "websocket";
-      this.connected = true;
-      this.startPingTimer();
-    } catch (wsErr) {
-      throw new Error(
-        `ServerTransport.connect: both WebTransport (see warn above) and WebSocket (${wsErr}) failed`,
-      );
+      // Try WebTransport first. If it fails (constructor exception or
+      // ready rejection), fall back to WebSocket. We catch and swallow
+      // the WT failure here so the caller sees a single resolution (or
+      // a single rejection if BOTH transports fail).
+      try {
+        await this.connectWebTransport();
+        // PR 11.7+ / AutoReconnect (Claude review B1) — if the user
+        // invoked dispose() while this connect was awaiting, do NOT
+        // flip `this.connected = true`. The fresh transport handle is
+        // already torn down by close()/dispose() — re-opening state
+        // here would create the inconsistent
+        // `{closed:true, userClosed:true, connected:true}` triple.
+        if (this.userClosed || this.closed) return;
+        this.activeKind = "webtransport";
+        this.connected = true;
+        this.startPingTimer();
+        this.onReconnectSucceeded();
+        return;
+      } catch (wtErr) {
+        // eslint-disable-next-line no-console
+        console.warn(`[ServerTransport] WebTransport failed, falling back to WebSocket: ${wtErr}`);
+      }
+      try {
+        await this.connectWebSocket();
+        // PR 11.7+ / AutoReconnect (Claude review B1) — same guard
+        // as the WT success path: a user-initiated dispose() that
+        // landed during the WS handshake must not flip connected=true.
+        if (this.userClosed || this.closed) return;
+        this.activeKind = "websocket";
+        this.connected = true;
+        this.startPingTimer();
+        this.onReconnectSucceeded();
+      } catch (wsErr) {
+        this.onReconnectFailed();
+        throw new Error(
+          `ServerTransport.connect: both WebTransport (see warn above) and WebSocket (${wsErr}) failed`,
+        );
+      }
+    } finally {
+      this.reconnecting = false;
     }
   }
 
@@ -318,10 +406,26 @@ export class ServerTransport {
     this.listeners.disconnect.push(f);
   }
 
-  /** Close the transport + emit `disconnect` listeners. */
-  close(): void {
+  /** Close the transport + emit `disconnect` listeners.
+   *
+   * PR 11.7+ / AutoReconnect — `close()` is no longer strictly
+   * terminal when called from a server-initiated drop path. The two
+   * call sites that fire it (`wt.closed` resolves, `ws.onclose`
+   * fires) are server-driven; they leave `userClosed=false` so the
+   * auto-reconnect health-check will retry. To permanently tear
+   * down, callers should pass `{user: true}` OR call the new
+   * `dispose()` method.
+   */
+  close(opts: {user?: boolean} = {}): void {
     if (this.closed) return;
     this.closed = true;
+    this.userClosed = opts.user === true;
+    this.lastDisconnectAt = performance.now();
+    // Reset transport-specific state so the next `connect()` doesn't
+    // operate on stale handles. `activeKind` is intentionally NOT
+    // cleared here — the health-check reads it to decide which
+    // transport to prefer (currently it just tries both, but the
+    // activeKind field stays meaningful for `getStats().transport`).
     if (this.pingTimer !== null) {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
@@ -349,6 +453,26 @@ export class ServerTransport {
     }
     this.connected = false;
     for (const f of this.listeners.disconnect) f();
+    // PR 11.7+ / AutoReconnect — start the health check + visibility
+    // listener ONLY for server-initiated drops (userClosed=false).
+    // User-initiated close is terminal; the page is unloading or the
+    // smoke is tearing down.
+    if (!this.userClosed) {
+      this.startAutoReconnect();
+    }
+  }
+
+  /**
+   * PR 11.7+ / AutoReconnect — explicit user-initiated terminal
+   * teardown. Equivalent to pre-AutoReconnect `close()`. Use this
+   * on page unload (`beforeunload`) or when the smoke is tearing
+   * down the test fixtures. Calling `close()` directly after a
+   * server drop will also flip `userClosed=true` (the default for
+   * explicit closes); only the wt.closed / ws.onclose paths leave
+   * `userClosed=false`.
+   */
+  dispose(): void {
+    this.close({user: true});
   }
 
   // -- Private helpers --------------------------------------------------
@@ -692,5 +816,124 @@ export class ServerTransport {
     if (!this.connected) return;
     const ping: Ping = {clientTimestamp: Math.floor(performance.now())};
     this.sendPing(ping);
+  }
+
+  // PR 11.7+ / AutoReconnect — health-check + visibility-API helpers.
+  //
+  // The health-check is a single `setInterval` that fires every
+  // RECONNECT_BACKOFF_MS (note: the interval period doubles after
+  // each failed attempt via `reconnectBackoffMs`). On each tick, if
+  // we're not connected AND not currently retrying AND the disconnect
+  // is older than RECONNECT_STALE_THRESHOLD_MS, call `connect()`.
+  //
+  // The visibility listener is an immediate retry trigger when the
+  // tab refocuses — typically the user just switched back from another
+  // tab, so the page has been backgrounded long enough that the
+  // connection may have been idle-killed by a NAT/router, and we want
+  // the snapshot stream live again before the user notices.
+  private startAutoReconnect(): void {
+    if (this.reconnectHealthCheckTimer !== null) return;
+    // eslint-disable-next-line no-console
+    console.info(
+      `[ServerTransport] auto-reconnect armed ` +
+      `(stale-threshold=${RECONNECT_STALE_THRESHOLD_MS}ms, backoff=${RECONNECT_BACKOFF_MS}ms)`,
+    );
+    // Health-check tick: at most once per `reconnectBackoffMs` (which
+    // doubles after failed attempts). We schedule the next tick at
+    // the END of the current one (rather than the natural interval)
+    // so a slow `connect()` doesn't stack calls. Inside the tick we
+    // also re-arm the visibility listener (idempotent — the listener
+    // is a single closure).
+    const tick = () => {
+      if (this.connected || this.userClosed || this.reconnecting) {
+        // Already recovered (or the user closed in the meantime). Stop
+        // the health-check; the next disconnect will re-arm it.
+        this.stopAutoReconnect();
+        return;
+      }
+      const now = performance.now();
+      const sinceDisconnect = this.lastDisconnectAt
+        ? now - this.lastDisconnectAt
+        : Infinity;
+      if (sinceDisconnect < RECONNECT_STALE_THRESHOLD_MS) {
+        // Too soon — the server may be mid-restart. Skip this tick.
+        this.scheduleNextHealthCheckTick();
+        return;
+      }
+      // eslint-disable-next-line no-console
+      console.info(`[ServerTransport] attempting auto-reconnect (backoff=${this.reconnectBackoffMs}ms)`);
+      this.connect().then(
+        () => {
+          // eslint-disable-next-line no-console
+          console.info(`[ServerTransport] auto-reconnect succeeded`);
+        },
+        (err) => {
+          // eslint-disable-next-line no-console
+          console.warn(`[ServerTransport] auto-reconnect attempt failed: ${err}`);
+        },
+      );
+      this.scheduleNextHealthCheckTick();
+    };
+    // First tick is at the current backoff (1s). On subsequent failed
+    // attempts the backoff doubles (capped at RECONNECT_BACKOFF_MAX_MS).
+    this.scheduleNextHealthCheckTick = () => {
+      if (this.reconnectHealthCheckTimer !== null) {
+        clearTimeout(this.reconnectHealthCheckTimer);
+      }
+      const delay = this.reconnectBackoffMs;
+      this.reconnectHealthCheckTimer = setTimeout(() => {
+        this.reconnectHealthCheckTimer = null;
+        tick();
+      }, delay);
+    };
+    this.scheduleNextHealthCheckTick();
+    // Visibility-API hook: when the tab becomes visible again, kick
+    // an immediate reconnect attempt (bypassing the backoff). Most
+    // users background a tab and then come back expecting things to
+    // "just work."
+    if (typeof document !== "undefined" && !this.onVisibilityChange) {
+      this.onVisibilityChange = () => {
+        if (document.visibilityState !== "visible") return;
+        if (this.connected || this.userClosed || this.reconnecting) return;
+        // eslint-disable-next-line no-console
+        console.info(`[ServerTransport] visibility change → triggering reconnect attempt`);
+        this.connect().catch(() => {
+          // The health-check will pick up the failure on its next tick.
+        });
+      };
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+    }
+  }
+
+  private stopAutoReconnect(): void {
+    if (this.reconnectHealthCheckTimer !== null) {
+      clearTimeout(this.reconnectHealthCheckTimer);
+      this.reconnectHealthCheckTimer = null;
+    }
+    if (this.onVisibilityChange && typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibilityChange);
+      this.onVisibilityChange = null;
+    }
+  }
+
+  /** Called from `connect()` on a successful connection (initial OR
+   *  reconnect). Resets the backoff so the next failure starts fresh
+   *  from RECONNECT_BACKOFF_MS. */
+  private onReconnectSucceeded(): void {
+    this.reconnectBackoffMs = RECONNECT_BACKOFF_MS;
+    this.lastDisconnectAt = null;
+    // Successful connect means the health-check no longer needs to
+    // tick. `startAutoReconnect` re-arms it on the next disconnect.
+    this.stopAutoReconnect();
+  }
+
+  /** Called from `connect()` when both WebTransport AND WebSocket
+   *  failed to connect. Doubles the backoff up to the cap. The
+   *  health-check will fire again at the new (longer) interval. */
+  private onReconnectFailed(): void {
+    this.reconnectBackoffMs = Math.min(
+      this.reconnectBackoffMs * 2,
+      RECONNECT_BACKOFF_MAX_MS,
+    );
   }
 }

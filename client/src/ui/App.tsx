@@ -343,9 +343,15 @@ export function App() {
               // reportConnection. No peer to close.
               try {
                 const t = sceneRef.current?.getServerTransport?.();
-                t?.close?.();
+                // PR 11.7+ / AutoReconnect (Claude review B2) — this is a
+                // user-initiated terminal close (PauseMenu "Disconnect
+                // Peer" button). Use `dispose()`, not `close()`:
+                // `close()` arms the auto-reconnect health-check, which
+                // would re-connect the tab within ~1s of clicking the
+                // button — exactly the opposite of what the user asked for.
+                t?.dispose?.();
               } catch (e) {
-                console.error("[pause-menu] server-transport close failed:", e);
+                console.error("[pause-menu] server-transport dispose failed:", e);
               }
             }}
             viewMode={hud.viewMode}

@@ -191,7 +191,20 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
         appendLog("[Force reconnect] no transport to reconnect (page never set one up)");
         return;
       }
-      if (t.close) {
+      // PR 11.7+ / AutoReconnect (Claude review B2) — this is the
+      // "Force reconnect" debug button. It's a hybrid: it tears down
+      // the existing transport (terminal — we then expect scene.ts
+      // to spin up a fresh one) AND replaces `window.__serverTransport`
+      // with undefined so the next scene() call claims the slot. Use
+      // `dispose()` to ensure the auto-reconnect health-check is NOT
+      // armed on the now-orphaned instance — without this, the old
+      // transport would keep polling the server every 1-30s until GC,
+      // leaking concurrent reconnect attempts.
+      if (t.dispose) {
+        try { t.dispose(); } catch {}
+      } else if (t.close) {
+        // Pre-PR-#58 path: the auto-reconnect didn't exist, so plain
+        // close() was terminal. Keep the fallback for old smoke stubs.
         try { t.close(); } catch {}
       }
       delete (window as any).__serverTransport;

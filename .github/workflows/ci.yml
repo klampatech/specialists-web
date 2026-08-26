@@ -423,6 +423,65 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
+  # PR 11.7+ / AutoReconnect — server-restart reconnect smoke. Boots
+  # canary + Vite itself (the smoke SIGKILLs + restarts the canary
+  # mid-session to verify the client's auto-reconnect health-check +
+  # visibility-API path). Runs after the reload smoke to keep CI
+  # failure ordering deterministic.
+  client-damage-server-reconnect-smoke:
+    name: client — damage server reconnect smoke (PR 11.7+, port 5191)
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      # NOTE: the reconnect smoke boots + kills + restarts the canary
+      # itself, so we don't pre-boot it here. The smoke's lifecycle:
+      #   1. boot canary
+      #   2. boot Vite (or use a fresh one — smoke also handles this)
+      #   3. open tab, assert connected
+      #   4. SIGKILL canary, assert disconnected
+      #   5. restart canary, assert auto-reconnect within 8s
+      #   6. SIGKILL again, dispatch visibilitychange, restart canary,
+      #      assert visibility-API reconnect within 5s
+      - name: Run damage server reconnect smoke
+        working-directory: client
+        run: node tools/damage-server-reconnect-smoke.mjs
+        env:
+          RECONNECT_SMOKE_URL: http://localhost:5191/
+          RECONNECT_SMOKE_WT_PORT: 14433
+          RECONNECT_SMOKE_WS_PORT: 14434
+      - name: Tear down stragglers (canary + vite)
+        if: always()
+        run: |
+          pkill -f canary-server.sh || true
+          pkill -f 'vite.*5191' || true
+          for port in 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   # Phase 0 / PR 2: headless smoke test of the Babylon scene.
   # Boots `npm run dev`, waits for the ready banner to disappear, captures a
   # screenshot, fails on any console error, and uploads the screenshot as a
