@@ -7,7 +7,17 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#59 readiness (2026-08-26). **`main` @ `468a135d` (post-#58 auto-reconnect).** **PR #58 (auto-reconnect on stale transport) MERGED** at `468a135` (2026-08-26, per `cc: 1542021891957592074`). **PR #59 OPEN, MERGEABLE** (branch `feat/phase1-pr-aimevent`, 1 squashed commit `aad6c0f`) — **AIMEvent — SERVER-AUTHORITATIVE HIT DETECTION**. Closes the "HP didn't move when I shot" UX trap from `cc: 1541898875252506775` (Kyle's 2-tab Vivaldi test). New wire type `AimEvent` (disc `0x0A`, **19 bytes** = 1 disc + 2 u16 source + 4 f32 yaw + 4 f32 pitch + 4 u32 frame + 4 u32 eventId). Server runs `hitscan::dual_pistol_hit` against snapshot-known positions (per-target lag-comp rewind to `req.frame - rtt/2`). Snapshot now carries yaw + pitch from `Room.players[id]` (was hardcoded 0.0 pre-#59). 8-gate validator with monotonic eventId window. Smoke 4/4 PASS locally, **MacBook function test ALL 4 PHASES PASS** on real Vivaldi Chrome 150.0.0.0 (cc: `1542042299767193610`): Phase 1 connect ✅, Phase 2 hit (HP 100→88 on BOTH tabs) ✅, Phase 3 ammo decrement ✅, Phase 4 miss path (ammo drops, no self-damage) ✅ — screenshots at `/home/kyle/.hermes/cache/images/aimevent-mac/1787723887-phase-{1,2,4}-{a,b}.png`. Claude cross-vendor review: 0 BLOCKING, 3 non-blocking (all fixed in `62d2df8`, consolidated into `aad6c0f` via rebase), 5 nits deferred to follow-ups. Follow-ups deferred: **(1)** 0x06 InputsServer `DEVBX_ROOM_ID` hardcode blocks per-tab yaw/pitch population (smoke verified schema but not values); **(2)** server-side hit detection refinement (hitbox lag-comp, multi-bullet support); **(3)** lag-comp rewind across sparse position history; **(4)** anti-cheat on yaw/pitch (Phase 4 PR 11.10); **(5)** melee path (`0x0B MeleeEvent` future PR). Servers DOWN. Recommended next: **PR vitest connectionStatus-drift** (cosmetic, ~30 min — peer-overlay/App.HUD state-machine divergence) or **PR fix-0x06-per-tab-room** (clears the InputsServer room hardcode, blocks proper yaw/pitch propagation). Defer: remote rig collision (blue rig clips through boxes — listed in HANDOFF but the PR AimEvent work didn't address it).
+**`You are here`**: post-PR-#59 readiness (2026-08-26). **`main` @ `89ab043d` (post-#59 AimEvent squash — MERGED 2026-08-26).** PR #59 (AimEvent — server-authoritative hit detection) MERGED. MacBook function test (cc: `1542042299767193610`) PASSED 4/4 phases on Vivaldi Chrome 150.0.0.0 with the new 0x0A wire path.
+
+**🔴 BLOCKER on `main` (Priority 1)**: PR #59 silently disabled the legacy `0x01 DamageRequest` wire (server/src/transport.rs:589 → "deprecated, use AimEvent; no damage applied") but **did not port the smoke suite**. 6 smoke scripts still hit `damageBus.sendDamageRequest(...)` (the 0x01 path) and silently fail their damage assertions — concrete example in the 2026-08-26 entry below shows `last hp=100 within 1500ms` which is exactly the no-broadcast symptom. PR #59's new `aim-event-smoke.mjs` (which uses 0x0A) PASSES green, so the AimEvent path works; the 6 legacy smokes fail. **4 of 25 CI jobs RED on `main @ 89ab043` until the smoke-suite is migrated.**
+
+**Recommended next PR**: `fix(smokes): migrate 6 smoke scripts from 0x01 DamageRequest to 0x0A AimEvent` — Codex for initial encode/decode port + Evo for the lag-comp `req.frame` pickup logic. ~1-2h wall. After that lands, the recommended Priority 2 is the cosmetic vitest connectionStatus-drift fix (~30 min) — pick the cosmetic Q-of-L item that surfaces as Priority 2 in the next session. **Do NOT pick up the 0x06 DEVBX hardcode fix or any deeper work until Priority 1 lands** — clean CI gate first, then quality.
+
+**Ad-hoc decisions this session** (full detail in the 2026-08-26 entry below):
+- GH-hosted runners (westus, ephemeral Azure VMs) confirmed; cross-job port-leak theories are off the table for this repo
+- `actionlint` binary installed at `/home/kyle/Development/specialists-web-pr-aimevent/actionlint` as a pre-push ci.yml check
+- Hard rule: never use `actions.{NAME}` — always canonical `actions/{NAME}`
+- New rule: wire-format changes must include smoke-suite update in same PR or named follow-up (PR #59 didn't — that's how we got here)
 
 **Where we landed (PR 11.7.E full session, 2026-08-25)**:
 
@@ -314,34 +324,101 @@ Also carry-forward from PR 11.7.B/11.7.C: `0x06 InputSeq` trailer (wire-size 17�
 
 ---
 
-## 2026-08-26 — PR #59 CI fix — `actions.cache@v4` → `actions/cache@v4` in aim-event smoke
+## 2026-08-26 — PR #59 CI fix + smoke-suite protocol regression discovered
 
-**TL;DR for #59 reviewer**: PR #59 was failing every push with GH's "workflow file issue" gate (zero jobs ran, 6 consecutive failures across `aad6c0f`/`62d2df8`/`c8e3cbd`). Root cause: the new `client-damage-server-aim-event-smoke` job in `.github/workflows/ci.yml` used `actions.cache@v4` (deprecated dotted form). GH's Actions validator rejects the dotted form. The 20 pre-existing `actions.cache@v4` references in OTHER jobs were tolerated (legacy alias) — the 21st introduction surfaced the issue.
+### Part 1: PR #59 merge-time fix (commit `cf1e57a`, now part of `89ab043`)
+PR #59 failed every push (6 consecutive runs) with GH's "workflow file issue" gate (zero jobs ran). Root cause: the new `client-damage-server-aim-event-smoke` job used `actions.cache@v4` (deprecated dotted form). GH's validator rejects the dotted form. Fix shipped in `cf1e57a` on `feat/phase1-pr-aimevent`: single-line `actions.cache@v4` → `actions/cache@v4`. Verified on the next run (32976749121): the workflow gate cleared, the new aim-event smoke PASSED green on first try (job 98203563202).
 
-**Fix (commit `cf1e57a` on `feat/phase1-pr-aimevent`)**: single-line `actions.cache@v4` → `actions/cache@v4` in the new job only. actionlint binary installed locally at `/home/kyle/Development/specialists-web-pr-aimevent/actionlint` (use as pre-push gate next time). PR is `MERGEABLE`, the new smoke (`client — damage server aim-event smoke (PR #59, port 5191)`) **PASSED green on the first run after the fix** (job 98203563202 in run 32976749121).
+PR #59 MERGED 2026-08-26 at `89ab043` (squashed commit includes the canonical form).
 
-**⚠️ New blocker surfaced (NOT fixed by `cf1e57a` — separate concern)**: run 32976749121 had 4 pre-existing port-conflict failures (`Port 5190 already in use`, `bind TCP/14434: Address already in use`) on:
-- `client — health regression smoke (PR 10)` (runner 1000012135)
-- `client — damage server HP-convergence smoke (PR 11.6.D, port 5191)` (runner 1000012150)
-- `client — damage server reload smoke (PR 11.7.E, port 5191)` (runner 1000012151)
-- `client — damage server smoke (PR 11.6.C, port 5190)` (runner 1000012153)
+### Part 2: Post-#59-merge smoke suite finding (⚠️ REAL ROOT CAUSE — supersedes the earlier "port-conflict" theory below)
 
-All 4 are **port-conflict-with-prior-job-stragglers** on the lampak self-hosted runner pool. The runners are separate VMs (different runner-name IDs) but all happened to land on machines with stale canary / vite processes bound to 5190/5191/14433/14434. The teardown `if: always()` + `pkill -f canary-server.sh || true` + `lsof -ti:${port}` catch loop is not aggressive enough — likely the parent `nohup bash tools/canary-server.sh` exits but child rust/cargo processes get orphaned.
+**Initial (wrong) hypothesis**: post-#59-merge CI reruns (e.g. run 32976749121, 32980632594) showed 4+ jobs failing on `Port 5190 already in use` / `bind TCP/14434` "Address already in use". I initially attributed this to leaked canary/vite processes on self-hosted runner VMs and filed a carry-forward for the pre-step pattern.
 
-**Recommended follow-up PR (carry-forward, non-blocking for #59 merge)**: `chore(ci): pre-step port-freeup for all canary-using smokes`. Either:
-- (a) Add a pre-step `pkill -9 -f canary-server.sh; pkill -9 -f vite; lsof -ti:5190,5191,14433,14434 | xargs -r kill -9` at the top of every canary-using smoke before installing deps, OR
-- (b) Switch all canary-using smokes off self-hosted runners onto `runs-on: ubuntu-latest` (GH-hosted VMs are clean per job).
+**Correction (this entry)**: those runner IDs (`1000012xxx`) turned out to be **GH-hosted ephemeral runners in `westus`**, NOT lampak self-hosted — different runners each time, fresh VMs. No port leak is possible across ephemeral runners. The real failure is **inside each individual job**.
 
-Option (b) is the small-surface fix and addresses root cause. Option (a) is a 5-line patch but perpetuates the latent straggler problem on every other smoke that doesn't have a pre-step.
+### Actual root cause: PR #59 replaced the legacy 0x01 DamageRequest with 0x0A AimEvent, but did not port the rest of the smoke suite
 
-**PR #59 status after `cf1e57a`**: 21/25 jobs PASS (incl. the new aim-event smoke). 4 failures are the port-conflict issue above, all pre-existing and unrelated to PR #59's delta. PR is still MERGEABLE; MacBook function-test verdict (cc: `1542042299767193610`) holds; CI rerun on a cleaner self-hosted runner should bring it all-green without further ci.yml changes.
+Server post-#59 (`server/src/transport.rs:589`):
+```
+// Wire-format compat: we KEEP the 0x01 discriminator
+// in the dispatch table so old clients don't crash the
+// dispatcher, but we DROP the body — clients sending
+// 0x01 get a warn-deprecated log line and the body is
+// never validated, never broadcast.
+"client sent damageRequest (0x01) — deprecated, use AimEvent (0x0A); no damage applied",
+```
 
-**Playtest status** ⚠️
-- **Still playable**: PR #59 MacBook function test (cc: `1542042299767193610`) PASSED all 4 phases on real Vivaldi Chrome 150.0.0.0 — Phase 1 connect ✅, Phase 2 hit (HP 100→88 BOTH tabs) ✅, Phase 3 ammo decrement ✅, Phase 4 miss path (ammo drops, no self-damage) ✅. Screenshots at `/home/kyle/.hermes/cache/images/aimevent-mac/1787723887-phase-{1,2,4}-{a,b}.png`.
-- **No new playtest this session**: change was a single-line ci.yml edit; no runtime behavior delta. MacBook validation holds.
-- **No new breaking change**: the only delta is a deprecated action reference → canonical reference. Behavior identical.
+So PR #59 silently disabled damage broadcast for every client still using `damageBus.sendDamageRequest(...)` (the legacy path). 6 smoke scripts still hit that path and now silently fail:
 
----
+- `client/tools/damage-server-smoke.mjs`
+- `client/tools/damage-server-hp-convergence-smoke.mjs`
+- `client/tools/damage-server-reload-smoke.mjs`
+- `client/tools/two-tab-smoke.mjs` (referenced in comments)
+- `client/tools/two-tab-manual-flow.mjs`
+- `client/tools/health-regression-smoke.mjs`
+
+The HP-convergence smoke (job 98216125416, run 32980632594) shows this directly:
+```
+[smoke] Both ServerTransports connected.
+[smoke] Primer: both tabs fired at each other; Tab A sees playerId=1 (hp=100), playerId=2 (hp=100).
+[smoke] Assertion 2 PASS: Tab A sent damage request (target HP before=100).
+[smoke][FAIL] FAIL: Pre-spam single-fire broadcast: snapshot HP for target player never dropped (last hp=100) within 1500ms. Pre-fire baseline=100.
+[smoke] SMOKE_NO_BOOT=1: skipping teardown (caller owns the pre-booted processes)
+```
+The snapshot HP **never drops** because the server silently drops 0x01 damage.
+
+### Implication: PR #59 introduced a smoke-breaking protocol change without porting the test suite
+
+This is load-bearing because:
+1. The MacBook function test (cc: `1542042299767193610`) verified the AimEvent (0x0A) path passes 4/4 phases — but only with the new client.
+2. PR #59's commit message said "Replaces legacy DamageRequest" but didn't port any of the smoke suite that exercises the legacy path.
+3. The smoke suite now silently gives FALSE PASSES for `damage-server-aim-event-smoke` (which uses 0x0A) while FAILING the 6 smokes that still use 0x01.
+4. Real client tabs running against the post-#59 server would also fail to deal damage unless they migrated to AimEvent. The MacBook test was on the new client so it passed.
+
+### Recommended next PRs (in order)
+
+**Priority 1 — restore CI truthfulness**:
+`fix(smokes): migrate 6 smoke scripts from 0x01 DamageRequest to 0x0A AimEvent`
+- Update `damage-server-smoke.mjs`, `damage-server-hp-convergence-smoke.mjs`, `damage-server-reload-smoke.mjs`, `two-tab-smoke.mjs`, `two-tab-manual-flow.mjs`, `health-regression-smoke.mjs` to use the new wire-format.
+- Each smoke needs new fields: `yaw`, `pitch`, `sourcePlayerId`, `serverFrame`, `monotonicEventId`. Per-smoke yaw/pitch fixtures specific to the peer geometry being hit (HP-convergence needs aim-at-peer; reload smoke needs aim that lands in the head hitbox at the snapshot-known distance).
+- This is a non-trivial port — the server's lag-comp rewind needs a meaningful `req.frame` (current server frame, not 0). Server now hitscan-tests; smoke fixtures may need to set up known yaw/pitch relative to peer.
+- Plan (coding-task-routing): Codex for the initial port + Evo for the lag-comp frame-pickup logic.
+- Estimated: 1-2h wall.
+
+**Priority 2 — close the original port-conflict carry-forward (less urgent)**:
+PR #60 (`fix/ci-port-hygiene-smoke-preflight`, single commit `9ea4a96`) was opened as a fix for the supposed port-conflict but is now a no-op for the actual problem. Recommended action: **CLOSE PR #60** as "won't fix; root cause is #59's protocol change". The pre-step is harmless-but-unnecessary.
+
+If desired, keep the pre-step as belt-and-suspenders for future cross-runner hygiene (it doesn't hurt anything; it just runs `pkill` that finds nothing in 99% of cases).
+
+### PR #60 status
+
+PR #60 was CLOSED 2026-08-26 with explanation comment. Branch `fix/ci-port-hygiene-smoke-preflight` retained in case of future reuse.
+
+The CI run 32980632594 against this branch showed:
+- preflight step executes on every job (`preflight complete` logged on each)
+- preflight found nothing to kill (clean ephemeral runner)
+- the same 4 jobs still fail, on the same `last hp=100` snapshot-never-drops pattern, confirmed to be a server-side `0x01` drop, not a port conflict
+
+### Ad-hoc decisions captured this session
+
+- **Runner identification pattern**: `runner_name: GitHub Actions 100001xxxxx` + `region: westus` + `Hosted Compute Agent` log line = GH-hosted ephemeral runner (fresh VM per job). Don't assume cross-job port leakage is possible. Cross-check via `gh run view --log | grep "Hosted Compute Agent"` before diagnosing "stale-listener" patterns.
+- **Pre-merge ci.yml hygiene gate**: installed `actionlint@1.7.7` binary at `/home/kyle/Development/specialists-web-pr-aimevent/actionlint`. Use as a manual `actionlint .github/workflows/ci.yml` check before pushing ci.yml changes.
+- **`actions.cache@v4` vs `actions/cache@v4`**: GH's workflow validator rejects the dotted form (deprecated alias). Every `uses:` action reference must use the canonical `owner/repo` slash form. The 20 existing `actions.cache@v4` references in `ci.yml` had been tolerated by GH (legacy alias), but the 21st introduction triggered a hard failure.
+- **Smoke-suite protocol migration discipline (new rule)**: when changing a wire format / message type, the PR MUST ALSO port every smoke + client fixture that depends on the old path. PR #59 disabled `0x01` server-side but didn't port the smoke suite — silent breakage. Future wire-format changes must include a smoke-suite update in the same PR or a named follow-up.
+
+### Status of work this session
+
+- Identified the actions.cache@v4 typo → PR #59 fix shipped via `cf1e57a` (pre-merge commit on `feat/phase1-pr-aimevent`).
+- PR #59 merged 2026-08-26 at `89ab043`.
+- Filed PR #60 (pre-step port-freeup) based on wrong diagnosis; closed without merge.
+- Identified real root cause via deeper log inspection: PR #59's 0x01-disable change without smoke-suite port.
+- Updated `docs/SPEC.md` Current-status block to reflect the regression + recommended next PR (Priority 1).
+
+### Playtest status
+
+- **No new playtest this session.** Branch `fix/ci-port-hygiene-smoke-preflight` had no MacBook two-tab validation because no new feature was added — just an extra `pkill` pre-step.
+- **The MacBook function test for PR #59 (cc: `1542042299767193610`) still holds**: Vivaldi Chrome 150.0.0.0 passed all 4 phases with the AimEvent (0x0A) path. That validation does NOT cover the smokes, which use the dropped 0x01 path.
 ## 2026-08-22 — PR 11.7.D2.2.1 follow-up — 3 lockstep smokes rewritten via ServerTransport
 
 
