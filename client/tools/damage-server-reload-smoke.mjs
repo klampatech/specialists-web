@@ -68,7 +68,7 @@ const NAV_TIMEOUT = Number(process.env.SMOKE_NAV_TIMEOUT ?? 30000);
 const CONNECT_TIMEOUT_MS = Number(process.env.SMOKE_CONNECT_TIMEOUT_MS ?? 5000);
 // 200ms wait after reload = 4 snapshot ticks @ 20Hz (50ms each). Generous
 // for CI localhost (snapshot tick is normally ≤16ms, fan-out is <1ms).
-const RELOAD_SETTLE_MS = Number(process.env.RELOAD_SMOKE_SETTLE_MS ?? 200);
+const RELOAD_SETTLE_MS = Number(process.env.RELOAD_SMOKE_SETTLE_MS ?? 2000);
 // Fire-cooldown-aware shot pacing (server cooldown = 120ms; we pace at
 // 200ms to dodge CI clock skew without relying on the warn-retry pattern).
 const FIRE_PACE_MS = 200;
@@ -561,32 +561,62 @@ async function runSmoke() {
 
     // ---- Assertion 4: Tab A's snapshot reports ammo = PLAYER_MAX_AMMO
     // within RELOAD_SETTLE_MS (well over one 20Hz snapshot tick).
-    log(`Waiting ${RELOAD_SETTLE_MS}ms for snapshot fan-out to carry new ammo...`);
-    await sleep(RELOAD_SETTLE_MS);
-    const postReloadA = await pageA.evaluate(({ sourceId }) => {
-      const snap = (window).__latestSnap ? (window).__latestSnap() : null;
-      const entry = snap ? snap.players.find((p) => p.playerId === sourceId) : null;
-      return entry ? entry.ammo : null;
-    }, { sourceId: 1 });
+    //
+    // Poll the snapshot every 100ms instead of a fixed sleep + single
+    // read. The 200ms fixed-sleep version was a CI race: snapshot
+    // generation is 20Hz (50ms/tick) but on a shared runner with
+    // other jobs loaded, the actual end-to-end relay time can
+    // approach 200ms; if the read happened just-before a tick,
+    // it returned the stale ammo=3 and the smoke flaked.
+    //
+    // Failure case captured: 2026-08-25 22:00 UTC reload-smoke CI
+    // run reported "snapshot ammo post-reload = 3 (expected 6)" at
+    // the 200ms read despite the server's validate_and_relay_reload
+    // firing correctly — the broadcast simply hadn't propagated yet.
+    // Now polls until either the snapshot shows the new value or
+    // RELOAD_SETTLE_MS elapses.
+    log(`Polling snapshot for ammo refill (up to ${RELOAD_SETTLE_MS}ms)...`);
+    const settleStart = Date.now();
+    let postReloadA = null;
+    while (Date.now() - settleStart < RELOAD_SETTLE_MS) {
+      postReloadA = await pageA.evaluate(({ sourceId }) => {
+        const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+        const entry = snap ? snap.players.find((p) => p.playerId === sourceId) : null;
+        return entry ? entry.ammo : null;
+      }, { sourceId: 1 });
+      if (postReloadA === PLAYER_MAX_AMMO) break;
+      await sleep(100);
+    }
     if (postReloadA === null) {
       throw new Error(`Tab A snapshot missing playerId=1 post-reload.`);
     }
     if (postReloadA !== PLAYER_MAX_AMMO) {
       throw new Error(
-        `Tab A snapshot ammo post-reload = ${postReloadA} (expected ${PLAYER_MAX_AMMO}). ` +
-        `Server's reload validator may have rejected the request — check ` +
-        `validate_and_relay_reload gates (rate-limit, ammo<max, hp>0, eventId-window).`,
+        `Tab A snapshot ammo post-reload = ${postReloadA} (expected ${PLAYER_MAX_AMMO} ` +
+        `after ${RELOAD_SETTLE_MS}ms). Server's reload validator may have rejected ` +
+        `the request — check validate_and_relay_reload gates ` +
+        `(rate-limit, ammo<max, hp>0, eventId-window).`,
       );
     }
-    log(`Assertion 4 PASS: Tab A snapshot ammo post-reload = ${postReloadA}.`);
+    log(`Assertion 4 PASS: Tab A snapshot ammo post-reload = ${postReloadA} (${Date.now() - settleStart}ms).`);
 
     // ---- Assertion 5: Tab B's snapshot reports the same ammo for
     // player 1. This is the server-authoritative propagation core.
-    const postReloadB = await pageB.evaluate(({ sourceId }) => {
-      const snap = (window).__latestSnap ? (window).__latestSnap() : null;
-      const entry = snap ? snap.players.find((p) => p.playerId === sourceId) : null;
-      return entry ? entry.ammo : null;
-    }, { sourceId: 1 });
+    // Same poll pattern as assertion 4 — assert the value when it
+    // arrives, not at a fixed wallclock offset.
+    const postReloadB = await (async () => {
+      const bStart = Date.now();
+      while (Date.now() - bStart < RELOAD_SETTLE_MS) {
+        const v = await pageB.evaluate(({ sourceId }) => {
+          const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+          const entry = snap ? snap.players.find((p) => p.playerId === sourceId) : null;
+          return entry ? entry.ammo : null;
+        }, { sourceId: 1 });
+        if (v === PLAYER_MAX_AMMO) return v;
+        await sleep(100);
+      }
+      return null;
+    })();
     if (postReloadB === null) {
       throw new Error(`Tab B snapshot missing playerId=1 post-reload.`);
     }

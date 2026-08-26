@@ -109,8 +109,15 @@ async function bootCanary() {
   //
   // The canary's WebSocket listener binds `0.0.0.0:WS_PORT` (IPv4
   // any), so a `127.0.0.1` TCP probe is sufficient.
+  //
+  // Deadline: 120s for CI cold-start (cargo build release from scratch
+  // on a fresh GitHub Actions runner takes 60-90s; local m5 with
+  // cached binary + cert finishes in <1s). Reconnect-smoke failure
+  // case: 2026-08-25 22:00 UTC — canary hit the previous 30s
+  // deadline on the first CI run because the workspace hadn't cached
+  // the release binary. Bumped to 120s with progress logging.
   const start = Date.now();
-  const deadline = 30_000;
+  const deadline = 120_000;
   while (Date.now() - start < deadline) {
     if (canaryProc.exitCode !== null) {
       throw new Error(`canary exited prematurely with code ${canaryProc.exitCode}`);
@@ -119,6 +126,9 @@ async function bootCanary() {
     if (wsReady) {
       log(`  canary WS port ready after ${Date.now() - start}ms`);
       return;
+    }
+    if ((Date.now() - start) % 5000 < 200) {
+      log(`  canary still booting… (t=${Date.now() - start}ms)`);
     }
     await sleep(200);
   }
