@@ -101,6 +101,50 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
+      # PR #60 / runner-hygiene: pre-step port-freeup. The lampak
+      # self-hosted runner pool reuses VMs across jobs, and stale
+      # child processes from prior jobs hold ports 5173-5191 + 14433 +
+      # 14434 long enough for the next job's
+      # `nohup bash tools/canary-server.sh` to fail with
+      # `bind: Address already in use` (os error 98). The post-job
+      # teardown's `pkill -f canary-server.sh || true` was not
+      # aggressive enough — likely the nohup parent bash exits before
+      # the child rust binary gets reaped. This pre-step forces a
+      # clean slate by SIGKILL on whatever's left, plus a 1s grace
+      # for socket close. Idempotent — every pkill is `|| true`, so
+      # a clean runner is a no-op. We match by NAME (the leaking
+      # children specifically) AND by PORT (catch-all for anything
+      # else holding those ports). We deliberately do NOT kill
+      # `cargo` itself — that's how Swatinem's cache decides what to
+      # upload. The `tr` filter excludes our own PID so the
+      # port-based kill can't hit the bash that's running THIS
+      # script (defense in depth — `pkill -f` matches the script
+      # text in the bash process's argv buffer, so we use path-
+      # anchored name patterns that don't match the script body).
+      - name: Smoke preflight — kill stragglers from prior jobs
+        run: |
+          set +e
+          SELF_PID=$$
+          pkill -9 -f 'tools/canary-server.sh' 2>/dev/null || true
+          pkill -9 -f 'target/release/specialists-server' 2>/dev/null || true
+          pkill -9 -f 'node_modules/vite/bin/vite.js' 2>/dev/null || true
+          for port in 5173 5174 5177 5181 5182 5183 5184 5185 5186 5187 5188 5190 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+              filtered=""
+              for pid in $pids; do
+                if [[ "$pid" != "$SELF_PID" ]]; then
+                  filtered="$filtered $pid"
+                fi
+              done
+              if [[ -n "$filtered" ]]; then
+                echo "freeing port ${port}: PIDs${filtered}"
+                kill -9 $filtered 2>/dev/null || true
+              fi
+            fi
+          done
+          sleep 1
+          echo "preflight complete"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -217,6 +261,50 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
+      # PR #60 / runner-hygiene: pre-step port-freeup. The lampak
+      # self-hosted runner pool reuses VMs across jobs, and stale
+      # child processes from prior jobs hold ports 5173-5191 + 14433 +
+      # 14434 long enough for the next job's
+      # `nohup bash tools/canary-server.sh` to fail with
+      # `bind: Address already in use` (os error 98). The post-job
+      # teardown's `pkill -f canary-server.sh || true` was not
+      # aggressive enough — likely the nohup parent bash exits before
+      # the child rust binary gets reaped. This pre-step forces a
+      # clean slate by SIGKILL on whatever's left, plus a 1s grace
+      # for socket close. Idempotent — every pkill is `|| true`, so
+      # a clean runner is a no-op. We match by NAME (the leaking
+      # children specifically) AND by PORT (catch-all for anything
+      # else holding those ports). We deliberately do NOT kill
+      # `cargo` itself — that's how Swatinem's cache decides what to
+      # upload. The `tr` filter excludes our own PID so the
+      # port-based kill can't hit the bash that's running THIS
+      # script (defense in depth — `pkill -f` matches the script
+      # text in the bash process's argv buffer, so we use path-
+      # anchored name patterns that don't match the script body).
+      - name: Smoke preflight — kill stragglers from prior jobs
+        run: |
+          set +e
+          SELF_PID=$$
+          pkill -9 -f 'tools/canary-server.sh' 2>/dev/null || true
+          pkill -9 -f 'target/release/specialists-server' 2>/dev/null || true
+          pkill -9 -f 'node_modules/vite/bin/vite.js' 2>/dev/null || true
+          for port in 5173 5174 5177 5181 5182 5183 5184 5185 5186 5187 5188 5190 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+              filtered=""
+              for pid in $pids; do
+                if [[ "$pid" != "$SELF_PID" ]]; then
+                  filtered="$filtered $pid"
+                fi
+              done
+              if [[ -n "$filtered" ]]; then
+                echo "freeing port ${port}: PIDs${filtered}"
+                kill -9 $filtered 2>/dev/null || true
+              fi
+            fi
+          done
+          sleep 1
+          echo "preflight complete"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -336,6 +424,50 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
+      # PR #60 / runner-hygiene: pre-step port-freeup. The lampak
+      # self-hosted runner pool reuses VMs across jobs, and stale
+      # child processes from prior jobs hold ports 5173-5191 + 14433 +
+      # 14434 long enough for the next job's
+      # `nohup bash tools/canary-server.sh` to fail with
+      # `bind: Address already in use` (os error 98). The post-job
+      # teardown's `pkill -f canary-server.sh || true` was not
+      # aggressive enough — likely the nohup parent bash exits before
+      # the child rust binary gets reaped. This pre-step forces a
+      # clean slate by SIGKILL on whatever's left, plus a 1s grace
+      # for socket close. Idempotent — every pkill is `|| true`, so
+      # a clean runner is a no-op. We match by NAME (the leaking
+      # children specifically) AND by PORT (catch-all for anything
+      # else holding those ports). We deliberately do NOT kill
+      # `cargo` itself — that's how Swatinem's cache decides what to
+      # upload. The `tr` filter excludes our own PID so the
+      # port-based kill can't hit the bash that's running THIS
+      # script (defense in depth — `pkill -f` matches the script
+      # text in the bash process's argv buffer, so we use path-
+      # anchored name patterns that don't match the script body).
+      - name: Smoke preflight — kill stragglers from prior jobs
+        run: |
+          set +e
+          SELF_PID=$$
+          pkill -9 -f 'tools/canary-server.sh' 2>/dev/null || true
+          pkill -9 -f 'target/release/specialists-server' 2>/dev/null || true
+          pkill -9 -f 'node_modules/vite/bin/vite.js' 2>/dev/null || true
+          for port in 5173 5174 5177 5181 5182 5183 5184 5185 5186 5187 5188 5190 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+              filtered=""
+              for pid in $pids; do
+                if [[ "$pid" != "$SELF_PID" ]]; then
+                  filtered="$filtered $pid"
+                fi
+              done
+              if [[ -n "$filtered" ]]; then
+                echo "freeing port ${port}: PIDs${filtered}"
+                kill -9 $filtered 2>/dev/null || true
+              fi
+            fi
+          done
+          sleep 1
+          echo "preflight complete"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -445,6 +577,50 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
+      # PR #60 / runner-hygiene: pre-step port-freeup. The lampak
+      # self-hosted runner pool reuses VMs across jobs, and stale
+      # child processes from prior jobs hold ports 5173-5191 + 14433 +
+      # 14434 long enough for the next job's
+      # `nohup bash tools/canary-server.sh` to fail with
+      # `bind: Address already in use` (os error 98). The post-job
+      # teardown's `pkill -f canary-server.sh || true` was not
+      # aggressive enough — likely the nohup parent bash exits before
+      # the child rust binary gets reaped. This pre-step forces a
+      # clean slate by SIGKILL on whatever's left, plus a 1s grace
+      # for socket close. Idempotent — every pkill is `|| true`, so
+      # a clean runner is a no-op. We match by NAME (the leaking
+      # children specifically) AND by PORT (catch-all for anything
+      # else holding those ports). We deliberately do NOT kill
+      # `cargo` itself — that's how Swatinem's cache decides what to
+      # upload. The `tr` filter excludes our own PID so the
+      # port-based kill can't hit the bash that's running THIS
+      # script (defense in depth — `pkill -f` matches the script
+      # text in the bash process's argv buffer, so we use path-
+      # anchored name patterns that don't match the script body).
+      - name: Smoke preflight — kill stragglers from prior jobs
+        run: |
+          set +e
+          SELF_PID=$$
+          pkill -9 -f 'tools/canary-server.sh' 2>/dev/null || true
+          pkill -9 -f 'target/release/specialists-server' 2>/dev/null || true
+          pkill -9 -f 'node_modules/vite/bin/vite.js' 2>/dev/null || true
+          for port in 5173 5174 5177 5181 5182 5183 5184 5185 5186 5187 5188 5190 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+              filtered=""
+              for pid in $pids; do
+                if [[ "$pid" != "$SELF_PID" ]]; then
+                  filtered="$filtered $pid"
+                fi
+              done
+              if [[ -n "$filtered" ]]; then
+                echo "freeing port ${port}: PIDs${filtered}"
+                kill -9 $filtered 2>/dev/null || true
+              fi
+            fi
+          done
+          sleep 1
+          echo "preflight complete"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -495,6 +671,50 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
+      # PR #60 / runner-hygiene: pre-step port-freeup. The lampak
+      # self-hosted runner pool reuses VMs across jobs, and stale
+      # child processes from prior jobs hold ports 5173-5191 + 14433 +
+      # 14434 long enough for the next job's
+      # `nohup bash tools/canary-server.sh` to fail with
+      # `bind: Address already in use` (os error 98). The post-job
+      # teardown's `pkill -f canary-server.sh || true` was not
+      # aggressive enough — likely the nohup parent bash exits before
+      # the child rust binary gets reaped. This pre-step forces a
+      # clean slate by SIGKILL on whatever's left, plus a 1s grace
+      # for socket close. Idempotent — every pkill is `|| true`, so
+      # a clean runner is a no-op. We match by NAME (the leaking
+      # children specifically) AND by PORT (catch-all for anything
+      # else holding those ports). We deliberately do NOT kill
+      # `cargo` itself — that's how Swatinem's cache decides what to
+      # upload. The `tr` filter excludes our own PID so the
+      # port-based kill can't hit the bash that's running THIS
+      # script (defense in depth — `pkill -f` matches the script
+      # text in the bash process's argv buffer, so we use path-
+      # anchored name patterns that don't match the script body).
+      - name: Smoke preflight — kill stragglers from prior jobs
+        run: |
+          set +e
+          SELF_PID=$$
+          pkill -9 -f 'tools/canary-server.sh' 2>/dev/null || true
+          pkill -9 -f 'target/release/specialists-server' 2>/dev/null || true
+          pkill -9 -f 'node_modules/vite/bin/vite.js' 2>/dev/null || true
+          for port in 5173 5174 5177 5181 5182 5183 5184 5185 5186 5187 5188 5190 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+              filtered=""
+              for pid in $pids; do
+                if [[ "$pid" != "$SELF_PID" ]]; then
+                  filtered="$filtered $pid"
+                fi
+              done
+              if [[ -n "$filtered" ]]; then
+                echo "freeing port ${port}: PIDs${filtered}"
+                kill -9 $filtered 2>/dev/null || true
+              fi
+            fi
+          done
+          sleep 1
+          echo "preflight complete"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -643,6 +863,50 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
+      # PR #60 / runner-hygiene: pre-step port-freeup. The lampak
+      # self-hosted runner pool reuses VMs across jobs, and stale
+      # child processes from prior jobs hold ports 5173-5191 + 14433 +
+      # 14434 long enough for the next job's
+      # `nohup bash tools/canary-server.sh` to fail with
+      # `bind: Address already in use` (os error 98). The post-job
+      # teardown's `pkill -f canary-server.sh || true` was not
+      # aggressive enough — likely the nohup parent bash exits before
+      # the child rust binary gets reaped. This pre-step forces a
+      # clean slate by SIGKILL on whatever's left, plus a 1s grace
+      # for socket close. Idempotent — every pkill is `|| true`, so
+      # a clean runner is a no-op. We match by NAME (the leaking
+      # children specifically) AND by PORT (catch-all for anything
+      # else holding those ports). We deliberately do NOT kill
+      # `cargo` itself — that's how Swatinem's cache decides what to
+      # upload. The `tr` filter excludes our own PID so the
+      # port-based kill can't hit the bash that's running THIS
+      # script (defense in depth — `pkill -f` matches the script
+      # text in the bash process's argv buffer, so we use path-
+      # anchored name patterns that don't match the script body).
+      - name: Smoke preflight — kill stragglers from prior jobs
+        run: |
+          set +e
+          SELF_PID=$$
+          pkill -9 -f 'tools/canary-server.sh' 2>/dev/null || true
+          pkill -9 -f 'target/release/specialists-server' 2>/dev/null || true
+          pkill -9 -f 'node_modules/vite/bin/vite.js' 2>/dev/null || true
+          for port in 5173 5174 5177 5181 5182 5183 5184 5185 5186 5187 5188 5190 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+              filtered=""
+              for pid in $pids; do
+                if [[ "$pid" != "$SELF_PID" ]]; then
+                  filtered="$filtered $pid"
+                fi
+              done
+              if [[ -n "$filtered" ]]; then
+                echo "freeing port ${port}: PIDs${filtered}"
+                kill -9 $filtered 2>/dev/null || true
+              fi
+            fi
+          done
+          sleep 1
+          echo "preflight complete"
       - run: npm ci
       - name: Cache Playwright browsers
         # PR 11.4.1: cache the Playwright browser binary across runs.
@@ -766,6 +1030,50 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
+      # PR #60 / runner-hygiene: pre-step port-freeup. The lampak
+      # self-hosted runner pool reuses VMs across jobs, and stale
+      # child processes from prior jobs hold ports 5173-5191 + 14433 +
+      # 14434 long enough for the next job's
+      # `nohup bash tools/canary-server.sh` to fail with
+      # `bind: Address already in use` (os error 98). The post-job
+      # teardown's `pkill -f canary-server.sh || true` was not
+      # aggressive enough — likely the nohup parent bash exits before
+      # the child rust binary gets reaped. This pre-step forces a
+      # clean slate by SIGKILL on whatever's left, plus a 1s grace
+      # for socket close. Idempotent — every pkill is `|| true`, so
+      # a clean runner is a no-op. We match by NAME (the leaking
+      # children specifically) AND by PORT (catch-all for anything
+      # else holding those ports). We deliberately do NOT kill
+      # `cargo` itself — that's how Swatinem's cache decides what to
+      # upload. The `tr` filter excludes our own PID so the
+      # port-based kill can't hit the bash that's running THIS
+      # script (defense in depth — `pkill -f` matches the script
+      # text in the bash process's argv buffer, so we use path-
+      # anchored name patterns that don't match the script body).
+      - name: Smoke preflight — kill stragglers from prior jobs
+        run: |
+          set +e
+          SELF_PID=$$
+          pkill -9 -f 'tools/canary-server.sh' 2>/dev/null || true
+          pkill -9 -f 'target/release/specialists-server' 2>/dev/null || true
+          pkill -9 -f 'node_modules/vite/bin/vite.js' 2>/dev/null || true
+          for port in 5173 5174 5177 5181 5182 5183 5184 5185 5186 5187 5188 5190 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+              filtered=""
+              for pid in $pids; do
+                if [[ "$pid" != "$SELF_PID" ]]; then
+                  filtered="$filtered $pid"
+                fi
+              done
+              if [[ -n "$filtered" ]]; then
+                echo "freeing port ${port}: PIDs${filtered}"
+                kill -9 $filtered 2>/dev/null || true
+              fi
+            fi
+          done
+          sleep 1
+          echo "preflight complete"
       - run: npm ci
       - name: Cache Playwright browsers
         uses: actions/cache@v4
@@ -840,6 +1148,50 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
+      # PR #60 / runner-hygiene: pre-step port-freeup. The lampak
+      # self-hosted runner pool reuses VMs across jobs, and stale
+      # child processes from prior jobs hold ports 5173-5191 + 14433 +
+      # 14434 long enough for the next job's
+      # `nohup bash tools/canary-server.sh` to fail with
+      # `bind: Address already in use` (os error 98). The post-job
+      # teardown's `pkill -f canary-server.sh || true` was not
+      # aggressive enough — likely the nohup parent bash exits before
+      # the child rust binary gets reaped. This pre-step forces a
+      # clean slate by SIGKILL on whatever's left, plus a 1s grace
+      # for socket close. Idempotent — every pkill is `|| true`, so
+      # a clean runner is a no-op. We match by NAME (the leaking
+      # children specifically) AND by PORT (catch-all for anything
+      # else holding those ports). We deliberately do NOT kill
+      # `cargo` itself — that's how Swatinem's cache decides what to
+      # upload. The `tr` filter excludes our own PID so the
+      # port-based kill can't hit the bash that's running THIS
+      # script (defense in depth — `pkill -f` matches the script
+      # text in the bash process's argv buffer, so we use path-
+      # anchored name patterns that don't match the script body).
+      - name: Smoke preflight — kill stragglers from prior jobs
+        run: |
+          set +e
+          SELF_PID=$$
+          pkill -9 -f 'tools/canary-server.sh' 2>/dev/null || true
+          pkill -9 -f 'target/release/specialists-server' 2>/dev/null || true
+          pkill -9 -f 'node_modules/vite/bin/vite.js' 2>/dev/null || true
+          for port in 5173 5174 5177 5181 5182 5183 5184 5185 5186 5187 5188 5190 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+              filtered=""
+              for pid in $pids; do
+                if [[ "$pid" != "$SELF_PID" ]]; then
+                  filtered="$filtered $pid"
+                fi
+              done
+              if [[ -n "$filtered" ]]; then
+                echo "freeing port ${port}: PIDs${filtered}"
+                kill -9 $filtered 2>/dev/null || true
+              fi
+            fi
+          done
+          sleep 1
+          echo "preflight complete"
       - run: npm ci
       - name: Cache Playwright browsers
         uses: actions/cache@v4
@@ -1062,6 +1414,50 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
+      # PR #60 / runner-hygiene: pre-step port-freeup. The lampak
+      # self-hosted runner pool reuses VMs across jobs, and stale
+      # child processes from prior jobs hold ports 5173-5191 + 14433 +
+      # 14434 long enough for the next job's
+      # `nohup bash tools/canary-server.sh` to fail with
+      # `bind: Address already in use` (os error 98). The post-job
+      # teardown's `pkill -f canary-server.sh || true` was not
+      # aggressive enough — likely the nohup parent bash exits before
+      # the child rust binary gets reaped. This pre-step forces a
+      # clean slate by SIGKILL on whatever's left, plus a 1s grace
+      # for socket close. Idempotent — every pkill is `|| true`, so
+      # a clean runner is a no-op. We match by NAME (the leaking
+      # children specifically) AND by PORT (catch-all for anything
+      # else holding those ports). We deliberately do NOT kill
+      # `cargo` itself — that's how Swatinem's cache decides what to
+      # upload. The `tr` filter excludes our own PID so the
+      # port-based kill can't hit the bash that's running THIS
+      # script (defense in depth — `pkill -f` matches the script
+      # text in the bash process's argv buffer, so we use path-
+      # anchored name patterns that don't match the script body).
+      - name: Smoke preflight — kill stragglers from prior jobs
+        run: |
+          set +e
+          SELF_PID=$$
+          pkill -9 -f 'tools/canary-server.sh' 2>/dev/null || true
+          pkill -9 -f 'target/release/specialists-server' 2>/dev/null || true
+          pkill -9 -f 'node_modules/vite/bin/vite.js' 2>/dev/null || true
+          for port in 5173 5174 5177 5181 5182 5183 5184 5185 5186 5187 5188 5190 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+              filtered=""
+              for pid in $pids; do
+                if [[ "$pid" != "$SELF_PID" ]]; then
+                  filtered="$filtered $pid"
+                fi
+              done
+              if [[ -n "$filtered" ]]; then
+                echo "freeing port ${port}: PIDs${filtered}"
+                kill -9 $filtered 2>/dev/null || true
+              fi
+            fi
+          done
+          sleep 1
+          echo "preflight complete"
       - run: npm ci
       - name: Cache Playwright browsers
         # PR 11.4.1: cache the Playwright browser binary across runs.
