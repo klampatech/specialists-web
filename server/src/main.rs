@@ -19,12 +19,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-
 use specialists_server::transport::{run_server, RoomRegistry};
 use specialists_server::cert::DEFAULT_SANS;
 use specialists_server::connection_outbound::global_drop_oldest_count;
+use specialists_server::session::Room;
 
 #[derive(Debug, Default)]
 struct Args {
@@ -313,13 +313,22 @@ async fn main() -> ExitCode {
             loop {
                 interval.tick().await;
                 let now_ms = start.elapsed().as_millis() as u64;
-                let room_arc = {
+                // PR-fix-0x06 — the snapshot generator must iterate
+                // every active room, not just DEVBX. Pre-fix this
+                // hardcoded `DEVBX_ROOM_ID` because every connection
+                // was unconditionally routed there regardless of the
+                // URL path. Post-fix the URL-derived room id is
+                // used (see `parse_room_id`), so the generator must
+                // walk the full `rooms` map and broadcast a snapshot
+                // to each room's connections.
+                let active_rooms: Vec<(String, Arc<RwLock<Room>>)> = {
                     let guard = rooms.read().await;
-                    guard.get(
-                        specialists_server::constants::DEVBX_ROOM_ID,
-                    ).cloned()
+                    guard
+                        .iter()
+                        .map(|(id, room_arc)| (id.clone(), room_arc.clone()))
+                        .collect()
                 };
-                if let Some(room_arc) = room_arc {
+                for (room_id, room_arc) in active_rooms {
                     let snap_opt = {
                         let room_guard = room_arc.read().await;
                         gen.maybe_emit(&*room_guard, now_ms)
@@ -335,10 +344,15 @@ async fn main() -> ExitCode {
                         );
                         let body = specialists_server::protocol::encode_snapshot(&snap);
                         wire.extend(body);
+                        // Tag the broadcast with the room id for log
+                        // clarity (helps debugging multi-room setups).
+                        let snap_len = wire.len();
+                        debug!(room_id = %room_id, "snapshot enqueued for room");
                         specialists_server::transport::broadcast_snapshot(
                             room_arc.clone(),
                             wire,
                         ).await;
+                        let _ = snap_len; // suppress unused warning if debug! is filtered
                     }
                 }
                 // Periodic stats line — single info!() call per interval

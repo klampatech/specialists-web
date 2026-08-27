@@ -236,6 +236,47 @@ async function runSmoke() {
     if (!connectedB) throw new Error("Tab B ServerTransport did not connect");
     log("Both ServerTransports connected.");
 
+    // PR-fix-0x06 — pre-fix the smoke immediately read the
+    // snapshot because every connection joined the single DEVBX room
+    // (which already had prior-smoke-residue players). Post-fix
+    // each connection joins its own URL-derived room (`AIMEVENT_*`)
+    // which is fresh on each run, so the snapshot stream needs time
+    // to populate. Wait up to 2s for Tab A's snapshot to carry a
+    // `playerId=1` entry before running the schema check.
+    const snapshotSettleStart = Date.now();
+    let settledSnapshot = false;
+    while (Date.now() - snapshotSettleStart < 2000) {
+      const probe = await pageA.evaluate(() => {
+        const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+        const entry = snap ? snap.players.find((p) => p.playerId === 1) : null;
+        return { hasEntry: !!entry };
+      });
+      if (probe.hasEntry) {
+        settledSnapshot = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (!settledSnapshot) {
+      log(`WARN: snapshot did not populate playerId=1 within 2000ms (pre-fix this was instant because DEVBX was shared)`);
+      // Dump snapshot stream state for debugging.
+      const snapState = await pageA.evaluate(() => {
+        const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+        const transport = (window).__serverTransport;
+        return {
+          snapFn: typeof (window).__latestSnap,
+          snapResult: snap ? {
+            serverFrame: snap.serverFrame,
+            playerCount: snap.players.length,
+            playerIds: snap.players.map((p) => p.playerId),
+          } : null,
+          transportKind: transport ? transport.kind : null,
+          transportConnected: transport ? transport.connected : null,
+        };
+      });
+      log(`DEBUG snap state: ${JSON.stringify(snapState)}`);
+    }
+
     // PR #59 §4.5: NOTE — the server's `0x06 InputsServer` arm
     // hard-codes the room ID to `DEVBX` (see transport.rs:962 —
     // `ensure_room(rooms, DEVBX_ROOM_ID)`). Any smoke using a
@@ -308,16 +349,19 @@ async function runSmoke() {
             `Snapshots missing player entries: A=${JSON.stringify(playerA1)} B=${JSON.stringify(playerB2)}`,
           );
         }
-        // PR #59 §4.5: schema check (replaces the pre-fix yaw>0 /
-        // pitch>0 assertion that the smoke originally carried). See the
-        // earlier comment in this function for the DEVBX-hardcode
-        // rationale — the server's 0x06 arm routes inputs to room
-        // `DEVBX` regardless of URL, so the smoke's snapshot (which
-        // reads from the smoke's own room) never sees populated yaw
-        // / pitch. The load-bearing assertion is the SCHEMA presence
-        // of yaw + pitch slots in PlayerState — checked above. Here we
-        // just log the values for visibility.
-        log(`Tab A snap: yaw=${playerA1.yaw} pitch=${playerA1.pitch} ammo=${playerA1.ammo} hp=${playerA1.hp} (yaw/pitch will populate once DEVBX-hardcode fix lands)`);
+        // PR #59 §4.5: schema check (yaw/pitch slots exist in
+        // PlayerState). Pre-fix this also carried a yaw>0 / pitch>0
+        // assertion, but the client's `sendInputsServer` is not yet
+        // wired into the game loop (the server has the 0x06 dispatch
+        // arm but no client code path calls it yet). The DEVBX-
+        // hardcode fix in this PR unblocks per-room yaw/pitch
+        // routing; the client-side wiring is a follow-up. Until
+        // then, we just verify the schema (and log the values).
+        log(`Tab A snap: yaw=${playerA1.yaw} pitch=${playerA1.pitch} ammo=${playerA1.ammo} hp=${playerA1.hp}`);
+        // PR #59 §4.5: schema presence is the load-bearing assertion.
+        // Yaw/pitch VALUE population requires the client to call
+        // `sendInputsServer(...)` from the game loop — currently a
+        // TODO; tracked in the SPEC carry-forward list.
     log(`Tab B snap: yaw=${playerB2.yaw} pitch=${playerB2.pitch} ammo=${playerB2.ammo} hp=${playerB2.hp}`);
     log(`Assertion 1 PASS: both tabs' snapshots populated with yaw + pitch + hp + ammo.`);
 
