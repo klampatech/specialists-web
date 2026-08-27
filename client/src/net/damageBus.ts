@@ -156,6 +156,14 @@ export function sendAimEvent(
   t: ServerTransport,
   req: AimEvent,
 ): number {
+  // PR 65 (debug) — log every AimEvent send at info level so smoke
+  // harnesses can grep for `aimEvent->send` lines in browser-console-A.log
+  // and confirm whether the gameplay code path reached sendAimEvent at
+  // all (vs. being gated upstream by fireHeld / wasFiring / ammo /
+  // cooldown). Without this trace, a missing AimEvent in the server
+  // log is ambiguous: did the client never send it, or did the server
+  // reject it?
+  console.info(`[PR-65-DEBUG] aimEvent->send source=${req.sourcePlayerId} yaw=${req.yawRadians} pitch=${req.pitchRadians} frame=${req.frame} eventId=${req.eventId}`);
   t.sendAimEvent(req);
   return req.eventId;
 }

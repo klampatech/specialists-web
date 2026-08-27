@@ -120,6 +120,23 @@ impl SnapshotGenerator {
                 .get(player_id)
                 .map(|p| (p.yaw_radians, p.pitch_radians))
                 .unwrap_or((0.0, 0.0));
+            // PR 65 (debug) — log the yaw/pitch read from the room's
+            // player entry. Pre-PR-65 the client's game loop never
+            // sent `sendInputsServer`, so yaw/pitch were always 0.0
+            // here and every server-side hit-scan used yaw=0 (miss).
+            // This log fires once per snapshot (20Hz per room) so a
+            // smoke can grep for "yaw=" lines and verify the client
+            // is actually sending inputs.
+            tracing::debug!(
+                target: "snapshot_debug",
+                room_id = %room.id,
+                player_id = *player_id,
+                yaw,
+                pitch,
+                hp,
+                ammo,
+                "snapshot_read_player_state"
+            );
             player_states.push(PlayerState {
                 player_id: *player_id,
                 position_x: pos.x,
