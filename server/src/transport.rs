@@ -41,7 +41,7 @@
 //   - Production cert handling (Let's Encrypt, PR 11.6.E now absorbed into 11.7).
 
 use std::sync::Mutex;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -53,6 +53,7 @@ use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 use wtransport::{Endpoint, ServerConfig};
@@ -92,9 +93,58 @@ fn next_placeholder_player_id() -> PlayerId {
 /// PR 11.6.D — per-connection state shared between the listener
 /// loop and `handle_binary`. Used `Cell` for interior mutability
 /// so the connection's `claimed_player_id` can be set on the first
-/// `DamageRequest` (which establishes the connection's identity)
-/// and checked on subsequent requests (FIX 8 anti-spoof).
-#[derive(Debug, Default)]
+/// Extract the room id from a transport request path.
+///
+/// Accepts paths of the form `/rooms/<id>` (with optional query
+/// string + fragment). Returns the room id, validated to match
+/// `[A-Za-z0-9_-]{1,64}`. For any other path shape — root `/`,
+/// `/something_else/<x>`, malformed input, or a room id that
+/// fails validation — returns `DEVBX_ROOM_ID` as the back-compat
+/// fallback (matches the pre-PR hardcoded behavior so existing
+/// clients with malformed URLs keep working).
+///
+/// Examples:
+///   "/rooms/DEVBX"               -> "DEVBX"
+///   "/rooms/AIMEVENT_12345"      -> "AIMEVENT_12345"
+///   "/rooms/foo?bar=baz"         -> "foo"
+///   "/rooms/"                    -> DEVBX_ROOM_ID (empty)
+///   "/rooms/with%20space"        -> DEVBX_ROOM_ID (invalid char)
+///   "/"                          -> DEVBX_ROOM_ID
+///   ""                           -> DEVBX_ROOM_ID
+///
+/// Pre-PR-#63 behavior: every connection was unconditionally
+/// routed to `DEVBX` regardless of the URL path. The smoke suites
+/// accidentally worked because each smoke passes a unique room
+/// name (`AIMEVENT_${Date.now()}` etc.) which the server
+/// collapsed to `DEVBX`. The bug only surfaces for InputServer
+/// yaw/pitch capture on a non-DEVBX room: the snapshot's
+/// `players[id].yaw_radians/.pitch_radians` stayed at 0.0 because
+/// the InputServer handler's `ensure_room(rooms, DEVBX_ROOM_ID)`
+/// routed to the wrong room's player map.
+pub(crate) fn parse_room_id(path: &str) -> String {
+    // Strip query string and fragment.
+    let path = path.split('?').next().unwrap_or("");
+    let path = path.split('#').next().unwrap_or("");
+    // Strip leading slashes for consistent matching.
+    let path = path.trim_start_matches('/');
+    // Extract `/rooms/<id>` -> `<id>`.
+    let Some(rest) = path.strip_prefix("rooms/") else {
+        return DEVBX_ROOM_ID.to_string();
+    };
+    let id = rest.split('/').next().unwrap_or("");
+    // Validate: alphanumeric + dash/underscore + length 1-64.
+    if id.is_empty() || id.len() > 64 {
+        return DEVBX_ROOM_ID.to_string();
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return DEVBX_ROOM_ID.to_string();
+    }
+    id.to_string()
+}
+
 pub(crate) struct ConnectionState {
     claimed_player_id: Cell<Option<PlayerId>>,
     /// PR 11.7.D2.1 / cleanup-track — the actual id under which this
@@ -107,6 +157,13 @@ pub(crate) struct ConnectionState {
     /// connections under the promoted id when the placeholder was
     /// already removed).
     actual_player_id: Cell<PlayerId>,
+    /// PR-fix-0x06 — the room id this connection is bound to. Extracted
+    /// from the transport request path during the handshake
+    /// (`/rooms/<id>`). Defaults to `DEVBX_ROOM_ID` at construction;
+    /// set via `stamp_room` once the path is known. Used by
+    /// `handle_binary`'s dispatch arms to route the wire event to the
+    /// correct room instead of the pre-fix hardcoded `DEVBX`.
+    room_id: RefCell<String>,
 }
 
 impl ConnectionState {
@@ -114,7 +171,25 @@ impl ConnectionState {
         Arc::new(Mutex::new(Self {
             claimed_player_id: Cell::new(None),
             actual_player_id: Cell::new(placeholder_player_id),
+            room_id: RefCell::new(DEVBX_ROOM_ID.to_string()),
         }))
+    }
+    /// PR-fix-0x06 — stamp the connection's room id. Called once per
+    /// connection (during the WebSocket / WebTransport handshake)
+    /// with the path extracted from the inbound request. Idempotent —
+    /// the first call wins (subsequent calls are ignored to match
+    /// the per-connection single-room binding).
+    pub(crate) fn stamp_room(&self, room_id: String) {
+        let mut current = self.room_id.borrow_mut();
+        if current.as_str() == DEVBX_ROOM_ID {
+            *current = room_id;
+        }
+    }
+    /// PR-fix-0x06 — read the connection's currently-bound room id.
+    /// Defaults to `DEVBX_ROOM_ID` if `stamp_room` hasn't been
+    /// called yet.
+    pub(crate) fn room_id(&self) -> String {
+        self.room_id.borrow().clone()
     }
     /// Check the connection's claimed identity against an incoming
     /// `DamageRequest`. Returns `Ok(claimed)` if the connection's
@@ -252,13 +327,35 @@ async fn handle_websocket_connection(
     peer: SocketAddr,
     rooms: RoomRegistry,
 ) -> Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .with_context(|| format!("websocket handshake from {peer}"))?;
-    info!(%peer, "WebSocket handshake accepted");
+    // PR-fix-0x06 — use `accept_hdr_async` (instead of `accept_async`)
+    // so we can capture the inbound HTTP request's `path` (e.g.
+    // `/rooms/AIMEVENT_12345`) during the handshake. The path is
+    // parsed via `parse_room_id` and the connection is bound to
+    // that room id. Pre-fix this used `accept_async` which throws
+    // away the HTTP request, hardcoding DEVBX for every connection.
+    let captured_path = Arc::new(Mutex::new(String::new()));
+    let callback_path = captured_path.clone();
+    let ws = tokio_tungstenite::accept_hdr_async(stream, move |req: &Request, response: Response| {
+        // Extract the path from the WebSocket upgrade request
+        // (`GET /rooms/<id> HTTP/1.1`). Stash it on the captured
+        // Arc<Mutex<String>> for the post-handshake code to read.
+        let path = req.uri().path();
+        if let Ok(mut guard) = callback_path.lock() {
+            *guard = path.to_string();
+        }
+        Ok(response)
+    })
+    .await
+    .with_context(|| format!("websocket handshake from {peer}"))?;
+    let path = captured_path.lock().unwrap().clone();
+    info!(%peer, %path, "WebSocket handshake accepted");
 
-    // Every connection joins the hard-coded "DEVBX" room (per §6 Q2).
-    let room_arc = ensure_room(&rooms, DEVBX_ROOM_ID).await;
+    // PR-fix-0x06 — extract the room id from the captured handshake
+    // path. Falls back to DEVBX_ROOM_ID if the path doesn't match
+    // the expected shape (matches pre-PR behavior — see
+    // `parse_room_id` doc).
+    let room_id = parse_room_id(&path);
+    let room_arc = ensure_room(&rooms, &room_id).await;
 
     // PR 11.6.D: per-connection outbound mpsc sender. Each
     // connection gets a unique placeholder PlayerId (assigned by
@@ -296,6 +393,9 @@ async fn handle_websocket_connection(
     let outbound = specialists_server::connection_outbound::ConnectionOutbound::new();
     let placeholder_id = next_placeholder_player_id();
     let conn_state = ConnectionState::new(placeholder_id);
+    // PR-fix-0x06 — stamp the room id (captured from the request
+    // path above) so `handle_binary` can route to the correct room.
+    conn_state.lock().unwrap().stamp_room(room_id.clone());
     {
         let mut room_guard = room_arc.write().await;
         room_guard.register_connection(placeholder_id, outbound.clone());
@@ -450,7 +550,12 @@ async fn handle_webtransport_session(
     let connection = session_request.accept().await?;
     info!(%authority, %path, "WebTransport session accepted");
 
-    let room_arc = ensure_room(&rooms, DEVBX_ROOM_ID).await;
+    // PR-fix-0x06 — extract the room id from the request path
+    // (`/rooms/<id>`) and route this connection there. Falls back
+    // to DEVBX_ROOM_ID if the path doesn't match the expected
+    // shape (matches pre-PR behavior — see `parse_room_id` doc).
+    let room_id = parse_room_id(&path);
+    let room_arc = ensure_room(&rooms, &room_id).await;
 
     // PR 11.6.D: per-connection outbound mpsc (same pattern as
     // WebSocket). Each connection gets a unique placeholder
@@ -475,6 +580,11 @@ async fn handle_webtransport_session(
     let outbound = specialists_server::connection_outbound::ConnectionOutbound::new();
     let placeholder_id = next_placeholder_player_id();
     let conn_state = ConnectionState::new(placeholder_id);
+    // PR-fix-0x06 — stamp the room id (captured from the request
+    // path above) so `handle_binary` can route InputServer yaw/pitch
+    // updates to the correct room instead of the pre-fix hardcoded
+    // DEVBX. First-call-wins via stamp_room's idempotent guard.
+    conn_state.lock().unwrap().stamp_room(room_id.clone());
     {
         let mut room_guard = room_arc.write().await;
         room_guard.register_connection(placeholder_id, outbound.clone());
@@ -640,7 +750,13 @@ pub(super) async fn handle_binary(
                     }
                 }
             };
-            let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
+            // PR-fix-0x06 — route AimEvent to the connection's
+            // bound room (extracted from the transport request path
+            // during the handshake). Pre-fix this was
+            // `DEVBX_ROOM_ID`, which routed every connection to
+            // the same room regardless of the URL.
+            let room_id = connection_state.lock().unwrap().room_id();
+            let room_arc = ensure_room(rooms, &room_id).await;
             let now = Instant::now();
             // Per-connection RTT proxy -- same shape as the PR
             // 11.6.D's DamageRequest arm. Look up the source
@@ -796,7 +912,8 @@ pub(super) async fn handle_binary(
                 return vec![];
             };
             // Push onto the room's PositionHistory. §1.2 seam: WRITE-ONLY.
-            let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
+            let room_id = connection_state.lock().unwrap().room_id();
+            let room_arc = ensure_room(rooms, &room_id).await;
             {
                 let mut room_guard = room_arc.write().await;
                 // PR 11.7.D2.1 / FIX — promote the connection from its
@@ -923,7 +1040,8 @@ pub(super) async fn handle_binary(
                 conn.claimed_player_id.get()
             };
             if let Some(player_id) = claimed_player_id_for_ping {
-                let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
+                let room_id = connection_state.lock().unwrap().room_id();
+                let room_arc = ensure_room(rooms, &room_id).await;
                 let mut room_guard = room_arc.write().await;
                 if let Some(player) = room_guard.players.get_mut(&player_id) {
                     player.last_ping_received_at = Some(Instant::now());
@@ -957,7 +1075,15 @@ pub(super) async fn handle_binary(
                 warn!("inputsServer: decoder rejected malformed payload");
                 return vec![];
             };
-            let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
+            // PR-fix-0x06 — route to the connection's bound room
+            // (extracted from the transport request path during the
+            // handshake). Pre-fix this was `DEVBX_ROOM_ID`, which
+            // meant non-DEVBX rooms received the InputsServer yaw/pitch
+            // captures but the snapshot was read from the wrong
+            // player map (always DEVBX's), so yaw/pitch stayed 0.0
+            // on non-DEVBX connections' snapshots.
+            let room_id = connection_state.lock().unwrap().room_id();
+            let room_arc = ensure_room(rooms, &room_id).await;
             // Convert Vec<u8> to [u8; 12] (EncodedInput). The decoder
             // already enforces length, so the conversion is infallible
             // modulo `try_into` for safety.
@@ -1087,7 +1213,8 @@ pub(super) async fn handle_binary(
                 Some(id) => id,
                 None => req.source_player_id,
             };
-            let room_arc = ensure_room(rooms, DEVBX_ROOM_ID).await;
+            let room_id = connection_state.lock().unwrap().room_id();
+            let room_arc = ensure_room(rooms, &room_id).await;
             let mut room_guard = room_arc.write().await;
             // Ensure the source is registered (mirrors the
             // PositionUpdate auto-register path — a tab that hasn't
@@ -1234,6 +1361,63 @@ mod tests {
         decode_damage_broadcast, decode_pong, encode_aim_event, encode_ping,
         encode_position_update, PositionUpdate,
     };
+
+    // PR-fix-0x06 — `parse_room_id` validation table.
+    //
+    // The happy path is `/rooms/<id>` (with optional query/fragment).
+    // The fallback is `DEVBX_ROOM_ID` for any path that doesn't
+    // match — this is the back-compat contract that keeps existing
+    // clients (and existing tests) working unchanged.
+    #[test]
+    fn parse_room_id_accepts_well_formed_paths() {
+        assert_eq!(parse_room_id("/rooms/DEVBX"), "DEVBX");
+        assert_eq!(parse_room_id("/rooms/AIMEVENT_12345"), "AIMEVENT_12345");
+        assert_eq!(parse_room_id("/rooms/foo?bar=baz"), "foo");
+        assert_eq!(parse_room_id("/rooms/foo#anchor"), "foo");
+        assert_eq!(parse_room_id("rooms/foo"), "foo"); // no leading slash
+        assert_eq!(parse_room_id("//rooms/foo"), "foo"); // double leading slash
+    }
+
+    #[test]
+    fn parse_room_id_rejects_malformed_paths_to_devbx_fallback() {
+        // Not a /rooms/ path → DEVBX.
+        assert_eq!(parse_room_id("/"), DEVBX_ROOM_ID);
+        assert_eq!(parse_room_id(""), DEVBX_ROOM_ID);
+        assert_eq!(parse_room_id("/index.html"), DEVBX_ROOM_ID);
+        // /rooms/ with no id → DEVBX.
+        assert_eq!(parse_room_id("/rooms/"), DEVBX_ROOM_ID);
+        // /rooms/<id> with a slash AFTER the id (no further path)
+        // → still the id (not the trailing slash).
+        assert_eq!(parse_room_id("/rooms/foo/bar"), "foo");
+        // Invalid characters in the id → DEVBX.
+        assert_eq!(parse_room_id("/rooms/with%20space"), DEVBX_ROOM_ID);
+        assert_eq!(parse_room_id("/rooms/.dot"), DEVBX_ROOM_ID);
+        assert_eq!(parse_room_id("/rooms/path;traversal"), DEVBX_ROOM_ID);
+        // Id too long (> 64 chars) → DEVBX.
+        let long_id = "a".repeat(65);
+        assert_eq!(parse_room_id(&format!("/rooms/{long_id}")), DEVBX_ROOM_ID);
+    }
+
+    #[test]
+    fn parse_room_id_accepts_max_length_id() {
+        // Exactly 64 chars alphanumeric + dash/underscore is OK.
+        let max_id = "a".repeat(64);
+        assert_eq!(parse_room_id(&format!("/rooms/{max_id}")), max_id);
+    }
+
+    // PR-fix-0x06 — ConnectionState room_id round-trip.
+    #[test]
+    fn connection_state_stamp_room_is_idempotent() {
+        let state = ConnectionState::new(100);
+        // Default is DEVBX.
+        assert_eq!(state.lock().unwrap().room_id(), DEVBX_ROOM_ID);
+        // First stamp wins.
+        state.lock().unwrap().stamp_room("ROOM_A".to_string());
+        assert_eq!(state.lock().unwrap().room_id(), "ROOM_A");
+        // Second stamp is ignored (first-call-wins).
+        state.lock().unwrap().stamp_room("ROOM_B".to_string());
+        assert_eq!(state.lock().unwrap().room_id(), "ROOM_A");
+    }
 
     fn fresh_rooms() -> RoomRegistry {
         // Pre-populate so the dispatcher's `ensure_room` is a no-op.
