@@ -299,10 +299,44 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
   };
   const onMouseMoveLocked = (e: MouseEvent) => {
     if (!target) return;
-    if (document.pointerLockElement !== target) return; // not locked
+    // PR 65 / non-pointer-lock path — if `window.__dragYawMode === true`
+    // (set by smoke harnesses that can't acquire pointer lock in
+    // headless Chrome), compute yaw/pitch delta from `clientX/Y`
+    // movement instead of `movementX/Y`. `movementX/Y` is only
+    // populated when the browser has pointer-lock engaged.
+    //
+    // The smoke harness sets the flag before mouse.move + mouse.down,
+    // and clears it after. Real players never set it (the regular
+    // pointer-lock path is preferred for first-person lock-down UX).
+    const dragYaw = (typeof window !== "undefined" && (window as { __dragYawMode?: boolean }).__dragYawMode === true);
+    if (!dragYaw && document.pointerLockElement !== target) return; // not locked
+    let dx: number, dy: number;
+    if (dragYaw) {
+      // `movementX/Y` is 0 outside pointer lock; use clientX/Y deltas
+      // tracked across calls. The MouseEvent object's properties
+      // don't persist across event invocations, so use the
+      // hook-state store via a `lastClientX/Y` window global.
+      const win = window as Window & { __dragYawLastClientX?: number; __dragYawLastClientY?: number };
+      const lastX = win.__dragYawLastClientX ?? e.clientX;
+      const lastY = win.__dragYawLastClientY ?? e.clientY;
+      dx = e.clientX - lastX;
+      dy = e.clientY - lastY;
+      win.__dragYawLastClientX = e.clientX;
+      win.__dragYawLastClientY = e.clientY;
+    } else {
+      dx = e.movementX;
+      dy = e.movementY;
+    }
+    // PR 65 (debug) — emit a console.info on every drag-yaw mousemove
+    // so the smoke harness can verify the drag actually accumulates
+    // yaw. Without this, a broken drag would silently no-op and the
+    // smoke would assert "yaw didn't change" without knowing why.
+    if (dragYaw) {
+      console.info(`[PR-65-DEBUG] dragYaw mousemove dx=${dx} dy=${dy} clientX=${e.clientX}`);
+    }
     // PR 11.1: yaw delta on horizontal mouse movement.
-    if (e.movementX !== 0) {
-      hooks.onYawDelta?.(e.movementX * MOUSE_LOOK.sensitivityRadPerPixel);
+    if (dx !== 0) {
+      hooks.onYawDelta?.(dx * MOUSE_LOOK.sensitivityRadPerPixel);
     }
     // PR 11.3: pitch delta on vertical mouse movement. The convention is
     // "mouse up = look up = positive pitch", but the browser reports
@@ -312,8 +346,8 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
     //   mouse down  → movementY > 0 → -movementY < 0 → pitch decreases → look down
     // The chase camera clamps to [-π/2, +π/2] so users physically hitting
     // the limits see the pitch hold at ±π/2 (not wrap).
-    if (e.movementY !== 0) {
-      hooks.onPitchDelta?.(-e.movementY * MOUSE_LOOK.sensitivityRadPerPixel);
+    if (dy !== 0) {
+      hooks.onPitchDelta?.(-dy * MOUSE_LOOK.sensitivityRadPerPixel);
     }
   };
 
@@ -375,6 +409,19 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
         // coupling) is what lets this stay a self-contained unit.
       };
       hooks.onFrame(state);
+      // PR 65 — expose the live `held` snapshot to window so smoke
+      // harnesses can verify that mousedown → fireHeld propagated
+      // (without it, the smoke can only assert at the AimEvent
+      // boundary, which is too far downstream to debug why a click
+      // didn't register).
+      if (typeof window !== "undefined") {
+        (window as Window & { __inputHeld?: unknown }).__inputHeld = {
+          forward: held.forward, right: held.right, jump: held.jumpPressed,
+          dive: held.divePressed, slide: held.slideHeld, wallrun: held.wallrunPressed,
+          fire: held.fireHeld, melee: held.meleePressed, bullet: held.bulletTimeHeld,
+          reload: held.reloadPressed, pointerLocked: held.pointerLocked,
+        };
+      }
       // Clear one-shot flags. Held flags stay until the matching keyup.
       held.jumpPressed = false;
       held.divePressed = false;

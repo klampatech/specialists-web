@@ -1114,12 +1114,16 @@ pub(super) async fn handle_binary(
             let pitch_bits = u16::from_le_bytes([input_bytes[4], input_bytes[5]]);
             let yaw_radians: f32 = (yaw_bits as f32) * (1.0 / 10430.4);  // 65535 / (2pi)
             let pitch_radians: f32 = (pitch_bits as f32) * (1.0 / 20861.9) - (std::f32::consts::PI / 2.0);  // 65535 / pi
-            // Best-effort player_id resolution: in PR 11.6.C there's no
-            // join handshake, so we use the first byte of the input
-            // blob as a placeholder. PR 11.6.D replaces this with a
-            // proper player-id assignment when the room broadcasts
-            // back. For now, just key the buffer on byte 0.
-            let player_id: PlayerId = input_bytes[0] as PlayerId;
+            // PR 65 — fix: use the connection's claimed/promoted player id as
+            // the source id, NOT byte 0 of the encoded input. The
+            // previous `input_bytes[0] as PlayerId` collapsed every
+            // non-moving client onto player_id=0 (move bits = 0 →
+            // id = 0), so the replay-protection map kept state
+            // across smoke runs (since the canary stays up) and
+            // rejected every fresh packet as "stale". Real players
+            // whose first packet is "no keys pressed" suffered the
+            // same fate.
+            let player_id: PlayerId = connection_state.lock().unwrap().get_actual();
             {
                 let mut room_guard = room_arc.write().await;
                 // PR 11.7.D2 / §1.2: replay protection on the

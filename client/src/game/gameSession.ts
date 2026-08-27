@@ -76,6 +76,7 @@ import {
 import { applyDamage, tickRespawn, type HealthSnapshot } from "./health";
 import {
   sendAimEvent as dbSendAimEvent,
+  sendInputsServer as dbSendInputsServer,
   sendPositionUpdateThrottled as dbSendPositionUpdateThrottled,
   sendReloadRequest as dbSendReloadRequest,
   nextReloadEventId as dbNextReloadEventId,
@@ -390,7 +391,12 @@ export function createGameSession(
   /** Previous `input.fireHeld` value — tracks rising edges. */
   let wasFiring = false;
   /** Previous `input.meleePressed` value — tracks rising edges. */
-  let wasMelee = false;
+   let wasMelee = false;
+   // PR 65 — track the snapshot's serverFrame when we last read it,
+   // so the AimEvent's `frame` field can be expressed relative to
+   // the server's authoritative clock (not the local runtime's
+   // counter, which drifts unboundedly).
+   let lastSnapshotFrameSeen = 0;
   // PR 11.7.D2 / §3.10 — wasRemoteFiring / wasRemoteMelee REMOVED.
   // The P2P lockstep substrate is gone; there is no longer a
   // "remote input" in the lockstep sense. The remote player's
@@ -522,6 +528,10 @@ export function createGameSession(
     const encodedInput = encodeInput(gameInput);
     submitLocalInput(gameInput);
     const advanced = runtime.advanceFrame();
+    // PR 65 — flush the queued InputsServer with the post-advance
+    // frame number so the server's inputs_buffer is keyed by the
+    // same frame the lockstep substrate just stepped.
+    flushInputsServer(advanced.frame);
 
     // PR 11.7.C / §3.7 — record the input in the predictor's local
     // input buffer (keyed by advanced.frame, the frame just processed).
@@ -610,13 +620,36 @@ export function createGameSession(
         now - lastFireMsLocal >= COMBAT.dualPistol.fireCooldownMs;
       const ammoOk = ammoCountLocal > 0;
       if (cooldownOk && ammoOk && serverTransport) {
+        // PR 65 — use the snapshot's `serverFrame` (most recent
+        // authoritative server frame) plus the per-tick offset
+        // relative to when the snapshot arrived. Pre-fix this used
+        // `advanced.frame` (the local runtime's frame counter) which
+        // can drift FAR behind the server's clock if the canary
+        // started before this tab connected. The server's frame gate
+        // rejects AimEvents with `frame` more than
+        // `POSITION_HISTORY_RETENTION_FRAMES` (64 = ~1s @ 64Hz) behind
+        // the server's `current_frame` — the local frame counter
+        // drifts unboundedly so it routinely blows this gate after a
+        // few seconds of gameplay.
+        const snap = (window as Window & { __latestSnap?: () => unknown }).__latestSnap?.() as { serverFrame?: number } | null;
+        const snapFrame = snap?.serverFrame ?? 0;
+        // The snapshot was emitted at the server's frame `snapFrame`;
+        // since then the local runtime has advanced `advanced.frame`
+        // by some delta. The server has also been ticking, so the
+        // current server frame is roughly `snapFrame + (runtimeDelta
+        // / 2)` (half of our local delta passed server-side by now).
+        // Use `snapFrame + localDelta - maxRewindBuffer` to keep the
+        // request safely within the rewind window.
+        const localDelta = advanced.frame - lastSnapshotFrameSeen;
+        const reqFrame = Math.max(snapFrame, snapFrame + localDelta - 16);
         const req: AimEvent = {
           sourcePlayerId: localPlayerId,
           yawRadians: gameInput.yawRadians ?? 0,
           pitchRadians: gameInput.pitchRadians ?? 0,
-          frame: advanced.frame,
+          frame: reqFrame,
           eventId: nextAimEventIdLocal++,
         };
+        lastSnapshotFrameSeen = snapFrame;
         dbSendAimEvent(serverTransport, req);
         // Stamp the local fire timestamp + decrement local ammo
         // (snapshot stream carries the authoritative ammo on the
@@ -749,12 +782,65 @@ export function createGameSession(
   // Today this goes through the lockstep substrate (`ggrsRuntime`).
   // PR 11.7 retires lockstep and routes the same encoded input to
   // `serverTransport` instead; only this method changes.
+  //
+  // PR 65 — §1.2 seam is now LIVE. `submitLocalInput(input)` encodes
+  // the input ONCE (`encodedInput`), then routes it to BOTH the
+  // lockstep substrate (so peer / smoke can read it via
+  // `runtime.lastSubmittedInput`) AND the serverTransport via a
+  // typed `InputsServer` packet. The server feeds the encoded bits
+  // into the per-room `inputs_buffer` keyed by `frame`, and applies
+  // the snapshot's yaw/pitch + position fields from the latest
+  // InputsServer (this is what populates `room.players[id].yaw_radians`
+  // and `.pitch_radians` so the snapshot fan-out carries live values).
+  //
+  // The `lastInputsSeq` counter increments once per packet; server
+  // uses it for replay protection (drops packets whose seq is
+  // older than the last-seen seq for the source).
+  //
+  // This is a no-op when `serverTransport === null` (no snapshot
+  // stream connected — legacy lockstep-only path).
+  let lastInputsSeqLocal = 0;
+  let inputsSeqSendPending: { encodedInput: Uint8Array; frame: number } | null = null;
+  const submitLocalInput = (input: InputState): void => {
+    const encoded = encodeInput(input);
+    runtime.submitLocalInput(encoded);
+    // Queue the InputsServer send — we need the `advanced.frame` to
+    // match, which we don't have until after `advanceFrame()` below.
+    // We stash the encoded bytes + the post-advance frame here; the
+    // actual `dbSendInputsServer(...)` call runs at the end of tick()
+    // once we know the frame number.
+    inputsSeqSendPending = { encodedInput: encoded, frame: 0 };
+  };
+  // PR 65 — flush the pending InputsServer after `runtime.advanceFrame`
+  // returns the just-stepped frame. Called from `tick()` once we have
+  // `advanced.frame`.
+  const flushInputsServer = (advancedFrame: number): void => {
+    if (inputsSeqSendPending && serverTransport) {
+      const pending = inputsSeqSendPending;
+      inputsSeqSendPending = null;
+      lastInputsSeqLocal = (lastInputsSeqLocal + 1) >>> 0;  // wrap to u32
+      // PR 65 — also align the InputsServer's `frame` with the
+      // server's authoritative clock (see AimEvent patch above).
+      // Without this, the replay-protection map rejects packets
+      // because the seq advances but the frame doesn't match what
+      // the snapshot expected.
+      const snap = (window as Window & { __latestSnap?: () => unknown }).__latestSnap?.() as { serverFrame?: number } | null;
+      const snapFrame = snap?.serverFrame ?? 0;
+      const localDelta = advancedFrame - lastSnapshotFrameSeen;
+      const alignedFrame = Math.max(snapFrame, snapFrame + localDelta - 16);
+      lastSnapshotFrameSeen = snapFrame;
+      dbSendInputsServer(serverTransport, {
+        frame: alignedFrame,
+        encodedInput: pending.encodedInput,
+        lastInputsSeq: lastInputsSeqLocal,
+      });
+    } else {
+      inputsSeqSendPending = null;
+    }
+  };
   // PR 11.7.C / §3.7 — late-bound predictor reference. `null` by
   // default; scene.ts sets it once the snapshot transport is connected.
   let predictor: import("../engine/clientPredictor").Predictor | null = null;
-  const submitLocalInput = (input: InputState): void => {
-    runtime.submitLocalInput(encodeInput(input));
-  };
 
   return {
     localController,

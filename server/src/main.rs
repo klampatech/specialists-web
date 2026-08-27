@@ -214,17 +214,28 @@ async fn main() -> ExitCode {
             );
             loop {
                 interval.tick().await;
-                let room_arc = {
+                // PR 65 — the physics tick loop must iterate EVERY active
+                // room, not just DEVBX. Pre-PR-#64 it was hardcoded to
+                // DEVBX_ROOM_ID because every connection was unconditionally
+                // routed there. Post-PR-#64 connections are routed to the
+                // URL-derived room id (see `parse_room_id`), so non-DEVBX
+                // rooms need their own `next_server_frame` increment +
+                // physics step. Without this fix, every AimEvent in a
+                // non-DEVBX room is rejected by the lag-comp gate with
+                // "frame too far in the future" because `next_server_frame`
+                // stays at 0 (the client advances its local frame counter
+                // ~64Hz but the server never ticks the room).
+                let active_rooms: Vec<(String, Arc<RwLock<Room>>)> = {
                     let guard = rooms.read().await;
-                    guard.get(
-                        specialists_server::constants::DEVBX_ROOM_ID,
-                    ).cloned()
+                    guard
+                        .iter()
+                        .map(|(id, room_arc)| (id.clone(), room_arc.clone()))
+                        .collect()
                 };
-                if let Some(room_arc) = room_arc {
+                for (_room_id, room_arc) in active_rooms {
                     let mut room_guard = room_arc.write().await;
                     // 1. Increment the server frame counter.
-                    let frame =
-                        room_guard.tick_server_frame();
+                    let frame = room_guard.tick_server_frame();
                     // 2. PR 11.7.B BLK-2 — drain the latest input
                     //    per player. Without this call, the
                     //    `drained_inputs_this_tick` scratch map is
