@@ -1,24 +1,35 @@
 // Smoke harness utilities — capture browser console + server stderr +
 // per-page DOM state into /tmp/smoke-{date}-{name}/. Used by every
 // smoke from now on so the visuals line up with the data.
-//
+// Any smoke can import the helpers below (log/fail/sleep) directly.
+// ...
 // Usage:
 //   import { attachSmokeCapture } from "./smoke-capture.mjs";
 //   const cap = attachSmokeCapture(page, { label: "A", outDir });
 //   ... do your smoke ...
 //   await cap.writeArtifact();
-//
 // Artifacts:
 //   - browser-console-A.log  (page.console log/warn/error captured live)
 //   - dom-A.json             (snapshot of body.innerText + frame counter + HUD chip text)
 //   - screenshot-A.png       (last frame before teardown)
-//
 // Plus the server-side log goes into /tmp/smoke-{date}-{name}/canary-stderr.log
 // (captured by the boot helper).
 
 import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { existsSync, statSync } from "node:fs";
+
+// Shared log/fail/sleep helpers — any smoke can import these without
+// going through the full attachSmokeCapture flow.
+export function log(msg) {
+  console.log(`[smoke] ${msg}`);
+}
+export function fail(msg) {
+  console.error(`[smoke][FAIL] ${msg}`);
+}
+export function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
 
 export function makeSmokeOutDir(label) {
   const date = new Date();
