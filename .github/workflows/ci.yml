@@ -1083,6 +1083,7 @@ jobs:
   # files. The parity smoke uses the new reference automatically.
   client-havok-parity-smoke:
     name: client — Havok parity smoke (PR 82)
+    needs: server-build
     runs-on: ubuntu-latest
     defaults:
       run:
