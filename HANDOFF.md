@@ -14,7 +14,43 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **No code work currently queued.** Recommended next direction (your call):
 - **(a) Pivot to weapons** — add a second weapon type (shotgun or sniper) with its own ammo constant + the WEAPONS-table refactor that Kyle flagged.
 - **(b) Pivot to new feature arc** — matchmaker (PR 11.9), production Tailscale-Funnel certs (PR 11.6.E), lobby UI, spectator mode, replay, scoreboard.
-- **(c) Maintenance / debt sweep — CF-N1 root-cause fix** — ship the mpsc capacity bump on a fresh branch (the `chore/phase1-server-outbound-channel-bump` branch was deleted; recreate and ship).
+- **(c) Maintenance / debt sweep — ship PR #80** — the CF-N1 **snapshot rate-limiter** (full plan in vault: `~/Obsidian/mem/projects/specialists-web-pr80-cfn1-rate-limit.md`). The OLD "bump mpsc 1024 → 2048" idea is NOT recommended per the `ci-flake-handling` skill ("do NOT bump again — capacity isn't the bottleneck, consumer decode rate is"). The rate-limiter is the architectural answer. Branches off `main @ cbf6eb7`, ~50 LOC, 1-2 hours. Recommended PRIMARY candidate.
+
+---
+
+## 2026-08-28 — PR #80 CF-N1 snapshot rate-limiter — PLANNED (deferred to next session)
+
+**Status**: PLAN COMPLETE, IMPLEMENTATION DEFERRED. Vault plan at `~/Obsidian/mem/projects/specialists-web-pr80-cfn1-rate-limit.md`.
+
+**Why deferred**: Kyle was at 70% usage when this was proposed (`cc: 1542961656848453632`). Plan + decisions locked in this session so the next session can pick up cold.
+
+**Kyle's question, my recommendations** (all approved by silence — Kyle said "I dont' understand the implications so make a recommendation"):
+
+| Question | Recommendation | Rationale |
+|----------|----------------|-----------|
+| Producer-side rate limiter (skip emit if consumer queue saturated)? | ✅ YES | State preserved (no data lost); consumer drains at own pace; no quality regression |
+| Threshold default? | **25% of cap (256 entries deep)** | Below 25% = comfortable, keep emitting. Above = consumer falling behind. Generous enough that healthy consumers never hit it |
+| Env var vs const? | **Env var** (`SNAPSHOT_RATE_LIMIT_PCT`, default 25) | Matches existing `CANARY_STATS_INTERVAL_MS` pattern; lets CI tune per-load shape (5191 vs 24p stress); cost negligible |
+| Log marker? | `[cf-n1-rate-limited]` (debug-level, expected under load) | Matches `[CI-FLAKE:CF-N1]` existing diagnostic naming |
+| Stats counter? | Add `rate_limited_total` to existing `[stress-stats]` line | Same 5s interval, same shape as `drops_total` |
+| Scope? | Snapshot generator loop ONLY (not WS listener, AimEvent, damage broadcast) | Surgical fix; minimize blast radius |
+| Smoke changes? | NONE | `[CI-FLAKE:CF-N1]` warn-then-retry stays as defensive diagnostic |
+
+**Diagnosis** (from `ci-flake-handling` skill):
+- 1024 capacity already in place (D2.1) — bumping again is wrong direction
+- Drop-oldest already in place (D2.1) — but doesn't prevent drops, just bounds queue
+- Real bottleneck: consumer-decode rate (~12-15Hz effective under CI) vs producer 20Hz
+- Architectural answer: skip emit when slowest consumer's queue is saturated
+
+**Files to change** (per vault plan):
+1. `server/src/snapshot.rs` — add `should_rate_limit(room, threshold_pct)` predicate + unit tests
+2. `server/src/main.rs` — gate `broadcast_snapshot` on the predicate; bump atomic counter; periodic stats
+3. `client/tools/damage-server-hp-convergence-smoke.mjs` — NO CHANGE (existing CF-N1 warn-then-retry is the regression gate)
+4. `docs/SPEC.md` + `HANDOFF.md` — post-merge
+
+**Success metric**: 5191 smoke flake rate over 20 consecutive CI runs drops from ~30% to <10%. If it doesn't, the next escalation is reducing SNAPSHOT_RATE_HZ or relaxing the `≥4 hits` lower bound (skill: "If 2x mpsc bump still doesn't close it, escalate to back-pressure — that's already done; so the next escalation is consumer-side decode speed or smoke-bound relaxation").
+
+**Branch name for next session**: `fix/pr80-cfn1-snapshot-rate-limit` off `main @ cbf6eb7`.
 
 ---
 
