@@ -1085,6 +1085,9 @@ jobs:
     name: client — Havok parity smoke (PR 82)
     needs: server-build
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -1092,9 +1095,7 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: client/package-lock.json
-      - name: Install npm deps
-        working-directory: client
-        run: npm ci
+      - run: npm ci
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
@@ -1106,15 +1107,13 @@ jobs:
         run: npx playwright install chromium
         timeout-minutes: 3
       - name: Boot canary server (ports 14433 + 14434)
-        # PR 82 — NO working-directory override here. Other smoke
-        # jobs (e.g. client-damage-server-reload-smoke) have the
-        # same shape and rely on ${{ github.workspace }} as cwd
-        # for this step. `tools/canary-server.sh` lives at the repo
-        # root, NOT in client/. Setting working-directory: client
-        # at the job level (as I did originally) breaks this step
-        # because bash can't find the script.
+        # PR 82 — relative path `../tools/canary-server.sh` because
+        # this job has `defaults: working-directory: client` at the
+        # job level. The script lives at REPO_ROOT/tools/, so we
+        # need to walk up one directory. Mirrors the
+        # client-two-tab-smoke pattern (PR 11.7.D2.1 fix).
         run: |
-          nohup bash tools/canary-server.sh --port-wt 14433 --port-ws 14434             > /tmp/canary-server-havok-parity.log 2>&1 &
+          nohup bash ../tools/canary-server.sh --port-wt 14433 --port-ws 14434 > /tmp/canary-server-havok-parity.log 2>&1 &
           echo $! > /tmp/canary-server-havok-parity.pid
           for i in $(seq 1 60); do
             if (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
@@ -1125,11 +1124,12 @@ jobs:
           done
           if ! (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
             echo "::error::Canary server (havok-parity) did not become ready in 60s"
-            cat /tmp/canary-server-havok-parity.log
+            echo "=== canary stderr (last 50 lines) ==="
+            tail -50 /tmp/canary-server-havok-parity.log
+            echo "=== /canary stderr ==="
             exit 1
           fi
       - name: Boot Vite dev server (port 5191)
-        working-directory: client
         run: |
           nohup npm run dev -- --host 127.0.0.1 --port 5191 --strictPort             > /tmp/vite-5191-havok-parity.log 2>&1 &
           echo $! > /tmp/vite-5191-havok-parity.pid
@@ -1146,7 +1146,6 @@ jobs:
             exit 1
           fi
       - name: Run Havok parity smoke
-        working-directory: client
         run: node tools/havok-parity-smoke.mjs
         env:
           HAVOK_PARITY_URL: http://localhost:5191/
