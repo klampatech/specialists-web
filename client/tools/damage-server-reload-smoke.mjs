@@ -51,14 +51,13 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
+// PR 11.7.E / §3.5 — constant must match `server/src/constants.rs::PLAYER_MAX_AMMO`.
+// PR 78 — smoke-side constant lives in `client/tools/_ammo.mjs` so any value
+// drift between server canonical + client mirror + smoke assertions is one-edit.
+import { PLAYER_MAX_AMMO } from "./_ammo.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
-
-// PR 11.7.E / §3.5 — constant must match `server/src/constants.rs::PLAYER_MAX_AMMO`.
-// Smoke reads from the snapshot (server-authoritative) — hardcoding here is fine
-// because the snapshot value is asserted literally below.
-const PLAYER_MAX_AMMO = 6;
 const URL = process.env.RELOAD_SMOKE_URL ?? "http://localhost:5191/";
 const WT_PORT = Number(process.env.RELOAD_SMOKE_WT_PORT ?? 14433);
 const WS_PORT = Number(process.env.RELOAD_SMOKE_WS_PORT ?? 14434);

@@ -54,12 +54,12 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
+// PR 78 — import from shared smoke constant; server canonical: server/src/constants.rs::PLAYER_MAX_AMMO
+import { PLAYER_MAX_AMMO } from "./_ammo.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
 
-// Constants that must mirror the server (single source of truth: server/src/constants.rs).
-const PLAYER_MAX_AMMO = 6;
 const DUAL_PISTOL_DAMAGE = 12;
 const URL = process.env.AIMEVENT_SMOKE_URL ?? "http://localhost:5191/";
 const WT_PORT = Number(process.env.AIMEVENT_SMOKE_WT_PORT ?? 14433);

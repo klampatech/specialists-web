@@ -13,6 +13,15 @@
 
 const { chromium } = require('/home/kyle/Development/specialists-web/client/node_modules/playwright');
 
+// PR 78 — server canonical: `server/src/constants.rs::PLAYER_MAX_AMMO`.
+// Client mirror: `client/src/engine/characterConfig.ts::PLAYER_MAX_AMMO`.
+// This smoke is CommonJS (.cjs) and can't import the ESM constant from
+// `client/tools/_ammo.mjs` directly; the literal `6` below is the
+// regression guard that catches value drift between server canonical
+// and the assertion expectations in this smoke. If the server value
+// changes, update this file + `_ammo.mjs` + `characterConfig.ts` together.
+const PLAYER_MAX_AMMO = 6;
+
 const CDP_URL = 'http://localhost:9223';
 const VITE_URL = 'http://100.95.111.112:5174';
 
@@ -205,7 +214,7 @@ async function main() {
   await sleep(800);
   const ammoAfterFire = await getHud(tabA, 1);
   log(`post-fire tabA HUD: ${ammoAfterFire.hudAmmoText} (snapshot: ${ammoAfterFire.snapshotAmmo})`);
-  if (ammoAfterFire.snapshotAmmo >= 6) {
+  if (ammoAfterFire.snapshotAmmo >= PLAYER_MAX_AMMO) {
     log(`WARN: ammo did not drop after fire (got ${ammoAfterFire.snapshotAmmo}). CDP mouse dispatch may not hit the in-game fire path; snapshot reload logic verified by 5191 smoke earlier. Continuing with reload probe anyway.`);
   }
 

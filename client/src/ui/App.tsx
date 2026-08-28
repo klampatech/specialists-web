@@ -19,6 +19,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createScene, type SceneHandle } from "../engine/scene";
+import { PLAYER_MAX_AMMO } from "../engine/characterConfig";
 import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
 import { DebugHud } from "./DebugHud";
@@ -327,7 +328,7 @@ export function App() {
             localRespawningMs={hud.localRespawningMs}
             remoteRespawningMs={hud.remoteRespawningMs}
             localAmmo={hud.localAmmo}
-            maxAmmo={6}
+            maxAmmo={PLAYER_MAX_AMMO}
             reloadingUntilMs={hud.reloadingUntilMs}
             reloadProgressMs={1500}
           />

@@ -43,6 +43,21 @@ export const MOVEMENT = {
   gravity: new Vector3(0, -9.81, 0),
 } as const;
 
+// PR 78 — client canonical source for `PLAYER_MAX_AMMO`. The server
+// (`server/src/constants.rs::PLAYER_MAX_AMMO`) remains the authoritative
+// source; this constant is the client's mirror. If the server value
+// changes, this constant must change in lockstep (the smoke suite
+// validates the value end-to-end).
+//
+// NB-1 carry-forward from PR 11.7.E: before this constant existed,
+// the literal `6` was hardcoded in 8+ client-side sites
+// (`gameSession.tryStartReload`'s ammo gate, `scene.ts` reload
+// completion edge, `<BulletHud maxAmmo={...} />`, and 4 smoke
+// scripts). If `server/src/constants.rs::PLAYER_MAX_AMMO` ever
+// changed, every one of those sites would silently break. The
+// constant is now imported wherever the literal was.
+export const PLAYER_MAX_AMMO: number = 6;
+
 /** Stunt tunables (animation-state only — no physics deformation). */
 export const STUNTS = {
   /** Dive: forward boost + lower friction + visual lean for `durationMs`. */
