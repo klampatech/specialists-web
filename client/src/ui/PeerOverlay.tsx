@@ -11,6 +11,7 @@
 // `BulletHud` so the bottom-left HUD chip stays in sync.
 
 import { useEffect, useState } from "react";
+import { mapStatusToConnectionStatus } from "./connectionStatus";
 
 // PR 11.7.D2 / §3.10 — WebRTCPeer + signaling imports REMOVED.
 // The P2P host/join flow is gone; the overlay now surfaces the
@@ -124,9 +125,16 @@ export function PeerOverlay({ onStatusChange }: PeerOverlayProps) {
   // PR 11.7.D2 / §3.10 — replaced WebRTC peer-lifecycle hooks
   // (`peer.on("open" / "disconnect")`) with a polling loop on
   // `window.__serverTransport` (set by scene.ts's
-  // __forceServerTransport probe). Polls every 200ms; reports the
-  // current `getStats().connected` bit + transport kind up to the
-  // parent via `onStatusChange`.
+  // __forceServerTransport probe). Reports the current
+  // `getStats().connected` bit + transport kind up to the parent via
+  // `onStatusChange`.
+  //
+  // PR 75 — bumped poll cadence from 200ms → 100ms (10Hz, matches
+  // App.tsx's HUD-timer cadence) so the BulletHud connection chip
+  // reflects mid-frame transport state transitions within the same
+  // window as the other HUD fields. Was previously lagging ~200ms
+  // behind, which surfaces as a visible flicker when the MacBook
+  // sleeps + wakes or the WebTransport connection drops + reconnects.
   useEffect(() => {
     let cancelled = false;
     const poll = () => {
@@ -144,7 +152,7 @@ export function PeerOverlay({ onStatusChange }: PeerOverlayProps) {
       }
     };
     poll();
-    const interval = window.setInterval(poll, 200);
+    const interval = window.setInterval(poll, 100);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
@@ -152,13 +160,11 @@ export function PeerOverlay({ onStatusChange }: PeerOverlayProps) {
   }, []);
 
   // Mirror the status up to App for the BulletHud connection chip.
+  // PR 75 — extracted the mapping to a pure helper (vitested under
+  // Node, no jsdom) so the state-machine surface is regression-covered.
   useEffect(() => {
     if (!onStatusChange) return;
-    let s: "offline" | "waiting-ice" | "connected" | "disconnected" = "offline";
-    if (status.startsWith("Server: connected")) s = "connected";
-    else if (status.startsWith("Server: connecting")) s = "waiting-ice";
-    else if (status.startsWith("Server: offline")) s = "disconnected";
-    onStatusChange(s);
+    onStatusChange(mapStatusToConnectionStatus(status));
   }, [status, onStatusChange]);
 
   return (
