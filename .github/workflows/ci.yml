@@ -1054,6 +1054,115 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  # PR 82 — Havok empirical-behavior parity smoke. Compares the
+  # current Havok WASM binary's trajectory (coyote-time ledge walk-off
+  # + jump, mid-air hitscan) against the committed reference captures
+  # in `client/test-data/`. Catches regressions where a Havok update
+  # or scene.ts change silently shifts the empirical trajectory enough
+  # that gameplay features relying on coyote-time, mid-air hitscan,
+  # or jump physics break.
+  #
+  # **Tolerance**: 0.20m per-frame Y-trajectory difference; ≤20/60
+  # frames may differ before the smoke fails. Per-frame timing noise
+  # (wall-clock setTimeout drift) produces 5-15 frame shifts per
+  # scenario even when the physics is identical. A real Havok
+  # regression (wrong gravity, missing contact, broken jump impulse)
+  # diverges by 5-30m sustained over 30+ frames, which still fails
+  # the frame-count gate at this tolerance.
+  #
+  # **Why canary**: the smoke drives `localController` (Babylon Havok
+  # controller). The controller path requires `__gameSession` to be
+  # initialized via the server-auth transport URL, which needs the
+  # canary server running. The smoke itself only exercises Havok
+  # physics (no multiplayer state-machine asserts).
+  #
+  # **To regenerate the reference** (after a deliberate Havok update
+  # that legitimately shifts the trajectory): run
+  # `node tools/capture-havok-reference.mjs` locally, visually inspect
+  # the new trajectories, commit the regenerated `*-reference.json`
+  # files. The parity smoke uses the new reference automatically.
+  client-havok-parity-smoke:
+    name: client — Havok parity smoke (PR 82)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Boot canary server (ports 14433 + 14434)
+        run: |
+          nohup bash tools/canary-server.sh --port-wt 14433 --port-ws 14434             > /tmp/canary-server-havok-parity.log 2>&1 &
+          echo $! > /tmp/canary-server-havok-parity.pid
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+              echo "Canary server (havok-parity) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
+            echo "::error::Canary server (havok-parity) did not become ready in 60s"
+            cat /tmp/canary-server-havok-parity.log
+            exit 1
+          fi
+      - name: Boot Vite dev server (port 5191)
+        run: |
+          nohup npm run dev -- --host 127.0.0.1 --port 5191 --strictPort             > /tmp/vite-5191-havok-parity.log 2>&1 &
+          echo $! > /tmp/vite-5191-havok-parity.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5191/ > /dev/null; then
+              echo "Vite (havok-parity) ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:5191/ > /dev/null; then
+            echo "::error::Vite (havok-parity) did not become ready in 60s"
+            cat /tmp/vite-5191-havok-parity.log
+            exit 1
+          fi
+      - name: Run Havok parity smoke
+        run: node tools/havok-parity-smoke.mjs
+        env:
+          HAVOK_PARITY_URL: http://localhost:5191/
+          HAVOK_PARITY_WT_PORT: 14433
+          HAVOK_PARITY_WS_PORT: 14434
+          SMOKE_NO_BOOT: "1"
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: havok-parity-smoke-json
+          path: client/tools/havok-parity-smoke.json
+          if-no-files-found: warn
+      - name: Tear down canary + Vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server-havok-parity.pid ]]; then kill "$(cat /tmp/canary-server-havok-parity.pid)" || true; fi
+          if [[ -f /tmp/vite-5191-havok-parity.pid ]]; then kill "$(cat /tmp/vite-5191-havok-parity.pid)" || true; fi
+          pkill -f canary-server.sh || true
+          pkill -f 'vite.*5191' || true
+          for port in 5191 14433 14434; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   # Phase 0 / PR 8.1: wallrun regression smoke. Asserts that holding Q
   # in mid-air does NOT make the character fly up indefinitely. The
   # underlying bug: if wallrunPressed is true at any frame after the
