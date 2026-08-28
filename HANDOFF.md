@@ -7,9 +7,40 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#73 (2026-08-28). **`main` @ `c4b0b52` (PR #73 squash — MERGED 2026-08-28).** PR #73 delivers the last CI ungating piece: **pre-bakes the canary dev cert via `actions/cache`** (keyed on `server/src/main.rs` + `server/src/transport.rs` hash), and **removes `continue-on-error: true` from `client-two-tab-manual-flow-smoke`** — that smoke is now a **required CI gate** (was opt-in since the cert-flakiness era). Rust toolchain pinning also added to the smoke job (matches other damage-server smokes). The pre-baked cert eliminates ~25s of cold-start cert-gen time per CI run; the manual-flow smoke's `walk magnitude` assertion (CF-2026-08-27.A, fixed in PR #70) is now stable enough to gate merges. **CI: 26/26 GREEN (no opt-ins, all required)** — verified on the post-merge run. **CI matrix is now zero opt-ins**: every smoke is a required check. **CF-N1 (HP-convergence mpsc-saturation race) hit twice on PR #73** — both cleared via the empty-commit + push + wait-for-green recipe (per the ci-flake-handling skill). No new flake; same pre-existing intermittent the empty-commit protocol handles. **PRs #72 + #73 MERGED. None outstanding.**
+**`You are here`**: post-PR-#75 (2026-08-28). **`main` @ `f576b6e` (PR #75 squash — MERGED 2026-08-28).** PR #75 closes the last cosmetic from the post-#73 queue. **Two fixes**: (1) PeerOverlay poll cadence bumped **200ms → 100ms** (matches App.tsx's HUD-timer cadence) so the BulletHud connection chip reflects mid-frame transport state transitions within the same window as the other HUD fields. Was previously lagging up to 200ms behind, which surfaced as visible flicker when the MacBook sleeps+wakes or the WebTransport connection drops+reconnects. (2) **Extracted** the inline `status-string → ConnectionStatus` mapping (three `startsWith` checks + default branch inside a React effect) to a pure helper `mapStatusToConnectionStatus(status: string): ConnectionStatus` in `client/src/ui/connectionStatus.ts`. The helper is **vitested under Node, no jsdom** — 10 new tests cover the connected / connecting / offline / default branches + mid-frame transitions + prefix-order invariant. **vitest: 33 → 43 tests PASS** (+10 new). **CF-N1 (HP-convergence mpsc-saturation race) hit on first CI run** of PR #75, cleared via the empty-commit + push + wait-for-green recipe (per the ci-flake-handling skill). No new flake. **CI: 26/26 GREEN on retry**. **PRs #72 + #73 + #74 + #75 MERGED. None open.**
 
-**Recommended next PR** (Priority 1, ~30 min): **PR 74 — `fix(ui): vitest connectionStatus-drift fix** — PeerOverlay / App.HUD state-machine lags when transport state changes mid-frame; cosmetic UI flicker, no behavior bug. Read `client/src/ui/PeerOverlay.tsx` + `client/src/ui/App.tsx` for the two-state-machine surface; the fix is probably "carry last-value-through" similar to PR #62's `connectionStatus` clobber fix. **Priority 2 (defer to live pilot)**: **Final live pilot at the office** — m5+MacBook both alive, real-gameplay walk + shoot across both machines against the now-clean PR #73 CI gate. This is the last acceptance criterion for the internet-multiplayer milestone (Kyle's "stable across all scenarios" criterion, cc: `1542549692896772196`). **Defer:** NB-3 from PR #56 (R-keypress needs a real-browser tier-3 test); remote rig collision (blue-rig clips through boxes); anti-cheat on yaw/pitch (Phase 4 / PR 11.10); server-side hit detection refinement (hitbox lag-comp + multi-bullet); PR `0x0B MeleeEvent` future wire type (Phase 2); visual rig position propagation (snapshot.positionX/Y → remote rig visualRoot); debug menu page.
+**Phase 1 / internet-multiplayer milestone is functionally complete**: wire path works (PR #59), smoke harness standard (PR #65–#68), cross-machine smoke as required gate (PR #71), CI fully ungated (PR #73), HUD state machine regression-covered (PR #75). **Only one remaining item before this milestone is fully accepted**: the **Final live pilot at the office** — m5+MacBook both alive (verified `ssh kylelampa@100.79.235.118` OK this session), real-gameplay walk+shoot across both machines. This is the last acceptance criterion for the milestone (Kyle's "stable across all scenarios" criterion, cc: `1542549692896772196`).
+
+**Defer (Phase 2 / cosmetic)**: NB-3 from PR #56 (R-keypress needs a real-browser tier-3 test); remote rig collision (blue-rig clips through boxes); anti-cheat on yaw/pitch (Phase 4 / PR 11.10); server-side hit detection refinement (hitbox lag-comp + multi-bullet); PR `0x0B MeleeEvent` future wire type (Phase 2); visual rig position propagation (snapshot.positionX/Y → remote rig visualRoot); debug menu page.
+
+---
+
+## 2026-08-28 — PR #75 merge + post-#75-merge docs
+
+**Scope**: post-merge docs PR for PR #75 (connectionStatus-drift fix). No code surface change. PR #75 already shipped (verified via `gh pr list`); merged at 15:00 UTC. `main` is now at `f576b6e`.
+
+**What PR #75 delivered** (recap for the next reader):
+- `client/src/ui/connectionStatus.ts` (NEW, 41 lines) — pure helper `mapStatusToConnectionStatus(status: string): ConnectionStatus` exported alongside the `ConnectionStatus` type union.
+- `client/src/ui/connectionStatus.test.ts` (NEW, 88 lines, 10 tests) — covers all four branches + mid-frame transition + prefix-order invariant. Tests run under Node (vitest config), no jsdom required.
+- `client/src/ui/PeerOverlay.tsx` — uses the helper instead of inline `startsWith` checks; poll cadence bumped from `setInterval(poll, 200)` to `setInterval(poll, 100)` to match App.tsx's HUD-timer.
+
+**Vitest state right now**: 43/43 PASS (was 33 baseline + 10 new). `npm run typecheck` clean. `npm run build` clean (+7.5 kB raw from Vite chunking noise; helper inlined into PeerOverlay at build).
+
+**CI state right now**: 26/26 GREEN on `main @ f576b6e`. All required, no opt-ins.
+
+**CF-N1 retrigger log**: hit once on PR #75's first CI run, cleared via empty-commit + push + wait-for-green. Same pre-existing intermittent (PR #42 outbound mpsc 256 saturation under sustained headless load) the empty-commit protocol handles.
+
+**Housekeeping done this session** (no PR, just shell):
+- Branch `fix/pr75-connectionstatus-drift` local + remote cleaned up after merge.
+- Worktree reconciled to `origin/main @ f576b6e`.
+- Docs branch `docs/post-pr75-merge` opened for this update.
+
+**Docs updates in this PR**:
+- `docs/SPEC.md` — new `Current status (2026-08-28, post-PR-#75 — connectionStatus-drift fixed, vitest coverage 43/43)` block (prefixed `|\n>` per the SPEC convention). Documents both fixes + CF-N1 retrigger + the milestone-completion summary.
+- `HANDOFF.md` — TL;DR refreshed to point at post-#75 + the final live pilot as the only remaining milestone acceptance work. Recommended next PR queue is now empty (Phase 2 items only).
+- New 2026-08-28 session entry documenting the docs PR.
+
+**Where we are**: Phase 1 / internet-multiplayer milestone is functionally complete. The next decision is whether to (a) run the final live pilot now (you're at the office, both machines alive), or (b) take a Phase 2 deferred work item, or (c) declare the milestone accepted and pivot to something new. No code work is currently queued.
 
 ---
 
