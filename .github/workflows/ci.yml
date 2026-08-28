@@ -743,19 +743,14 @@ jobs:
     #   4. Tab A walks forward → Tab B's remote rig mirrors the walk.
     #   5. HP cross-tab converges after firing from Tab A.
     # See client/tools/two-tab-manual-flow.mjs for the full assertion list.
-    # NOTE: this smoke is a manual-flow REPLICA, not part of the
-    # automated PR gate yet. CI's slow dev-cert generation (~75s)
-    # races the smoke's canary-wait timeout, making this job flaky
-    # on a cold runner. Kyle runs it manually via
-    # `node client/tools/two-tab-manual-flow.mjs` against his local
-    # canary+vite to validate cross-tab visible behavior. Once we
-    # wire canary-server.sh to skip cert generation when a
-    # pre-baked cert exists in CI's cache, this flips to a required
-    # gate. (CI FAIL is expected on the first few runs as we
-    # stabilize the boot ordering.)
-    name: client — two-tab manual-flow smoke (replicates user manual test, PR 11.7.D2.1, opt-in)
+    # PR 73 — pre-baked dev cert at job setup eliminates the ~75s
+    # cold-start dev-cert generation that previously raced the
+    # smoke's canary-wait timeout. PR #70 fixed the walk-assertion
+    # false-positive + PR #71 verified the wire path on the same
+    # cert infrastructure; this PR is the third piece. The smoke
+    # is now a required CI gate (no continue-on-error).
+    name: client — two-tab manual-flow smoke (replicates user manual test, PR 11.7.D2.1)
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: client
@@ -777,6 +772,24 @@ jobs:
       - name: Install Playwright browser (chromium only)
         run: npx playwright install chromium
         timeout-minutes: 3
+      - name: Cache canary self-signed cert (PR 73 — eliminates 75s cold-start delay)
+        # PR 73 — cache `server/certs/` so the dev-cert is pre-baked
+        # across CI runs. The cert is keyed on the SANs list + the
+        # server binary's build hash (changes when `--sans` or the
+        # rcgen path changes). This eliminates the cold-start cert
+        # generation (~75-85s) that previously raced the smoke's
+        # canary-wait timeout (60s), making the smoke flaky on cold
+        # runners. With the cache, the smoke's canary boot is
+        # immediate — the existing 60s wait loop is plenty of
+        # headroom for the binary to bind.
+        uses: actions/cache@v4
+        with:
+          path: server/certs
+          key: canary-cert-${{ runner.os }}-${{ hashFiles('server/src/main.rs', 'server/src/transport.rs') }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
       - name: Pre-build canary binary (avoid racing smoke's boot)
         run: |
           # Belt-and-suspenders: kill any stragglers from previous
@@ -786,12 +799,10 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
           # PR 11.6.B server is a release-mode cargo binary; build it
-          # FIRST so the smoke doesn't have to wait for compile +
-          # cert generation at smoke time. CI's cold dev-cert
-          # generation alone takes ~75-85s; building the binary
-          # first lets the smoke's own canary boot immediately on
-          # top. Note: this job's defaults.run.working-directory is
-          # `client/`, so we cd up one level to find the repo root.
+          # FIRST so the smoke doesn't have to wait for compile at
+          # smoke time. With the cert cached (PR 73), the canary
+          # boot itself is now ~0.5s — the smoke's 60s wait loop has
+          # ample headroom.
           (cd ../server && cargo build --release --bin specialists-server)
         env:
           CARGO_TERM_COLOR: never
