@@ -422,13 +422,26 @@ async function main() {
   if (!rigsAAfter?.local || !rigsBAfter?.remote) {
     errors.push(`[walk-read] post-walk rig positions unavailable`);
   } else {
-    const walkedBy = Math.abs(rigsAAfter.local.x - rigsA.local.x);
+    // PR 70 / CF-2026-08-27.A — measure walk distance as magnitude
+    // (√(Δx² + Δz²)) instead of `Δx` alone. Babylon's W key moves
+    // the rig in +Z (forward in the standard scene), not +X —
+    // the previous `Δx`-only check caused a false-positive "W key
+    // not reaching input handler" on every CI run. The smoke is
+    // opt-in (`continue-on-error: true`), so the failure didn't
+    // block PRs, but it wasted ~2 minutes per CI run AND could mask
+    // a real walk regression if the rig happened to move only in Z.
+    // The fix ungates the smoke to required.
+    const dx = rigsAAfter.local.x - rigsA.local.x;
+    const dz = rigsAAfter.local.z - rigsA.local.z;
+    const walkedBy = Math.sqrt(dx * dx + dz * dz);
     if (walkedBy < 0.3) {
-      errors.push(`[walk] Tab A's local rig didn't translate (Δx=${walkedBy.toFixed(2)}m) — W key not reaching input handler`);
+      errors.push(`[walk] Tab A's local rig didn't translate (Δ=${walkedBy.toFixed(2)}m) — W key not reaching input handler`);
     } else {
       log(`Tab A walked ${walkedBy.toFixed(2)}m forward.`);
       // Did Tab B's view of Tab A's remote rig follow?
-      const tabBRemoteMovedBy = Math.abs(rigsBAfter.remote.x - rigsB.remote.x);
+      const remoteDx = rigsBAfter.remote.x - rigsB.remote.x;
+      const remoteDz = rigsBAfter.remote.z - rigsB.remote.z;
+      const tabBRemoteMovedBy = Math.sqrt(remoteDx * remoteDx + remoteDz * remoteDz);
       if (tabBRemoteMovedBy < 0.2) {
         const lastSet = rigsBAfter.lastSetPos;
         const lastTick = rigsBAfter.lastTick;
