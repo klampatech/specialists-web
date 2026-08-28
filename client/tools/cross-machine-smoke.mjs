@@ -108,6 +108,18 @@ async function isTcpReachable(host, port, timeoutMs = 2000) {
   });
 }
 
+// PR 71 — pick the right host for the navigation URL. When
+// KYLAMPA_SSH_PASSWORD is empty (CI), use 127.0.0.1 because CI
+// runners don't have Tailscale. When MacBook path is active (local
+// dev), use the Tailscale IP so the MacBook Chrome can reach the
+// canary + vite.
+const NAV_HOST = MACBOOK_SSH_PASSWORD ? M5_TAILSCALE_IP : "127.0.0.1";
+// PR 71 — pick the right SANS for the dev cert. Local dev needs
+// Tailscale IPs; CI doesn't.
+const SANS_EXTRA = MACBOOK_SSH_PASSWORD ? `--sans ${M5_TAILSCALE_IP},${MACBOOK_IP}` : "";
+
+log(`NAV_HOST = ${NAV_HOST}`);
+
 // --- Canary + Vite boot ---
 async function bootCanary() {
   log("Booting canary server (binds 0.0.0.0 by default)…");
@@ -116,7 +128,7 @@ async function bootCanary() {
     [resolve(REPO_ROOT, "tools", "canary-server.sh"),
      "--port-wt", String(WT_PORT),
      "--port-ws", String(WS_PORT),
-     "--sans", `${M5_TAILSCALE_IP},${MACBOOK_IP}`],
+     ...(SANS_EXTRA ? SANS_EXTRA.split(" ") : [])],
     { RUST_LOG: "snapshot_debug=debug,info" },
     "canary",
   );
@@ -312,7 +324,7 @@ async function main() {
         content: `
           window.__forceServerTransport = true;
           window.__damageServerPorts   = { wt: ${WT_PORT}, ws: ${WS_PORT} };
-          window.__damageServerUrl     = ${JSON.stringify(`http://${M5_TAILSCALE_IP}:${VITE_PORT}/`)};
+          window.__damageServerUrl     = ${JSON.stringify(`http://${NAV_HOST}:${VITE_PORT}/`)};
           window.__damageServerRoomId  = "${ROOM}";
           window.__localPlayerId       = ${localId};
           window.__peerPlayerId        = ${peerId};
@@ -320,7 +332,7 @@ async function main() {
       });
     }
 
-    const navUrl = `http://${M5_TAILSCALE_IP}:${VITE_PORT}/?server=${encodeURIComponent(`ws://${M5_TAILSCALE_IP}:${WS_PORT}/rooms/${ROOM}`)}`;
+    const navUrl = `http://${NAV_HOST}:${VITE_PORT}/?server=${encodeURIComponent(`ws://${NAV_HOST}:${WS_PORT}/rooms/${ROOM}`)}`;
     log(`Navigating both tabs to ${navUrl}`);
     await Promise.all([
       pageA.goto(navUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }),
