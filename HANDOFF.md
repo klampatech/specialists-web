@@ -7,11 +7,77 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#75 (2026-08-28). **`main` @ `f576b6e` (PR #75 squash — MERGED 2026-08-28).** PR #75 closes the last cosmetic from the post-#73 queue. **Two fixes**: (1) PeerOverlay poll cadence bumped **200ms → 100ms** (matches App.tsx's HUD-timer cadence) so the BulletHud connection chip reflects mid-frame transport state transitions within the same window as the other HUD fields. Was previously lagging up to 200ms behind, which surfaced as visible flicker when the MacBook sleeps+wakes or the WebTransport connection drops+reconnects. (2) **Extracted** the inline `status-string → ConnectionStatus` mapping (three `startsWith` checks + default branch inside a React effect) to a pure helper `mapStatusToConnectionStatus(status: string): ConnectionStatus` in `client/src/ui/connectionStatus.ts`. The helper is **vitested under Node, no jsdom** — 10 new tests cover the connected / connecting / offline / default branches + mid-frame transitions + prefix-order invariant. **vitest: 33 → 43 tests PASS** (+10 new). **CF-N1 (HP-convergence mpsc-saturation race) hit on first CI run** of PR #75, cleared via the empty-commit + push + wait-for-green recipe (per the ci-flake-handling skill). No new flake. **CI: 26/26 GREEN on retry**. **PRs #72 + #73 + #74 + #75 MERGED. None open.**
+**`You are here`**: post-PR-#76 (2026-08-28). **`main` @ `455d28d` (PR #76 squash — MERGED 2026-08-28).** **🎯 Phase 1 / internet-multiplayer milestone is FULLY ACCEPTED.** Final live pilot ran this session at 15:30 UTC on real m5+MacBook via `cross-machine-smoke.mjs` with `KYLAMPA_SSH_PASSWORD` set. **`tab_b_source: "macbook"`** confirmed in the summary JSON (NOT the m5-headless fallback). All 3 assertions PASSED:
+1. Both tabs `Connected (idle)` within 0.5s with `liveHookFn` set on both remote rig visualRoots.
+2. Tab B 'd' keypress for 2s moved `(-4, 0) → (2.5, 0)`; Tab A's view tracked exactly to `(2.5, 0)`.
+3. Tab A real mouse click sent AimEvent (`frame=568, eventId=3564497716`) → Tab B HP dropped `100 → 88` (Δ=12 = `DUAL_PISTOL_DAMAGE`).
 
-**Phase 1 / internet-multiplayer milestone is functionally complete**: wire path works (PR #59), smoke harness standard (PR #65–#68), cross-machine smoke as required gate (PR #71), CI fully ungated (PR #73), HUD state machine regression-covered (PR #75). **Only one remaining item before this milestone is fully accepted**: the **Final live pilot at the office** — m5+MacBook both alive (verified `ssh kylelampa@100.79.235.118` OK this session), real-gameplay walk+shoot across both machines. This is the last acceptance criterion for the milestone (Kyle's "stable across all scenarios" criterion, cc: `1542549692896772196`).
+Artifacts at `/tmp/smoke-20260828-103022-cross-machine/` (8 files, 470KB). Closes the "stable across all scenarios" acceptance criterion from `cc: 1542549692896772196`. **CI: 26/26 GREEN on `main @ 455d28d`. PR queue is EMPTY.**
 
-**Defer (Phase 2 / cosmetic)**: NB-3 from PR #56 (R-keypress needs a real-browser tier-3 test); remote rig collision (blue-rig clips through boxes); anti-cheat on yaw/pitch (Phase 4 / PR 11.10); server-side hit detection refinement (hitbox lag-comp + multi-bullet); PR `0x0B MeleeEvent` future wire type (Phase 2); visual rig position propagation (snapshot.positionX/Y → remote rig visualRoot); debug menu page.
+**No code work currently queued.** Recommended next direction (your call):
+- **(a) Phase 2 work** — pick a deferred item: NB-3 R-keypress tier-3 test, remote rig collision (blue-rig clips through boxes), anti-cheat on yaw/pitch (Phase 4 / PR 11.10), server-side hit detection refinement (hitbox lag-comp + multi-bullet), `0x0B MeleeEvent` wire type, visual rig position propagation (snapshot.positionX/Y → remote rig visualRoot), debug menu page.
+- **(b) Pivot to a new feature arc** — what's the next product goal beyond Phase 1? Matchmaker (PR 11.9), production Tailscale-Funnel cert handling, lobby UI, spectator mode, replay system, scoreboard, etc.
+- **(c) Maintenance / debt sweep** — no open bugs from CI or live-pilot evidence, but there are Phase-1 code-surface items deferred (e.g. `0x06 InputsServer DEVBX_ROOM_ID hardcode` carry-forward from PR #59, which still affects non-DEVBX rooms).
+
+---
+
+## 2026-08-28 — Final live pilot (15:30 UTC) + Phase 1 milestone accepted + PR #76 docs
+
+**THIS IS THE BIG ENTRY.** Phase 1 / internet-multiplayer milestone is now FULLY ACCEPTED. The live pilot that was the only outstanding acceptance criterion ran cleanly on the first try.
+
+**Live pilot setup**:
+- m5 (Kyle's NUC, Tailscale IP `100.95.111.112`) — headless Chrome Tab A driver
+- MacBook Pro (Kyle's, Tailscale IP `100.79.235.118`) — real Google Chrome Tab B observer via SSH+CDP tunnel
+- Pre-flight: killed leftover canary / vite / SSH-tunnel / MacBook Chrome on port 9224 (verified clean)
+- `KYLAMPA_SSH_PASSWORD='kyle'` set in env (Kyle shared the password over chat per the operator manual — note for next session: **rotate the password on the MacBook ASAP via `passwd` from the Mac terminal directly**; sshpass can't do this)
+- Smoke command: `KYLAMPA_SSH_PASSWORD='kyle' node client/tools/cross-machine-smoke.mjs`
+- Canary ports: WT 14437 + WS 14438 (overrides the smoke defaults via `RUST_CM_WT_PORT` / `RUST_CM_WS_PORT` not set, so it used built-in defaults)
+- Vite port: 5193 (default)
+- Room: `CM_1787931022944` (timestamp-derived, isolated from any other smoke run)
+
+**Pilot timeline** (54s total):
+- 0–6s: canary boots
+- 6–7s: vite boots
+- 7–8s: MacBook SSH confirmed reachable
+- 8–9s: m5 headless Tab A launched
+- 9–10s: MacBook Chrome launched via `nohup ... & disown` (raw SSH cmd, exit 0)
+- 10–11s: SSH tunnel m5:9224 → MacBook:9224 established
+- 11s: `✓ MacBook Tab B connected via CDP tunnel`
+- 12s: Both tabs navigated to `http://100.95.111.112:5193/?server=ws://...`
+- 12.5s: Both tabs `Connected (idle)`
+- 13–14s: Assertion 1 — both tabs' remote rig visualRoots verified with `liveHookFn: true`
+- 14–17s: Assertion 2 — Tab B 'd' keypress for 2s moved `(-4, 0) → (2.5, 0)`; Tab A's view tracked exactly
+- 17–19s: Assertion 3 — Tab A real mouse click sent AimEvent → Tab B HP `100 → 88`
+- 19s: `=== ALL CROSS-MACHINE ASSERTIONS PASSED ===`
+- 54s: Smoke exits rc=0
+
+**Pilot artifacts** (`/tmp/smoke-20260828-103022-cross-machine/`, 8 files, 470KB):
+- `cross-machine-summary.json` (682 bytes) — `{tab_b_source: "macbook", all_assertions_passed: true, rig_visual_A_after_move: {visualX: 2.5, visualZ: 0, ...}, tab_b_hp_before: 100, tab_b_hp_after: 88}`
+- `browser-console-A.log` (m5 headless)
+- `browser-console-B.log` (**real MacBook Chrome**)
+- `screenshot-A-after-move.png` (m5 headless, 70KB)
+- `screenshot-B-after-move.png` (**real MacBook Chrome**, 221KB — visible Babylon scene + HUD)
+- `canary.log` (180KB — full session trace including snapshot broadcasts)
+- `vite.log` (410 bytes)
+- `macbook-tunnel.log` (45 bytes — tunnel established cleanly)
+
+**Cleanup** (post-smoke, all verified CLEAN):
+- Killed m5 dev canary (port 14437 WT + 14438 WS)
+- Killed m5 dev vite (port 5193)
+- Killed m5 MacBook CDP tunnel (port 9224)
+- Killed MacBook Chrome with `--remote-debugging-port=9224` (via sshpass)
+- No leftover specialist processes remain
+
+**Why this matters**: This is the acceptance test Kyle has been chasing since `cc: 1542549692896772196` ("regression or we never fixed the issue"). The m5-headless fallback that PR #71 wired into CI proves the pipeline works; the m5+MacBook real-Chrome variant proves it works on the actual production target hardware with the actual production browser. **Two machines, two real Chrome instances, real mouse, real keypress, real wire path, real damage**. No fallback. No "works on the dev box." The milestone is accepted.
+
+**PR #76 docs** (also this session): docs-only post-#75-merge PR; merged 16:03 UTC. Updated HANDOFF TL;DR + SPEC Current-status to reflect post-#75 + final live pilot as the only remaining milestone work. (This PR refreshes those to reflect the pilot SUCCESS + milestone acceptance.)
+
+**CF-N1 retrigger log for PR #76**: hit twice (unusually sticky this session — usually clears on 2nd, took 3rd here). Three empty commits total on the branch (`7745fba`, `627b8a0`). No new flake, same pre-existing intermittent. **Now resetting the operator-manual counter**: the next session should still apply the empty-commit + push + wait recipe as documented; no behavior change.
+
+**Recommended next direction** (no specific PR queued — your call):
+- **(a) Phase 2 work** — pick a deferred item. NB-3 R-keypress tier-3 test (real-browser integration test, ~1h), remote rig collision (visible QA defect, ~30min), anti-cheat yaw/pitch (Phase 4 / PR 11.10, multi-session), server-side hit detection refinement (hitbox lag-comp + multi-bullet, multi-session), `0x0B MeleeEvent` wire type (Phase 2, ~2 sessions), visual rig position propagation (snapshot.positionX/Y → remote rig visualRoot, ~30min), debug menu page (~2h).
+- **(b) Pivot to a new feature arc** — matchmaker (PR 11.9 from the original plan), production Tailscale-Funnel cert handling (PR 11.6.E from the original plan), lobby UI, spectator mode, replay system, scoreboard, leaderboard, anti-cheat telemetry, etc.
+- **(c) Maintenance / debt sweep** — Phase-1 code-surface items deferred: `0x06 InputsServer DEVBX_ROOM_ID hardcode` carry-forward from PR #59 (affects non-DEVBX rooms; non-blocking but real), `server/src/main.rs` outbound mpsc capacity bump (CF-N1 root cause; 256 → 512 was on the `chore/phase1-server-outbound-channel-bump` branch that we dropped — could revisit and ship).
 
 ---
 
