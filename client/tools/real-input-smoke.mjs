@@ -22,13 +22,14 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { attachSmokeCapture, makeSmokeOutDir, spawnWithStderrCapture } from "./smoke-capture.mjs";
+// PR 78 — import from shared smoke constant; server canonical: server/src/constants.rs::PLAYER_MAX_AMMO
+import { PLAYER_MAX_AMMO } from "./_ammo.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
 const VT_URL  = "http://localhost:5191/";
 const WT_PORT = 14433;
 const WS_PORT = 14434;
-const PLAYER_MAX_AMMO = 6;
 const DUAL_PISTOL_DAMAGE = 12;
 const EXPECTED_HP_DROP = DUAL_PISTOL_DAMAGE;
 const HIT_SETTLE_MS = 4000;  // generous wait for cross-machine latency

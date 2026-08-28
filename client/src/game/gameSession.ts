@@ -53,7 +53,7 @@
 
 import { type Scene, Vector3 } from "@babylonjs/core";
 
-import { CAPSULE } from "../engine/characterConfig";
+import { CAPSULE, PLAYER_MAX_AMMO } from "../engine/characterConfig";
 import { createCharacterController, type CharacterController, type InputState } from "../engine/characterController";
 import { attachPoseUpdater, createCharacterModel } from "../engine/characterModel";
 import { decodeInput, encodeInput } from "../net/inputBitmask";
@@ -438,11 +438,11 @@ export function createGameSession(
   // for the AimEvent pre-check (avoid spamming the wire when
   // the server would reject). Both are cosmetic — the server is
   // the source of truth and the snapshot stream carries the
-  // authoritative values. Initial ammo = 6 (matches
-  // `server/src/constants.rs::PLAYER_MAX_AMMO` and App.tsx's
-  // `<BulletHud maxAmmo={6} />`).
+  // authoritative values. Initial ammo = PLAYER_MAX_AMMO (matches
+  // `server/src/constants.rs::PLAYER_MAX_AMMO` — the server is canonical;
+  // see `client/src/engine/characterConfig.ts` for the client mirror).
   let lastFireMsLocal = 0;
-  let ammoCountLocal = 6;
+  let ammoCountLocal = PLAYER_MAX_AMMO;
   /**
    * PR 11.4: when true, BOTH controllers skip their per-tick
    * `update()` call (the spectator camera has absorbed the WASD keys,
@@ -947,9 +947,10 @@ export function createGameSession(
       const localSnapPlayer = snap?.players.find((p) => p.playerId === localPlayerId);
             // No-op if the local player's magazine is already full. The
       // server enforces the same gate authoritatively (gate 4 in
-      // validate_and_relay_reload: ammo<max). Literal 6 mirrors the
-      // server-side PLAYER_MAX_AMMO constant in server/src/constants.rs.
-      if (localSnapPlayer && localSnapPlayer.ammo >= 6) return;
+      // validate_and_relay_reload: ammo<max). Uses PLAYER_MAX_AMMO
+      // from `client/src/engine/characterConfig.ts` (the client mirror
+      // of `server/src/constants.rs::PLAYER_MAX_AMMO`).
+      if (localSnapPlayer && localSnapPlayer.ammo >= PLAYER_MAX_AMMO) return;
       const eventId = dbNextReloadEventId();
       const now = performance.now();
       reloadingUntilMs = now + COMBAT.dualPistol.reloadMs;
