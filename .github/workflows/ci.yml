@@ -815,6 +815,81 @@ jobs:
             pids=$(lsof -ti:${port} 2>/dev/null || true)
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
+  client-cross-machine-smoke:
+    # PR 71 — cross-machine browser validation smoke. CI uses the
+    # m5-headless fallback path (no MacBook access from CI runners).
+    # Real cross-machine validation happens locally via
+    # `node client/tools/cross-machine-smoke.mjs` with
+    # KYLAMPA_SSH_PASSWORD set, to actually exercise m5 headless +
+    # MacBook real Chrome via SSH+CDP tunnel. The CI job is the
+    # regression gate: a fix that passes locally but breaks the
+    # wire path gets caught here.
+    #
+    # Unique ports (14437/14438/5193) avoid clashes with other
+    # smokes' port allocations. The canary boots with --sans so the
+    # dev cert covers m5's Tailscale IP.
+    name: client — cross-machine browser validation smoke (PR 11.7.D3.4, m5-headless fallback in CI)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (release)
+        working-directory: .
+        run: cargo build --release --manifest-path server/Cargo.toml
+      - name: Run cross-machine smoke
+        run: node ./tools/cross-machine-smoke.mjs
+        env:
+          RUST_CM_WT_PORT: "14437"
+          RUST_CM_WS_PORT: "14438"
+          RUST_CM_VITE_PORT: "5193"
+          # Force m5-headless Tab B path explicitly. The smoke's
+          # isMacbookReachable() already detects unset password and
+          # falls back automatically; this makes the CI intent clear.
+          KYLAMPA_SSH_PASSWORD: ""
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-machine-smoke-artifacts
+          path: |
+            /tmp/smoke-*-cross-machine/canary.log
+            /tmp/smoke-*-cross-machine/vite.log
+            /tmp/smoke-*-cross-machine/browser-console-*.log
+            /tmp/smoke-*-cross-machine/macbook-tunnel.log
+            /tmp/smoke-*-cross-machine/cross-machine-summary.json
+            /tmp/smoke-*-cross-machine/screenshot-*.png
+          if-no-files-found: warn
+      - name: Tear down canary + Vite
+        if: always()
+        run: |
+          pkill -f canary-server.sh || true
+          pkill -f 'vite.*5193' || true
+          for port in 5193 14437 14438; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
   # PR 11.7.D3.3 — 24-player stress smoke. Pushes the room to
   # MAX_PLAYERS_PER_ROOM = 24 (server/src/constants.rs) and verifies
   # the snapshot fan-out reaches all 24 tabs without saturating the

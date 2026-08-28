@@ -47,7 +47,12 @@ const MACBOOK_CDP_LOCAL = 9224;
 const MACBOOK_CDP_REMOTE = 9224;  // CDP port on MacBook Chrome
 
 const ROOM = `CM_${Date.now()}`;
-const MACBOOK_SSH_PASSWORD = process.env.KYLAMPA_SSH_PASSWORD ?? "[REDACTED]";
+const MACBOOK_SSH_PASSWORD = process.env.KYLAMPA_SSH_PASSWORD && process.env.KYLAMPA_SSH_PASSWORD.length > 0
+  ? process.env.KYLAMPA_SSH_PASSWORD
+  : null;  // PR 71 — null disables the MacBook path entirely (smoke
+           // uses m5-headless Tab B fallback). Empty string falls
+           // through to null to make CI's `KYLAMPA_SSH_PASSWORD: ""`
+           // explicit-disable behave identically to "unset".
 
 log(`OUT_DIR = ${OUT_DIR}`);
 log(`Room     = ${ROOM}`);
@@ -67,6 +72,9 @@ function spawnLogged(cmd, args, opts, logName) {
 }
 
 function sshCmd(...args) {
+  if (!MACBOOK_SSH_PASSWORD) {
+    return { status: 127, stdout: "", stderr: "KYLAMPA_SSH_PASSWORD not set" };
+  }
   return spawnSync(
     "sshpass",
     ["-p", MACBOOK_SSH_PASSWORD, "ssh",
@@ -85,6 +93,7 @@ function sshExec(...args) {
 }
 
 function isMacbookReachable() {
+  if (!MACBOOK_SSH_PASSWORD) return false;  // PR 71 — no password = no MacBook path
   const r = sshCmd("echo", "ok");
   return r.status === 0 && r.stdout.trim() === "ok";
 }
