@@ -7,17 +7,43 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#76 (2026-08-28). **`main` @ `455d28d` (PR #76 squash — MERGED 2026-08-28).** **🎯 Phase 1 / internet-multiplayer milestone is FULLY ACCEPTED.** Final live pilot ran this session at 15:30 UTC on real m5+MacBook via `cross-machine-smoke.mjs` with `KYLAMPA_SSH_PASSWORD` set. **`tab_b_source: "macbook"`** confirmed in the summary JSON (NOT the m5-headless fallback). All 3 assertions PASSED:
-1. Both tabs `Connected (idle)` within 0.5s with `liveHookFn` set on both remote rig visualRoots.
-2. Tab B 'd' keypress for 2s moved `(-4, 0) → (2.5, 0)`; Tab A's view tracked exactly to `(2.5, 0)`.
-3. Tab A real mouse click sent AimEvent (`frame=568, eventId=3564497716`) → Tab B HP dropped `100 → 88` (Δ=12 = `DUAL_PISTOL_DAMAGE`).
+**`You are here`**: post-PR-#78 (2026-08-28). **`main` @ `cbf6eb7` (PR #78 squash — MERGED 2026-08-28).** PR #78 closes **NB-1** (carry-forward from PR 11.7.E). Before this PR, the literal `6` was hardcoded in **7 client-side sites** (3 production code + 4 smoke scripts), with only a comment reference to `server/src/constants.rs::PLAYER_MAX_AMMO`. If the server value ever changed, every site would silently break. **Fix**: added `PLAYER_MAX_AMMO` to `client/src/engine/characterConfig.ts` (client canonical mirror) + `client/tools/_ammo.mjs` (smoke shared source). 6 sites now use the named constant; .cjs smoke keeps a literal + coupling comment (CommonJS can't import ESM). **vitest: 43/43** (structural, no count change). **CF-N1 hit on first CI run**, cleared via empty-commit recipe. **CI: 26/26 GREEN on retry**. **`Phase 1 milestone + NB-1 both closed`.**
 
-Artifacts at `/tmp/smoke-20260828-103022-cross-machine/` (8 files, 470KB). Closes the "stable across all scenarios" acceptance criterion from `cc: 1542549692896772196`. **CI: 26/26 GREEN on `main @ 455d28d`. PR queue is EMPTY.**
+**⚠️ Important caveat from Kyle (`cc: 1542955136383459439`)**: this is a **temporary bridge** for the current dual-pistol-only state. Once weapons multiply (different ammo counts per weapon — e.g. shotgun 2, sniper 5, rifle 30), the top-level `PLAYER_MAX_AMMO` constant needs to become `WEAPONS.dualPistol.maxAmmo` or similar. The single-weapon assumption is encoded in the naming. NB-3 follow-up (R-keypress real-browser tier-3 test) was already covered by the cross-machine pilot + the .cjs smoke's existing B-3 pointerLocked check, so NB-3 is also effectively closed at the milestone-acceptance level (formal close-out deferred to whenever weapons get added — both NB-1 and NB-3 reopen then).
 
 **No code work currently queued.** Recommended next direction (your call):
-- **(a) Phase 2 work** — pick a deferred item: NB-3 R-keypress tier-3 test, remote rig collision (blue-rig clips through boxes), anti-cheat on yaw/pitch (Phase 4 / PR 11.10), server-side hit detection refinement (hitbox lag-comp + multi-bullet), `0x0B MeleeEvent` wire type, visual rig position propagation (snapshot.positionX/Y → remote rig visualRoot), debug menu page.
-- **(b) Pivot to a new feature arc** — what's the next product goal beyond Phase 1? Matchmaker (PR 11.9), production Tailscale-Funnel cert handling, lobby UI, spectator mode, replay system, scoreboard, etc.
-- **(c) Maintenance / debt sweep** — no open bugs from CI or live-pilot evidence, but there are Phase-1 code-surface items deferred (e.g. `0x06 InputsServer DEVBX_ROOM_ID hardcode` carry-forward from PR #59, which still affects non-DEVBX rooms).
+- **(a) Pivot to weapons** — add a second weapon type (shotgun or sniper) with its own ammo constant + the WEAPONS-table refactor that Kyle flagged.
+- **(b) Pivot to new feature arc** — matchmaker (PR 11.9), production Tailscale-Funnel certs (PR 11.6.E), lobby UI, spectator mode, replay, scoreboard.
+- **(c) Maintenance / debt sweep — CF-N1 root-cause fix** — ship the mpsc capacity bump on a fresh branch (the `chore/phase1-server-outbound-channel-bump` branch was deleted; recreate and ship).
+
+---
+
+## 2026-08-28 — PR #78 merge + post-#78-merge docs + Kyle's "weapons" call-out
+
+**Scope**: post-merge docs PR for PR #78 (PLAYER_MAX_AMMO constant extraction). No code surface change. PR #78 already shipped (verified via `gh pr list`); merged at 17:00 UTC. `main` is now at `cbf6eb7`.
+
+**What PR #78 delivered** (recap for the next reader):
+- `client/src/engine/characterConfig.ts` — added `export const PLAYER_MAX_AMMO: number = 6` (client canonical mirror). Header comment makes the server-canonical-vs-client-mirror relationship explicit.
+- `client/tools/_ammo.mjs` (NEW) — `export const PLAYER_MAX_AMMO = 6` (smoke shared source). Same coupling comment.
+- 3 production-code sites refactored: `gameSession.ts:445` (initial ammo), `gameSession.ts:952` (reload gate), `App.tsx:330` (BulletHud maxAmmo prop).
+- 3 ESM smokes refactored: `real-input-smoke.mjs`, `damage-server-aim-event-smoke.mjs`, `damage-server-reload-smoke.mjs`. All now `import { PLAYER_MAX_AMMO } from "./_ammo.mjs"`.
+- `damage-server-reload-t3-smoke.cjs` — kept the literal `6` + added a regression-guard comment explaining the CommonJS/ESM interop limitation and the value-coupling requirement.
+
+**Vitest state right now**: 43/43 PASS (no count change — this is structural, not behavioral).
+**CI state right now**: 26/26 GREEN on `main @ cbf6eb7`. All required, no opt-ins.
+
+**CF-N1 retrigger log for PR #78**: hit on first CI run, cleared via empty-commit + push + wait-for-green on retry (1 retry, total 1 empty commit `adc7475`). Same pre-existing intermittent.
+
+**⚠️ Kyle's "weapons" call-out (`cc: 1542955136383459439`)** — this is the most important thing in this PR. From a software-engineering perspective, the top-level `PLAYER_MAX_AMMO` constant only serves us until we start implementing different weapons, each with their own ammo count. The single-weapon assumption is encoded in the naming — once we add a shotgun (ammo=2), sniper (ammo=5), rifle (ammo=30), etc., the constant needs to become `WEAPONS.dualPistol.maxAmmo` (or similar per-weapon table).
+
+**Implication**: this PR is a **temporary bridge** for the current dual-pistol-only state, not a permanent design choice. The next session should treat the constant as "good enough for now, refactor when weapons arrive." The PR explicitly does NOT need a follow-up; the WEAPONS-table refactor is naturally part of whatever PR introduces the second weapon.
+
+**NB-1 carry-forward from PR 11.7.E: CLOSED**. NB-3 (R-keypress real-browser tier-3 test) was effectively closed at the milestone-acceptance level via the cross-machine pilot + the .cjs smoke's existing B-3 pointerLocked check. Formal close-out deferred to whenever weapons get added (both NB-1 and NB-3 reopen then, because the literal-6 / WEAPONS-table refactor and a real-browser reload-key test will both want fresh assertions).
+
+**Recommended next direction** (no specific PR queued — your call):
+- **(a) Pivot to weapons** — add a second weapon type (shotgun or sniper) with its own ammo constant + the WEAPONS-table refactor that Kyle flagged.
+- **(b) Pivot to new feature arc** — matchmaker, production Tailscale-Funnel certs, lobby UI, spectator mode, replay, scoreboard, leaderboard.
+- **(c) Maintenance / debt sweep — CF-N1 root-cause fix** — ship the mpsc capacity bump on a fresh branch (the `chore/phase1-server-outbound-channel-bump` branch was deleted; recreate and ship).
 
 ---
 
