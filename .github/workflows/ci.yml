@@ -859,7 +859,22 @@ jobs:
         working-directory: .
         run: cargo build --release --manifest-path server/Cargo.toml
       - name: Run cross-machine smoke
-        run: node ./tools/cross-machine-smoke.mjs
+        # PR 71 — hard timeout (180s) wraps the smoke so the CI job
+        # never hangs on teardown. The smoke has its own 10s hard-exit
+        # timeout in the teardown finally block, but Playwright's
+        # browser.close() can hang indefinitely under load; the
+        # shell timeout is the outer belt-and-suspenders guarantee.
+        # Exit code is propagated via `exit $TIMEOUT_RC` so test
+        # failures (non-zero) still fail the CI step.
+        run: |
+          set +e
+          timeout 180 node ./tools/cross-machine-smoke.mjs
+          SMOKE_RC=$?
+          set -e
+          if [ $SMOKE_RC -eq 124 ]; then
+            echo "::error::cross-machine-smoke timed out after 180s (exit 124 from timeout)"
+          fi
+          exit $SMOKE_RC
         env:
           RUST_CM_WT_PORT: "14437"
           RUST_CM_WS_PORT: "14438"
