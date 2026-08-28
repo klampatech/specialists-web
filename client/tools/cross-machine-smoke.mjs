@@ -47,7 +47,12 @@ const MACBOOK_CDP_LOCAL = 9224;
 const MACBOOK_CDP_REMOTE = 9224;  // CDP port on MacBook Chrome
 
 const ROOM = `CM_${Date.now()}`;
-const MACBOOK_SSH_PASSWORD = process.env.KYLAMPA_SSH_PASSWORD ?? "[REDACTED]";
+const MACBOOK_SSH_PASSWORD = process.env.KYLAMPA_SSH_PASSWORD && process.env.KYLAMPA_SSH_PASSWORD.length > 0
+  ? process.env.KYLAMPA_SSH_PASSWORD
+  : null;  // PR 71 — null disables the MacBook path entirely (smoke
+           // uses m5-headless Tab B fallback). Empty string falls
+           // through to null to make CI's `KYLAMPA_SSH_PASSWORD: ""`
+           // explicit-disable behave identically to "unset".
 
 log(`OUT_DIR = ${OUT_DIR}`);
 log(`Room     = ${ROOM}`);
@@ -67,6 +72,9 @@ function spawnLogged(cmd, args, opts, logName) {
 }
 
 function sshCmd(...args) {
+  if (!MACBOOK_SSH_PASSWORD) {
+    return { status: 127, stdout: "", stderr: "KYLAMPA_SSH_PASSWORD not set" };
+  }
   return spawnSync(
     "sshpass",
     ["-p", MACBOOK_SSH_PASSWORD, "ssh",
@@ -85,6 +93,7 @@ function sshExec(...args) {
 }
 
 function isMacbookReachable() {
+  if (!MACBOOK_SSH_PASSWORD) return false;  // PR 71 — no password = no MacBook path
   const r = sshCmd("echo", "ok");
   return r.status === 0 && r.stdout.trim() === "ok";
 }
@@ -99,6 +108,18 @@ async function isTcpReachable(host, port, timeoutMs = 2000) {
   });
 }
 
+// PR 71 — pick the right host for the navigation URL. When
+// KYLAMPA_SSH_PASSWORD is empty (CI), use 127.0.0.1 because CI
+// runners don't have Tailscale. When MacBook path is active (local
+// dev), use the Tailscale IP so the MacBook Chrome can reach the
+// canary + vite.
+const NAV_HOST = MACBOOK_SSH_PASSWORD ? M5_TAILSCALE_IP : "127.0.0.1";
+// PR 71 — pick the right SANS for the dev cert. Local dev needs
+// Tailscale IPs; CI doesn't.
+const SANS_EXTRA = MACBOOK_SSH_PASSWORD ? `--sans ${M5_TAILSCALE_IP},${MACBOOK_IP}` : "";
+
+log(`NAV_HOST = ${NAV_HOST}`);
+
 // --- Canary + Vite boot ---
 async function bootCanary() {
   log("Booting canary server (binds 0.0.0.0 by default)…");
@@ -107,7 +128,7 @@ async function bootCanary() {
     [resolve(REPO_ROOT, "tools", "canary-server.sh"),
      "--port-wt", String(WT_PORT),
      "--port-ws", String(WS_PORT),
-     "--sans", `${M5_TAILSCALE_IP},${MACBOOK_IP}`],
+     ...(SANS_EXTRA ? SANS_EXTRA.split(" ") : [])],
     { RUST_LOG: "snapshot_debug=debug,info" },
     "canary",
   );
@@ -303,7 +324,7 @@ async function main() {
         content: `
           window.__forceServerTransport = true;
           window.__damageServerPorts   = { wt: ${WT_PORT}, ws: ${WS_PORT} };
-          window.__damageServerUrl     = ${JSON.stringify(`http://${M5_TAILSCALE_IP}:${VITE_PORT}/`)};
+          window.__damageServerUrl     = ${JSON.stringify(`http://${NAV_HOST}:${VITE_PORT}/`)};
           window.__damageServerRoomId  = "${ROOM}";
           window.__localPlayerId       = ${localId};
           window.__peerPlayerId        = ${peerId};
@@ -311,7 +332,7 @@ async function main() {
       });
     }
 
-    const navUrl = `http://${M5_TAILSCALE_IP}:${VITE_PORT}/?server=${encodeURIComponent(`ws://${M5_TAILSCALE_IP}:${WS_PORT}/rooms/${ROOM}`)}`;
+    const navUrl = `http://${NAV_HOST}:${VITE_PORT}/?server=${encodeURIComponent(`ws://${NAV_HOST}:${WS_PORT}/rooms/${ROOM}`)}`;
     log(`Navigating both tabs to ${navUrl}`);
     await Promise.all([
       pageA.goto(navUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }),
@@ -525,35 +546,35 @@ async function main() {
     writeFileSync(`${OUT_DIR}/cross-machine-summary.json`, JSON.stringify(summary, null, 2));
     log("=== ALL CROSS-MACHINE ASSERTIONS PASSED ===");
     log(`Artifacts in ${OUT_DIR}/`);
-
+    // PR 71 — exit immediately after success. Don't wait for the
+    // teardown finally block to fire (fire-and-forget). The OS
+    // reaps the child processes on process exit. Without this,
+    // the smoke hangs for the shell `timeout 180` duration even
+    // though all assertions passed in <30s.
+    process.exit(0);
   } catch (e) {
     summary.results.error = e.message;
     writeFileSync(`${OUT_DIR}/cross-machine-summary.json`, JSON.stringify(summary, null, 2));
     console.error("FATAL:", e);
     process.exit(1);
   } finally {
-    // Teardown order: tabs → browsers → tunnel → MacBook Chrome → canary → vite
-    log("Tearing down (hard timeout 10s)…");
-    const hardExit = setTimeout(() => {
-      console.error("TEARDOWN TIMEOUT — force exit");
-      process.exit(2);
-    }, 10_000);
-    try {
-      const teardownPromises = [];
-      if (pageA) teardownPromises.push(pageA.context().close().catch(() => {}));
-      if (pageB) teardownPromises.push(pageB.context().close().catch(() => {}));
-      if (browserA) teardownPromises.push(browserA.close().catch(() => {}));
-      if (browserB) teardownPromises.push(browserB.close().catch(() => {}));
-      if (macbookTabB) teardownPromises.push(macbookTabB.macBrowser.close().catch(() => {}));
-      await Promise.allSettled(teardownPromises);
-      if (tunnel) { try { tunnel.kill("SIGKILL"); } catch {} }
-      if (summary.macbook_reachable) macbookKillChrome();
-      if (canary) { try { canary.kill("SIGKILL"); } catch {} }
-      if (vite) { try { vite.kill("SIGKILL"); } catch {} }
-    } finally {
-      clearTimeout(hardExit);
-    }
-    await sleep(500);
+    // PR 71 — fire-and-forget teardown. Don't `await` browser.close()
+    // because Playwright's close() can hang indefinitely under load
+    // (observed in CI: ~160s wait after assertions passed). We have
+    // already written cross-machine-summary.json by the time we reach
+    // this finally block, so the smoke's signal-of-success is durable.
+    // The OS reaps the subprocesses when the process exits. The CI
+    // shell `timeout 180` is the outer belt-and-suspenders guarantee.
+    log("Fire-and-forget teardown (no await)…");
+    if (pageA) { try { pageA.context().close().catch(() => {}); } catch {} }
+    if (pageB) { try { pageB.context().close().catch(() => {}); } catch {} }
+    if (browserA) { try { browserA.close().catch(() => {}); } catch {} }
+    if (browserB) { try { browserB.close().catch(() => {}); } catch {} }
+    if (macbookTabB) { try { macbookTabB.macBrowser.close().catch(() => {}); } catch {} }
+    if (tunnel) { try { tunnel.kill("SIGKILL"); } catch {} }
+    if (summary.macbook_reachable) macbookKillChrome();
+    if (canary) { try { canary.kill("SIGKILL"); } catch {} }
+    if (vite) { try { vite.kill("SIGKILL"); } catch {} }
   }
 }
 
