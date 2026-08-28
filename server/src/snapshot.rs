@@ -174,6 +174,56 @@ impl Default for SnapshotGenerator {
 // pulling in `session::PlayerId`.
 pub use crate::session::PlayerId as PlayerIdT;
 
+// -- PR 80 — snapshot rate-limit predicate ------------------------------
+//
+// Producer-side gate: skip the next `broadcast_snapshot` if ANY
+// connection's outbound queue is saturated (depth > threshold_pct%
+// of the per-connection cap).
+//
+// **Why a free function (not a `SnapshotGenerator` method)**: the
+// predicate reads per-connection state (queue depth), not
+// per-generator state. It's a snapshot-decision input, not a
+// generator-state accessor. Free function keeps the generator
+// single-purpose (time-based emit).
+//
+// **Why async**: each `ConnectionOutbound::queue_depth()` takes a
+// `tokio::sync::Mutex` lock. We have to await that per-connection.
+// For an empty room, returns false immediately (no awaits). For
+// a 24-player room, 24 sequential awaits — each lock is
+// near-instant under low contention.
+//
+// **Threshold semantics**: strictly greater-than. A queue at
+// exactly `threshold_pct%` of cap is NOT rate-limited (still room
+// for one more emit before the gate trips).
+//
+// **False-positive risk**: low. The cost of skipping an emit is
+// at most one missed snapshot (50ms gap, sub-perceptual); the cost
+// of NOT skipping is consumer-saturation drops + smoke flake.
+pub async fn should_rate_limit(room: &Room, threshold_pct: u8) -> bool {
+    // Clamp to a sane range. Out-of-band values should not crash
+    // the rate-limiter — fall back to "never rate-limit" (101%)
+    // or "always rate-limit" (0%) per the env-var's intent.
+    let clamped = threshold_pct.min(100);
+    for outbound in room.connections.values() {
+        let depth = outbound.queue_depth().await;
+        let cap = outbound.capacity();
+        // Avoid divide-by-zero on a misconfigured cap (shouldn't
+        // happen — with_capacity rejects 0 — but defensive).
+        if cap == 0 {
+            continue;
+        }
+        // depth * 100 > cap * pct → depth/cap > pct/100
+        // Multiply-first avoids floating-point; usize overflow
+        // is impossible here (cap = 1024, depth <= 1024, pct <= 100,
+        // so both products fit easily in u64).
+        let threshold_depth = (cap as u64 * clamped as u64) / 100;
+        if (depth as u64) > threshold_depth {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +357,104 @@ mod tests {
         assert_eq!(snap.players.len(), 0);
         let bytes = crate::protocol::encode_snapshot(&snap);
         assert_eq!(bytes.len(), crate::protocol::SNAPSHOT_WIRE_SIZE_MIN);
+    }
+
+    // ---- PR 80 — should_rate_limit tests --------------------------------
+    //
+    // Helper: build a room with N players each wired to a
+    // ConnectionOutbound of `cap` capacity. Returns the room +
+    // a vec of outbound handles so the test can saturate specific
+    // connections.
+    async fn room_with_outbounds(
+        ids: &[PlayerId],
+        cap: usize,
+    ) -> (Room, Vec<crate::connection_outbound::ConnectionOutbound>) {
+        let mut room = Room::new("DEVBX");
+        let mut outs = Vec::new();
+        for id in ids {
+            room.add_player(*id);
+            room.physics
+                .add_player(*id, Position { x: 0.0, y: 0.0 });
+            let co = crate::connection_outbound::ConnectionOutbound::with_capacity(cap);
+            room.register_connection(*id, co.clone());
+            outs.push(co);
+        }
+        (room, outs)
+    }
+
+    #[tokio::test]
+    async fn rate_limit_empty_room_is_false() {
+        let room = Room::new("DEVBX");
+        // No connections → can't be rate-limited.
+        assert!(!should_rate_limit(&room, 25).await);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_all_consumers_healthy_is_false() {
+        let (room, _outs) = room_with_outbounds(&[1, 2], 32).await;
+        // Nothing enqueued → depth=0, well below 25% threshold
+        // (which is 8 for cap=32). Should NOT rate-limit.
+        assert!(!should_rate_limit(&room, 25).await);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_one_consumer_saturated_is_true() {
+        let (room, outs) = room_with_outbounds(&[1, 2], 32).await;
+        // Saturate the first connection: push 16 items (= 50% of
+        // cap=32; 25% threshold means depth > 8 → 16 > 8 ✓).
+        for _ in 0..16 {
+            outs[0].try_send(vec![0u8; 4]).await.unwrap();
+        }
+        // Even though player 2 is empty, player 1 is saturated →
+        // gate trips (it's ANY, not ALL).
+        assert!(should_rate_limit(&room, 25).await);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_threshold_edge_at_exactly_pct_is_false() {
+        let (room, outs) = room_with_outbounds(&[1], 100).await;
+        // Fill exactly to 25% (= 25 entries for cap=100).
+        // Predicate uses strict >, so depth==threshold → NOT
+        // rate-limited (one more emit before the gate trips).
+        for _ in 0..25 {
+            outs[0].try_send(vec![0u8; 4]).await.unwrap();
+        }
+        assert!(!should_rate_limit(&room, 25).await);
+        // One more → depth=26, strictly > 25 → rate-limit fires.
+        outs[0].try_send(vec![0u8; 4]).await.unwrap();
+        assert!(should_rate_limit(&room, 25).await);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_all_consumers_saturated_is_true() {
+        let (room, outs) = room_with_outbounds(&[1, 2, 3], 16).await;
+        // Saturate all 3 connections: 9 entries each (> 25% of 16 = 4).
+        for out in &outs {
+            for _ in 0..9 {
+                out.try_send(vec![0u8; 4]).await.unwrap();
+            }
+        }
+        assert!(should_rate_limit(&room, 25).await);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_pct_100_never_limits() {
+        let (room, outs) = room_with_outbounds(&[1], 32).await;
+        // Saturate fully (32 entries).
+        for _ in 0..32 {
+            outs[0].try_send(vec![0u8; 4]).await.unwrap();
+        }
+        // threshold_pct=100 means "never rate-limit" — even a
+        // fully-saturated queue passes.
+        assert!(!should_rate_limit(&room, 100).await);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_pct_clamped_above_100() {
+        let (room, _outs) = room_with_outbounds(&[1], 32).await;
+        // Out-of-band threshold → clamped to 100 → never limits.
+        assert!(!should_rate_limit(&room, 150).await);
+        assert!(!should_rate_limit(&room, 200).await);
+        assert!(!should_rate_limit(&room, 255).await);
     }
 }

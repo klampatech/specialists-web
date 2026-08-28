@@ -65,6 +65,41 @@ pub fn global_drop_oldest_count() -> u64 {
     GLOBAL_DROP_OLDEST_COUNT.load(Ordering::Relaxed)
 }
 
+// -- PR 80 snapshot rate-limit counters -----------------------------------
+//
+// Mirror of `GLOBAL_DROP_OLDEST_COUNT`: bumped every time the
+// snapshot generator skips an emit because at least one consumer's
+// outbound queue is saturated. Exposed via the same periodic stats
+// line (`[stress-stats]`) so operators can distinguish:
+//   - drops_total: mpsc saturation, consumer too slow to drain
+//                   (existing diagnostic, fires when back-pressure
+//                   loses an enqueue)
+//   - rate_limited_total: producer skipped an emit intentionally
+//                   (NEW diagnostic, fires when the producer-side
+//                   rate-limit gate trips)
+//
+// High `drops_total` with low `rate_limited_total` = consumer is
+// so slow that the producer should rate-limit harder (threshold too
+// lenient). High `rate_limited_total` with low `drops_total` =
+// producer rate-limit is catching saturation before drops happen
+// (the goal).
+static GLOBAL_RATE_LIMITED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the process-wide rate-limited counter. Bumped at the
+/// `broadcast_snapshot` skip-site in `main.rs`.
+pub fn global_rate_limited_count() -> u64 {
+    GLOBAL_RATE_LIMITED_COUNT.load(Ordering::Relaxed)
+}
+
+/// PR 80 — atomic increment for the rate-limited counter.
+/// Called from `snapshot_generator_loop` (in `main.rs`) every time
+/// the rate-limit gate trips for a room. Uses `Relaxed` ordering
+/// (mirroring `global_drop_oldest_count`'s pattern) because the
+/// counter is a diagnostic, not a synchronization primitive.
+pub fn global_rate_limited_count_inc() {
+    GLOBAL_RATE_LIMITED_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Producer + consumer handle for the per-connection outbound queue.
 /// Cloned freely; all clones share the same underlying queue + notify.
 ///
@@ -202,6 +237,27 @@ impl ConnectionOutbound {
     #[cfg(test)]
     pub async fn len(&self) -> usize {
         self.inner.queue.lock().await.len()
+    }
+
+    /// PR 80 — non-test public accessor for the queue depth.
+    /// Used by the snapshot rate-limiter
+    /// (`snapshot::should_rate_limit`) to gate the next emit when
+    /// ANY consumer is saturated. Async because the underlying
+    /// `Mutex` is a `tokio::sync::Mutex` (not std); the lock is
+    /// near-instant under low contention (no `try_lock` variant on
+    /// tokio Mutex). The producer-side rate-limit decision fires
+    /// once per 50ms tick — the brief async-await cost is
+    /// negligible.
+    pub async fn queue_depth(&self) -> usize {
+        self.inner.queue.lock().await.len()
+    }
+
+    /// Configured capacity (used by the rate-limiter to convert
+    /// `threshold_pct` into a concrete queue-depth threshold).
+    /// Public so callers don't need to know the cap is stored on
+    /// the inner struct.
+    pub fn capacity(&self) -> usize {
+        self.inner.cap
     }
 
     /// Whether the queue has been closed (test-only).
