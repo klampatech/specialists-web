@@ -1110,7 +1110,15 @@ jobs:
         run: |
           nohup bash tools/canary-server.sh --port-wt 14433 --port-ws 14434             > /tmp/canary-server-havok-parity.log 2>&1 &
           echo $! > /tmp/canary-server-havok-parity.pid
-          for i in $(seq 1 60); do
+          # PR 82 — use a 180s boot timeout instead of the standard
+          # 60s. Reason: this is the FIRST smoke job to run after the
+          # server-build cache is populated, so the canary's first
+          # `cargo run --release` may still do incremental
+          # recompilation + cert-gen even with the warm cache. Local
+          # boot from cold cache takes ~15-20s; CI cold (rust-toolchain
+          # setup + linker resolution) can hit 70-90s. 180s gives
+          # headroom for the first run + safety margin.
+          for i in $(seq 1 180); do
             if (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
               echo "Canary server (havok-parity) ready after ${i}s"
               break
@@ -1118,7 +1126,7 @@ jobs:
             sleep 1
           done
           if ! (echo > /dev/tcp/127.0.0.1/14434) >/dev/null 2>&1; then
-            echo "::error::Canary server (havok-parity) did not become ready in 60s"
+            echo "::error::Canary server (havok-parity) did not become ready in 180s"
             cat /tmp/canary-server-havok-parity.log
             exit 1
           fi
