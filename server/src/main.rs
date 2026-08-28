@@ -310,6 +310,15 @@ async fn main() -> ExitCode {
             interval.set_missed_tick_behavior(
                 tokio::time::MissedTickBehavior::Skip,
             );
+            // PR 80 — read the snapshot rate-limit threshold from
+            // the env once at startup. Default 25% (= 256 entries
+            // deep against the 1024 cap). Set to 100 to disable the
+            // gate entirely; set to 0 to gate every emit (useful for
+            // stress testing). Mirrors the existing
+            // `CANARY_STATS_INTERVAL_MS` env var pattern.
+            let rate_limit_pct: u8 = std::env::var(
+                "SNAPSHOT_RATE_LIMIT_PCT",
+            ).ok().and_then(|s| s.parse().ok()).unwrap_or(25);
             // PR 11.7.D3.3 — log the global drop-oldest counter every
             // 5 seconds so the 24-player stress smoke can grep for
             // `[stress-stats]` lines and assert no drops occurred.
@@ -321,6 +330,9 @@ async fn main() -> ExitCode {
             ).ok().and_then(|s| s.parse().ok()).unwrap_or(5_000);
             let mut last_stats = std::time::Instant::now();
             let mut last_drops: u64 = 0;
+            // PR 80 — rate-limited counter deltas (paired with
+            // `last_drops` for the existing drop-counter stats line).
+            let mut last_rate_limited: u64 = 0;
             loop {
                 interval.tick().await;
                 let now_ms = start.elapsed().as_millis() as u64;
@@ -340,6 +352,30 @@ async fn main() -> ExitCode {
                         .collect()
                 };
                 for (room_id, room_arc) in active_rooms {
+                    // PR 80 — rate-limit gate. Skip the whole
+                    // emit-and-broadcast for this room if ANY
+                    // connection's queue is saturated (> rate_limit_pct
+                    // % of cap). State is preserved (the next emit at
+                    // the next tick has the latest positions); we
+                    // just give the consumer room to drain. Bumps the
+                    // global counter so the periodic stats line
+                    // reports it.
+                    let rate_limited = {
+                        let room_guard = room_arc.read().await;
+                        specialists_server::snapshot::should_rate_limit(
+                            &*room_guard, rate_limit_pct,
+                        ).await
+                    };
+                    if rate_limited {
+                        specialists_server::connection_outbound::global_rate_limited_count_inc();
+                        debug!(
+                            target: "cf_n1",
+                            room_id = %room_id,
+                            threshold_pct = rate_limit_pct,
+                            "cf-n1-rate-limited: skipping snapshot emit (consumer queue saturated)",
+                        );
+                        continue;
+                    }
                     let snap_opt = {
                         let room_guard = room_arc.read().await;
                         gen.maybe_emit(&*room_guard, now_ms)
@@ -373,14 +409,22 @@ async fn main() -> ExitCode {
                 {
                     let drops = global_drop_oldest_count();
                     let delta = drops.saturating_sub(last_drops);
+                    // PR 80 — also log the rate-limited counter so
+                    // operators can correlate `[cf-n1-rate-limited]`
+                    // (debug) with the delta totals (info).
+                    let rate_limited = specialists_server::connection_outbound::global_rate_limited_count();
+                    let rl_delta = rate_limited.saturating_sub(last_rate_limited);
                     info!(
                         target: "stress_stats",
                         drops_total = drops,
                         drops_since_last = delta,
+                        rate_limited_total = rate_limited,
+                        rate_limited_since_last = rl_delta,
                         interval_ms = stats_interval_ms,
-                        "[stress-stats] drop-oldest counter"
+                        "[stress-stats] snapshot counters"
                     );
                     last_drops = drops;
+                    last_rate_limited = rate_limited;
                     last_stats = std::time::Instant::now();
                 }
             }
