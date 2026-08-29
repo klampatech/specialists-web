@@ -57,6 +57,28 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ---
 
+## 2026-08-29 — Session end (paused for quota reset)
+
+**Status**: PR #84 merged (all 5 PRs in this round closed: #78 / #81 / #82 / #83 / #84). Standing down for the day.
+
+**Quota note**: 5-hour Token Plan window is currently tripped (cron wrote `~/.quota-tripped` at 15:25 today; proxy returns `429 Token Plan usage limit reached`). Kyle confirmed he has no weekly quota, only the 5-hour Token Plan. **My prior "70% weekly usage" framing was wrong** — corrected this session.
+
+**What was already noted as the next direction** (from HANDOFF TL;DR, your call):
+- **(a) Weapons arc** — add a second weapon type (shotgun or sniper) + `WEAPONS.<type>.maxAmmo` refactor
+- **(b) New feature arc** — matchmaker (PR 11.9), production Tailscale-Funnel certs (PR 11.6.E), lobby UI, spectator mode, replay, scoreboard
+- **(c) Maintenance sweep** — DEVBX hardcode in `server/src/transport.rs:962`, PointerLock ESC flicker, remote rig clipping through boxes, anti-cheat (Phase 4)
+
+**Clean shutdown confirmed**:
+- Working tree clean on `docs/post-pr81-82-83-cfn1-closed` (one untracked `client/tools/havok-parity-smoke.json` — that's a smoke-output artifact, not source)
+- All canary + vite processes killed; ports 5191/14433/14434 clean
+- `main` at `1ea4c3e` (PR #84 squash) — no pending merges
+
+**To pick back up when the 5h window resets**: cron will clear `~/.quota-tripped` automatically. Next session reads HANDOFF.md TL;DR ("post-PR-#83"), then asks which of (a)/(b)/(c) to launch. Don't start autonomously — per `§evo-never-start-work-autonomously-2026-08-29`.
+
+**Lesson to encode for next time** (already in memory + skill + reference doc, but worth restating): when Kyle says "fire next" or any go-ahead, **read `~/.quota-tripped` first** before committing to a multi-hour arc. A tripped quota is a stop signal, not a "burn anyway" signal — flag it before starting, not after.
+
+---
+
 ## 2026-08-28 — PR #80 CF-N1 snapshot rate-limiter — PLANNED (deferred to next session)
 
 **Status**: PLAN COMPLETE, IMPLEMENTATION DEFERRED. Vault plan at `~/Obsidian/mem/projects/specialists-web-pr80-cfn1-rate-limit.md`.
