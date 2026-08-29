@@ -28,9 +28,26 @@ use crate::protocol::{PlayerState, Snapshot};
 use crate::session::{PlayerId, Room};
 
 /// PR 11.7.B — the per-room snapshot emitter. Lives in
-/// `snapshot_generator_loop` in `main.rs`; one instance per
-/// room. The `last_emit_ms` field tracks the last emission time
-/// so `maybe_emit` knows when the next emit is due.
+/// `snapshot_generator_loop` in `main.rs`; **one instance per
+/// room** (PR 83 enforced this). The `last_emit_ms` field tracks
+/// the last emission time so `maybe_emit` knows when the next
+/// emit is due.
+///
+/// **Why per-room** (PR 83 / CF-N1 root cause): the snapshot
+/// loop in `main.rs` iterates the `rooms` HashMap each tick.
+/// The rooms HashMap iterates in arbitrary (non-deterministic)
+/// order. With a single shared `SnapshotGenerator`, the FIRST
+/// room in iteration would consume the 20Hz budget
+/// (`last_emit_ms = now_ms`), and every subsequent room in the
+/// same tick would get `None` from `maybe_emit` (because
+/// `now_ms - last_emit_ms < 50ms`). The pre-PR-83
+/// implementation had this exact bug — one stale room would
+/// "win" every tick and starve every other room, surfacing as
+/// CF-N1 (the HP-convergence smoke's `__latestSnap()` never
+/// returned a non-null snapshot for the starving room, so the
+/// primer's `frame: 0` got rejected with "frame too far in the
+/// past"). PR 83 fixes it by giving each room its own
+/// `SnapshotGenerator` in a `HashMap<RoomId, SnapshotGenerator>`.
 pub struct SnapshotGenerator {
     /// PR 11.7.B — wall-clock millis at the last emit. Compared
     /// against the next call's `now_ms` to decide whether to

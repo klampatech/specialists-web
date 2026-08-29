@@ -302,7 +302,30 @@ async fn main() -> ExitCode {
     let snapshot_gen_handle = tokio::spawn({
         let rooms = rooms.clone();
         async move {
-            let mut gen = specialists_server::snapshot::SnapshotGenerator::new();
+            // PR 83 / CF-N1 follow-up — per-room SnapshotGenerator.
+            // The single `gen` instance pre-PR-83 meant the
+            // `last_emit_ms` time check was shared across all rooms.
+            // With the rooms HashMap iterating in arbitrary order
+            // each tick, the FIRST room in iteration consumed the
+            // 20Hz budget and updated `last_emit_ms = now_ms`, so
+            // every OTHER room in the same tick got `None` from
+            // `maybe_emit` (because `now_ms - last_emit_ms < 50ms`).
+            // Under sustained multi-room load (e.g. several smoke
+            // runs in a single canary session), one stale room would
+            // "win" every tick and starve every other room — the
+            // HP-convergence smoke then fires AimEvents with
+            // `frame: 0` (because `__latestSnap()` never returns
+            // non-null for the starving room), and the server
+            // rejects them with "frame too far in the past".
+            //
+            // The PR 11.7.B / `snapshot::SnapshotGenerator` docstring
+            // at line 30-33 already calls out "one instance per room"
+            // as the design intent — this PR makes the implementation
+            // match. Old rooms are GC'd when the connection closes
+            // (see transport.rs WS close handler); the loop prunes
+            // them on every tick.
+            let mut gens: HashMap<String, specialists_server::snapshot::SnapshotGenerator> =
+                HashMap::new();
             let start = std::time::Instant::now();
             let mut interval = tokio::time::interval(
                 std::time::Duration::from_millis(50), // 1000/50 = 20Hz
@@ -376,10 +399,26 @@ async fn main() -> ExitCode {
                         );
                         continue;
                     }
+                    // PR 83 — per-room `SnapshotGenerator` so each
+                    // room gets its own 20Hz budget. Pre-PR-83
+                    // shared a single `gen` across all rooms and
+                    // the first-in-iteration room would consume the
+                    // tick. Now `gens.entry(room_id).or_default()`
+                    // gives every room its own `last_emit_ms`.
                     let snap_opt = {
                         let room_guard = room_arc.read().await;
+                        let gen = gens
+                            .entry(room_id.clone())
+                            .or_insert_with(specialists_server::snapshot::SnapshotGenerator::new);
                         gen.maybe_emit(&*room_guard, now_ms)
                     };
+                    // If the room didn't emit, no `last_emit_ms`
+                    // update — but its entry in `gens` stays so the
+                    // next tick can use it. Old rooms are pruned
+                    // below.
+                    if snap_opt.is_none() {
+                        continue;
+                    }
                     if let Some(snap) = snap_opt {
                         let mut wire = Vec::with_capacity(
                             1 + specialists_server::protocol::SNAPSHOT_WIRE_SIZE_MIN
@@ -402,6 +441,18 @@ async fn main() -> ExitCode {
                         let _ = snap_len; // suppress unused warning if debug! is filtered
                     }
                 }
+                // PR 83 — prune `gens` entries for rooms that have
+                // been removed from the registry. Without this the
+                // map would grow unboundedly across the canary's
+                // lifetime (a long-running canary with 1000+ room
+                // creates + closes would carry 1000 dead generators).
+                // The active_rooms snapshot above tells us which
+                // rooms are still live; everything else is stale.
+                let active_room_ids: std::collections::HashSet<String> = {
+                    let guard = rooms.read().await;
+                    guard.keys().cloned().collect()
+                };
+                gens.retain(|room_id, _| active_room_ids.contains(room_id));
                 // Periodic stats line — single info!() call per interval
                 // so the canary log doesn't get spammed.
                 if stats_interval_ms > 0
