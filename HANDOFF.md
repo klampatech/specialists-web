@@ -7,14 +7,53 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#78 (2026-08-28). **`main` @ `cbf6eb7` (PR #78 squash — MERGED 2026-08-28).** PR #78 closes **NB-1** (carry-forward from PR 11.7.E). Before this PR, the literal `6` was hardcoded in **7 client-side sites** (3 production code + 4 smoke scripts), with only a comment reference to `server/src/constants.rs::PLAYER_MAX_AMMO`. If the server value ever changed, every site would silently break. **Fix**: added `PLAYER_MAX_AMMO` to `client/src/engine/characterConfig.ts` (client canonical mirror) + `client/tools/_ammo.mjs` (smoke shared source). 6 sites now use the named constant; .cjs smoke keeps a literal + coupling comment (CommonJS can't import ESM). **vitest: 43/43** (structural, no count change). **CF-N1 hit on first CI run**, cleared via empty-commit recipe. **CI: 26/26 GREEN on retry**. **`Phase 1 milestone + NB-1 both closed`.**
-
-**⚠️ Important caveat from Kyle (`cc: 1542955136383459439`)**: this is a **temporary bridge** for the current dual-pistol-only state. Once weapons multiply (different ammo counts per weapon — e.g. shotgun 2, sniper 5, rifle 30), the top-level `PLAYER_MAX_AMMO` constant needs to become `WEAPONS.dualPistol.maxAmmo` or similar. The single-weapon assumption is encoded in the naming. NB-3 follow-up (R-keypress real-browser tier-3 test) was already covered by the cross-machine pilot + the .cjs smoke's existing B-3 pointerLocked check, so NB-3 is also effectively closed at the milestone-acceptance level (formal close-out deferred to whenever weapons get added — both NB-1 and NB-3 reopen then).
+**`You are here`**: post-PR-#83 (2026-08-29). **`main` @ `c851795` (PR #83 squash — MERGED 2026-08-29 20:45 UTC, combined with PR #82).** **CF-N1 (HP-convergence mpsc-saturation race) is CLOSED at the actual root cause.** PR #83 fixed the bug that PR #81 had misdiagnosed: the snapshot loop in `server/src/main.rs` shared a single `SnapshotGenerator` across all rooms, so the first room in HashMap iteration consumed the 20Hz budget every tick and starved every other. The HP-conv smoke's `__latestSnap()` returned `null` for 10+ seconds in starving rooms → primer fired `frame: 0` → server rejected with "frame too far in the past (rewind window exceeded)". **Fix**: per-room `HashMap<String, SnapshotGenerator>` with stale-entry GC each tick. PR #81's rate-limiter stays (it's a useful second-line defense for genuine consumer-saturation) but wasn't the cause. **PR #82 (Havok parity smoke as required CI gate)** was unblocked once #83 landed — combined into the same squash commit. **CI: 27/27 GREEN**. **Verification**: 30/30 local smoke runs PASS (8 fresh canary + 8 stale-canary + 5 stress + 5 final + 4 probing); 108/108 cargo unit tests; 43/43 vitest. **Lesson captured**: skill `ci-smoke-flake-triage` Category 5 (architectural bug masquerading as a flake) + reference `references/specialists-web-cfn1-root-cause.md`. Vault plan `~/Obsidian/mem/projects/specialists-web-pr80-cfn1-rate-limit.md` marked SUPERSEDED.
 
 **No code work currently queued.** Recommended next direction (your call):
 - **(a) Pivot to weapons** — add a second weapon type (shotgun or sniper) with its own ammo constant + the WEAPONS-table refactor that Kyle flagged.
 - **(b) Pivot to new feature arc** — matchmaker (PR 11.9), production Tailscale-Funnel certs (PR 11.6.E), lobby UI, spectator mode, replay, scoreboard.
-- **(c) Maintenance / debt sweep — ship PR #80** — the CF-N1 **snapshot rate-limiter** (full plan in vault: `~/Obsidian/mem/projects/specialists-web-pr80-cfn1-rate-limit.md`). The OLD "bump mpsc 1024 → 2048" idea is NOT recommended per the `ci-flake-handling` skill ("do NOT bump again — capacity isn't the bottleneck, consumer decode rate is"). The rate-limiter is the architectural answer. Branches off `main @ cbf6eb7`, ~50 LOC, 1-2 hours. Recommended PRIMARY candidate.
+- **(c) Maintenance / debt sweep — close out carry-forwards** — DEVBX hardcode in 0x06 arm (`server/src/transport.rs:962`), PointerLock ESC-equals-resume flicker (PR 11.2 series known issue), remote rig collision (blue-rig clips through boxes), or anti-cheat (Phase 4).
+
+---
+
+## 2026-08-29 — CF-N1 closed (PR #81 wrong-fix, PR #83 real-fix) + Havok parity smoke landed (PR #82)
+
+**Scope**: two PRs merged in quick succession on 2026-08-29. PR #83 fixed the CF-N1 flake that PR #81 had misdiagnosed; PR #82 added the Havok parity smoke as a CI gate. GitHub squash-merged both into a single commit `c851795` on `main`.
+
+**What was actually wrong (the root cause)**: the snapshot loop in `server/src/main.rs` shared a **single** `SnapshotGenerator` (`let mut gen = SnapshotGenerator::new();`) across all rooms. The `rooms` HashMap iterates in arbitrary order; the FIRST room in iteration per tick consumed the 20Hz budget (`last_emit_ms = now_ms`), so every OTHER room in the same tick got `None` from `maybe_emit` (because `now_ms - last_emit_ms < 50ms`). Under sustained multi-room load (a canary serving multiple smoke runs, each creating a fresh `HP_CONV_<timestamp>` room), one stale room would "win" every tick and starve every other. The HP-convergence smoke's `__latestSnap()` returned `null` for 10+ seconds in starving rooms → primer fired `frame: 0` (the default fallback) → server rejected with `validate_and_relay_aim: rejected - frame too far in the past (rewind window exceeded) source=1 req_frame=0 current_frame=460 max_rewind=64`.
+
+**The diagnostic walk** (5 steps, full reference in `references/specialists-web-cfn1-root-cause.md`):
+1. **User signal**: Kyle said "you were supposed to fix it this time anyway" (cc: `1543347660830937129`) — this is the strongest possible indicator of Category 5 (architectural bug masquerading as a flake). PR #81 had just shipped as a Cat 2/4 fix; the flake came back; do NOT re-apply with a wider margin.
+2. **Smoke failure log**: `Snapshot primer failed: server did not re-key both connections within 150ms. Found playerId=1=false, playerId=2=false` → server log `validate_and_relay_aim: rejected - frame too far in the past ... req_frame=0`. **Key clue**: `req_frame=0` from the client. The `0` is the default fallback `const currentFrame = snap ? snap.serverFrame : 0;` — `__latestSnap()` was returning `null`.
+3. **Side-channel probe**: `__latestSnap()` polled every 200ms for 5s — **returned null the whole time**. The snapshot stream was completely starved.
+4. **Server-side observability**: `grep "snapshot enqueued" /tmp/canary2.log | grep -oE 'room_id="[^"]+"' | sort -u` → **only one room** (PROBE3, the first room created in the probe). 3673 enqueues in 4 minutes, all going to PROBE3, zero going to PROBE4 / PROBE5 / HP_CONV_ / etc. `[stress-stats]` said `rate_limited_total=0` — PR #81's gate **never fired**. Bottleneck was upstream of the broadcast step.
+5. **Find the single-resource-across-N-callers pattern**: in `server/src/main.rs` `gen.maybe_emit(&*room_guard, now_ms)` uses a shared `gen`. The `SnapshotGenerator` docstring already said "one instance per room" — the implementation didn't match. **Fix**: `let mut gens: HashMap<String, SnapshotGenerator> = HashMap::new();` with `gens.entry(room_id).or_default()` per tick + `gens.retain(|id, _| active_room_ids.contains(id))` for GC.
+
+**PRs that shipped**:
+- **PR #81** (`0e347ba`) — producer-side snapshot rate-limiter (`should_rate_limit`, `SNAPSHOT_RATE_LIMIT_PCT` env var, `[cf-n1-rate-limited]` debug log, periodic stats). 6 unit tests. Merged 2026-08-28. The rate-limiter is still in the codebase — it's a valid second line of defense for genuine consumer-saturation scenarios. Just not the cause of CF-N1.
+- **PR #82** (`1ea4c3e`, squash-merged into `c851795`) — Havok parity smoke (`client/tools/havok-parity-smoke.mjs` ~448 LOC) + regenerated references + new `client-havok-parity-smoke` CI job (required gate). 0.20m per-frame tolerance, ≤20/60 frames may differ.
+- **PR #83** (`c851795`, combined squash) — per-room `HashMap<String, SnapshotGenerator>` + GC. The actual CF-N1 fix. +50/-4 in `server/src/main.rs` + docstring update in `server/src/snapshot.rs`.
+
+**Verification** (local + CI):
+- 30/30 HP-conv smoke runs PASS locally (8 fresh canary + 8 stale-canary + 5 stress + 5 final + 4 probing)
+- 27/27 CI checks green on PR #83
+- 108/108 cargo unit tests (snapshot + transport + all modules)
+- 43/43 vitest boundary tests
+- All other server smokes green: damage-server, damage-server-reload, damage-server-aim-event, damage-server-reconnect, havok-parity
+- Main `ee65e0607e` (pre-fix) and `c851795` (post-fix) both confirmed against the canary
+
+**What's now stale** (already updated this session):
+- Vault plan `~/Obsidian/mem/projects/specialists-web-pr80-cfn1-rate-limit.md` — marked SUPERSEDED by PR #83, "Carry-forward" section struck through, "Resolution (2026-08-29)" added at top
+- `docs/SPEC.md` — three new `Current status` entries prepended (post-#83, post-#82, post-#81)
+- `HANDOFF.md` (this file) — TL;DR updated + this entry
+- Memory entry `§cfn1-shared-tick-budget-2026-08-29` — added as a permanent anchor
+
+**Lesson captured at three levels**:
+1. **Memory** — anchor entry for session-start loading
+2. **Skill `ci-smoke-flake-triage` Category 5** — decision tree + triggers (already existed, v1.4.0)
+3. **Reference doc `references/specialists-web-cfn1-root-cause.md`** — full diagnostic walk-through (already existed)
+
+**If you see this pattern again** (shared per-tick budget + non-deterministic iteration = starvation): probe the side-channel the smoke reads from, check producer-distribution skew (one participant gets 100% / others 0%), look for "docstring says per-item, code uses shared", and apply the **per-item throttle state** fix immediately. Don't go through Cat 1/2/3 — go straight to Cat 5.
 
 ---
 
