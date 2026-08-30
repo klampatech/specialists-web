@@ -54,7 +54,6 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 3. **Reference doc `references/specialists-web-cfn1-root-cause.md`** — full diagnostic walk-through (already existed)
 
 **If you see this pattern again** (shared per-tick budget + non-deterministic iteration = starvation): probe the side-channel the smoke reads from, check producer-distribution skew (one participant gets 100% / others 0%), look for "docstring says per-item, code uses shared", and apply the **per-item throttle state** fix immediately. Don't go through Cat 1/2/3 — go straight to Cat 5.
-
 ---
 
 ## 2026-08-29 — Session end (paused for quota reset)
