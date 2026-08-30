@@ -958,8 +958,26 @@ export async function createScene(
         // (the canary server's --port-wt / --port-ws flags).
         const urlBase = (window as unknown as { __damageServerUrl?: string }).__damageServerUrl
           ?? `${window.location.protocol}//${window.location.host}`;
-        const roomId = (window as unknown as { __damageServerRoomId?: string }).__damageServerRoomId
-          ?? "DEVBX";
+        const roomId = (window as unknown as { __damageServerRoomId?: string }).__damageServerRoomId;
+        if (!roomId) {
+          // PR 11.6.D / DEVBX-hardcode-cleanup (2026-08-30): the
+          // silent `?? "DEVBX"` fallback masked URL-vs-client
+          // mismatches in smoke harnesses (any smoke that didn't
+          // inject __damageServerRoomId silently joined DEVBX,
+          // masking whether the server-side parse_room_id() was
+          // actually returning the right room). Throwing surfaces
+          // the missing-injection at smoke-fail time, where the bug
+          // matters. Server-side parse_room_id() already does the
+          // correct thing (URL → room with DEVBX_ROOM_ID only as
+          // back-compat for malformed paths); this is the matching
+          // client-side guard.
+          throw new Error(
+            "[scene] __damageServerRoomId not set — smoke harness must inject window.__damageServerRoomId before scene boots. " +
+            "The room id should be derived from the URL path /rooms/<id> via parseRoomFromUrl(). " +
+            "Server-side parse_room_id() already handles malformed URLs by falling back to DEVBX_ROOM_ID, " +
+            "but the client should never silently substitute a default."
+          );
+        }
         // PR 11.6.D — read the local player ID from the page init
         // script (smoke sets this via `window.__localPlayerId`). Defaults
         // to 1 (matches the smoke's first tab; the smoke uses 2 for tab B).
