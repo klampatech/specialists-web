@@ -12,7 +12,7 @@
 //   3. After navigation, the scene mounts and the `ServerTransport`
 //      connects (connectionStatus === "connected" within 5s).
 //   4. While the create-room fetch is in flight, the lobby shows an
-//      inline status text (data-kind="busy" on the lobby-error slot,
+//      inline status text (data-kind="busy" on the lobby-busy testid,
 //      neutral color) — replaces the silent "did it hang?" UX.
 //   5. With a stubbed {exists:true, players:5, max:24} response,
 //      clicking Join after a successful getRoom() renders the
@@ -279,7 +279,7 @@ async function main() {
         }
         await route.continue();
       });
-      const busyLocator = page.locator('[data-testid="lobby-error"][data-kind="busy"]');
+      const busyLocator = page.locator('[data-testid="lobby-busy"][data-kind="busy"]');
       const navPromise = page.waitForURL(
         (url) => {
           const u = new URL(url);

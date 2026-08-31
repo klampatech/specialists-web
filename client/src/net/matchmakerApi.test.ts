@@ -90,8 +90,11 @@ describe("matchmakerApi — error cause discriminator", () => {
       caught = e;
     }
     expect(isMatchmakerNetworkError(caught)).toBe(false);
+    // Error message must mirror the URL the request actually went
+    // to (encodeURIComponent applied to the id). Otherwise operator
+    // logs show "BAD/ID" but the server saw "BAD%2FID" — confusing.
     expect((caught as Error).message).toMatch(
-      /GET \/rooms\/BAD\/ID → 400 Bad Request/,
+      /GET \/rooms\/BAD%2FID → 400 Bad Request/,
     );
   });
 

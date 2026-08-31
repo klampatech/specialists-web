@@ -70,12 +70,13 @@ export const roomApi = {
   },
 
   async getRoom(origin: string, id: string): Promise<GetRoomResponse> {
+    const encodedId = encodeURIComponent(id);
     let res: Response;
     try {
-      res = await fetch(`${origin}/rooms/${encodeURIComponent(id)}`);
+      res = await fetch(`${origin}/rooms/${encodedId}`);
     } catch (e) {
       const wrapped = new Error(
-        `GET /rooms/${id}: ${(e as Error).message || "fetch failed"}`,
+        `GET /rooms/${encodedId}: ${(e as Error).message || "fetch failed"}`,
       );
       (wrapped as Error & { cause: MatchmakerErrorCause }).cause = "network";
       throw wrapped;
@@ -85,7 +86,7 @@ export const roomApi = {
     }
     if (!res.ok) {
       const err = new Error(
-        `GET /rooms/${id} → ${res.status} ${res.statusText}: ${await res.text()}`,
+        `GET /rooms/${encodedId} → ${res.status} ${res.statusText}: ${await res.text()}`,
       );
       (err as Error & { cause: MatchmakerErrorCause }).cause = "http";
       throw err;

@@ -35,7 +35,7 @@
 //   - Errors clear on the next user interaction (typing or
 //     clicking either button) — cleanest UX without a timer.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   isMatchmakerNetworkError,
@@ -72,6 +72,15 @@ export function Lobby() {
   // Create can still type a code and click Join (and vice versa).
   const [creating, setCreating] = useState(false);
   const [joining, setJoining] = useState(false);
+  // Monotonic counter for in-flight getRoom() fetches. Stored
+  // as a ref (not state) because we need to read the LATEST
+  // value synchronously in the post-await check — React state
+  // updates are async, so a state read inside the same event
+  // tick would return the stale value. Suppresses the stale-
+  // fetch race where the user types a new code while a
+  // previous fetch is still in flight (caught by Claude Code
+  // review, 2026-08-31).
+  const joinSeqRef = useRef(0);
   const [error, setError] = useState<string | null>(null);
   // Inline status text shown while a fetch is in flight. Lives
   // in the same data-testid slot as `error` but with a neutral
@@ -142,10 +151,23 @@ export function Lobby() {
       setStatus("Checking room…");
       setJoining(true);
     });
+    // Stamp this fetch with a monotonic seq (via ref, not state, so
+    // the post-await check sees the latest value synchronously). If
+    // the user types a new code while we're awaiting, the latest
+    // ref value will differ from this captured one and we'll skip
+    // the stale roomStatus write below. Caught by Claude Code review.
+    joinSeqRef.current += 1;
+    const seq = joinSeqRef.current;
     try {
       const r = await roomApi.getRoom(origin, id);
       // got a definitive response — drop the in-flight status.
       setStatus(null);
+      if (seq !== joinSeqRef.current) {
+        // A newer fetch has started (user retyped). Drop this
+        // stale response silently — the latest fetch will paint
+        // its own status + roomStatus when it resolves.
+        return;
+      }
       if (!r.exists) {
         setError(`Room "${id}" not found. Ask the host to share a fresh link.`);
         setRoomStatus(null);
@@ -237,7 +259,7 @@ export function Lobby() {
     if (status) {
       return (
         <p
-          data-testid="lobby-error"
+          data-testid="lobby-busy"
           data-kind="busy"
           style={{
             color: "#a9b3c7",
