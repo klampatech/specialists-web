@@ -111,6 +111,53 @@ function emptyListeners(): ListenerMap {
   return {inputs: [], damageBroadcast: [], damageReject: [], snapshot: [], pong: [], disconnect: []};
 }
 
+/**
+ * Parse a room id from a transport URL path of the form `/rooms/<id>`.
+ *
+ * Mirrors server-side `server/src/transport.rs::parse_room_id()` semantics:
+ *   - Validates `[A-Za-z0-9_-]{1,64}` (matches the server's regex).
+ *   - Throws on malformed paths — the client should never silently
+ *     substitute a default. Server-side still has a DEVBX_ROOM_ID
+ *     back-compat fallback for legacy clients with broken URLs, but
+ *     the client-side parser is stricter: by the time a smoke
+ *     harness has a URL, the path SHOULD be valid.
+ *
+ * Examples:
+ *   `parseRoomFromUrl("ws://host:14434/rooms/AIMEVENT_12345")` -> `"AIMEVENT_12345"`
+ *   `parseRoomFromUrl("ws://host:14434/rooms/DEVBX")`         -> `"DEVBX"`
+ *   `parseRoomFromUrl("ws://host:14434/rooms/foo?bar=baz")`   -> `"foo"`
+ *   `parseRoomFromUrl("ws://host:14434/rooms/")`              -> throws
+ *   `parseRoomFromUrl("ws://host:14434/rooms/with space")`    -> throws
+ */
+export function parseRoomFromUrl(urlString: string): string {
+  let u: URL;
+  try {
+    u = new URL(urlString);
+  } catch {
+    throw new Error(`[parseRoomFromUrl] not a valid URL: ${urlString}`);
+  }
+  const path = u.pathname.replace(/^\/+/, "");
+  const rest = path.startsWith("rooms/") ? path.slice("rooms/".length) : null;
+  if (rest === null) {
+    throw new Error(
+      `[parseRoomFromUrl] URL pathname must start with /rooms/<id>, got "${u.pathname}" from ${urlString}`,
+    );
+  }
+  const id = rest.split("/")[0];
+  if (id === "") {
+    throw new Error(`[parseRoomFromUrl] empty room id in ${urlString}`);
+  }
+  if (id.length > 64) {
+    throw new Error(`[parseRoomFromUrl] room id too long (>64 chars) in ${urlString}`);
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+    throw new Error(
+      `[parseRoomFromUrl] room id "${id}" fails [A-Za-z0-9_-] validation in ${urlString}`,
+    );
+  }
+  return id;
+}
+
 /** Window of recent RTT samples (ms). */
 const RTT_WINDOW = 8;
 /** Initial ping delay — the first ping fires after this delay on connect. */
@@ -185,7 +232,9 @@ export class ServerTransport {
    *   (vite proxy) or `http://192.168.1.10:5190`. The transport derives
    *   the WebTransport URL as `https://<host>:4433/rooms/<roomId>` and
    *   the WebSocket URL as `ws://<host>:4434/rooms/<roomId>`.
-   * @param roomId The room to join (PR 11.6.C hard-codes `"DEVBX"`).
+   * @param roomId The room to join (derived from URL via
+   *   `parseRoomFromUrl()`). Server-side `parse_room_id()` matches the
+   *   same `[A-Za-z0-9_-]{1,64}` validation.
    */
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   constructor(urlBase: string, roomId: string) {

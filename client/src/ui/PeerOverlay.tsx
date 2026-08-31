@@ -12,6 +12,7 @@
 
 import { useEffect, useState } from "react";
 import { mapStatusToConnectionStatus } from "./connectionStatus";
+import { parseRoomFromUrl } from "../net/serverTransport";
 
 // PR 11.7.D2 / §3.10 — WebRTCPeer + signaling imports REMOVED.
 // The P2P host/join flow is gone; the overlay now surfaces the
@@ -61,8 +62,27 @@ if (
       const u = new URL(serverParam);
       (window as unknown as {__damageServerUrl?: string}).__damageServerUrl = u.origin;
       const roomParam = url.searchParams.get("room");
+      let resolvedRoomId: string | undefined;
       if (roomParam) {
-        (window as unknown as {__damageServerRoomId?: string}).__damageServerRoomId = roomParam;
+        resolvedRoomId = roomParam;
+      } else {
+        // DEVBX-hardcode-cleanup (2026-08-30): if the smoke harness
+        // didn't pass a redundant `?room=...` query param, derive the
+        // room id from the `?server=ws://host:port/rooms/<id>` path.
+        // The smoke harness convention is to encode the room in the
+        // server URL, so this is the path the actual URLs use. If
+        // the path is malformed (no `/rooms/<id>`), surface it here
+        // — `scene.ts`'s `ServerTransport` constructor will throw
+        // loudly rather than silently default to DEVBX.
+        try {
+          resolvedRoomId = parseRoomFromUrl(u.toString());
+        } catch {
+          // No room in the server URL — leave `__damageServerRoomId`
+          // unset; scene.ts will throw if it's actually needed.
+        }
+      }
+      if (resolvedRoomId) {
+        (window as unknown as {__damageServerRoomId?: string}).__damageServerRoomId = resolvedRoomId;
       }
       const localIdParam = url.searchParams.get("localId");
       if (localIdParam) {
