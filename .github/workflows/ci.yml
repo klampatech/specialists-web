@@ -2120,6 +2120,128 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  # PR #89 follow-up — orchestrator smoke + shell/systemd lint gates.
+  #
+  # PR #89 (cert-source dispatcher + WSS termination) shipped two
+  # orchestrator bugs that the existing unit tests couldn't catch:
+  #
+  #   - Regression 1: tools/canary-server.sh defaulted PORT_WSS
+  #     before the arg-parsing loop ran (shell-script ordering bug
+  #     that `bash -n` does NOT catch).
+  #   - Regression 2: futures::future::OptionFuture::from(None)
+  #     resolves with None immediately, killing run_server in ~1ms
+  #     before listeners could bind.
+  #
+  # These jobs are the gap-fillers:
+  #
+  #   1. client-canary-orchestrator-smoke — boots the canary
+  #      end-to-end and asserts (a) the orchestrator stays alive
+  #      past the listener-spawn window, (b) WS + WSS + WT ports
+  #      are reachable, (c) WS handshake completes. This catches
+  #      BOTH regression classes above.
+  #
+  #   2. server-shell-systemd-gate — runs `bash -n` on every .sh
+  #      in tools/ (catches syntax errors + unclosed braces that
+  #      would only surface at first invocation) and
+  #      `systemd-analyze verify` on every .service file (catches
+  #      unit-file syntax errors that would only surface in
+  #      production). Both gates are sub-second.
+  #
+  # The orchestrator smoke is forward-compatible: it feature-detects
+  # whether `tools/canary-server.sh` accepts the new PR-#89 flags
+  # (--port-wss, --cert-source) by grepping the script source, so
+  # it works on main today AND on PR branches.
+  client-canary-orchestrator-smoke:
+    name: client — canary orchestrator smoke (PR #89 follow-up)
+    # Depends on server-build so the canary binary is the same one
+    # that passed cargo test in CI. No browser needed — the smoke
+    # is pure TCP/TLS/WS probes, faster than the Playwright smokes.
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — orchestrator smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Run canary orchestrator smoke
+        working-directory: client
+        run: node tools/canary-orchestrator-smoke.mjs
+        env:
+          CANARY_PORT_WT: 14433
+          CANARY_PORT_WS: 14434
+          CANARY_PORT_WSS: 14435
+          # ORCHESTRATOR_ALIVE_HOLD_MS is 5s by default — gives the
+          # orchestrator a clear window to either stay up or die
+          # prematurely (the OptionFuture::from(None) bug kills it
+          # in ~1ms, so 5s is a wide margin).
+      - name: Upload canary log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-orchestrator-smoke-log
+          path: /tmp/canary-orchestrator-smoke.log
+          if-no-files-found: warn
+
+  server-shell-systemd-gate:
+    name: server — shell + systemd lint gate (PR #89 follow-up)
+    # Sub-second gate. Runs on every PR (no need gating — the cost
+    # is negligible). Catches:
+    #   - tools/*.sh: syntax errors via `bash -n`. The PORT_WSS
+    #     regression was an ordering bug, not a syntax bug, so
+    #     `bash -n` wouldn't have caught IT — but it WOULD catch
+    #     unclosed braces, mismatched case/esac, missing fi, etc.
+    #   - tools/*.service: unit-file syntax errors via
+    #     `systemd-analyze verify`. Catches unknown directives,
+    #     Type= vs ExecStart mismatches, missing [Install] sections,
+    #     and the dozen other silent-until-prod failures.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n on all shell scripts in tools/
+        run: |
+          echo "=== bash -n tools/*.sh ==="
+          status=0
+          for f in tools/*.sh; do
+            if [[ -f "$f" ]]; then
+              echo "--- $f ---"
+              if ! bash -n "$f"; then
+                echo "::error::bash -n failed for $f"
+                status=1
+              fi
+            fi
+          done
+          exit $status
+      - name: systemd-analyze verify on all unit files in tools/
+        run: |
+          echo "=== systemd-analyze verify tools/*.service ==="
+          status=0
+          for f in tools/*.service; do
+            if [[ -f "$f" ]]; then
+              echo "--- $f ---"
+              if ! systemd-analyze verify "$f"; then
+                echo "::error::systemd-analyze verify failed for $f"
+                status=1
+              fi
+            fi
+          done
+          # Also check the canonical /etc path in case operators symlink
+          if [[ -f /etc/systemd/system/specialists-server.service ]]; then
+            echo "--- /etc/systemd/system/specialists-server.service ---"
+            systemd-analyze verify /etc/systemd/system/specialists-server.service || status=1
+          fi
+          exit $status
+
   spec-canonical:
     name: spec layout — canonical at docs/SPEC.md
     runs-on: ubuntu-latest
