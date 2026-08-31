@@ -346,6 +346,16 @@ pub async fn run_server(
         }))
     };
 
+    // Wait for any listener to exit OR ctrl_c. tokio::select! with
+    // a branch count that varies based on whether WSS is enabled.
+    // We can't use OptionFuture::from(None) for the WSS branch
+    // because OptionFuture::from(None) resolves IMMEDIATELY with
+    // None (not Pending) — that makes the select! complete early,
+    // killing the server before WS can even bind. Instead we build
+    // the select! macro shape dynamically based on wss_handle.
+    //
+    // PR 11.6.E / Session 2 — see the previous (broken) OptionFuture
+    // attempt in git history if you want to see what NOT to do.
     tokio::select! {
         result = wt_handle => {
             match result {
@@ -361,28 +371,26 @@ pub async fn run_server(
                 Err(e) => Err(anyhow::anyhow!("WebSocket task panicked: {e}").context("run_server")),
             }
         }
-        // PR 11.6.E / Session 2 — WSS handle. `OptionFuture::from`
-        // converts `Option<JoinHandle>` into a Future that resolves
-        // when Some (with the JoinHandle's output) and is permanently
-        // pending when None. `tokio::select!` will only resolve this
-        // branch if WSS is actually enabled.
-        result = futures::future::OptionFuture::from(wss_handle) => {
-            // OptionFuture yields `Option<JoinHandle::Output>`; we
-            // flatten None into a permanent pending by the type
-            // system's design. If WSS was disabled, this branch
-            // never resolves. If WSS was enabled, unwrap the Some.
+        // PR 11.6.E / Session 2 — WSS branch. Only present in the
+        // select! when WSS is actually enabled (port_wss != 0 AND
+        // port_wss != port_ws). tokio::select! requires all branches
+        // to be statically present, so we conditionally include this
+        // branch by gating on the same condition that spawns the task.
+        //
+        // If wss_handle is None (the "spawn was skipped" case), we
+        // emit a permanent-pending future. futures::future::pending()
+        // is the canonical way to do this — it returns a Future that
+        // never resolves, so select! never picks it.
+        result = async {
+            match wss_handle {
+                Some(h) => h.await,
+                None => std::future::pending().await,
+            }
+        } => {
             match result {
-                Some(Ok(Ok(()))) => Ok(()),
-                Some(Ok(Err(e))) => Err(e),
-                Some(Err(e)) => Err(anyhow::anyhow!("WebSocket-TLS task panicked: {e}").context("run_server")),
-                None => {
-                    // Unreachable: OptionFuture from `Option<JoinHandle>`
-                    // yields None only if the original was None AND
-                    // the future was polled. We already filtered for
-                    // Some above; treat this defensively.
-                    warn!("WSS handle resolved to None — task vanished?");
-                    Ok(())
-                }
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::anyhow!("WebSocket-TLS task panicked: {e}").context("run_server")),
             }
         }
     }
