@@ -1,0 +1,79 @@
+[Unit]
+Description=Specialists Web server (PR 11.6.E production Tailscale-Funnel)
+Documentation=https://github.com/klampatech/specialists-web
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# Tailscaled must be up so `tailscale funnel status` resolves.
+# We don't strictly require tailscaled.service (some distros use
+# different unit names) — the ExecStartPre gate below checks
+# Funnel availability and fails loud if the host isn't in a
+# Funnel-enabled Tailnet.
+
+[Service]
+Type=simple
+User=kyle
+WorkingDirectory=/home/kyle/Development/specialists-web
+Environment=CARGO_PROFILE=release
+Environment=CERT_SOURCE=letsencrypt
+
+# ExecStartPre: gate on Tailscale Funnel being available on this host.
+# We refuse to boot the server if Funnel isn't configured — that way
+# the operator sees a clear "Funnel not enabled" error instead of the
+# server silently falling back to a self-signed cert.
+#
+# `tailscale funnel status` exits 0 + prints the Funnel table when
+# Funnel is enabled for the tailnet; it exits non-zero (with "Funnel
+# not enabled" or similar) when the tailnet doesn't allow Funnel
+# access for this host. The `grep -q 4433` ensures 4433 is in the
+# configured set — even if Funnel is on for a different port, we
+# don't want to boot a "production" server on a port Funnel isn't
+# proxying.
+ExecStartPre=/bin/sh -c 'tailscale funnel status | grep -q "4433" || { echo "[specialists-server] ExecStartPre: Tailscale Funnel on :4433 not configured; refusing to boot in letsencrypt mode"; exit 1; }'
+
+# ExecStartPost: pull the Let's Encrypt cert + key out of the
+# Tailscale state and write them to the paths the server expects.
+# The cert is provisioned by Tailscale's ACME flow when Funnel is
+# enabled for the hostname; we just locate it and copy it to
+# $CERT_DIR (default <repo>/server/certs).
+#
+# PR 11.6.E scope: this is a copy operation, not cert provisioning.
+# Real provisioning is handled by `tailscale funnel --https=4433 on`,
+# which the operator runs once per host (idempotent).
+#
+# We use Tailscale's cert file API path: the cert lives at
+# /var/lib/tailscale/files/cert_<hash>.pem for the active node;
+# `tailscale cert` prints the current cert + key to stdout in PEM
+# format (one invocation: cert, second invocation: key).
+ExecStartPost=/bin/sh -c '\
+  CERT_DIR="$${CERT_DIR:-/home/kyle/Development/specialists-web/server/certs}"; \
+  mkdir -p "$$CERT_DIR"; \
+  tailscale cert > "$$CERT_DIR/lets-encrypt.pem" || { echo "[specialists-server] ExecStartPost: tailscale cert failed; refusing to start server"; exit 1; }; \
+  tailscale cert --key > "$$CERT_DIR/lets-encrypt.key" || { echo "[specialists-server] ExecStartPost: tailscale cert --key failed; refusing to start server"; exit 1; }; \
+  chmod 0600 "$$CERT_DIR/lets-encrypt.key"; \
+  chmod 0644 "$$CERT_DIR/lets-encrypt.pem"; \
+  echo "[specialists-server] wrote lets-encrypt cert to $$CERT_DIR"'
+
+# ExecReload: rotate the cert + restart the server. Tailscale
+# rotates Let's Encrypt certs every ~60-90 days; when that happens,
+# we want to pick up the new cert without dropping connections.
+# HUP triggers ExecReload per systemd convention.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Main process: launch the canary wrapper, which spawns cargo run
+# --release of specialists-server. The wrapper is preferred over
+# invoking the binary directly because it owns the cert path
+# resolution + the letsencrypt fail-loud.
+ExecStart=/home/kyle/Development/specialists-web/tools/canary-server.sh --cert-source letsencrypt --port-wt 4433 --port-ws 4434
+
+# Restart on failure (Funnel config drift, transient network).
+# Don't restart on clean exit (Ctrl-C / SIGTERM).
+Restart=on-failure
+RestartSec=5
+
+# Hardening (light — this runs as kyle, not a service user).
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/kyle/Development/specialists-web/server/certs /home/kyle/.cargo /home/kyle/Development/specialists-web/server/target
+
+[Install]
+WantedBy=default.target

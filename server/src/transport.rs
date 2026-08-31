@@ -241,6 +241,7 @@ impl ConnectionState {
 pub async fn run_server(
     port_wt: u16,
     port_ws: u16,
+    cert_source: specialists_server::cert::CertSource,
     cert_path: PathBuf,
     key_path: PathBuf,
     sans: Vec<String>,
@@ -248,11 +249,12 @@ pub async fn run_server(
 ) -> Result<()> {
     let wt_handle = tokio::spawn({
         let rooms = rooms.clone();
+        let cert_source = cert_source;
         let cert_path = cert_path.clone();
         let key_path = key_path.clone();
         let sans = sans.clone();
         async move {
-            if let Err(e) = run_web_transport(port_wt, cert_path, key_path, sans, rooms).await {
+            if let Err(e) = run_web_transport(port_wt, cert_source, cert_path, key_path, sans, rooms).await {
                 warn!("run_web_transport exited: {e:?}");
                 Err(e)
             } else {
@@ -502,16 +504,28 @@ async fn handle_websocket_connection(
 /// Spawned by `main`. Loads (or generates) the cert at the given
 /// paths, builds the `wtransport::Endpoint`, and dispatches incoming
 /// sessions. Returns on `Endpoint::accept()` error or shutdown.
+///
+/// `cert_source` selects between self-signed (dev/CI — generates the
+/// cert if missing) and letsencrypt (production / Tailscale Funnel —
+/// fails loud if the cert files are not on disk). The cert dispatcher
+/// in `crate::cert::ensure_certs` owns the source-specific behavior;
+/// this function only logs the resolved mode.
 pub(crate) async fn run_web_transport(
     port: u16,
+    cert_source: specialists_server::cert::CertSource,
     cert_path: PathBuf,
     key_path: PathBuf,
     sans: Vec<String>,
     rooms: RoomRegistry,
 ) -> Result<()> {
-    specialists_server::cert::ensure_dev_certs(&cert_path, &key_path, sans_with_defaults(sans))
-        .await
-        .context("ensure_dev_certs")?;
+    specialists_server::cert::ensure_certs(
+        cert_source,
+        &cert_path,
+        &key_path,
+        sans_with_defaults(sans),
+    )
+    .await
+    .context("ensure_certs")?;
     let identity = specialists_server::cert::load_identity(&cert_path, &key_path)
         .await
         .context("load_identity")?;
@@ -525,7 +539,7 @@ pub(crate) async fn run_web_transport(
         format!("wtransport Endpoint::server on UDP/{port} — port in use?")
     })?;
     let local = server.local_addr().context("wtransport local_addr")?;
-    info!(%local, "WebTransport listener bound (primary transport, §3.3)");
+    info!(%local, ?cert_source, "WebTransport listener bound (primary transport, §3.3)");
 
     loop {
         let incoming = server.accept().await;

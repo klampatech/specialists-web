@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use specialists_server::transport::{run_server, RoomRegistry};
-use specialists_server::cert::DEFAULT_SANS;
+use specialists_server::cert::{CertSource, DEFAULT_SANS, LETS_ENCRYPT_CERT, LETS_ENCRYPT_KEY};
 use specialists_server::connection_outbound::global_drop_oldest_count;
 use specialists_server::session::Room;
 
@@ -34,6 +34,12 @@ struct Args {
     key_out: Option<PathBuf>,
     sans: Vec<String>,
     gen_cert: bool,
+    /// TLS cert source — `self-signed` (default, dev/CI) or
+    /// `letsencrypt` (production / cloud deploy via Tailscale Funnel).
+    /// PR 11.6.E adds the production path so the server can serve a
+    /// real Let's Encrypt cert at the Funnel URL with no dev-cert
+    /// browser warning.
+    cert_source: Option<CertSource>,
     print_help: bool,
 }
 
@@ -76,6 +82,15 @@ fn parse_args() -> Result<Args> {
             "--gen-cert" => {
                 args.gen_cert = true;
             }
+            "--cert-source" => {
+                let raw = iter
+                    .next()
+                    .context("--cert-source requires a value")?;
+                args.cert_source = Some(
+                    CertSource::from_str(&raw)
+                        .with_context(|| format!("invalid --cert-source {raw:?}"))?,
+                );
+            }
             "-h" | "--help" => {
                 args.print_help = true;
             }
@@ -92,20 +107,27 @@ fn print_help() {
         "specialists-server — PR 11.6.B server scaffold\n\
          \n\
          USAGE:\n  \
-         specialists-server [--port-wt <u16>] [--port-ws <u16>] [--cert <path>] [--key <path>] [--sans <csv>]\n  \
+         specialists-server [--port-wt <u16>] [--port-ws <u16>] [--cert <path>] [--key <path>] [--sans <csv>] [--cert-source <self-signed|letsencrypt>]\n  \
          specialists-server --gen-cert --cert-out <path> --key-out <path> [--sans <csv>]\n\
          \n\
          FLAGS:\n  \
-         --port-wt <u16>    UDP port for the WebTransport listener (default: 4433)\n  \
-         --port-ws <u16>    TCP port for the WebSocket listener (default: 4434)\n  \
-         --cert <path>      Path to the PEM cert (default: server/certs/dev.pem)\n  \
-         --key <path>       Path to the PEM key (default: server/certs/dev.key)\n  \
-         --sans <csv>       Comma-separated Subject Alternative Names for the self-signed cert\n  \
-                            (defaults to localhost,127.0.0.1,::1). Add your Tailscale IP\n  \
-                            here when running from a non-loopback host.\n  \
-         --gen-cert         Generate the self-signed cert + key, then exit 0. Used by\n  \
-                            tools/canary-server.sh on first boot.\n  \
-         -h, --help         Print this help and exit.\n\
+         --port-wt <u16>             UDP port for the WebTransport listener (default: 4433)\n  \
+         --port-ws <u16>             TCP port for the WebSocket listener (default: 4434)\n  \
+         --cert <path>               Path to the PEM cert (default: server/certs/dev.pem for self-signed,\n  \
+                                    server/certs/lets-encrypt.pem for letsencrypt)\n  \
+         --key <path>                Path to the PEM key (default: server/certs/dev.key for self-signed,\n  \
+                                    server/certs/lets-encrypt.key for letsencrypt)\n  \
+         --sans <csv>                Comma-separated Subject Alternative Names for the self-signed cert\n  \
+                                    (defaults to localhost,127.0.0.1,::1). Add your Tailscale IP\n  \
+                                    here when running from a non-loopback host. Ignored in letsencrypt\n  \
+                                    mode — SANs come from the cert itself.\n  \
+         --cert-source <mode>        Cert source: 'self-signed' (default, dev/CI) or 'letsencrypt'\n  \
+                                    (production / Tailscale Funnel). Selects which cert files\n  \
+                                    are loaded and whether the server generates a self-signed\n  \
+                                    cert on first boot.\n  \
+         --gen-cert                  Generate the self-signed cert + key, then exit 0. Used by\n  \
+                                    tools/canary-server.sh on first boot. Self-signed only.\n  \
+         -h, --help                  Print this help and exit.\n\
          \n\
          ENVIRONMENT:\n  \
          RUST_LOG                       Standard tracing-subscriber env filter. Default: info.\n  \
@@ -129,19 +151,38 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Cert paths. `ensure_dev_certs` is idempotent — if both files
-    // already exist, it's a no-op.
+    // Resolve cert source. Defaults to SelfSigned — keeps existing
+    // dev/CI behavior unchanged. LetsEncrypt is opt-in via the
+    // --cert-source flag and is paired with the systemd unit's
+    // ExecStartPost that writes the Funnel-provisioned cert.
+    let cert_source = args.cert_source.unwrap_or(CertSource::SelfSigned);
+
+    // Cert paths. Defaults depend on cert_source:
+    //   SelfSigned   -> server/certs/dev.{pem,key}
+    //   LetsEncrypt  -> server/certs/lets-encrypt.{pem,key}
+    // The `--cert` / `--key` flags override either default. The
+    // `ensure_certs` dispatcher picks the right loader based on
+    // `cert_source` and the resolved paths.
+    let default_cert = match cert_source {
+        CertSource::SelfSigned => "server/certs/dev.pem",
+        CertSource::LetsEncrypt => LETS_ENCRYPT_CERT,
+    };
+    let default_key = match cert_source {
+        CertSource::SelfSigned => "server/certs/dev.key",
+        CertSource::LetsEncrypt => LETS_ENCRYPT_KEY,
+    };
     let cert_path = args
         .cert_out
         .clone()
-        .unwrap_or_else(|| PathBuf::from("server/certs/dev.pem"));
+        .unwrap_or_else(|| PathBuf::from(default_cert));
     let key_path = args
         .key_out
         .clone()
-        .unwrap_or_else(|| PathBuf::from("server/certs/dev.key"));
+        .unwrap_or_else(|| PathBuf::from(default_key));
 
     // Merge user-provided SANs with the defaults. The cert helper
-    // dedupes internally.
+    // dedupes internally. SANs are only consumed in self-signed mode
+    // — in letsencrypt mode they come from the cert itself.
     let mut sans: Vec<String> = DEFAULT_SANS.iter().map(|s| s.to_string()).collect();
     for s in args.sans.clone() {
         if !sans.iter().any(|existing| existing == &s) {
@@ -151,7 +192,16 @@ async fn main() -> ExitCode {
 
     if args.gen_cert {
         // Single-purpose CLI flag used by canary-server.sh. Generate
-        // the cert (no-op if both files exist) and exit.
+        // the cert (no-op if both files exist) and exit. Self-signed
+        // only — calling --gen-cert with --cert-source=letsencrypt
+        // is a user error; fail loud.
+        if cert_source != CertSource::SelfSigned {
+            eprintln!(
+                "error: --gen-cert only makes sense with --cert-source=self-signed\n\
+                 (letsencrypt certs are provisioned by Tailscale Funnel, not generated)\n"
+            );
+            return ExitCode::from(2);
+        }
         match specialists_server::cert::ensure_dev_certs(&cert_path, &key_path, sans).await {
             Ok(()) => {
                 println!("wrote {} and {}", cert_path.display(), key_path.display());
@@ -171,8 +221,11 @@ async fn main() -> ExitCode {
 
     info!(
         port_wt,
-        port_ws, cert = %cert_path.display(), key = %key_path.display(),
-        "starting specialists-server (PR 11.6.B scaffold)"
+        port_ws,
+        cert_source = ?cert_source,
+        cert = %cert_path.display(),
+        key = %key_path.display(),
+        "starting specialists-server (PR 11.6.B scaffold; cert provisioning via PR 11.6.E)"
     );
 
     // `run_server` owns both listener tasks. The integration canary starts
@@ -182,6 +235,7 @@ async fn main() -> ExitCode {
     let server = run_server(
         port_wt,
         port_ws,
+        cert_source,
         cert_path,
         key_path,
         sans,
