@@ -79,20 +79,29 @@ interface HudState {
 }
 
 export function App() {
-  // PR 11.9 — matchmaker lobby. When the URL has no `?server=` flag,
-  // the user landed on the entry page without being invited to a
-  // specific room — show the lobby instead of the game scene. The
-  // lobby navigates to `?server=<ws_url>` after Create/Join, at which
-  // point the URL flag drives the existing PeerOverlay/scene.ts flow.
-  // Detection happens at module evaluation (see PeerOverlay.tsx) AND
-  // here as a React-level guard (the Lobby component itself reads the
-  // URL too, but this guard short-circuits the heavy scene mount).
+  // PR 11.9 — matchmaker lobby. The lobby shows when:
+  //   - We're in a production build (real user landed on the
+  //     entry URL with no invite link), OR
+  //   - The URL explicitly opts in via `?lobby=1` (manual QA +
+  //     the lobby smoke).
+  //
+  // Dev builds default to the scene because developer machines +
+  // CI smokes load the entry URL directly to test scene mount,
+  // networking, and gameplay. Showing a lobby modal here would
+  // block every existing client smoke. The production-only gate
+  // keeps the lobby a real-user surface while preserving the
+  // dev workflow.
   const [hasServerParam] = useState(() => {
     if (typeof window === "undefined") return false;
     const u = new URL(window.location.href);
     return !!u.searchParams.get("server");
   });
-  if (!hasServerParam && import.meta.env.DEV) {
+  const [forceLobby] = useState(() => {
+    if (typeof window === "undefined") return false;
+    const u = new URL(window.location.href);
+    return u.searchParams.get("lobby") === "1";
+  });
+  if (forceLobby || (!hasServerParam && !import.meta.env.DEV)) {
     return <Lobby />;
   }
 

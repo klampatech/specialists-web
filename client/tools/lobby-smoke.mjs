@@ -178,8 +178,15 @@ async function main() {
       if (m.type() === "error") log(`[browser:error] ${m.text()}`);
     });
 
-    log(`Navigating to ${URL_BASE} (no ?server= param → lobby should render)`);
-    await page.goto(URL_BASE, { waitUntil: "networkidle", timeout: NAV_TIMEOUT });
+    // Lobby is opt-in for dev builds (so existing CI smokes that
+    // load the entry URL directly to test the scene aren't blocked).
+    // Production builds show the lobby by default when no
+    // ?server= param is set. ?lobby=1 forces the lobby in dev for
+    // manual QA + this smoke.
+    const target = new URL(URL_BASE);
+    target.searchParams.set("lobby", "1");
+    log(`Navigating to ${target.toString()} (no ?server= param → lobby should render)`);
+    await page.goto(target.toString(), { waitUntil: "networkidle", timeout: NAV_TIMEOUT });
 
     // Assertion 1: Lobby renders.
     log(`ASSERTION 1: lobby component renders`);
