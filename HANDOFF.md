@@ -7,14 +7,57 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#83 (2026-08-29). **`main` @ `c851795` (PR #83 squash — MERGED 2026-08-29 20:45 UTC, combined with PR #82).** **CF-N1 (HP-convergence mpsc-saturation race) is CLOSED at the actual root cause.** PR #83 fixed the bug that PR #81 had misdiagnosed: the snapshot loop in `server/src/main.rs` shared a single `SnapshotGenerator` across all rooms, so the first room in HashMap iteration consumed the 20Hz budget every tick and starved every other. The HP-conv smoke's `__latestSnap()` returned `null` for 10+ seconds in starving rooms → primer fired `frame: 0` → server rejected with "frame too far in the past (rewind window exceeded)". **Fix**: per-room `HashMap<String, SnapshotGenerator>` with stale-entry GC each tick. PR #81's rate-limiter stays (it's a useful second-line defense for genuine consumer-saturation) but wasn't the cause. **PR #82 (Havok parity smoke as required CI gate)** was unblocked once #83 landed — combined into the same squash commit. **CI: 27/27 GREEN**. **Verification**: 30/30 local smoke runs PASS (8 fresh canary + 8 stale-canary + 5 stress + 5 final + 4 probing); 108/108 cargo unit tests; 43/43 vitest. **Lesson captured**: skill `ci-smoke-flake-triage` Category 5 (architectural bug masquerading as a flake) + reference `references/specialists-web-cfn1-root-cause.md`. Vault plan `~/Obsidian/mem/projects/specialists-web-pr80-cfn1-rate-limit.md` marked SUPERSEDED.
-
-**No code work currently queued.** Recommended next direction (your call):
-- **(a) Pivot to weapons** — add a second weapon type (shotgun or sniper) with its own ammo constant + the WEAPONS-table refactor that Kyle flagged.
-- **(b) Pivot to new feature arc** — matchmaker (PR 11.9), production Tailscale-Funnel certs (PR 11.6.E), lobby UI, spectator mode, replay, scoreboard.
-- **(c) Maintenance / debt sweep — close out carry-forwards** — DEVBX hardcode in 0x06 arm (`server/src/transport.rs:962`), PointerLock ESC-equals-resume flicker (PR 11.2 series known issue), remote rig collision (blue-rig clips through boxes), or anti-cheat (Phase 4).
+**`You are here`**: post-PR-#87 (2026-08-30). **`main` @ `226423e` (PR #87 squash — MERGED 2026-08-30 21:28 UTC).** Closes the long-running DEVBX hardcode carry-forward from PR 11.7.E. **The bug had two layers, not one**: server-side `parse_room_id()` (PR #63) was already correct — only the client side had a bug. Two client-side surfaces: (1) `scene.ts` had a silent `?? "DEVBX"` fallback when `window.__damageServerRoomId` was unset, and (2) `PeerOverlay.tsx` only set `__damageServerRoomId` from a separate `?room=` URL param that no actual smoke passes — every smoke encodes the room in the `?server=.../rooms/<id>` URL path. Net effect: `__damageServerRoomId` was always unset, `scene.ts` silently fell back to DEVBX, and any real smoke failure would have been silently masked. **Fix** (4 files, +154/-4): `scene.ts` throws on missing injection (instead of silently defaulting); `serverTransport.ts` exports `parseRoomFromUrl()` mirroring server-side `parse_room_id()` regex `[A-Za-z0-9_-]{1,64}`; `PeerOverlay.tsx` derives room from the `?server=.../rooms/<id>` URL path when `?room=` is absent; new `client/src/net/serverTransport.test.ts` covers 9 cases. **CI: 27/27 GREEN on merge commit (run 33336396036).** Local verification: `two-tab-smoke.mjs` PASS (3), `two-tab-manual-flow.mjs` PASS (5: clean snapshots, rig separation, rig meshes, walk mirror 7.91m, HP convergence — this was the in-CI smoke that was relying on the silent fallback), `health-regression-smoke.mjs` PASS. typecheck clean, vitest 43 → **52 PASS** (+9), build clean (bundle 7,065.57 kB, same hash as main, +0 delta). This was the (B) PR in the B → A → C vote. **No code work currently queued.** Recommended next direction (your call):
+- **(a) PR 11.6.E — Production Tailscale-Funnel certs + WebTransport primary** (~2-3 sessions, the big one). Real domain, Let's Encrypt, WT as primary transport, no dev cert warnings. Closes the cloud-deploy gap.
+- **(b) PR `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator already shipped; this is verification + a small capacity bump if needed before sustained cloud load.
+- **(c) Pivot to weapons / matchmaker / new feature arc** — Phase 2 candidates from previous TL;DR: WEAPONS-table refactor (shotgun/sniper), matchmaker (PR 11.9), lobby UI, spectator mode, replay, scoreboard, or any of the maintenance carry-forwards (remote rig collision, PointerLock ESC flicker, anti-cheat).
 
 ---
+
+## 2026-08-30 — PR #87 merged (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86)
+
+**Scope**: three PRs merged in this session. PR #85 was the docs merge-conflict resolution from yesterday. PR #86 was a README refresh — it was stuck on the Phase-0 "feel test" framing, 2 phases and ~30 PRs out of date. PR #87 was the actual netcode-cleanup work: closes the long-running DEVBX hardcode carry-forward from PR 11.7.E. GitHub squash-merged all three.
+
+**What was actually wrong (the two-layer DEVBX bug)**:
+
+1. **Server-side `parse_room_id()` (PR #63) is already correct.** Investigation 2026-08-30 confirmed that the URL → room routing works: it returns the URL-derived room name and only falls back to `DEVBX_ROOM_ID` for malformed paths. So the original "non-DEVBX rooms don't get yaw/pitch on snapshot" bug was already closed server-side. The HANDOFF carry-forward was stale — the **real** remaining bug was entirely client-side.
+
+2. **Client-side surface #1: `client/src/engine/scene.ts`** — silent `?? "DEVBX"` fallback when `window.__damageServerRoomId` was unset. This masked URL-vs-client mismatches: any smoke harness that forgot to inject `__damageServerRoomId` silently joined DEVBX, masking whether the server-side routing was working correctly.
+
+3. **Client-side surface #2: `client/src/ui/PeerOverlay.tsx`** — only set `__damageServerRoomId` from a separate `?room=` URL query param. But **every actual smoke passes the room in the `?server=ws://host:port/rooms/<id>` URL path** instead. So `__damageServerRoomId` was always unset → `scene.ts` silently fell back to DEVBX → real smoke failures (if any) would have been silently masked.
+
+**Net effect** (pre-fix): every smoke run that should have detected URL-vs-client mismatches couldn't, because the silent fallback papered over the issue. The bug was a **latent failure mode** — the system happened to work because DEVBX was the default, but a future change that relied on the room name being correctly threaded through the client would have silently broken.
+
+**The diagnostic walk**:
+1. **Initial reading**: HANDOFF carry-forward said "DEVBX hardcode in 0x06 arm (server/src/transport.rs:962)" — looked server-side.
+2. **Code grep**: `grep -nE "DEVBX" server/src/transport.rs server/src/main.rs` showed `DEVBX_ROOM_ID` only as a back-compat safety net in `parse_room_id()` (line 124 fallback for malformed paths). `parse_room_id()` itself correctly extracts the URL-derived room.
+3. **Client-side grep**: `grep -rE "DEVBX" client/src/` showed the silent fallback in `scene.ts:962` — that was bug surface #1.
+4. **Smoke-script grep**: `grep -rE "__damageServerRoomId" client/tools/` showed 9 of 18 smoke scripts don't inject `__damageServerRoomId`. But those smokes DO turn on the DEV probe (`__forceServerTransport=true` in `two-tab-manual-flow.mjs` and `cdp-drive.mjs`). So they hit the silent fallback.
+5. **PeerOverlay.tsx grep**: `grep -nE "roomParam|/rooms/" client/src/ui/PeerOverlay.tsx` showed that PeerOverlay only reads `?room=` URL param, never derives from `?server=.../rooms/<id>` URL path. **That was bug surface #2** — the smokes pass the room in the server URL path, PeerOverlay ignores it.
+
+**The fix**:
+- `scene.ts`: replace `?? "DEVBX"` with `if (!roomId) throw new Error(...)`. Surfaces missing-injection at smoke-fail time.
+- `serverTransport.ts`: extract top-level `export function parseRoomFromUrl(urlString): string`. Mirrors server-side `parse_room_id()` semantics (`[A-Za-z0-9_-]{1,64}` regex), throws on malformed paths (no silent fallback — server-side still has the back-compat safety net for legacy clients).
+- `PeerOverlay.tsx`: when `?room=` is absent, derive room from `?server=.../rooms/<id>` URL path via `parseRoomFromUrl()`. **This is the path every actual smoke uses** — so the missing-injection silent-fallback is no longer reached for any real URL.
+- `client/src/net/serverTransport.test.ts`: new, 9 vitest unit tests (happy path, query string stripping, dashes/underscores, empty id, space-in-id, missing-prefix, too-long, not-a-URL).
+
+**Verification**:
+- typecheck clean
+- vitest 43 → 52 PASS (+9 new)
+- npm run build clean (bundle 7,065.57 kB, same hash as main, +0 delta — `parseRoomFromUrl` tree-shakes to nothing in prod bundle because it's only referenced from the DEV-gated probe path)
+- Local end-to-end: `two-tab-smoke.mjs` PASS (3), `two-tab-manual-flow.mjs` PASS (5 — this is the in-CI smoke that was relying on the silent fallback), `health-regression-smoke.mjs` PASS
+- All 27 CI checks GREEN on merge commit (run 33336396036) — zero flakes, zero retries
+
+**What stays unchanged**:
+- Server-side `DEVBX_ROOM_ID` in `server/src/constants.rs:37` — it's the legitimate back-compat safety net for malformed URL paths (server-side `parse_room_id()` still falls back to it). Not touched.
+- All 9 smoke scripts that explicitly inject `__damageServerRoomId` — they keep working unchanged (the change only fires when the injection is missing).
+- All server-side code (no Rust touched in this PR).
+
+**Lesson captured**: "Silent fallbacks mask missing-injection bugs." When a smoke harness forgets to set up state, the system should fail loudly at the point of use, not silently substitute a default that happens to work. The throw-based approach surfaces the bug at smoke-fail time (where it matters) instead of silently routing the wrong room.
+
+**PR #86 — README refresh** (separate, but same session): the root `README.md` was stuck on "Phase 0 — The feel test" framing. Refreshed to reflect Phase 1 internet-multiplayer shipped status, real tech stack (ggrs removed, Rapier + enhanced-determinism), two-terminal quickstart, real repo structure, new CI section. 1 file, +38/-10. `MERGEABLE` on first push, merged clean.
+
+**PR #85 — merge-conflict resolution** (carry-forward from yesterday): single conflict in HANDOFF.md (line 57-81), both sides inserting a new section header in the same place. Resolution: kept both in chronological order (2026-08-29 session-end entry before 2026-08-28 PR #80 PLANNED entry). docs/SPEC.md auto-merged clean. Merge commit `0d339ef`. Pushed + verified `MERGEABLE`.
 
 ## 2026-08-29 — CF-N1 closed (PR #81 wrong-fix, PR #83 real-fix) + Havok parity smoke landed (PR #82)
 
