@@ -15,6 +15,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -32,6 +33,7 @@ jobs:
         working-directory: server
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -74,6 +76,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -96,6 +99,7 @@ jobs:
     # the npm + smoke steps run with explicit `working-directory: client`.
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -212,6 +216,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -331,6 +336,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -440,6 +446,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -490,6 +497,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -554,6 +562,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -638,6 +647,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -756,6 +766,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -846,6 +857,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -936,6 +948,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -994,6 +1007,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1090,6 +1104,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1202,6 +1217,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1283,6 +1299,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1404,6 +1421,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1489,6 +1507,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1580,6 +1599,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1668,6 +1688,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1761,6 +1782,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1860,6 +1882,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1928,6 +1951,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1997,6 +2021,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -2065,6 +2090,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -2134,6 +2160,7 @@ jobs:
     # repo root; npm + smoke steps run with explicit `working-directory: client`.
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -2238,6 +2265,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -2286,6 +2314,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - name: bash -n on all shell scripts in tools/
         run: |
           echo "=== bash -n tools/*.sh ==="
@@ -2325,6 +2354,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
       - name: Check that docs/SPEC.md exists
         run: |
           if [[ ! -f docs/SPEC.md ]]; then
