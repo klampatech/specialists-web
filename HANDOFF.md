@@ -8,11 +8,65 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 |## ⚡ TL;DR for the next session (read this first)
 
 **`You are here`**: post-PR-#87 (2026-08-30). **`main` @ `226423e` (PR #87 squash — MERGED 2026-08-30 21:28 UTC).** Closes the long-running DEVBX hardcode carry-forward from PR 11.7.E. **The bug had two layers, not one**: server-side `parse_room_id()` (PR #63) was already correct — only the client side had a bug. Two client-side surfaces: (1) `scene.ts` had a silent `?? "DEVBX"` fallback when `window.__damageServerRoomId` was unset, and (2) `PeerOverlay.tsx` only set `__damageServerRoomId` from a separate `?room=` URL param that no actual smoke passes — every smoke encodes the room in the `?server=.../rooms/<id>` URL path. Net effect: `__damageServerRoomId` was always unset, `scene.ts` silently fell back to DEVBX, and any real smoke failure would have been silently masked. **Fix** (4 files, +154/-4): `scene.ts` throws on missing injection (instead of silently defaulting); `serverTransport.ts` exports `parseRoomFromUrl()` mirroring server-side `parse_room_id()` regex `[A-Za-z0-9_-]{1,64}`; `PeerOverlay.tsx` derives room from the `?server=.../rooms/<id>` URL path when `?room=` is absent; new `client/src/net/serverTransport.test.ts` covers 9 cases. **CI: 27/27 GREEN on merge commit (run 33336396036).** Local verification: `two-tab-smoke.mjs` PASS (3), `two-tab-manual-flow.mjs` PASS (5: clean snapshots, rig separation, rig meshes, walk mirror 7.91m, HP convergence — this was the in-CI smoke that was relying on the silent fallback), `health-regression-smoke.mjs` PASS. typecheck clean, vitest 43 → **52 PASS** (+9), build clean (bundle 7,065.57 kB, same hash as main, +0 delta). This was the (B) PR in the B → A → C vote. **No code work currently queued.** Recommended next direction (your call):
-- **(a) PR 11.6.E — Production Tailscale-Funnel certs + WebTransport primary** (~2-3 sessions, the big one). Real domain, Let's Encrypt, WT as primary transport, no dev cert warnings. Closes the cloud-deploy gap.
+| **(a) PR 11.6.E — Production Tailscale-Funnel certs + WebTransport primary** — **Session 1 LANDED as PR #89 (2026-08-30, OPEN, 27/27 CI green)**. Cert-source dispatcher + systemd Funnel unit + operator runbook. **Session 2 (WSS termination + CI funnel-smoke job) is the remaining work** — separate PR, ~1 session, unblocks the "browser on HTTPS page mixed-content-blocks WS fallback" gap. **Recommended next direction: Session 2 of PR 11.6.E**, then either matchmaker (PR 11.9), outbound mpsc back-pressure review, or Phase 2 pivot.
 - **(b) PR `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator already shipped; this is verification + a small capacity bump if needed before sustained cloud load.
 - **(c) Pivot to weapons / matchmaker / new feature arc** — Phase 2 candidates from previous TL;DR: WEAPONS-table refactor (shotgun/sniper), matchmaker (PR 11.9), lobby UI, spectator mode, replay, scoreboard, or any of the maintenance carry-forwards (remote rig collision, PointerLock ESC flicker, anti-cheat).
 
 ---
+
+## 2026-08-30 — PR #89 opened (PR 11.6.E session 1: cert-source + systemd Funnel unit)
+
+**Scope**: Session 1 of the PR 11.6.E plan from `~/Obsidian/mem/projects/specialists-web-pr-11.6-e-prod-funnel-certs.md`. Three pieces, all landed as **PR #89** (OPEN, **27/27 CI green** at squash `1a3ddf6`). Branch `feat/2026-08-31-pr-11.6-e-prod-funnel-certs`.
+
+**What shipped**:
+
+- **`CertSource` enum** (`SelfSigned | LetsEncrypt`) in `server/src/cert.rs` with `from_str()` parser accepting 6 value variants (self-signed/selfsigned/self_signed, letsencrypt/lets-encrypt/lets_encrypt) and rejecting garbage with a message that names the bad value + the accepted set.
+- **`ensure_letsencrypt_certs()`** — fails loud if cert OR key is missing (never silently falls back to self-signed). The critical production safety check is in `ensure_certs()`: the LetsEncrypt dispatcher must NOT generate a self-signed fallback, and there's a regression test (`ensure_certs_letsencrypt_fails_loud`) that asserts the files are still missing after a failed load.
+- **`ensure_certs()` dispatcher** — routes `CertSource::SelfSigned → ensure_dev_certs` (generates when missing), `CertSource::LetsEncrypt → ensure_letsencrypt_certs` (loads from disk).
+- **CLI flag `--cert-source`** in both `specialists-server` (main.rs) and `tools/canary-server.sh`. Help text updated; `--gen-cert` refuses to run in letsencrypt mode (letsencrypt certs are provisioned by Tailscale Funnel, not generated).
+- **Cert path defaults switch** based on source: self-signed → `server/certs/dev.{pem,key}` (unchanged), letsencrypt → `server/certs/lets-encrypt.{pem,key}`.
+- **`tools/specialists-server.service`** — systemd user unit. ExecStartPre gates on `tailscale funnel status | grep -q "4433"` (refuses to boot if Funnel isn't configured). ExecStartPost pulls the Let's Encrypt cert via `tailscale cert` + writes to `server/certs/`. ExecReload = `kill -HUP $MAINPID` for cert rotation. Restart=on-failure, no auto restart on clean exit. Hardening: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ReadWritePaths=...server/certs...server/target`. `systemd-analyze verify` clean.
+- **`docs/funnel-deploy.md`** — operator runbook. Prerequisites, one-time-per-host setup (Funnel on + systemd unit install + boot), verification commands, cert rotation note (current workaround = `systemctl --user restart`, future PR should add a path watcher), Funnel policy gate behavior, what's NOT in this PR.
+
+**Verification (8/8 local + 27/27 CI)**:
+
+| Surface | Result |
+|---|---|
+| `cargo test` (server) | **210/210 PASS** — 108 unit + 8 new cert_source + 35 protocol_wire + 18 snapshot + 26 session_canary + 15 damage_relay |
+| `cargo check --tests` | Clean (4 pre-existing unused-import warnings in unrelated files) |
+| `npm run typecheck` (client) | Clean |
+| `npm run build` (client) | Clean (built in 2m 5s) |
+| `vitest run` (client) | **52/52 PASS** across 8 test files |
+| `systemd-analyze verify` (unit) | Clean (no warnings) |
+| canary end-to-end self-signed | WebTransport `[::]:14433`, WebSocket `0.0.0.0:14434`, log `cert_source=SelfSigned` |
+| canary end-to-end letsencrypt (fake cert at `/tmp/.../lets-encrypt.pem`) | WebTransport `[::]:24433`, WebSocket `0.0.0.0:24434`, log `loading production cert from ... (letsencrypt / Tailscale Funnel) cert_source=LetsEncrypt` |
+| canary `--cert-source bogus` | Exit 2 with "expected 'self-signed' or 'letsencrypt'" |
+| canary `--cert-source letsencrypt` w/ missing cert | Exit 1 with clear "run sudo tailscale funnel..." message |
+| CI | **27/27 GREEN** (run 33348088767) including server-build + typecheck+build + vitest + 24 client smokes |
+
+**Files**: 8 files changed, 702 insertions(+), 60 deletions(-).
+
+- `server/src/cert.rs` (+140 lines): enum + loader + dispatcher.
+- `server/src/main.rs` (+94 lines): --cert-source CLI + cert path defaults + help text + gen-cert guard.
+- `server/src/transport.rs` (+24 lines): thread CertSource through run_server + run_web_transport.
+- `server/tests/session_canary.rs` (+1 line): thread CertSource::SelfSigned into in-process WebTransport test.
+- `server/tests/cert_source.rs` (NEW, 166 lines): 8 tests covering parser + fail-loud + dispatcher.
+- `tools/canary-server.sh` (+102 lines): --cert-source CLI + cert path resolution + fail-loud boot message.
+- `tools/specialists-server.service` (NEW, 121 lines): systemd user unit.
+- `docs/funnel-deploy.md` (NEW, 178 lines): operator runbook.
+
+**Lesson encoded for future PRs**: When adding a "user-initiated terminal close" or "new cert source" API to an existing binary, the dispatcher layer (`ensure_certs` here) is the load-bearing surface — not the loader functions. The 3-test pattern `loader_alone_fails / dispatcher_routes_correctly / dispatcher_does_not_silently_fall_back` catches both the unit-level regression AND the production-safety regression in 8 tests / 166 lines. Worth standardizing for future refactors of `damage_relay::validate_and_relay_*`, `session::spawn_room_*`, etc.
+
+**What's NOT in Session 1 (Session 2 work)**:
+
+- **WSS termination** (`run_web_socket` with TLS wrapper): mixed-content-block fix for HTTPS pages that fall back from WebTransport to WebSocket. New listener on `--port-wss 4434` (TLS-wrapped WS) reusing the same cert as WT. ~6 new tests for the WSS handshake path.
+- **`client-tools-funnel-smoke` CI job**: spins up the canary in letsencrypt mode with a pre-baked cert (via `actions/cache`), probes `https://localhost:4433/health` + verifies WebTransport connection over HTTPS with no dev-cert warning. Must gate on self-hosted runner (Tailnet policy).
+- **Cert rotation watcher** (systemd path unit) — future PR.
+- **Dedicated `specialists` user + system unit** — future PR (dev-box user unit is correct for now).
+
+**Quota state**: `~/.quota-tripped` was fresh at session start (tripped_at 8/30 23:00:01Z, est reset 8/31 04:00:01Z = ~2h 47m from start). The cron is advisory — proxy served the actual work (cargo test, cargo build, npm install, npm build, vitest) successfully despite the marker. `requests_failed: 7` (unchanged from session start). All work landed. No quota-driven interruptions. Kyle's explicit "just continue on whatever was next highest priority" override of the auto-pause rule made this possible.
+
+**Next session task**: PR 11.6.E Session 2 — WSS termination + CI funnel-smoke job. Branch: `feat/2026-08-31-pr-11.6-e-session-2-wss` off `main` (assuming #89 is merged by then) or off the PR #89 branch tip (if not). Estimated ~1 session.
 
 ## 2026-08-30 — PR #87 merged (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86)
 
