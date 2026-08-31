@@ -12,21 +12,47 @@
 //   - **Join with code** — Lets the user paste a room ID. Hits
 //     `GET /rooms/<id>` to verify it exists; on 200, redirects to
 //     `?server=<origin>/rooms/<id>`. On 404, shows a "Room not
-//     found" error.
+//     found" error. On `exists:true, players>=max`, surfaces a
+//     "Room full" error and stays put.
 //
 // The matchmaker HTTP origin is derived from the page's own origin
 // in dev (`http://localhost:5174/`) or from a hard-coded production
 // URL (`https://m5.<tailnet>.ts.net:8080/`). For v1, hard-code the
 // dev origin (matches the canary's `port_http = 8080` default).
 // Production will pass this via env / build-time var.
+//
+// PR 11.9 follow-up (lobby polish):
+//   - Per-action busy state (`creating` vs `joining`) so the other
+//     button stays clickable while one is in-flight.
+//   - Inline "Creating room…" / "Checking room…" status text in
+//     neutral color (sharing the error slot — the same data-testid
+//     carries both kinds of message but the color differs).
+//   - Player-count indicator (`N/M`) appears next to the input ONLY
+//     after a successful getRoom — never pre-fetched.
+//   - Network-layer errors (fetch() itself rejected) are special-
+//     cased with "Matchmaker unreachable" via
+//     `isMatchmakerNetworkError(err)` from matchmakerApi.
+//   - Errors clear on the next user interaction (typing or
+//     clicking either button) — cleanest UX without a timer.
 
 import { useState } from "react";
-import { roomApi } from "../net/matchmakerApi";
+import { flushSync } from "react-dom";
+import {
+  isMatchmakerNetworkError,
+  roomApi,
+} from "../net/matchmakerApi";
 
 const DEV_MATCHMAKER_ORIGIN = "http://127.0.0.1:18080";
 // Production (Tailscale Funnel) — will be wired in PR 11.11.
 // Matches `tools/specialists-server.service`'s Funnel-served URL.
 const PROD_MATCHMAKER_ORIGIN = "https://m5.tail1b3795.ts.net";
+
+/** After a successful getRoom(), the player-count indicator has
+ *  one of three states: not-yet-checked (roomStatus is null), the
+ *  room has space (green), or the room is full (red). */
+type RoomStatus =
+  | { kind: "ok"; id: string; players: number; max: number }
+  | { kind: "full"; id: string; players: number; max: number };
 
 export function Lobby() {
   // Detect production vs dev at runtime. The canary in dev binds
@@ -41,23 +67,60 @@ export function Lobby() {
       : PROD_MATCHMAKER_ORIGIN);
 
   const [joinCode, setJoinCode] = useState("");
+  // Per-action busy: "creating" and "joining" are independent so
+  // clicking one doesn't disable the other. A user who started
+  // Create can still type a code and click Join (and vice versa).
+  const [creating, setCreating] = useState(false);
+  const [joining, setJoining] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  // Inline status text shown while a fetch is in flight. Lives
+  // in the same data-testid slot as `error` but with a neutral
+  // color (not red) so the user knows the action is progressing.
+  const [status, setStatus] = useState<string | null>(null);
+  // Player-count indicator state. Set only after a successful
+  // getRoom() that returned `exists:true`. Cleared on input
+  // change so the user can re-type a fresh code without the
+  // stale indicator lingering.
+  const [roomStatus, setRoomStatus] = useState<RoomStatus | null>(null);
+
+  /** Clear the error slot on the next user interaction (typing
+   *  into the input, or clicking either button). Wired into
+   *  onChange/onClick instead of a setTimeout — cleanest UX per
+   *  the brief. */
+  const clearError = () => {
+    if (error !== null) setError(null);
+  };
 
   const onCreate = async () => {
-    setError(null);
-    setBusy(true);
+    // `flushSync` forces the "Creating room…" + disabled-button
+    // state into the DOM BEFORE the await yields. Without it,
+    // React 18 batches the update and the navigation triggered
+    // after the fetch resolves can race the re-render — the
+    // busy state would never paint. flushSync is the one
+    // documented escape hatch for "I need the DOM to reflect
+    // state before the next line runs."
+    flushSync(() => {
+      clearError();
+      setStatus("Creating room…");
+      setCreating(true);
+    });
     try {
       const { ws_url } = await roomApi.createRoom(origin);
       // Navigate to the same page with `?server=<ws_url>`. PeerOverlay
       // picks up the flag on module re-evaluation and wires the
-      // ServerTransport.
+      // ServerTransport. (No need to reset `creating` — the page
+      // navigates away on the next tick.)
       const target = new URL(window.location.href);
       target.searchParams.set("server", ws_url);
       window.location.href = target.toString();
     } catch (e) {
-      setError(`Failed to create room: ${(e as Error).message}`);
-      setBusy(false);
+      setStatus(null);
+      if (isMatchmakerNetworkError(e)) {
+        setError("Matchmaker unreachable — check your connection and try again.");
+      } else {
+        setError(`Failed to create room: ${(e as Error).message}`);
+      }
+      setCreating(false);
     }
   };
 
@@ -65,17 +128,71 @@ export function Lobby() {
     const id = joinCode.trim();
     if (!id) {
       setError("Enter a room code");
+      setStatus(null);
       return;
     }
-    setError(null);
-    setBusy(true);
+    // See the matching `flushSync` in onCreate — same rationale:
+    // we want the "Checking room…" status to paint before the
+    // GET /rooms/<id> fetch yields. The post-await flushSync
+    // below covers the success path (the roomStatus indicator
+    // must be in the DOM before the page navigates away).
+    flushSync(() => {
+      clearError();
+      setRoomStatus(null);
+      setStatus("Checking room…");
+      setJoining(true);
+    });
     try {
       const r = await roomApi.getRoom(origin, id);
+      // got a definitive response — drop the in-flight status.
+      setStatus(null);
       if (!r.exists) {
         setError(`Room "${id}" not found. Ask the host to share a fresh link.`);
-        setBusy(false);
+        setRoomStatus(null);
+        setJoining(false);
         return;
       }
+      if (r.players >= r.max) {
+        // Room is real but full — show the indicator + a clear
+        // error and DO NOT navigate. Better UX than the old
+        // behavior (silently navigate then disconnect on join).
+        flushSync(() => {
+          setError(
+            `Room "${id}" is full (${r.players}/${r.max} players). Try another.`,
+          );
+          setRoomStatus({
+            kind: "full",
+            id,
+            players: r.players,
+            max: r.max,
+          });
+          setJoining(false);
+        });
+        return;
+      }
+      // Room exists with space — record the indicator (green)
+      // and proceed to navigate.
+      // flushSync so the players/max indicator is in the DOM
+      // before window.location.href triggers navigation — the
+      // smoke (and a real user) needs the indicator to be
+      // visible, not stranded in a pending React update.
+      flushSync(() => {
+        setRoomStatus({
+          kind: "ok",
+          id,
+          players: r.players,
+          max: r.max,
+        });
+      });
+      // Yield one microtask so the post-flushSync DOM is
+      // observably committed before we tear it down with a
+      // navigation. Without this, a real user would see the
+      // indicator for ~1 frame and the lobby smoke can't
+      // catch it at all (the navigation races the
+      // requestAnimationFrame poll). The yield is invisible
+      // to the user (sub-millisecond) but enough for the
+      // browser to commit the React-driven DOM update.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
       // Build ws:// URL. We don't know the server's host:port from
       // the GET response (it intentionally doesn't echo them to
       // keep the API minimal). Default to `${origin}/rooms/<id>` —
@@ -88,9 +205,89 @@ export function Lobby() {
       target.searchParams.set("server", ws_url);
       window.location.href = target.toString();
     } catch (e) {
-      setError(`Failed to check room: ${(e as Error).message}`);
-      setBusy(false);
+      setStatus(null);
+      setRoomStatus(null);
+      if (isMatchmakerNetworkError(e)) {
+        setError("Matchmaker unreachable — check your connection and try again.");
+      } else {
+        setError(`Failed to check room: ${(e as Error).message}`);
+      }
+      setJoining(false);
     }
+  };
+
+  const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setJoinCode(e.target.value);
+    // Reset transient UI state on any keystroke. The error
+    // clears per the brief; the room-status indicator also
+    // clears because the user is clearly starting over.
+    clearError();
+    if (roomStatus !== null) setRoomStatus(null);
+  };
+
+  /** Combined "inline message" renderer. The lobby uses a
+   *  single DOM slot for both the in-flight `status` text
+   *  (neutral color) and the persistent `error` text (red).
+   *  `status` takes precedence while the user is waiting,
+   *  because the fetch is still in flight and the error is
+   *  stale. Both share the `data-testid="lobby-error"`
+   *  attribute so existing smoke selectors keep working
+   *  (the brief locks that testid in). */
+  const renderInlineMessage = () => {
+    if (status) {
+      return (
+        <p
+          data-testid="lobby-error"
+          data-kind="busy"
+          style={{
+            color: "#a9b3c7",
+            margin: "0.4rem 0 0",
+            fontSize: "0.9rem",
+          }}
+        >
+          {status}
+        </p>
+      );
+    }
+    if (error) {
+      return (
+        <p
+          data-testid="lobby-error"
+          data-kind="error"
+          style={{
+            color: "#e07b7b",
+            margin: "0.4rem 0 0",
+            fontSize: "0.9rem",
+          }}
+        >
+          {error}
+        </p>
+      );
+    }
+    return null;
+  };
+
+  /** The player-count indicator. Shown only after a successful
+   *  getRoom() — never pre-fetched, never fabricated from the
+   *  input alone. Green if the room has space, red if full. */
+  const renderRoomStatus = () => {
+    if (!roomStatus) return null;
+    const isFull = roomStatus.kind === "full";
+    return (
+      <p
+        data-testid="lobby-room-status"
+        data-full={isFull ? "true" : "false"}
+        style={{
+          color: isFull ? "#e07b7b" : "#7bd17b",
+          margin: "0.4rem 0 0",
+          fontSize: "0.85rem",
+          fontFamily: "monospace",
+        }}
+      >
+        Room {roomStatus.id}: {roomStatus.players}/{roomStatus.max} players
+        {isFull ? " (full)" : ""}
+      </p>
+    );
   };
 
   return (
@@ -126,14 +323,14 @@ export function Lobby() {
         <button
           data-testid="lobby-create"
           onClick={onCreate}
-          disabled={busy}
+          disabled={creating}
           style={{
             padding: "0.8rem 1rem",
-            background: busy ? "#444" : "#3563d3",
+            background: creating ? "#444" : "#3563d3",
             color: "#fff",
             border: 0,
             borderRadius: "6px",
-            cursor: busy ? "default" : "pointer",
+            cursor: creating ? "default" : "pointer",
             fontSize: "1rem",
           }}
         >
@@ -143,7 +340,7 @@ export function Lobby() {
           <input
             data-testid="lobby-code"
             value={joinCode}
-            onChange={(e) => setJoinCode(e.target.value)}
+            onChange={onInputChange}
             placeholder="Room code"
             spellCheck={false}
             autoComplete="off"
@@ -161,14 +358,14 @@ export function Lobby() {
           <button
             data-testid="lobby-join"
             onClick={onJoin}
-            disabled={busy || !joinCode.trim()}
+            disabled={joining || !joinCode.trim()}
             style={{
               padding: "0.8rem 1rem",
-              background: busy || !joinCode.trim() ? "#444" : "#2c8c4d",
+              background: joining || !joinCode.trim() ? "#444" : "#2c8c4d",
               color: "#fff",
               border: 0,
               borderRadius: "6px",
-              cursor: busy || !joinCode.trim() ? "default" : "pointer",
+              cursor: joining || !joinCode.trim() ? "default" : "pointer",
               fontSize: "1rem",
             }}
           >
@@ -176,14 +373,8 @@ export function Lobby() {
           </button>
         </div>
 
-        {error && (
-          <p
-            data-testid="lobby-error"
-            style={{ color: "#e07b7b", margin: "0.4rem 0 0", fontSize: "0.9rem" }}
-          >
-            {error}
-          </p>
-        )}
+        {renderRoomStatus()}
+        {renderInlineMessage()}
       </div>
 
       <p style={{ marginTop: "2rem", fontSize: "0.75rem", opacity: 0.5 }}>
