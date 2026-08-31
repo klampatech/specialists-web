@@ -39,6 +39,17 @@
 //   - Matchmaker (multi-room; PR 11.9).
 //   - Lockstep substrate retirement (PR 11.7).
 //   - Production cert handling (Let's Encrypt, PR 11.6.E now absorbed into 11.7).
+//
+// **What PR 11.6.E / Session 2 adds vs Session 1**:
+//   - New WSS listener (`run_web_socket_tls`) on `--port-wss`. Same
+//     wire protocol as the plain WS listener (discriminator router +
+//     room routing), but with a TLS handshake terminated via tokio-rustls
+//     using the same cert + key as the WebTransport listener. This
+//     closes the "page is HTTPS, ws:// is mixed-content-blocked" gap
+//     that the PR 11.6.B/C dev canary was hitting on Funnel URLs.
+//   - Plain WS on `--port-ws` (unchanged) for dev/CI. WSS on `--port-wss`
+//     (new) for production. Both listeners share the same cert and the
+//     same `handle_websocket_connection` body — only the handshake differs.
 
 use std::sync::Mutex;
 use std::cell::{Cell, RefCell};
@@ -51,8 +62,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
@@ -241,6 +253,19 @@ impl ConnectionState {
 pub async fn run_server(
     port_wt: u16,
     port_ws: u16,
+    // TLS-wrapped WebSocket listener (production / Tailscale Funnel
+    // HTTPS pages). Reuses the same cert + key as the WebTransport
+    // listener. Default port: 4434 (same as `port_ws` in dev — the
+    // `--port-wss` flag overrides this in prod when Funnel needs a
+    // separate port).
+    //
+    // PR 11.6.E / Session 2: this is the new arg. Set to
+    // `port_ws` if you want the WSS listener on the same port
+    // number as plain WS (acceptable when only one of them is
+    // bound at a time, e.g. dev CI uses ws:// and prod uses
+    // wss://).
+    port_wss: u16,
+    cert_source: specialists_server::cert::CertSource,
     cert_path: PathBuf,
     key_path: PathBuf,
     sans: Vec<String>,
@@ -248,11 +273,12 @@ pub async fn run_server(
 ) -> Result<()> {
     let wt_handle = tokio::spawn({
         let rooms = rooms.clone();
+        let cert_source = cert_source;
         let cert_path = cert_path.clone();
         let key_path = key_path.clone();
         let sans = sans.clone();
         async move {
-            if let Err(e) = run_web_transport(port_wt, cert_path, key_path, sans, rooms).await {
+            if let Err(e) = run_web_transport(port_wt, cert_source, cert_path, key_path, sans, rooms).await {
                 warn!("run_web_transport exited: {e:?}");
                 Err(e)
             } else {
@@ -273,6 +299,63 @@ pub async fn run_server(
         }
     });
 
+    // PR 11.6.E / Session 2 — WSS listener. Spawned alongside WS,
+    // both sharing the same `rooms` registry. The WSS listener is
+    // opt-out via `port_wss == 0` (the systemd unit can disable it
+    // by passing `--port-wss 0` if the operator only wants WT for
+    // some reason). Default `port_wss == port_ws` keeps the dev
+    // canary unchanged (only plain WS binds; WSS is silently skipped
+    // because its port would conflict with WS).
+    //
+    // We use `OptionFuture` to wait on the WSS handle only when it's
+    // Some — when None, the future is permanently pending, so
+    // `tokio::select!` will never resolve on that branch.
+    let wss_handle = if port_wss == 0 || port_wss == port_ws {
+        // Either explicitly disabled (0) or would collide with plain
+        // WS. Don't spawn a second listener on the same port. The dev
+        // canary hits this path because dev serves ws:// on 4434 and
+        // doesn't need wss:// (the dev page is loaded over http://).
+        if port_wss == port_ws {
+            info!(
+                port_wss,
+                "WSS listener skipped: port_wss == port_ws (dev canary serves plain ws:// only; production uses a separate --port-wss)"
+            );
+        }
+        None
+    } else {
+        // Build the TLS acceptor from the same cert + key the WT
+        // listener is using. `load_identity` is the same helper the
+        // WT path uses; here we just need the PEM bytes for rustls.
+        let acceptor = match build_wss_tls_acceptor(&cert_path, &key_path).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("WSS listener disabled: TLS acceptor build failed: {e:?}");
+                return Err(e);
+            }
+        };
+        Some(tokio::spawn({
+            let rooms = rooms.clone();
+            async move {
+                if let Err(e) = run_web_socket_tls(port_wss, acceptor, rooms).await {
+                    warn!("run_web_socket_tls exited: {e:?}");
+                    Err(e)
+                } else {
+                    Ok(())
+                }
+            }
+        }))
+    };
+
+    // Wait for any listener to exit OR ctrl_c. tokio::select! with
+    // a branch count that varies based on whether WSS is enabled.
+    // We can't use OptionFuture::from(None) for the WSS branch
+    // because OptionFuture::from(None) resolves IMMEDIATELY with
+    // None (not Pending) — that makes the select! complete early,
+    // killing the server before WS can even bind. Instead we build
+    // the select! macro shape dynamically based on wss_handle.
+    //
+    // PR 11.6.E / Session 2 — see the previous (broken) OptionFuture
+    // attempt in git history if you want to see what NOT to do.
     tokio::select! {
         result = wt_handle => {
             match result {
@@ -286,6 +369,28 @@ pub async fn run_server(
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(anyhow::anyhow!("WebSocket task panicked: {e}").context("run_server")),
+            }
+        }
+        // PR 11.6.E / Session 2 — WSS branch. Only present in the
+        // select! when WSS is actually enabled (port_wss != 0 AND
+        // port_wss != port_ws). tokio::select! requires all branches
+        // to be statically present, so we conditionally include this
+        // branch by gating on the same condition that spawns the task.
+        //
+        // If wss_handle is None (the "spawn was skipped" case), we
+        // emit a permanent-pending future. futures::future::pending()
+        // is the canonical way to do this — it returns a Future that
+        // never resolves, so select! never picks it.
+        result = async {
+            match wss_handle {
+                Some(h) => h.await,
+                None => std::future::pending().await,
+            }
+        } => {
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::anyhow!("WebSocket-TLS task panicked: {e}").context("run_server")),
             }
         }
     }
@@ -322,11 +427,127 @@ pub(crate) async fn run_web_socket(
     }
 }
 
-async fn handle_websocket_connection(
-    stream: TcpStream,
-    peer: SocketAddr,
+/// PR 11.6.E / Session 2 — TLS-wrapped WebSocket listener.
+///
+/// Same wire protocol as `run_web_socket`, but terminates TLS at the
+/// listener so it can be exposed on a Tailscale Funnel HTTPS URL
+/// (and not be mixed-content-blocked when the page is loaded over
+/// HTTPS). Reuses the cert + key that the WebTransport listener is
+/// using — same `ensure_certs` dispatcher, same file paths.
+///
+/// Why a separate function from `run_web_socket`: the WS upgrade
+/// happens AFTER the TLS handshake (`tokio_rustls::TlsAcceptor::accept`
+/// → `tokio_tungstenite::accept_async` on the TLS stream). Inlining
+/// the TLS handshake into `run_web_socket` would force the plain-WS
+/// path to also pay the TLS handshake cost on every accept. Split
+/// listeners keep each path's startup cost proportional to its
+/// protocol.
+pub(crate) async fn run_web_socket_tls(
+    port: u16,
+    acceptor: TlsAcceptor,
     rooms: RoomRegistry,
 ) -> Result<()> {
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind TCP/{port} (wss)"))?;
+    let local = listener
+        .local_addr()
+        .with_context(|| format!("local_addr on TCP/{port} (wss)"))?;
+    info!(%local, "WebSocket-TLS listener bound (production / Tailscale Funnel, §3.3)");
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                let rooms = rooms.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // TLS handshake first. The acceptor is cheap to
+                    // clone (Arc internally) so this doesn't add
+                    // per-connection cost.
+                    let tls_stream = match acceptor.accept(stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(%peer, "WSS TLS handshake failed: {e:?}");
+                            return;
+                        }
+                    };
+                    info!(%peer, "WSS TLS handshake accepted");
+                    if let Err(e) = handle_websocket_connection(tls_stream, peer, rooms).await {
+                        warn!(%peer, "wss connection ended with error: {e:?}");
+                    }
+                });
+            }
+            Err(e) => {
+                error!("TCP accept (wss) failed: {e:?}");
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+/// PR 11.6.E / Session 2 — load PEM cert + key into a tokio-rustls
+/// `TlsAcceptor`. Same files the WebTransport listener uses; we
+/// don't need the `wtransport::Identity` (that's a wtransport-private
+/// type), just the raw rustls ServerConfig + a TlsAcceptor wrapping it.
+///
+/// `ServerConfig::builder().with_no_client_auth()` is the right choice
+/// here — the server doesn't authenticate clients (clients connect
+/// anonymously and identify themselves via the `DamageRequest`
+/// discriminator carrying a PlayerId claim). Adding client-auth at
+/// the TLS layer would mean provisioning a CA + distributing client
+/// certs, which is out of scope for PR 11.6.E.
+async fn build_wss_tls_acceptor(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<TlsAcceptor> {
+    use rustls_pemfile::{certs, pkcs8_private_keys};
+    use std::io::BufReader;
+
+    // Read cert chain + private key from disk. PEM format; rustls
+    // 0.23 + rustls-pemfile 2.x. The cert chain may contain
+    // multiple entries (leaf + intermediates) — we pass the whole
+    // Vec to `with_chain`.
+    let cert_file = std::fs::File::open(cert_path)
+        .with_context(|| format!("open cert {cert_path:?}"))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("rustls_pemfile::certs")?;
+
+    let key_file = std::fs::File::open(key_path)
+        .with_context(|| format!("open key {key_path:?}"))?;
+    let mut key_reader = BufReader::new(key_file);
+    let mut keys = pkcs8_private_keys(&mut key_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("rustls_pemfile::pkcs8_private_keys")?;
+
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in {cert_path:?}");
+    }
+    if keys.is_empty() {
+        anyhow::bail!("no private keys found in {key_path:?}");
+    }
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        keys.remove(0),
+    );
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("rustls ServerConfig::with_single_cert")?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+async fn handle_websocket_connection<S>(
+    stream: S,
+    peer: SocketAddr,
+    rooms: RoomRegistry,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // PR-fix-0x06 — use `accept_hdr_async` (instead of `accept_async`)
     // so we can capture the inbound HTTP request's `path` (e.g.
     // `/rooms/AIMEVENT_12345`) during the handshake. The path is
@@ -502,16 +723,28 @@ async fn handle_websocket_connection(
 /// Spawned by `main`. Loads (or generates) the cert at the given
 /// paths, builds the `wtransport::Endpoint`, and dispatches incoming
 /// sessions. Returns on `Endpoint::accept()` error or shutdown.
+///
+/// `cert_source` selects between self-signed (dev/CI — generates the
+/// cert if missing) and letsencrypt (production / Tailscale Funnel —
+/// fails loud if the cert files are not on disk). The cert dispatcher
+/// in `crate::cert::ensure_certs` owns the source-specific behavior;
+/// this function only logs the resolved mode.
 pub(crate) async fn run_web_transport(
     port: u16,
+    cert_source: specialists_server::cert::CertSource,
     cert_path: PathBuf,
     key_path: PathBuf,
     sans: Vec<String>,
     rooms: RoomRegistry,
 ) -> Result<()> {
-    specialists_server::cert::ensure_dev_certs(&cert_path, &key_path, sans_with_defaults(sans))
-        .await
-        .context("ensure_dev_certs")?;
+    specialists_server::cert::ensure_certs(
+        cert_source,
+        &cert_path,
+        &key_path,
+        sans_with_defaults(sans),
+    )
+    .await
+    .context("ensure_certs")?;
     let identity = specialists_server::cert::load_identity(&cert_path, &key_path)
         .await
         .context("load_identity")?;
@@ -525,7 +758,7 @@ pub(crate) async fn run_web_transport(
         format!("wtransport Endpoint::server on UDP/{port} — port in use?")
     })?;
     let local = server.local_addr().context("wtransport local_addr")?;
-    info!(%local, "WebTransport listener bound (primary transport, §3.3)");
+    info!(%local, ?cert_source, "WebTransport listener bound (primary transport, §3.3)");
 
     loop {
         let incoming = server.accept().await;

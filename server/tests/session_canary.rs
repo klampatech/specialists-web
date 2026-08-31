@@ -366,6 +366,7 @@ async fn webtransport_echo_works() {
     let server_handle = tokio::spawn(async move {
         transport::run_web_transport(
             port,
+            specialists_server::cert::CertSource::SelfSigned,
             cert_path_clone,
             key_path_clone,
             vec!["localhost".to_string(), "127.0.0.1".to_string()],
