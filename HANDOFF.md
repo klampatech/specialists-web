@@ -122,7 +122,51 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Spec sync**: `docs/SPEC.md` is unchanged at this point — PR #89's WSS termination is a deployment-surface change, not a spec-affecting change. The operator runbook at `docs/funnel-deploy.md` is the canonical reference for the cert-source + systemd wiring. Next session: if PR 11.9 matchmaker is chosen, that's a spec change (`§3.5 lobby/matchmaker` section) and needs a spec update as part of the work.
 
 
-## 2026-08-30 — PR #87 merged (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86) (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86)
+## 2026-08-31 — PR #91 (matchmaker) + lobby smoke + spec §3.5
+
+**Scope**: PR 11.9 matchmaker work. New branch `feat/pr-11.9-matchmaker` from `main @ a50a53e` (post #89+#90). All work in this session.
+
+**What PR #91 lands** (the matchmaker carry-forward from PR 11.6 plan §5 Q2):
+
+- **Server matchmaker HTTP listener** (`server/src/matchmaker.rs`, +431 lines): 3 endpoints (`POST /rooms`, `GET /rooms/<id>`, `GET /health`), 8-char URL-safe room IDs, hand-rolled HTTP/1.1 listener (no `axum`/`hyper` dep — keeps build time + surface area tight), `Access-Control-Allow-Origin: *` for cross-origin lobby fetch.
+- **Server wiring** (`server/src/{main,transport,lib}.rs` + `Cargo.toml`): `run_server()` gains `port_http: u16` param, `--port-http` CLI flag (default 8080, 0 disables), `tokio::select!` arm with the same permanent-pending-on-None pattern as the WSS branch (PR 11.6.E regression #2). `rand = "0.8"` dep.
+- **Tools**: `canary-server.sh --port-http`, `specialists-server.service` ExecStart updated.
+- **Client** (`client/src/{net/matchmakerApi.ts, ui/Lobby.tsx, ui/App.tsx}`): typed `roomApi`, React Lobby component (Create room / Join with code), `App.tsx` short-circuits to Lobby when no `?server=` URL param. Production builds strip the lobby (`import.meta.env.DEV` guard).
+- **Spec** (`docs/SPEC.md`): new `§3.5 Matchmaker + lobby (PR 11.9)` section explaining in-process architecture + the 3 endpoints + lazy-room-creation invariant + out-of-scope items (MMR/region/server-browser/Discord OAuth).
+- **Smoke** (`client/tools/lobby-smoke.mjs`, +237 lines): 3 assertions — Lobby renders, Create navigates to `?server=<ws_url>`, ServerTransport connects. Pure Playwright + WS probes, sub-30s runtime. Screenshot at `client/tools/lobby-smoke.png`.
+- **CI** (`.github/workflows/ci.yml`): new `client-lobby-smoke` job, depends on `server-build`.
+
+**Carry-forward (filed in TL;DR for next session):**
+- (a) Lobby polish — empty-state UX, error toasts, "room full" handling
+- (b) MMR / Glicko-2 matchmaking (Phase 2)
+- (c) Region selection / server browser (Phase 2)
+- (d) Discord OAuth (Phase 2)
+- (e) Anti-DoS on the matchmaker (Phase 4)
+
+**Verified locally (post-commit):**
+- `cargo test`: 224 PASS + matchmaker module compiles
+- `npm run typecheck`: clean
+- `npm run build`: clean (7,065.67 kB, same as main, Lobby tree-shakes)
+- `npm test`: 56/56 PASS
+- `node tools/lobby-smoke.mjs`: 3/3 PASS (lobby renders + create navigates + ServerTransport connects)
+
+**CI state on PR #91 (run 33416911683):**
+- ✅ lobby smoke (1m0s)
+- ✅ canary orchestrator smoke (29s)
+- ✅ typecheck + build (2m29s)
+- ✅ server build + test (1m1s)
+- ✅ vitest boundary tests (18s)
+- ✅ shell + systemd lint gate (4s)
+- ⚠️ 15 client smokes (port-binding flake) — pre-existing infra issue (port contention with stale canary procs from prior CI runs). Mergeable but UNSTABLE. Same shape as PR #89's `mergeStateStatus: UNSTABLE` (CI flake, not blocker). Kyle merged #89 in this state.
+
+**Known follow-ups (out of scope for this PR):**
+- Room cleanup (rooms with 0 players for >1hr get pruned)
+- Two-tab cross-machine lobby smoke (covered by existing damage-server-smoke.mjs which uses pre-baked URLs)
+- roomApi.getRoom() returns `max: 24` hardcoded — should come from constants.rs
+
+---
+
+## 2026-08-30 — PR #87 merged (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86)## 2026-08-30 — PR #87 merged (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86) (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86)
 
 **Scope**: three PRs merged in this session. PR #85 was the docs merge-conflict resolution from yesterday. PR #86 was a README refresh — it was stuck on the Phase-0 "feel test" framing, 2 phases and ~30 PRs out of date. PR #87 was the actual netcode-cleanup work: closes the long-running DEVBX hardcode carry-forward from PR 11.7.E. GitHub squash-merged all three.
 
