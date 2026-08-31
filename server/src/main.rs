@@ -40,6 +40,11 @@ struct Args {
     /// real Let's Encrypt cert at the Funnel URL with no dev-cert
     /// browser warning.
     cert_source: Option<CertSource>,
+    /// PR 11.6.E / Session 2 — TLS-wrapped WebSocket port. Set to
+    /// `port_ws` (default 4434) if you don't want WSS bound (dev).
+    /// Set to a separate port (e.g. 4435) for production behind
+    /// Tailscale Funnel. `0` disables WSS entirely.
+    port_wss: Option<u16>,
     print_help: bool,
 }
 
@@ -62,6 +67,14 @@ fn parse_args() -> Result<Args> {
                         .context("--port-ws requires a value")?
                         .parse()
                         .context("--port-ws must be u16")?,
+                );
+            }
+            "--port-wss" => {
+                args.port_wss = Some(
+                    iter.next()
+                        .context("--port-wss requires a value")?
+                        .parse()
+                        .context("--port-wss must be u16")?,
                 );
             }
             "--cert" | "--cert-out" => {
@@ -216,6 +229,12 @@ async fn main() -> ExitCode {
 
     let port_wt = args.port_wt.unwrap_or(4433);
     let port_ws = args.port_ws.unwrap_or(4434);
+    // PR 11.6.E / Session 2 — default WSS port equals plain WS port
+    // so dev canary (single binary, single port) doesn't bind WSS by
+    // accident. Production (systemd unit, --cert-source=letsencrypt)
+    // passes `--port-wss 4435` explicitly to bind a separate TLS
+    // port. `--port-wss 0` disables WSS entirely.
+    let port_wss = args.port_wss.unwrap_or(port_ws);
 
     let rooms: RoomRegistry = Arc::new(RwLock::new(HashMap::new()));
 
@@ -235,6 +254,7 @@ async fn main() -> ExitCode {
     let server = run_server(
         port_wt,
         port_ws,
+        port_wss,
         cert_source,
         cert_path,
         key_path,

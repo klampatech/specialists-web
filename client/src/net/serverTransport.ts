@@ -248,21 +248,34 @@ export class ServerTransport {
     // proxy), so the WebTransport URL is `https://<host>:14433`.
     // The transport reads the WT port from a global probe the smoke
     // sets (`window.__damageServerPorts`), defaulting to 14433.
-    const ports = (globalThis as unknown as {__damageServerPorts?: {wt?: number; ws?: number}}).__damageServerPorts;
+    const ports = (globalThis as unknown as {__damageServerPorts?: {wt?: number; ws?: number; wss?: number}}).__damageServerPorts;
     const wtPort = ports?.wt ?? 14433;
     const wsPort = ports?.ws ?? 14434;
     this.wtUrl = `https://${host}:${wtPort}/rooms/${roomId}`;
-    this.wsUrl = `ws://${host}:${wsPort}/rooms/${roomId}`;
-    // PR 11.7.D3 / known-issue — if the page is loaded over HTTPS, this
-    // ws:// URL is mixed-content-blocked. The local-dev canary serves
-    // plain WS only (not WSS); production must terminate TLS at a
-    // reverse proxy layer that flips ws:// → wss:// based on the page
-    // protocol. Tracked as a known issue.
+    // PR 11.6.E / Session 2 — WSS URL. When the page is loaded over
+    // HTTPS and the browser falls back from WebTransport to
+    // WebSocket, browsers mixed-content-block plain `ws://` URLs. The
+    // WSS listener (`run_web_socket_tls`) terminates TLS on the same
+    // cert + key as the WebTransport listener, so the fallback path
+    // works cleanly on HTTPS pages.
+    //
+    // The WSS port defaults to `wsPort + 1` when the page is HTTPS
+    // (so a dev canary running `--port-ws 4434 --port-wss 4435`
+    // works), but operators can override via
+    // `window.__damageServerPorts.wss`. For HTTP pages we keep
+    // `ws://` (no TLS) on the plain WS port.
+    const wssPort = ports?.wss ?? (wsPort + 1);
     if (typeof location !== "undefined" && location.protocol === "https:") {
-      console.warn(
-        `[ServerTransport] page is HTTPS but ws://${host}:${wsPort}/rooms/${roomId} is mixed-content-blocked. ` +
-        `Production needs a TLS-terminating reverse proxy; local-dev needs HTTP.`,
+      this.wsUrl = `wss://${host}:${wssPort}/rooms/${roomId}`;
+      // Quiet the "mixed-content-blocked" warning that the
+      // pre-PR-11.6.E code emitted (PR 11.6.B/C's known-issue note).
+      // The WSS endpoint is now real; we just confirm the URL is
+      // well-formed.
+      console.log(
+        `[ServerTransport] WSS fallback URL: ${this.wsUrl} (HTTPS page; mixed-content block closed by PR 11.6.E)`,
       );
+    } else {
+      this.wsUrl = `ws://${host}:${wsPort}/rooms/${roomId}`;
     }
   }
 

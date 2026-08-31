@@ -39,6 +39,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 PORT_WT="${PORT_WT:-4433}"
 PORT_WS="${PORT_WS:-4434}"
+PORT_WSS="${PORT_WSS:-$PORT_WS}"
 CERT_DIR="${CERT_DIR:-$REPO_ROOT/server/certs}"
 SANS="${SANS:-localhost,127.0.0.1,::1}"
 CERT_SOURCE="${CERT_SOURCE:-self-signed}"
@@ -62,6 +63,11 @@ while [[ $# -gt 0 ]]; do
       PORT_WT="$2"; shift 2 ;;
     --port-ws)
       PORT_WS="$2"; shift 2 ;;
+    --port-wss)
+      # PR 11.6.E / Session 2 — TLS-wrapped WS port. Production
+      # binds a separate port for wss:// (Funnel HTTPS fallback).
+      # Dev canary leaves this at PORT_WS so only one listener binds.
+      PORT_WSS="$2"; shift 2 ;;
     --cert-dir)
       CERT_DIR="$2"; shift 2 ;;
     --sans)
@@ -148,6 +154,7 @@ echo "[canary] key:  $KEY_PATH"
 exec cargo run --manifest-path server/Cargo.toml --quiet $CARGO_PROFILE_FLAG -- \
   --port-wt "$PORT_WT" \
   --port-ws "$PORT_WS" \
+  --port-wss "$PORT_WSS" \
   --cert-source "$CERT_SOURCE" \
   --cert "$CERT_PATH" \
   --key "$KEY_PATH" \

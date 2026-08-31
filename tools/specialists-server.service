@@ -24,11 +24,20 @@ Environment=CERT_SOURCE=letsencrypt
 # `tailscale funnel status` exits 0 + prints the Funnel table when
 # Funnel is enabled for the tailnet; it exits non-zero (with "Funnel
 # not enabled" or similar) when the tailnet doesn't allow Funnel
-# access for this host. The `grep -q 4433` ensures 4433 is in the
+# access for this host. The `grep -q "4433"` ensures 4433 is in the
 # configured set — even if Funnel is on for a different port, we
 # don't want to boot a "production" server on a port Funnel isn't
 # proxying.
-ExecStartPre=/bin/sh -c 'tailscale funnel status | grep -q "4433" || { echo "[specialists-server] ExecStartPre: Tailscale Funnel on :4433 not configured; refusing to boot in letsencrypt mode"; exit 1; }'
+#
+# PR 11.6.E / Session 2 — also gate on 4435 (the WSS port for HTTPS
+# fallback). The systemd unit refuses to boot if either port is
+# missing from Funnel, so we don't end up with a partial-prod state
+# where WebTransport is reachable but WSS isn't.
+ExecStartPre=/bin/sh -c '\
+  STATUS="$$(tailscale funnel status 2>&1)" || { echo "[specialists-server] ExecStartPre: tailscale funnel status failed; refusing to boot"; exit 1; }; \
+  echo "$$STATUS" | grep -q "4433" || { echo "[specialists-server] ExecStartPre: Tailscale Funnel on :4433 not configured; refusing to boot in letsencrypt mode"; exit 1; }; \
+  echo "$$STATUS" | grep -q "4435" || { echo "[specialists-server] ExecStartPre: Tailscale Funnel on :4435 not configured; refusing to boot (WSS would be unreachable)"; exit 1; }; \
+  echo "[specialists-server] ExecStartPre: Funnel on :4433 and :4435 confirmed"'
 
 # ExecStartPost: pull the Let's Encrypt cert + key out of the
 # Tailscale state and write them to the paths the server expects.
@@ -63,7 +72,13 @@ ExecReload=/bin/kill -HUP $MAINPID
 # --release of specialists-server. The wrapper is preferred over
 # invoking the binary directly because it owns the cert path
 # resolution + the letsencrypt fail-loud.
-ExecStart=/home/kyle/Development/specialists-web/tools/canary-server.sh --cert-source letsencrypt --port-wt 4433 --port-ws 4434
+#
+# PR 11.6.E / Session 2 — port-wss 4435 (TLS-wrapped WS for HTTPS
+# fallback). Production needs WSS so browsers on the Funnel HTTPS
+# page can fall back from WebTransport to WebSocket without
+# mixed-content-block. Plain ws on 4434 stays bound for dev/CI
+# compatibility + reverse-proxy setups that handle TLS upstream.
+ExecStart=/home/kyle/Development/specialists-web/tools/canary-server.sh --cert-source letsencrypt --port-wt 4433 --port-ws 4434 --port-wss 4435
 
 # Restart on failure (Funnel config drift, transient network).
 # Don't restart on clean exit (Ctrl-C / SIGTERM).

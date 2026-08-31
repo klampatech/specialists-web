@@ -41,25 +41,33 @@ git pull origin main
 cargo build --release --manifest-path server/Cargo.toml
 ```
 
-### 2. Enable + start Funnel on :4433 (HTTPS)
+### 2. Enable + start Funnel on :4433 (HTTPS) + :4435 (WSS)
 
 ```sh
 sudo tailscale funnel --https=4433 on
+sudo tailscale funnel --https=4435 on
 ```
 
-This is idempotent — if Funnel is already on, the command is a no-op.
-Verify:
+These are idempotent — if Funnel is already on for a port, the command
+is a no-op. Verify:
 ```sh
 tailscale funnel status
-# expect:
+# expect (post-11.6.E/Session-2):
 #   https://m5.tail1b3795.ts.net:4433 (Funnel on)
 #   |-- / proxy http://localhost:4433
+#   https://m5.tail1b3795.ts.net:4435 (Funnel on)
+#   |-- / proxy http://localhost:4435
 ```
 
-NOTE: PR 11.6.E binds the server to `--port-wt 4433` (UDP) and
-`--port-ws 4434` (TCP). The systemd unit's ExecStartPre fails loud
-if Funnel isn't configured on 4433, so you can't accidentally boot
-the server on a port Funnel isn't proxying.
+NOTE: PR 11.6.E binds the server to `--port-wt 4433` (UDP, WebTransport),
+`--port-ws 4434` (TCP, plain WS), and `--port-wss 4435` (TCP, TLS-wrapped
+WS for HTTPS fallback). The systemd unit's ExecStartPre fails loud if
+Funnel isn't configured on 4433, so you can't accidentally boot the server
+on a port Funnel isn't proxying. The WSS listener reuses the same Let's
+Encrypt cert as the WebTransport listener — `wss://` is a separate
+listener on port 4435 because Funnel only forwards a single TCP port per
+configured host:port, and the WS-port (4434) needs to stay plain for dev/CI
+compatibility.
 
 ### 3. Install the systemd user unit
 
@@ -151,11 +159,25 @@ The systemd unit only activates in `--cert-source letsencrypt`
 mode. Self-signed boots still work via the same `canary-server.sh`
 wrapper, just with the default cert source.
 
-## What's NOT in PR 11.6.E
+## What's NOT in PR 11.6.E (Session 2 + future PRs)
 
 These are explicitly out of scope for this PR and live as
 follow-ups in HANDOFF:
 
+- **`client-tools-funnel-smoke` CI job**: spins up the canary in
+  letsencrypt mode with a pre-baked cert (via `actions/cache`),
+  probes `https://localhost:4433/health` + verifies WebTransport
+  connection over HTTPS with no dev-cert warning. **Deferred** —
+  requires self-hosted runner with `tailscale` installed +
+  `[self-hosted, lampak-m5]` label infrastructure that doesn't
+  exist yet. Filed as carry-forward. **Manual end-to-end
+  verification path**: open `https://m5.tail1b3795.ts.net:4433/`
+  in a browser (any network — Funnel exposes it to the public
+  internet), verify no "Your connection is not private" warning
+  AND no "self-signed certificate" warning. The browser's
+  DevTools → Network → WS filter should show
+  `wss://m5.tail1b3795.ts.net:4435/rooms/...` after a WebTransport
+  failure fallback.
 - **Matchmaker** — separate, opens up multi-room + lobby UI.
 - **Cloud smoke** — once A is up, a real end-to-end cross-Tailnet
   test (you on the MacBook, me on m5, both hitting the Funnel URL).

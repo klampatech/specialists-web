@@ -40,8 +40,33 @@ rapier3d = { version = "0.18", default-features = false, features = ["dim3", "f3
 # PR 11.7 once a compatible current release is verified; keeping it here
 # keeps the dev canary reproducible in the meantime.
 wtransport = { path = "vendor/wtransport", default-features = false, features = ["self-signed"] }
-# WebSocket fallback transport.
+# WebSocket fallback transport (plain `ws://`, dev/CI).
 tokio-tungstenite = "0.24"
+# PR 11.6.E / Session 2 — TLS-wrapped WebSocket fallback transport
+# (`wss://`, production / Tailscale Funnel). When the page is loaded
+# over HTTPS and the browser falls back from WebTransport to WebSocket,
+# browsers mixed-content-block plain `ws://` URLs — the WSS listener
+# terminates TLS on the same cert as the WebTransport listener, so the
+# fallback path works cleanly on HTTPS pages.
+#
+# `tokio-rustls` 0.26 matches `rustls` 0.23 (already in the dep tree
+# via `wtransport`). `rustls-pemfile` reads the PEM cert + key files
+# we already produce for the WT listener. Reusing the same identity
+# means a single cert/keystore is shared between WT and WSS.
+#
+# `tokio-rustls` defaults to `aws_lc_rs` as the crypto provider, but
+# `wtransport` uses `ring`. To avoid the rustls-0.23 "could not
+# automatically determine crypto provider" panic, we explicitly
+# default-disable `aws_lc_rs` and let `rustls`'s `ring` feature
+# (also enabled) be the provider — same as `wtransport`.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+# PR 11.6.E / Session 2 — direct rustls dep for building the
+# ServerConfig in `build_wss_tls_acceptor`. `rustls` is already in
+# the dep tree via `wtransport` (transitive), but we declare it
+# directly so the WSS code path uses the canonical API instead of
+# reaching through wtransport's re-export.
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }
 # Byte buffer helpers (BufMut for the wire encoders, Bytes for IO).
 bytes = "1"
 # Error helpers + glue.
