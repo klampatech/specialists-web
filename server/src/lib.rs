@@ -20,6 +20,7 @@ pub mod connection_outbound;
 pub mod damage_relay;
 pub mod constants;
 pub mod hitscan;
+pub mod matchmaker;
 pub mod physics;
 pub mod position_history;
 pub mod protocol;

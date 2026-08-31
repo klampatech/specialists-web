@@ -24,6 +24,7 @@ import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
 import { DebugHud } from "./DebugHud";
 import { PauseMenu } from "./PauseMenu";
+import { Lobby } from "./Lobby";
 // PR 11.7.D2 / §3.10 — WebRTCPeer + GgnetTransport imports REMOVED.
  // The P2P lockstep substrate is gone; see the header comment.
 
@@ -78,6 +79,23 @@ interface HudState {
 }
 
 export function App() {
+  // PR 11.9 — matchmaker lobby. When the URL has no `?server=` flag,
+  // the user landed on the entry page without being invited to a
+  // specific room — show the lobby instead of the game scene. The
+  // lobby navigates to `?server=<ws_url>` after Create/Join, at which
+  // point the URL flag drives the existing PeerOverlay/scene.ts flow.
+  // Detection happens at module evaluation (see PeerOverlay.tsx) AND
+  // here as a React-level guard (the Lobby component itself reads the
+  // URL too, but this guard short-circuits the heavy scene mount).
+  const [hasServerParam] = useState(() => {
+    if (typeof window === "undefined") return false;
+    const u = new URL(window.location.href);
+    return !!u.searchParams.get("server");
+  });
+  if (!hasServerParam && import.meta.env.DEV) {
+    return <Lobby />;
+  }
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sceneRef = useRef<SceneHandle | null>(null);
   // PR 11.7.D2 / §3.10 — peerRef REMOVED. No WebRTC peer to own;

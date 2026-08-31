@@ -291,7 +291,36 @@ Six phases. Each is a shippable thing. Don't build N+1 until N is solid.
 
 **Out of scope**: matchmaking, accounts, leaderboards.
 
-### **Phase 2 — Lobbies & accounts** (~2 weeks)
+#### §3.5 Matchmaker + lobby (PR 11.9)
+
+**Goal.** Replace the hard-coded `?server=ws://host:port/rooms/DEVBX` URL pattern with a real lobby surface. Players get a "create room" button that mints a unique room ID; the resulting shareable URL is the entire matchmaker experience.
+
+**Why "matchmaker-free" instead of a separate service.** The original PR 11.6 plan (§5 Q2) considered two architectures: (a) matchmaker as a separate crate (CS2/Valorant pattern), (b) matchmaker endpoints on the game server. We chose (b) because:
+- One m5 host serves one game at a time. There's no fleet to coordinate.
+- Single domain (`https://m5.tailnet.ts.net`) for both matchmaker HTTP + game WS/WSS — clients hit one origin, no CORS, no second deployment.
+- Adds ~100 lines of Rust (a hand-rolled HTTP/1.1 listener for `POST /rooms` + `GET /rooms/<id>`) instead of a second crate + second CI pipeline.
+- Reuses the existing `Arc<RwLock<HashMap<String, Room>>>` registry — multi-room is already wired, just behind a UI.
+
+**Surface.** New HTTP listener on `--port-http <u16>` (default 8080 in dev, configurable for prod). Three endpoints:
+
+| Method | Path | Returns |
+|---|---|---|
+| `POST /rooms` | — | `200 {"id":"<random>","ws_url":"ws://host:port/rooms/<id>","wss_url":"wss://host:port/rooms/<id>","max_players":N}` |
+| `GET /rooms/<id>` | — | `200 {"exists":true,"players":N,"max":N}` or `404 {"exists":false}` |
+| `GET /health` | — | `200 "ok"` (liveness probe) |
+
+Room IDs are server-generated random 8-char `[A-Za-z0-9_-]{8}` (subset of `parse_room_id`'s `[A-Za-z0-9_-]{1,64}` regex — avoids reserved URLs, keeps URL short for share). Lobby returns the full URLs so the client doesn't need to know the host/port.
+
+**Client.** Replaces the entry page's hard-coded "DEVBX" URL with a Lobby component:
+- `Create room` button → `POST /rooms` → redirects to `/?server=<ws_url>`
+- `Join with code` textbox + button → `GET /rooms/<id>` → on `200`, redirect to `/?server=ws://host:port/rooms/<id>`; on `404`, show "Room not found".
+
+**Out of scope** (deferred): MMR (Glicko-2), region selection, server browser, Discord OAuth, anti-DoS on the matchmaker (Phase 4). Room cleanup (rooms with 0 players for >1hr get pruned) is a follow-on — PR 11.9 leaves rooms alive forever in v1.
+
+**CI smokes.** New `client/tools/lobby-smoke.mjs`: (1) POST /rooms from tab A → (2) GET /rooms/<id> from tab B → (3) both tabs navigate to the lobby-minted URL → (4) assert both tabs `Connected (idle)` within 5s and HP converges on damage. Headless Chromium with WS-fallback (per PR #89's tier-3 verification pattern).
+
+
+### **Phase 2 — Lobbies & accounts** (~2 weeks) (~2 weeks)
 - Discord OAuth (zero-friction)
 - Web lobby: create room, join room, ready-up
 - Simple MMR-based matchmaking (Glicko-2)

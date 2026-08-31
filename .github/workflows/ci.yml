@@ -2120,6 +2120,87 @@ jobs:
           fi
           pkill -f 'vite' || true
 
+  # PR 11.9 — matchmaker lobby smoke. Boots the canary server with
+  # the new `--port-http 18080` matchmaker endpoint + Vite on a
+  # fresh port 5194, opens a single headless tab at the entry URL
+  # (no `?server=` param), asserts the Lobby component renders,
+  # clicks "Create room", and verifies the navigation lands on
+  # `?server=<ws_url>` AND the ServerTransport connects.
+  client-lobby-smoke:
+    name: client — lobby smoke (PR 11.9, port 5194)
+    needs: server-build
+    runs-on: ubuntu-latest
+    # No `defaults.run.working-directory` — cargo steps run from
+    # repo root; npm + smoke steps run with explicit `working-directory: client`.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — lobby smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Boot canary server (WT 14433 + WS 14434 + HTTP 18080)
+        run: |
+          nohup bash tools/canary-server.sh --port-wt 14433 --port-ws 14434 --port-http 18080 --cert-source self-signed \
+            > /tmp/canary-server.log 2>&1 &
+          echo $! > /tmp/canary-server.pid
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1; then
+              echo "Canary matchmaker HTTP ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1; then
+            echo "::error::Canary matchmaker HTTP did not become ready in 60s"
+            cat /tmp/canary-server.log
+            exit 1
+          fi
+      - name: Run lobby smoke
+        working-directory: client
+        run: node tools/lobby-smoke.mjs
+        env:
+          LOBBY_SMOKE_URL: http://localhost:5194/
+          CANARY_SERVER_PORT_WT: 14433
+          CANARY_SERVER_PORT_WS: 14434
+          CANARY_SERVER_PORT_HTTP: 18080
+          SMOKE_PNG: client/tools/lobby-smoke.png
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lobby-smoke-screenshot
+          path: client/tools/lobby-smoke.png
+          if-no-files-found: warn
+      - name: Tear down canary
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server.pid ]]; then kill "$(cat /tmp/canary-server.pid)" || true; fi
+          pkill -f canary-server.sh || true
+          for port in 14433 14434 18080 5194; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   # PR #89 follow-up — orchestrator smoke + shell/systemd lint gates.
   #
   # PR #89 (cert-source dispatcher + WSS termination) shipped two

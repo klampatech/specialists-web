@@ -45,6 +45,12 @@ struct Args {
     /// Set to a separate port (e.g. 4435) for production behind
     /// Tailscale Funnel. `0` disables WSS entirely.
     port_wss: Option<u16>,
+    /// PR 11.9 — matchmaker HTTP listener port. Hosts
+    /// `POST /rooms`, `GET /rooms/<id>`, `GET /health`. Set to
+    /// `0` to disable (default in `release` builds for prod where
+    /// the systemd unit binds a separate matchmaker; `8080` for
+    /// dev canary).
+    port_http: Option<u16>,
     print_help: bool,
 }
 
@@ -75,6 +81,14 @@ fn parse_args() -> Result<Args> {
                         .context("--port-wss requires a value")?
                         .parse()
                         .context("--port-wss must be u16")?,
+                );
+            }
+            "--port-http" => {
+                args.port_http = Some(
+                    iter.next()
+                        .context("--port-http requires a value")?
+                        .parse()
+                        .context("--port-http must be u16")?,
                 );
             }
             "--cert" | "--cert-out" => {
@@ -126,6 +140,8 @@ fn print_help() {
          FLAGS:\n  \
          --port-wt <u16>             UDP port for the WebTransport listener (default: 4433)\n  \
          --port-ws <u16>             TCP port for the WebSocket listener (default: 4434)\n  \
+         --port-wss <u16>            TCP port for the TLS-wrapped WebSocket listener (default: same as --port-ws).\n                                   Set to a separate port in production to avoid mixed-content with plain WS.\n                                   0 disables WSS entirely.\n  \
+         --port-http <u16>           TCP port for the matchmaker HTTP listener (default: 8080).\n                                   Hosts POST /rooms, GET /rooms/<id>, GET /health. 0 disables.\n  \
          --cert <path>               Path to the PEM cert (default: server/certs/dev.pem for self-signed,\n  \
                                     server/certs/lets-encrypt.pem for letsencrypt)\n  \
          --key <path>                Path to the PEM key (default: server/certs/dev.key for self-signed,\n  \
@@ -235,16 +251,21 @@ async fn main() -> ExitCode {
     // passes `--port-wss 4435` explicitly to bind a separate TLS
     // port. `--port-wss 0` disables WSS entirely.
     let port_wss = args.port_wss.unwrap_or(port_ws);
+    // PR 11.9 — matchmaker HTTP listener. Default 8080 (dev / dev-box
+    // canary). Production passes `--port-http 0` to disable if the
+    // operator wants the matchmaker as a separate service.
+    let port_http = args.port_http.unwrap_or(8080);
 
     let rooms: RoomRegistry = Arc::new(RwLock::new(HashMap::new()));
 
     info!(
         port_wt,
         port_ws,
+        port_http,
         cert_source = ?cert_source,
         cert = %cert_path.display(),
         key = %key_path.display(),
-        "starting specialists-server (PR 11.6.B scaffold; cert provisioning via PR 11.6.E)"
+        "starting specialists-server (PR 11.6.B + 11.9 matchmaker; cert provisioning via PR 11.6.E)"
     );
 
     // `run_server` owns both listener tasks. The integration canary starts
@@ -255,6 +276,7 @@ async fn main() -> ExitCode {
         port_wt,
         port_ws,
         port_wss,
+        port_http,
         cert_source,
         cert_path,
         key_path,

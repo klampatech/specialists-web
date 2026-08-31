@@ -81,6 +81,11 @@ futures = "0.3"
 # direct dependency (rather than relying on a transitive wtransport version)
 # so the hitscan API is stable if the transport implementation changes.
 glam = "0.27"
+# PR 11.9 — matchmaker room-ID minting. `rand::thread_rng()` gives
+# cryptographic-quality randomness; we only need 8 chars from a
+# 64-char alphabet (48 bits of entropy) per ID. The whole `rand`
+# crate is small (~150KB) and pulls in no extras.
+rand = "0.8"
 
 [dev-dependencies]
 # Re-declared under dev-dependencies so the integration smoke in

@@ -265,6 +265,13 @@ pub async fn run_server(
     // bound at a time, e.g. dev CI uses ws:// and prod uses
     // wss://).
     port_wss: u16,
+    // PR 11.9 — matchmaker HTTP listener port (POST /rooms +
+    // GET /rooms/<id> + GET /health). 0 disables. The listener
+    // shares the same `RoomRegistry` as the WT/WS/WSS
+    // transports — `POST /rooms` mints a fresh room ID; the
+    // actual room is created lazily on first connection via
+    // `ensure_room`.
+    port_http: u16,
     cert_source: specialists_server::cert::CertSource,
     cert_path: PathBuf,
     key_path: PathBuf,
@@ -346,6 +353,28 @@ pub async fn run_server(
         }))
     };
 
+    // PR 11.9 — matchmaker HTTP listener (POST /rooms, GET /rooms/<id>,
+    // GET /health). Same select!-shape pattern as the WSS branch:
+    // `0` disables (no spawn → permanent-pending in the select!).
+    // Default 8080 in dev canary; production passes `--port-http 0`
+    // to disable if a separate matchmaker service is running.
+    let http_handle = if port_http == 0 {
+        info!("HTTP matchmaker listener skipped: --port-http 0");
+        None
+    } else {
+        Some(tokio::spawn({
+            let rooms = rooms.clone();
+            async move {
+                if let Err(e) = specialists_server::matchmaker::run_matchmaker_http(port_http, rooms).await {
+                    warn!("run_matchmaker_http exited: {e:?}");
+                    Err(e)
+                } else {
+                    Ok(())
+                }
+            }
+        }))
+    };
+
     // Wait for any listener to exit OR ctrl_c. tokio::select! with
     // a branch count that varies based on whether WSS is enabled.
     // We can't use OptionFuture::from(None) for the WSS branch
@@ -391,6 +420,21 @@ pub async fn run_server(
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(anyhow::anyhow!("WebSocket-TLS task panicked: {e}").context("run_server")),
+            }
+        }
+        // PR 11.9 — matchmaker HTTP listener. Same select!-shape
+        // pattern as the WSS branch: when `http_handle` is None,
+        // emit a permanent-pending future so select! never picks it.
+        result = async {
+            match http_handle {
+                Some(h) => h.await,
+                None => std::future::pending().await,
+            }
+        } => {
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::anyhow!("matchmaker HTTP task panicked: {e}").context("run_server")),
             }
         }
     }

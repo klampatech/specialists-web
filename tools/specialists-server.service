@@ -78,7 +78,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 # page can fall back from WebTransport to WebSocket without
 # mixed-content-block. Plain ws on 4434 stays bound for dev/CI
 # compatibility + reverse-proxy setups that handle TLS upstream.
-ExecStart=/home/kyle/Development/specialists-web/tools/canary-server.sh --cert-source letsencrypt --port-wt 4433 --port-ws 4434 --port-wss 4435
+ExecStart=/home/kyle/Development/specialists-web/tools/canary-server.sh --cert-source letsencrypt --port-wt 4433 --port-ws 4434 --port-wss 4435 --port-http 8080
 
 # Restart on failure (Funnel config drift, transient network).
 # Don't restart on clean exit (Ctrl-C / SIGTERM).
