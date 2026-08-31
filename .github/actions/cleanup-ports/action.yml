@@ -1,0 +1,74 @@
+# PR 11.9 CI flake fix — kill stale specialists-server / vite / cargo
+# processes + free up the canary + Vite + matchmaker HTTP ports before
+# running a client smoke.
+#
+# The GH Actions runners are nominally ephemeral per job, but
+# self-hosted runners + the shared-rental ubuntu-latest pool can
+# re-use a runner across jobs (the runner image is restored, but
+# jobs that timed out without cleanup can leave processes that
+# block the next boot). The result: a smoke's "Boot canary" step
+# fails with `Address already in use` on TCP/14434 or UDP/14433.
+#
+# This action:
+#   1. Kills any leftover specialists-server / vite / cargo / npm
+#      processes (best-effort, not an error if none are running).
+#   2. Free up the ports used by the smokes (14433, 14434, 18080, plus
+#      the Vite dev ports 5174-5200 and the matchmaker HTTP port).
+#   3. Emits a small "pre-flight" log so the smoke run has visible
+#      "starting clean" proof in the CI log.
+#
+# Idempotent — safe to add to every client-smoke job without risk.
+# Future-proof — no need to update this file when adding a new smoke.
+
+name: Cleanup ports + processes for client smoke
+description: Kills stale specialists-server / vite / cargo + frees 14433/14434/18080 + Vite ports (5174-5200)
+runs:
+  using: composite
+  steps:
+    - name: Kill stale processes + free ports
+      shell: bash
+      run: |
+        # 1. Kill known binary names first (faster than per-port lsof).
+        for pat in 'specialists-server' 'canary-server.sh' 'vite' 'cargo' 'npm exec vite' 'playwright'; do
+          # pgrep -f matches the full command line, more reliable than pkill -x.
+          pids=$(pgrep -f "$pat" || true)
+          if [[ -n "$pids" ]]; then
+            echo "[cleanup] killing $pat: $(echo $pids | tr '\n' ' ')"
+            echo "$pids" | xargs -r kill -TERM 2>/dev/null || true
+            sleep 1
+            echo "$pids" | xargs -r kill -KILL 2>/dev/null || true
+          fi
+        done
+
+        # 2. Free the canary / matchmaker / Vite ports. Each smoke
+        # runs in a fresh job, but the runner image may carry over
+        # from a previous failed/aborted run on the same machine.
+        # Range 5174-5200 covers all Vite dev ports used by the
+        # current client smokes (see grep '5190\|5191\|5193\|5194'
+        # in client/tools/*.mjs).
+        for port in 14433 14434 18080 5174 5175 5180 5184 5185 5186 5187 5188 5189 5190 5191 5192 5193 5194 5195 5196 5197 5198 5199 5200; do
+          pids=$(lsof -ti:${port} 2>/dev/null || true)
+          if [[ -n "$pids" ]]; then
+            echo "[cleanup] freeing port ${port}: $(echo $pids | tr '\n' ' ')"
+            echo "$pids" | xargs -r kill -KILL 2>/dev/null || true
+          fi
+        done
+
+        # 3. Give the kernel a moment to release sockets (TIME_WAIT
+        # for TCP/14434 takes a few seconds after a kill). 2s is
+        # enough in practice — the canary's TCP listener rebinds
+        # on the next boot step.
+        sleep 2
+
+        # 4. Verify the critical ports are now free.
+        problems=0
+        for port in 14433 14434 18080; do
+          if (echo > /dev/tcp/127.0.0.1/${port}) >/dev/null 2>&1; then
+            echo "::warning::port ${port} still bound after cleanup — boot may fail"
+            problems=$((problems + 1))
+          fi
+        done
+
+        if [[ $problems -eq 0 ]]; then
+          echo "[cleanup] ports 14433/14434/18080 free; ready for smoke boot"
+        fi

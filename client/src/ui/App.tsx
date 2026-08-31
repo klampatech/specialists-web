@@ -24,6 +24,7 @@ import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
 import { DebugHud } from "./DebugHud";
 import { PauseMenu } from "./PauseMenu";
+import { Lobby } from "./Lobby";
 // PR 11.7.D2 / §3.10 — WebRTCPeer + GgnetTransport imports REMOVED.
  // The P2P lockstep substrate is gone; see the header comment.
 
@@ -78,6 +79,32 @@ interface HudState {
 }
 
 export function App() {
+  // PR 11.9 — matchmaker lobby. The lobby shows when:
+  //   - We're in a production build (real user landed on the
+  //     entry URL with no invite link), OR
+  //   - The URL explicitly opts in via `?lobby=1` (manual QA +
+  //     the lobby smoke).
+  //
+  // Dev builds default to the scene because developer machines +
+  // CI smokes load the entry URL directly to test scene mount,
+  // networking, and gameplay. Showing a lobby modal here would
+  // block every existing client smoke. The production-only gate
+  // keeps the lobby a real-user surface while preserving the
+  // dev workflow.
+  const [hasServerParam] = useState(() => {
+    if (typeof window === "undefined") return false;
+    const u = new URL(window.location.href);
+    return !!u.searchParams.get("server");
+  });
+  const [forceLobby] = useState(() => {
+    if (typeof window === "undefined") return false;
+    const u = new URL(window.location.href);
+    return u.searchParams.get("lobby") === "1";
+  });
+  if (forceLobby || (!hasServerParam && !import.meta.env.DEV)) {
+    return <Lobby />;
+  }
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sceneRef = useRef<SceneHandle | null>(null);
   // PR 11.7.D2 / §3.10 — peerRef REMOVED. No WebRTC peer to own;

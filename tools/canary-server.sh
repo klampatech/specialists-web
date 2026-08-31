@@ -19,11 +19,13 @@
 # the orchestrator can read its stdout / stderr.
 #
 # Usage:
-#   tools/canary-server.sh [--port-wt <u16>] [--port-ws <u16>] [--cert-dir <dir>] [--sans <csv>] [--cert-source <mode>]
+#   tools/canary-server.sh [--port-wt <u16>] [--port-ws <u16>] [--port-wss <u16>] [--port-http <u16>] [--cert-dir <dir>] [--sans <csv>] [--cert-source <mode>]
 #
 # Env-var equivalents (consumed by the script as defaults):
 #   PORT_WT      (default 4433)
 #   PORT_WS      (default 4434)
+#   PORT_WSS     (default = PORT_WS)
+#   PORT_HTTP    (default 8080) — PR 11.9 matchmaker
 #   CERT_DIR     (default <repo>/server/certs)
 #   CERT_SOURCE  (default "self-signed")
 #
@@ -40,11 +42,15 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT_WT="${PORT_WT:-4433}"
 PORT_WS="${PORT_WS:-4434}"
 # PR 11.6.E / Session 2 — PORT_WSS default is set AFTER the while loop
-# so we can mirror whatever --port-ws parsed (the smoke harness passes
+# so we can mirror whatever --port-ws parsed. The smoke harness passes
 # --port-ws as a CLI arg, not as $PORT_WS env, so a "default from env"
-# at this point would miss the CLI value and silently fall back to 4434).
+# at this point would miss the CLI value and silently fall back to 4434.
 # See the bottom of the script (post-while) for the actual default.
 PORT_WSS=""
+# PR 11.9 — matchmaker HTTP listener. Default 8080. Set PORT_HTTP=0
+# to disable (e.g., in production when a separate matchmaker service
+# is running).
+PORT_HTTP="${PORT_HTTP:-8080}"
 CERT_DIR="${CERT_DIR:-$REPO_ROOT/server/certs}"
 SANS="${SANS:-localhost,127.0.0.1,::1}"
 CERT_SOURCE="${CERT_SOURCE:-self-signed}"
@@ -73,6 +79,10 @@ while [[ $# -gt 0 ]]; do
       # binds a separate port for wss:// (Funnel HTTPS fallback).
       # Dev canary leaves this at PORT_WS so only one listener binds.
       PORT_WSS="$2"; shift 2 ;;
+    --port-http)
+      # PR 11.9 — matchmaker HTTP listener (POST /rooms,
+      # GET /rooms/<id>, GET /health). 0 disables.
+      PORT_HTTP="$2"; shift 2 ;;
     --cert-dir)
       CERT_DIR="$2"; shift 2 ;;
     --sans)
@@ -158,7 +168,7 @@ else
   fi
 fi
 
-echo "[canary] booting specialists-server (WebTransport UDP/$PORT_WT, WebSocket TCP/$PORT_WS)"
+echo "[canary] booting specialists-server (WebTransport UDP/$PORT_WT, WebSocket TCP/$PORT_WS, matchmaker HTTP/$PORT_HTTP)"
 echo "[canary] cert source: $CERT_SOURCE"
 echo "[canary] cert: $CERT_PATH"
 echo "[canary] key:  $KEY_PATH"
@@ -169,6 +179,7 @@ exec cargo run --manifest-path server/Cargo.toml --quiet $CARGO_PROFILE_FLAG -- 
   --port-wt "$PORT_WT" \
   --port-ws "$PORT_WS" \
   --port-wss "$PORT_WSS" \
+  --port-http "$PORT_HTTP" \
   --cert-source "$CERT_SOURCE" \
   --cert "$CERT_PATH" \
   --key "$KEY_PATH" \
