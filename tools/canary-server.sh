@@ -39,7 +39,12 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 PORT_WT="${PORT_WT:-4433}"
 PORT_WS="${PORT_WS:-4434}"
-PORT_WSS="${PORT_WSS:-$PORT_WS}"
+# PR 11.6.E / Session 2 — PORT_WSS default is set AFTER the while loop
+# so we can mirror whatever --port-ws parsed (the smoke harness passes
+# --port-ws as a CLI arg, not as $PORT_WS env, so a "default from env"
+# at this point would miss the CLI value and silently fall back to 4434).
+# See the bottom of the script (post-while) for the actual default.
+PORT_WSS=""
 CERT_DIR="${CERT_DIR:-$REPO_ROOT/server/certs}"
 SANS="${SANS:-localhost,127.0.0.1,::1}"
 CERT_SOURCE="${CERT_SOURCE:-self-signed}"
@@ -84,6 +89,15 @@ while [[ $# -gt 0 ]]; do
       exit 2 ;;
   esac
 done
+
+# PR 11.6.E / Session 2 — set PORT_WSS default AFTER the while loop so
+# it picks up whatever --port-ws parsed. Without this, --port-wss would
+# silently default to its env-default (4434) and the WSS listener would
+# try to bind a port that no smoke harness actually expects. The
+# "default == port_ws" semantic keeps the dev canary single-listener.
+if [[ -z "$PORT_WSS" ]]; then
+  PORT_WSS="$PORT_WS"
+fi
 
 # Resolve cert paths based on the cert source. PR 11.6.E split the
 # dev / prod cert layout:
