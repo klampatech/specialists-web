@@ -841,24 +841,72 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 - **Walk TOWARD not AWAY from Tab B's camera** — current GIF shows Tab A walking in a direction that takes the teal rig OFF Tab B's screen. A recording with Tab A walking INTO Tab B's view (so the teal rig visibly grows larger) would be more visually compelling.
 - **`two-tab-manual-flow.mjs` should be re-run end-to-end with both fixes in place** to confirm 6/6 visible assertions pass.
 - **CI integration:** the manual-flow smoke is currently opt-in with `continue-on-error: true`. Once walk-mirror + visual rig are stable across 5 local runs, promote the smoke to blocking CI.
-- **PR #51** (WebTransport validation via Tailscale Funnel + debug HUD) is on the same branch (`feat/phase1-pr11.7.d3-debug-hud`) — should split before merge per the PR-size discipline established in PR #50.
+- **PR #51** (WebTransport validation via Tailscale Funnel + debug HUD) is on the same branch (`feat/phase1-pr11.7.d3-debug-hud`) — should split before merge per the PR-size discipline established in PR #50.### 2026-08-31 — PR #89: Production Tailscale-Funnel certs + WebTransport primary (branch `feat/2026-08-31-pr-11.6-e-prod-funnel-certs`, MERGED `82ea528`)
+
+**Closes the "production deploy" gap from the Phase-1 carry-forward at `### WebTransport validation incomplete` (above).** Before this PR, the canary served WebTransport on a self-signed dev cert — fine for two-tab local smokes (Chromium falls back to WS) but unusable for any real client. The fix: a cert-source dispatcher + WSS termination + a systemd user unit that pulls a Let's Encrypt cert via `tailscale cert` on every boot.
+
+**Concrete changes (4 commits, +1435/-132 across 14 files):**
+
+1. **`CertSource` enum + dispatcher (`server/src/cert.rs`, +140)** — `SelfSigned | LetsEncrypt` with `from_str()` accepting 6 value variants and rejecting garbage. `ensure_certs()` is the dispatcher; `ensure_letsencrypt_certs()` is the fail-loud loader. **Critical invariant**: LetsEncrypt mode NEVER silently falls back to self-signed (covered by `ensure_certs_letsencrypt_fails_loud` regression test).
+2. **WSS termination (`server/src/transport.rs`, +251)** — TLS-wrapped WebSocket on a separate `--port-wss` port. The dev canary's default `port_wss == port_ws` keeps the dev single-listener (one TLS listener would force everything onto TLS). Production letsencrypt mode uses a distinct WSS port. Closes the "HTTPS page can't talk `ws://`" mixed-content gap.
+3. **`--cert-source` CLI flag** in `server/src/main.rs` (`SpecialistsServer::parse()`) and `tools/canary-server.sh`. `--gen-cert` refuses to run in letsencrypt mode (letsencrypt certs are provisioned by Funnel, not generated).
+4. **Cert path defaults switch** based on source: self-signed → `server/certs/dev.{pem,key}` (unchanged), letsencrypt → `server/certs/lets-encrypt.{pem,key}`.
+5. **`tools/specialists-server.service`** — systemd user unit. `ExecStartPre` gates on `tailscale funnel status | grep -q "4433"` (refuses to boot if Funnel isn't configured). `ExecStartPost` pulls the LE cert via `tailscale cert` + writes to `server/certs/`. `ExecReload = kill -HUP $MAINPID` for cert rotation. Hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths=...server/certs...server/target`.
+6. **`docs/funnel-deploy.md`** — operator runbook: prerequisites, one-time-per-host setup, verification commands, cert rotation workaround, Funnel policy gate behavior.
+7. **Server tests** — `server/tests/cert_source.rs` (8 tests) + `server/tests/wss_listener.rs` (14 tests). cargo total **224/224**.
+8. **Client WSS support** — `client/src/net/serverTransport.ts` (WSS URL selection: `wssPort = ports?.wss ?? wsPort + 1`) + `client/src/net/serverTransport.wss.test.ts` (4 new vitest tests). vitest total **56/56**.
+
+**Two regressions caught and fixed mid-PR** (both originally visible only on the CI re-run after Session 2 landed; both documented in PR body "Regression fixes" section):
+
+1. **`PORT_WSS` default-before-arg-parsing** (`tools/canary-server.sh`) — `PORT_WSS="${PORT_WSS:-$PORT_WS}"` was set at line 42, BEFORE the while loop parsed `--port-ws`. So `bash tools/canary-server.sh --port-ws 14434` (no `--port-wss`) gave `PORT_WSS=4434` (env-default) instead of mirroring the parsed `PORT_WS=14434`. Server tried to bind WSS on 4434, collided with another listener, died. 10/27 CI smokes failed. **Fix**: defer `PORT_WSS` default until after the arg-parsing loop (`if [[ -z "$PORT_WSS" ]]; then PORT_WSS="$PORT_WS"; fi`). **Class-of-bug rule**: any `VAR="${OTHER_VAR:-default}"` mirror pattern must be set AFTER the arg-parsing loop, not before.
+2. **`OptionFuture::from(None)` early-resolve** (`server/src/transport.rs`) — used `futures::future::OptionFuture::from(wss_handle)` for the WSS branch in `run_server`'s `tokio::select!`. Assumed `OptionFuture::from(None)` yields `Pending` forever. **Wrong** — it yields `None` immediately (its resolved state). The select! branch fired, my match arm returned `Ok(())`, and `run_server` completed in ~1ms before the WS listener could even bind 14434. **Fix**: replaced with `async { match wss_handle { Some(h) => h.await, None => std::future::pending().await } }`. `std::future::pending()` is the canonical Pending future — select! blocks forever on it. **Class-of-bug rule**: every `tokio::select!` branch must be a future that NEVER resolves when the underlying thing is disabled. Reach for `std::future::pending()` first; `OptionFuture::from(None)` is "None = done", the opposite of what you want.
+
+**CI**: 27/27 GREEN on the post-fix re-run (run 33350027898). `bash tools/canary-server.sh --port-ws 14434 --port-wss 14435 --cert-source self-signed` boots cleanly; WSS handshake via `curl --insecure -H 'Connection: Upgrade' -H 'Upgrade: websocket' https://127.0.0.1:14435/health` returns `HTTP/1.1 101 Switching Protocols`.
+
+**Tier-3 verification on MacBook Chrome 151.0.7922.175** (via CDP tunnel m5:9223→macbook:9223): 4/4 PASS — WS handshake completes, scene + physics running, snapshot stream arriving (`__latestSnap()` returns 1 player, HP=100), HUD renders `Server: connected (websocket)` + `Connected (idle)` + `HP me: 100` + `Ammo: 6/6`. Screenshot verified visually: full 3D scene rendered (red capsule + grey floor + orange terrain, renderer: `webgl2` fallback — Chrome 151 Mac doesn't expose WebGPU by default).
+
+### 2026-08-31 — PR #90: close the `run_server` orchestrator CI gap (branch `fix/orchestrator-ci-coverage`, MERGED `a50a53e`)
+
+**Motivation.** PR #89's two regressions (PORT_WSS shell ordering + `OptionFuture::from(None)` early-resolve) shared a class: `run_server` boots, binds ports, then exits prematurely. Neither `cargo test` (which calls `run_web_transport` directly, bypassing `run_server`) nor the existing `damage-server-*-smoke.mjs` jobs (which use `SMOKE_NO_BOOT=1` or only check `ss -ltn` port binding) could catch this class. End-to-end `run_server` orchestration had no CI coverage.
+
+**Concrete changes (2 files, +553):**
+
+1. **`client/tools/canary-orchestrator-smoke.mjs`** (new, 431 lines) — boots `tools/canary-server.sh` end-to-end and asserts 5 properties:
+   1. Canary stays alive for 5s (catches the `OptionFuture::from(None)` early-resolve bug — which kills the server in ~1ms)
+   2. WS port reachable on dual-stack (catches the `PORT_WSS` bind collision)
+   3. WSS port TLS handshake completes (skipped on pre-#89 canary)
+   4. Canary log contains `WebTransport listener bound` (catches "orchestrator died before reaching WT spawn")
+   5. WS handshake returns `HTTP/1.1 101 Switching Protocols` (proves server is processing frames, not just binding ports)
+   - **Forward-compatible**: feature-detects `--port-wss` + `--cert-source` by grepping `tools/canary-server.sh` source, so it runs on `main` today AND on PR branches with the new flags. WSS assertion gracefully skipped on pre-#89 canary. Pure TCP/TLS/WS probes — no Playwright dependency, ~10s runtime.
+2. **CI jobs** in `.github/workflows/ci.yml`:
+   - **`client-canary-orchestrator-smoke`** — depends on `server-build`, reuses the cargo binary that passed `cargo test`. Uploads `/tmp/canary-orchestrator-smoke.log` as an artifact on failure.
+   - **`server-shell-systemd-gate`** (sub-second, runs on every PR): `bash -n tools/*.sh` + `systemd-analyze verify tools/*.service`. Catches shell-script syntax errors AND unit-file syntax errors that previously only surfaced in production.
+
+**CI result on PR #90** (run 33405160121): `client — canary orchestrator smoke` PASS (1m11s, 5/5 assertions, WSS skipped because main-canary pre-#89), `server — shell + systemd lint gate` PASS (12s), all 27 other existing smokes still pass. 0 fails.
+
+**Lesson encoded**: every refactor of `run_server` (select! shape, listener spawning, mode-driven control flow, cert-source threading) now has end-to-end CI coverage. The orchestrator smoke is forward-compatible — future `run_server` changes that drop a listener or break the orchestrator will fail CI.
+
+
 
 ---
 
 ## Known issues
 
-### WebTransport validation incomplete (PR 11.7.D2.2 carry-forward, 2026-08-23)
+### WebTransport validation (PR 11.6.E closed most blockers, 2026-08-31)
 
-**Symptom.** PR #50 retires the lockstep P2P substrate and adopts `ServerTransport` (WebTransport-primary, WebSocket-fallback) as the sole multiplayer transport. The smoke matrix passes 20/20 against WS-fallback, and WebTransport is in fact attempted first. However, **WebTransport is unverifiable end-to-end in dev** for four reasons:
+**History.** PR #50 retires the lockstep P2P substrate and adopts `ServerTransport` (WebTransport-primary, WebSocket-fallback) as the sole multiplayer transport. PR #50 shipped with WebTransport as the primary but unverifiable end-to-end in dev — a 4-point carry-forward was filed at `docs/SPEC.md` (this section, pre-#89).
 
-1. **Insecure-page stripping.** Chrome strips `WebTransport` from any page loaded over `http://`. We added `VITE_HTTPS_KEY` / `VITE_HTTPS_CERT` env vars in `vite.config.ts` to point Vite at the same cert as the canary, but the dev workflow now requires both canary cert regen AND Vite boot with these vars. Documented in HANDOFF.md decision log.
-2. **QUIC cert verification is separate from HTTPS.** Chrome's QUIC TLS verifier does NOT respect `--ignore-certificate-errors`. The dev cert (`CN=wtransport self-signed`, regenerated 2026-08-23 with `IP:100.95.111.112` SAN) is trusted for HTTPS once `mkcert`'d into the OS trust store. QUIC still fails because the canary has no real CA chain.
-3. **Headless Chrome151 strips WebTransport/WebGPU unconditionally.** Confirmed via multiple flag combinations (`--enable-features=WebTransport --enable-unsafe-webgpu --webtransport-developer-mode --ignore-certificate-errors-spki-list`). The page context in headless mode simply does not expose these APIs.
-4. **Manual 24-player-scale validation requires real HTTPS.** Tailscale Funnel (or Let's Encrypt via Cloudflare for a public hostname) gets a real cert that Chrome + Chrome-QUIC both respect. We do not have this set up yet.
+**Closed by PR #89 (PR 11.6.E, MERGED 2026-08-31, `82ea528`)**:
 
-**Recommended fix path** (PR 11.7.D2.3 or follow-on): `sudo tailscale funnel 14433 on` on the m5 — gives `https://m5.<tailnet>.ts.net:443` a real Let's Encrypt cert via Tailscale's HTTPS termination. Update `canary-server.sh` to listen on the Funnel-served port, then point Playwright tests + Kyle's Chrome at the Funnel URL. End-to-end WT validation then becomes testable.
+- **Reason #1 (Insecure-page stripping)** — **CLOSED.** PR #89 added WSS termination (`--port-wss`, separate port for `wss://`). Now HTTPS pages have a valid `wss://` fallback for the mixed-content case. Pre-#89, an HTTPS page couldn't talk to `ws://` (mixed-content-blocked); post-#89, it talks `wss://` and the server terminates TLS on a separate port (`14435` in dev, configurable via `--port-wss`).
+- **Reason #2 (QUIC cert verification separate from HTTPS)** — **PARTIALLY CLOSED.** PR #89 added the `CertSource` dispatcher (`server/src/cert.rs`) with `--cert-source {self-signed|letsencrypt}`. In letsencrypt mode the canary loads `server/certs/lets-encrypt.{pem,key}` from Tailscale Funnel's `tailscale cert` (pulled via `ExecStartPost` in `tools/specialists-server.service`). QUIC now verifies against a real CA chain when running letsencrypt mode under Funnel. Self-signed mode (dev) still uses the mkcert-trusted cert — QUIC verification fails in headless, which is why CI defers WT to manual smoke.
+- **Reason #4 (Manual scale validation needs real HTTPS)** — **CLOSED.** Funnel deployment path is documented in `docs/funnel-deploy.md`. Operator can `sudo tailscale funnel 14433 on` + `systemctl --user enable --now specialists-server.service` to get `https://m5.<tailnet>.ts.net:443` a real LE cert, with the canary serving both WT and WSS behind it.
 
-**Severity**: blocker for 24-player scale goal. NOT a blocker for shipping PR #50 (which compiles, all existing smokes green, architecturally correct). Ship PR #50 + file PR #51 (WebTransport validation).
+**Still open**:
+
+- **Reason #3 (Headless Chrome151 strips WebTransport/WebGPU)** — still no fix. CI smokes that need WebTransport end-to-end must run against a real (non-headless) browser. The tier-3 verification done on PR #89 used headless Chromium with WS fallback (`cross-machine-smoke.mjs`) plus a manual MacBook Chrome 151 walk via CDP — both went via the WS path. Filed as a known CI limitation; tier-3 (real-browser) smokes close the gap for now.
+
+**Severity post-PR-#89**: 24-player scale validation can now happen against a real Funnel-served deployment with WT-primary. The CI gap (headless can't drive WT) is mitigated by the tier-3 smoke recipe (`docs/specialists-web/references/cross-machine-smoke.mjs` + manual macbook walk).
 
 ### Server-side `physics.step()` server-authoritative step needs verification (carry-forward from PR #50, 2026-08-23)
 

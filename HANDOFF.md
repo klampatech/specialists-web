@@ -7,10 +7,10 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#87 (2026-08-30). **`main` @ `226423e` (PR #87 squash — MERGED 2026-08-30 21:28 UTC).** Closes the long-running DEVBX hardcode carry-forward from PR 11.7.E. **The bug had two layers, not one**: server-side `parse_room_id()` (PR #63) was already correct — only the client side had a bug. Two client-side surfaces: (1) `scene.ts` had a silent `?? "DEVBX"` fallback when `window.__damageServerRoomId` was unset, and (2) `PeerOverlay.tsx` only set `__damageServerRoomId` from a separate `?room=` URL param that no actual smoke passes — every smoke encodes the room in the `?server=.../rooms/<id>` URL path. Net effect: `__damageServerRoomId` was always unset, `scene.ts` silently fell back to DEVBX, and any real smoke failure would have been silently masked. **Fix** (4 files, +154/-4): `scene.ts` throws on missing injection (instead of silently defaulting); `serverTransport.ts` exports `parseRoomFromUrl()` mirroring server-side `parse_room_id()` regex `[A-Za-z0-9_-]{1,64}`; `PeerOverlay.tsx` derives room from the `?server=.../rooms/<id>` URL path when `?room=` is absent; new `client/src/net/serverTransport.test.ts` covers 9 cases. **CI: 27/27 GREEN on merge commit (run 33336396036).** Local verification: `two-tab-smoke.mjs` PASS (3), `two-tab-manual-flow.mjs` PASS (5: clean snapshots, rig separation, rig meshes, walk mirror 7.91m, HP convergence — this was the in-CI smoke that was relying on the silent fallback), `health-regression-smoke.mjs` PASS. typecheck clean, vitest 43 → **52 PASS** (+9), build clean (bundle 7,065.57 kB, same hash as main, +0 delta). This was the (B) PR in the B → A → C vote. **No code work currently queued.** Recommended next direction (your call):
-- **(a) PR 11.6.E — Production Tailscale-Funnel certs + WebTransport primary** — **Sessions 1+2 LANDED as PR #89 (2026-08-30, OPEN, 27/27 CI green after fix)**. Cert-source dispatcher + systemd Funnel unit + WSS termination + operator runbook. Two regressions caught and fixed mid-PR: (1) `PORT_WSS` default-before-arg-parsing — `bash tools/canary-server.sh --port-ws 14434` didn't propagate to `--port-wss` because the default was resolved at line 42 before the while loop ran; (2) `OptionFuture::from(None)` resolves with `None` immediately, not Pending, so the WSS branch in `tokio::select!` fired early and killed the server before WS could bind — replaced with `std::future::pending().await` when the WSS handle is None. **Recommended next direction: matchmaker (PR 11.9), outbound mpsc back-pressure review, or Phase 2 pivot** — PR 11.6.E is closed.
-- **(b) PR `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator already shipped; this is verification + a small capacity bump if needed before sustained cloud load.
-- **(c) Pivot to weapons / matchmaker / new feature arc** — Phase 2 candidates from previous TL;DR: WEAPONS-table refactor (shotgun/sniper), matchmaker (PR 11.9), lobby UI, spectator mode, replay, scoreboard, or any of the maintenance carry-forwards (remote rig collision, PointerLock ESC flicker, anti-cheat).
+**`You are here`**: post-PR-#89 + #90 (2026-08-31). **`main` @ `a50a53e` (PR #89 + #90 MERGED 2026-08-31 14:57 UTC).** Closes the PR 11.6.E work AND the orchestrator CI gap. **`You are here` summary**: PR 11.6.E (cert-source dispatcher + WSS termination + systemd Funnel unit) is now SHIPPED to main. PR #90 added a `canary-orchestrator-smoke.mjs` + shell/systemd lint gates to CI that catch the two regressions that bit PR #89 at validation time (PORT_WSS shell ordering, `OptionFuture::from(None)` early-resolve). Both new CI jobs green. **No code work currently queued.** Recommended next direction (your call):
+- **(a) PR 11.9 — Matchmaker** (~1-2 sessions, next big Phase-1 surface). Lobby → queue → region select → server pick → connect. Closes the "friends can't find each other in DEVBX" UX gap. Pre-reqs are all green: cert-source + WSS from #89 (production deploy), DEVBX cleanup from #87, snapshot/HP convergence from #56. Cleanest place to start.
+- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator already shipped; this is verification + a small capacity bump if needed before sustained cloud load.
+- **(c) Pivot to weapons / new feature arc** — Phase 2 candidates: WEAPONS-table refactor (shotgun/sniper), lobby UI, spectator mode, replay, scoreboard, or any of the maintenance carry-forwards (remote rig collision, PointerLock ESC flicker, anti-cheat).
 
 ---
 
@@ -68,7 +68,61 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Next session task**: PR 11.6.E Session 2 — WSS termination + CI funnel-smoke job. Branch: `feat/2026-08-31-pr-11.6-e-session-2-wss` off `main` (assuming #89 is merged by then) or off the PR #89 branch tip (if not). Estimated ~1 session.
 
-## 2026-08-30 — PR #87 merged (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86)
+
+## 2026-08-30 → 08-31 — PR #89 MERGED (PR 11.6.E sessions 1+2) + PR #90 MERGED (orchestrator CI gap) + cross-machine tier-3 validation
+
+**Scope**: Two-day, three-PR closeout. PR #89 (cert-source + WSS + systemd Funnel unit, the deployment story) and PR #90 (orchestrator smoke + shell/systemd lint gates, the CI gap-filler that catches the regressions that bit PR #89). Both **MERGED** to `main` at `a50a53e` (PR #89 squash `82ea528` + PR #90 squash `a50a53e`, 2026-08-31 14:57 UTC).
+
+**What PR #89 landed** (the big one — the deployment surface):
+
+- **PR 11.6.E Sessions 1+2** — 14 files changed, 1435+/132- across 4 commits on branch `feat/2026-08-31-pr-11.6-e-prod-funnel-certs`:
+  - `server/src/cert.rs` +140 — `CertSource` enum, `ensure_certs()` dispatcher, `ensure_letsencrypt_certs()` fail-loud loader
+  - `server/src/transport.rs` +251 — WSS termination (tokio-rustls + rustls-pemfile), `--port-wss` CLI flag, `std::future::pending()` for disabled WSS branch in `tokio::select!`
+  - `server/src/main.rs` +114 — `--cert-source` CLI flag, `run_server` orchestrator refactor
+  - `server/tests/cert_source.rs` +157 — 8 tests for cert-source dispatcher
+  - `server/tests/wss_listener.rs` +283 — 14 WSS listener tests
+  - `server/Cargo.toml` / `Cargo.lock` — `tokio-rustls` + `rustls-pemfile` deps
+  - `client/src/net/serverTransport.ts` +33 — WSS URL selection (`wssPort = ports?.wss ?? wsPort + 1`), WSS upgrade path
+  - `client/src/net/serverTransport.wss.test.ts` +83 — 4 new vitest tests for WSS client transport
+  - `tools/canary-server.sh` +123 — `--port-wss` + `--cert-source` CLI flags, **PORT_WSS default deferred until after arg-parsing loop** (regression fix #1)
+  - `tools/specialists-server.service` +94 — systemd user unit, `ExecStartPre` gates on Funnel status, `ExecStartPost` pulls LE cert, hardening + `ReadWritePaths` for cert dir
+  - `docs/funnel-deploy.md` +187 — operator runbook
+- **Two regressions caught and fixed mid-PR** (both documented in PR body "Regression fixes" section):
+  1. **`PORT_WSS` default-before-arg-parsing** — `tools/canary-server.sh` defaulted `PORT_WSS="${PORT_WSS:-$PORT_WS}"` at line 42 BEFORE the while loop parsed `--port-ws`. So `bash tools/canary-server.sh --port-ws 14434` (no `--port-wss`) gave `PORT_WSS=4434` (env-default) instead of mirroring the parsed `PORT_WS=14434`. Server tried to bind WSS on 4434, collided, died. **Fix**: defer `PORT_WSS` default until after the arg-parsing loop.
+  2. **`OptionFuture::from(None)` early-resolve** — used `futures::future::OptionFuture::from(wss_handle)` for the WSS branch in `run_server`'s `tokio::select!`. Assumed `OptionFuture::from(None)` yields `Pending` forever. **Wrong** — it yields `None` immediately (its resolved state). The select! branch fired, my match arm returned `Ok(())`, and `run_server` completed in ~1ms before the WS listener could even bind 14434. 10/27 CI smokes cascaded into failure. **Fix**: replaced with `async { match wss_handle { Some(h) => h.await, None => std::future::pending().await } }`.
+- **CI**: 27/27 GREEN on the post-fix re-run (after 10/27 RED on initial Session-2 squash).
+- **Pre-merge validation (this session)**:
+  - m5 headless two-tab + cross-machine smoke (3/3 PASS): connect, snapshot fan-out, walk-mirror (Tab B 'd' keypress → Tab A visual x=2.45), damage round-trip (Tab A mouse-click → Tab B HP 100→88).
+  - **Tier-3 on MacBook Chrome 151.0.7922.175** via CDP tunnel m5:9223→macbook:9223 (4/4 PASS): WS handshake completes, scene + physics running, snapshot stream arriving, HUD renders `Server: connected (websocket)` + `Connected (idle)` + `HP me: 100` + `Ammo: 6/6`. Screenshot verified visually: full 3D scene rendered with red capsule + grey floor + orange terrain, renderer: `webgl2` (correct fallback for MacBook Chrome 151).
+  - **WSS handshake across tailnet** (m5:14435 from both m5 localhost AND macbook 100.79.235.118): `curl --insecure -H 'Connection: Upgrade' -H 'Upgrade: websocket' https://100.95.111.112:14435/health` → `HTTP/1.1 101 Switching Protocols`. Canary log shows `WSS TLS handshake accepted peer=100.79.235.118:NNNNN` for the macbook IP.
+  - Stress stats: `drops_total=0, rate_limited_total=0` for the entire 15+ min run.
+
+**What PR #90 landed** (the CI gap-filler, motivated by the two PR-#89 regressions):
+
+- **`client/tools/canary-orchestrator-smoke.mjs`** (new, 431 lines) — boots the canary via `tools/canary-server.sh` end-to-end and asserts 5 properties:
+  1. Canary stays alive for 5s (catches the `OptionFuture::from(None)` early-resolve bug — which kills the server in ~1ms)
+  2. WS port reachable on dual-stack (catches the `PORT_WSS` bind collision)
+  3. WSS port TLS handshake completes (skipped on pre-#89 canary)
+  4. Canary log contains `WebTransport listener bound` (catches "orchestrator died before reaching WT spawn")
+  5. WS handshake returns `HTTP/1.1 101 Switching Protocols` (proves server is processing frames, not just binding ports)
+  - **Forward-compatible**: feature-detects `--port-wss` + `--cert-source` by grepping `tools/canary-server.sh` source (works on main today AND on PR branches with the new flags). Pure TCP/TLS/WS probes — no Playwright dependency, ~10s runtime.
+- **CI job `client-canary-orchestrator-smoke`** (depends on `server-build`, reuses the cargo binary that passed `cargo test`). Uploads `/tmp/canary-orchestrator-smoke.log` as an artifact on failure.
+- **CI job `server-shell-systemd-gate`** (sub-second, runs on every PR):
+  - `bash -n tools/*.sh` — catches syntax errors that only surface at first invocation
+  - `systemd-analyze verify tools/*.service` — catches unit-file syntax errors, `Type=` vs `ExecStart` mismatches, missing `[Install]` sections, hardening-directive typos
+- **CI result** (PR #90 run 33405160121): `client — canary orchestrator smoke` PASS (1m11s, 5/5 assertions, WSS skipped because main-canary pre-#89), `server — shell + systemd lint gate` PASS (12s), all 27 other existing smokes still pass. 0 fails. 2 pending (24-player stress smoke [opt-in] + Havok parity smoke [unrelated queue delay]).
+
+**Carry-forward (filed in HANDOFF TL;DR for next session, options a/b/c)**:
+- **(a) PR 11.9 — Matchmaker** (~1-2 sessions): lobby → queue → region select → server pick → connect. Pre-reqs are all green: cert-source + WSS from #89 (production deploy), DEVBX cleanup from #87, snapshot/HP convergence from #56.
+- **(b) Outbound mpsc + back-pressure review** (~1 session, defensive).
+- **(c) Pivot to weapons / new feature arc**: WEAPONS-table refactor (shotgun/sniper), lobby UI, spectator mode, replay, scoreboard, or any maintenance carry-forward (remote rig collision, PointerLock ESC flicker, anti-cheat).
+
+**Quota state**: `~/.quota-tripped` was fresh at session start; proxy served all generation calls (cargo test, npm install, vitest, etc.) successfully. `requests_failed` count unchanged. No quota-driven interruptions.
+
+**Spec sync**: `docs/SPEC.md` is unchanged at this point — PR #89's WSS termination is a deployment-surface change, not a spec-affecting change. The operator runbook at `docs/funnel-deploy.md` is the canonical reference for the cert-source + systemd wiring. Next session: if PR 11.9 matchmaker is chosen, that's a spec change (`§3.5 lobby/matchmaker` section) and needs a spec update as part of the work.
+
+
+## 2026-08-30 — PR #87 merged (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86) (DEVBX hardcode cleanup, two-layer fix) + README refresh (#86)
 
 **Scope**: three PRs merged in this session. PR #85 was the docs merge-conflict resolution from yesterday. PR #86 was a README refresh — it was stuck on the Phase-0 "feel test" framing, 2 phases and ~30 PRs out of date. PR #87 was the actual netcode-cleanup work: closes the long-running DEVBX hardcode carry-forward from PR 11.7.E. GitHub squash-merged all three.
 
