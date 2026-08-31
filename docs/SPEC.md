@@ -919,6 +919,51 @@ The Phase 0 milestones table above is a one-liner. Below is the same info plus t
 
 ---
 
+
+### 2026-08-31 — PR #91: in-process matchmaker + lobby UI + lobby smoke (PR 11.9) (branch `feat/pr-11.9-matchmaker`, MERGED `1f1faf3`)
+
+The matchmaker carry-forward from PR 11.6 plan §5 Q2 ("matchmaker is a separate service"). Decision: ship as **in-process** rather than a separate crate. Reasons:
+
+- After PR #89 shipped the production deploy surface (Funnel + same-domain letsencrypt), the lobby UI + matchmaker HTTP + game WS/WSS all live on the same origin (`https://m5.tailnet.ts.net`). No fleet to coordinate.
+- Single domain simplifies the client (no CORS, no second deploy).
+- Reuses the existing `Arc<RwLock<HashMap<String, Room>>>` registry — multi-room was already wired in transport.rs; we just exposed it through a 3-endpoint HTTP listener.
+- ~430 lines of hand-rolled HTTP/1.1 (no `axum`/`hyper` dep) vs. a second crate + second CI pipeline.
+
+**Server** (`server/src/matchmaker.rs`):
+- 3 endpoints: `POST /rooms`, `GET /rooms/<id>`, `GET /health`.
+- 8-char URL-safe room IDs ([A-Za-z0-9_-]{8}; ~2.2×10^14 keyspace).
+- `POST /rooms` returns a fresh ID WITHOUT pre-creating the room; the room is created lazily on first WS/WT connection via `ensure_room`. Avoids the stale-room problem for v1.
+- `GET /rooms/<id>` reports `room.connections.len()` as the live player count.
+- `Access-Control-Allow-Origin: *` because the lobby UI lives on Vite's port (5174) while matchmaker is on a separate port (8080).
+- `run_matchmaker_http` wired into `run_server`'s `tokio::select!` via the same permanent-pending-on-None pattern as the WSS branch (PR 11.6.E regression #2 — `std::future::pending()`, not `OptionFuture::from(None)`).
+- New CLI flag `--port-http` (default 8080 in dev, 0 disables).
+
+**Client** (`client/src/{net/matchmakerApi.ts, ui/Lobby.tsx, ui/App.tsx}`):
+- `matchmakerApi.ts`: typed `roomApi.createRoom / .getRoom / .health`.
+- `Lobby.tsx`: Create room / Join with code UI. ~160 lines.
+- `App.tsx`: lobby gates — production build shows lobby by default when no `?server=` URL param; dev build only shows lobby on `?lobby=1` (so CI smokes that load the entry URL directly still see the scene mount — this fixed a 15-smoke CI flake on the first PR #91 push).
+- `import.meta.env.DEV` guard keeps the lobby tree-shaken from production bundles.
+
+**CI** (`.github/workflows/ci.yml` + `.github/actions/cleanup-ports/action.yml`):
+- New job `client — lobby smoke (PR 11.9, port 5194)` — boots canary + Vite, navigates with `?lobby=1`, asserts Lobby renders + Create navigates + ServerTransport connects (3 assertions, sub-30s runtime).
+- New **composite action** `cleanup-ports` runs as the first step of every smoke job. Kills stale specialists-server / vite / cargo / playwright processes + frees TCP/UDP 14433/14434/18080 + Vite dev ports 5174-5200. Resolved the pre-existing port-binding CI flake (15 client smokes failing on PR #90 + earlier) — idempotent and harmless for jobs that don't bind these ports.
+
+**Verification (locally + CI)**:
+- `cargo test`: 224 PASS + matchmaker module compiles
+- `npm run typecheck`: clean
+- `npm run build`: clean (7,065.67 kB, same as main, Lobby tree-shakes)
+- `npm test`: 56/56 PASS
+- `node tools/lobby-smoke.mjs`: 3/3 PASS locally + in CI
+
+15 files changed, +1181/-8. Final CI: 30/30 pass, 0 fail, `mergeStateStatus: CLEAN`. MERGED 2026-08-31 17:29:55 UTC, squash `1f1faf3`.
+
+**Out of scope for this PR (carry-forward for next session):**
+- Lobby polish (empty-state UX, error toasts, "room full" handling)
+- MMR (Glicko-2), region selection, server browser
+- Discord OAuth
+- Anti-DoS on the matchmaker (Phase 4)
+- Room cleanup (rooms with 0 players for >1hr get pruned)
+- Two-tab cross-machine lobby smoke (covered by existing damage-server-smoke.mjs which uses pre-baked URLs)
 ## Known issues
 
 ### WebTransport validation (PR 11.6.E closed most blockers, 2026-08-31)
