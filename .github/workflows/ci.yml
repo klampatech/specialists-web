@@ -2160,25 +2160,18 @@ jobs:
         timeout-minutes: 3
       - name: Boot canary server (WT 14433 + WS 14434 + HTTP 18080)
         run: |
-          nohup bash tools/canary-server.sh --port-wt 14433 --port-ws 14434 --port-http 18080 --cert-source self-signed \
-            > /tmp/canary-server.log 2>&1 &
-          echo $! > /tmp/canary-server.pid
-          # Wait up to 180s for matchmaker HTTP — covers cold cargo
-          # builds (~90s on GitHub runners for release profile) plus
-          # matchmaker HTTP bind. CI runners are slower than m5 so we
-          # pad generously.
-          for i in $(seq 1 180); do
-            if (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1; then
-              echo "Canary matchmaker HTTP ready after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-          if ! (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1; then
-            echo "::error::Canary matchmaker HTTP did not become ready in 180s"
-            cat /tmp/canary-server.log
+          # Pre-warm cargo's incremental cache so the smoke's
+          # `cargo run` is fast (debug profile already built in the
+          # `Build server` step above; the canary spawn happens in
+          # the lobby smoke itself). This step just verifies the
+          # build artifact exists.
+          if [[ ! -f server/target/debug/specialists-server ]]; then
+            echo "::error::specialists-server debug binary missing — the Build server step above should have produced it"
+            ls -la server/target/debug/specialists-server 2>&1 || true
             exit 1
           fi
+          echo "Server debug binary present: $(ls -la server/target/debug/specialists-server)"
+          echo "Lobby smoke will spawn its own canary via tools/canary-server.sh."
       - name: Run lobby smoke
         working-directory: client
         run: node tools/lobby-smoke.mjs

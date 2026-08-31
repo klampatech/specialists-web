@@ -59,6 +59,21 @@ let viteProc = null;
 
 async function bootCanary() {
   log(`Booting canary (WT=${WT_PORT}, WS=${WS_PORT}, HTTP=${HTTP_PORT})...`);
+  // If the matchmaker HTTP port is already bound (e.g., a CI step
+  // pre-warmed the canary), skip our own spawn — two canaries can't
+  // share port 18080. We still bind a teardown listener to the
+  // existing process so killProcs doesn't kill the wrong pid.
+  try {
+    const probe = await fetch(`http://127.0.0.1:${HTTP_PORT}/health`);
+    if (probe.ok) {
+      log(`Canary already running on :${HTTP_PORT} (skipping spawn)`);
+      canaryProc = null; // signal killProcs to skip
+      return;
+    }
+  } catch (_) {
+    // not running — proceed to spawn
+  }
+
   canaryProc = spawn(
     "bash",
     [
