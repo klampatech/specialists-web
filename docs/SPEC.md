@@ -318,6 +318,8 @@ Room IDs are server-generated random 8-char `[A-Za-z0-9_-]{8}` (subset of `parse
 
 **Out of scope** (deferred): MMR (Glicko-2), region selection, server browser, Discord OAuth, anti-DoS on the matchmaker (Phase 4). Room cleanup (rooms with 0 players for >1hr get pruned) is a follow-on — PR 11.9 leaves rooms alive forever in v1.
 
+**Accessibility (a11y)** — PR 94 (2026-09-01) ships the lobby a11y carry-forward: `role="dialog"` + `aria-modal="true"` + `aria-labelledby` on the modal container, ARIA labels on the code input + Create / Join buttons, visible help text linked via `aria-describedby`, a `aria-live="polite"` wrapper around the inline status / error slot (WCAG 4.1.3 Status Messages), focus trap cycling Tab / Shift+Tab between code input + Join button, autofocus on the code input on mount, and restore-focus on unmount. Smoke grew 10 → 15 assertions (5 new a11y checks).
+
 **CI smokes.** New `client/tools/lobby-smoke.mjs`: (1) POST /rooms from tab A → (2) GET /rooms/<id> from tab B → (3) both tabs navigate to the lobby-minted URL → (4) assert both tabs `Connected (idle)` within 5s and HP converges on damage. Headless Chromium with WS-fallback (per PR #89's tier-3 verification pattern).
 
 

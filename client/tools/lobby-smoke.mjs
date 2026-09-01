@@ -27,6 +27,19 @@
 //   7. With a real 404 (type a bogus code), the lobby shows the
 //      "Room <id> not found" error. Typing a fresh character
 //      clears the error (next-interaction auto-dismiss).
+
+// PR 11.9 follow-up (lobby polish) added 7 new assertions
+// (assertions 2+4 bundled): busy-state-on-create, create-navigates,
+// scene-connects, room-status-indicator, full-room-error/indicator/
+// no-nav (3 assertions), error-renders, error-clears-on-input.
+// Total 10.
+//
+// PR 94 (lobby a11y) adds 5 more (assertions 8-12): role-dialog-
+// testid (lobby div has role="dialog" + aria-modal="true"),
+// focus-trap-tab (Tab from Join -> Code), focus-trap-shift-tab
+// (Shift+Tab from Code -> Join), first-input-autofocus (code input
+// focused on mount), aria-label-input (code input has aria-label=
+// "Room code"). Total 15.
 //
 // The smoke is a single tab (NOT two-tab) because the matchmaker
 // surface itself is single-player-shaped (you create a room, you
@@ -540,6 +553,140 @@ async function main() {
       } catch (e) {
         fail(`404 error did not appear within 3s: ${e.message}`);
         recordFail("error-renders", e.message);
+      }
+    } finally {
+      await page2.close();
+    }
+
+    // ----- PR 94 (lobby a11y) new assertions -----
+    // The lobby React tree is replaced for each a11y assertion so
+    // refs + focus state from earlier tests don't leak. Tests run
+    // 8 -> 12 (role-dialog-testid, focus-trap-tab, focus-trap-shift-
+    // tab, first-input-autofocus, aria-label-input). Total smoke
+    // passes 10 -> 15.
+
+    // Assertion 8: role=dialog + aria-modal=true on the outer lobby
+    // div. The smoke uses the existing `lobby` testid so we don't
+    // need a new testid; the role + aria-modal attrs are added by
+    // the PR 94 a11y pass.
+    log(`ASSERTION 8: lobby has role="dialog" + aria-modal="true"`);
+    page2 = await openLobbyPage(context);
+    try {
+      const dialogAttr = await page2
+        .locator('[data-testid="lobby"]')
+        .getAttribute("role");
+      const modalAttr = await page2
+        .locator('[data-testid="lobby"]')
+        .getAttribute("aria-modal");
+      if (dialogAttr !== "dialog") {
+        fail(`lobby role should be "dialog" (got: ${JSON.stringify(dialogAttr)})`);
+        recordFail("role-dialog-testid", `role=${JSON.stringify(dialogAttr)}`);
+      } else if (modalAttr !== "true") {
+        fail(`lobby aria-modal should be "true" (got: ${JSON.stringify(modalAttr)})`);
+        recordFail("role-dialog-testid", `aria-modal=${JSON.stringify(modalAttr)}`);
+      } else {
+        log(`  ✓ lobby has role="dialog" aria-modal="true"`);
+        recordPass("role-dialog-testid");
+      }
+    } finally {
+      await page2.close();
+    }
+
+    // Assertion 9: the code input has aria-label="Room code". The
+    // exact label string is what the brief specifies -- screen readers
+    // announce this verbatim, so it's load-bearing for the a11y
+    // contract. We assert the literal value, not just "non-null".
+    log(`ASSERTION 9: code input has aria-label="Room code"`);
+    page2 = await openLobbyPage(context);
+    try {
+      const codeLabel = await page2
+        .getByTestId("lobby-code")
+        .getAttribute("aria-label");
+      if (codeLabel !== "Room code") {
+        fail(`code input aria-label should be "Room code" (got: ${JSON.stringify(codeLabel)})`);
+        recordFail("aria-label-input", `aria-label=${JSON.stringify(codeLabel)}`);
+      } else {
+        log(`  ✓ code input has aria-label="Room code"`);
+        recordPass("aria-label-input");
+      }
+    } finally {
+      await page2.close();
+    }
+
+    // Assertion 10: the code input is focused on mount (autofocus).
+    // The PR 94 a11y pass wires a `useEffect` that focuses the
+    // input on the next requestAnimationFrame after mount. The
+    // smoke waits 100ms before checking -- well over one frame
+    // (16ms at 60Hz) so the rAF has fired by then.
+    log(`ASSERTION 10: code input has focus on mount (autofocus)`);
+    page2 = await openLobbyPage(context);
+    try {
+      await sleep(100);
+      const focusedTestId = await page2.evaluate(
+        () => document.activeElement?.getAttribute("data-testid") ?? null,
+      );
+      if (focusedTestId !== "lobby-code") {
+        fail(`expected focus on lobby-code (got: ${JSON.stringify(focusedTestId)})`);
+        recordFail("first-input-autofocus", `focused=${JSON.stringify(focusedTestId)}`);
+      } else {
+        log(`  ✓ focus on lobby-code on mount`);
+        recordPass("first-input-autofocus");
+      }
+    } finally {
+      await page2.close();
+    }
+
+    // Assertions 11 + 12: focus trap. Tab from Join -> Code, Shift+Tab
+    // from Code -> Join. The PR 94 a11y pass wires a keydown listener
+    // on the modal container that preventDefaults the default Tab
+    // behavior when focus is on the trap boundaries. Test 11 asserts
+    // focus moves from Join -> Code; test 12 asserts Code -> Join.
+    // Both tests share a single page session so we can chain
+    // focus calls without React re-mounting.
+    log(`ASSERTIONS 11+12: focus trap -- Tab from Join -> Code, Shift+Tab from Code -> Join`);
+    page2 = await openLobbyPage(context);
+    try {
+      // The Join button is disabled until a code is typed (the
+      // `disabled={joining || !joinCode.trim()}` guard). Disabled
+      // elements refuse focus from both user input and JS .focus(),
+      // so we have to seed the input with a code first to put the
+      // Join button into a focusable state.
+      await page2.getByTestId("lobby-code").fill("ABCDEFGH");
+      // Test 11: Tab from Join -> Code.
+      await page2.getByTestId("lobby-join").focus();
+      const beforeTabTestId = await page2.evaluate(
+        () => document.activeElement?.getAttribute("data-testid") ?? null,
+      );
+      if (beforeTabTestId !== "lobby-join") {
+        fail(`focus did not land on lobby-join before Tab (got: ${JSON.stringify(beforeTabTestId)})`);
+        recordFail("focus-trap-tab", `pre-tab focused=${JSON.stringify(beforeTabTestId)}`);
+      } else {
+        await page2.keyboard.press("Tab");
+        await sleep(50);
+        const afterTabTestId = await page2.evaluate(
+          () => document.activeElement?.getAttribute("data-testid") ?? null,
+        );
+        if (afterTabTestId !== "lobby-code") {
+          fail(`Tab from Join did not move focus to Code (got: ${JSON.stringify(afterTabTestId)})`);
+          recordFail("focus-trap-tab", `after-tab focused=${JSON.stringify(afterTabTestId)}`);
+        } else {
+          log(`  ✓ Tab from Join moved focus to Code`);
+          recordPass("focus-trap-tab");
+        }
+      }
+      // Test 12: Shift+Tab from Code -> Join.
+      await page2.getByTestId("lobby-code").focus();
+      await page2.keyboard.press("Shift+Tab");
+      await sleep(50);
+      const afterShiftTabTestId = await page2.evaluate(
+        () => document.activeElement?.getAttribute("data-testid") ?? null,
+      );
+      if (afterShiftTabTestId !== "lobby-join") {
+        fail(`Shift+Tab from Code did not move focus to Join (got: ${JSON.stringify(afterShiftTabTestId)})`);
+        recordFail("focus-trap-shift-tab", `after-shift-tab focused=${JSON.stringify(afterShiftTabTestId)}`);
+      } else {
+        log(`  ✓ Shift+Tab from Code moved focus to Join`);
+        recordPass("focus-trap-shift-tab");
       }
     } finally {
       await page2.close();
