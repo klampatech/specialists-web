@@ -45,7 +45,8 @@ function makePlayer(
     hp: 100,
     ammo: 0,
     isFiring: 0,
-  };
+    weaponId: 0,
+      };
 }
 
 describe("remoteInterpolator PR 11.7.C — interpolation + extrapolation", () => {
@@ -185,16 +186,16 @@ describe("remoteInterpolator PR 11.7.C — interpolation + extrapolation", () =>
       serverFrame: 100,
       nextServerFrame: 105,
       players: [
-        { playerId: 1, positionX: 0, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0 },
-        { playerId: 2, positionX: 5, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0 },
+        { playerId: 1, positionX: 0, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0, weaponId: 0 },
+        { playerId: 2, positionX: 5, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0, weaponId: 0 },
       ],
     };
     const snap2: Snapshot = {
       serverFrame: 105,
       nextServerFrame: 110,
       players: [
-        { playerId: 1, positionX: 0, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0 },
-        { playerId: 2, positionX: 7, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0 },
+        { playerId: 1, positionX: 0, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0, weaponId: 0 },
+        { playerId: 2, positionX: 7, positionY: 0, velocityX: 0, velocityY: 0, yaw: 0, pitch: 0, hp: 100, ammo: 0, isFiring: 0, weaponId: 0 },
       ],
     };
     interp.onSnapshot(snap1, /* arrivedAtMs */ 1000);

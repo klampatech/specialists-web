@@ -48,7 +48,7 @@ export const SNAPSHOT_BODY_SIZE = 9;
  *  (velocityX f32 BE) + 4 (velocityY f32 BE) + 4 (yaw f32 BE) +
  *  4 (pitch f32 BE) + 1 (hp u8) + 1 (ammo u8) + 1 (isFiring
  *  u8) = 29 bytes. */
-export const PLAYER_STATE_BODY_SIZE = 29;
+export const PLAYER_STATE_BODY_SIZE = 30;
 
 // -- Wire-size constants (disc + body — full packet) ------------
 
@@ -68,17 +68,21 @@ export function snapshotWireSize(playerCount: number): number {
  * Per-player state inside a Snapshot. Mirrors
  * `server/src/protocol.rs::PlayerState`.
  *
- * Wire layout (29 bytes — `PLAYER_STATE_BODY_SIZE`):
- *   byte 0..1    playerId (u16 BE)
- *   byte 2..5    positionX (f32 BE)
- *   byte 6..9    positionY (f32 BE)
- *   byte 10..13  velocityX (f32 BE)
- *   byte 14..17  velocityY (f32 BE)
- *   byte 18..21  yaw (f32 BE — radians)
- *   byte 22..25  pitch (f32 BE — radians)
- *   byte 26      hp (u8)
- *   byte 27      ammo (u8)
- *   byte 28      isFiring (u8 — 0 or 1)
+ * Wire layout (30 bytes — `PLAYER_STATE_BODY_SIZE`):
+ *   byte 0..1   playerId (u16 BE)
+ *   byte 2..5   positionX (f32 BE)
+ *   byte 6..9   positionY (f32 BE)
+ *   byte 10..13 velocityX (f32 BE)
+ *   byte 14..17 velocityY (f32 BE)
+ *   byte 18..21 yaw (f32 BE — radians)
+ *   byte 22..25 pitch (f32 BE — radians)
+ *   byte 26     hp (u8)
+ *   byte 27     ammo (u8)
+ *   byte 28     isFiring (u8 — 0 or 1)
+ *   byte 29     weaponId (u8 — PR #102; 0=DualPistol, 1=Shotgun,
+ *              2=Sniper; pre-#102 clients won't receive this byte
+ *              but the post-#102 server always sends it — see
+ *              `protocol/damage.ts` + `server/src/protocol.rs`.)
  */
 export interface PlayerState {
   playerId: number;
@@ -94,6 +98,15 @@ export interface PlayerState {
   ammo: number;
   /** 0 or 1. Wire-compatible bool. */
   isFiring: number;
+  /**
+   * PR #102 — current weapon id (0=DualPistol, 1=Shotgun,
+   * 2=Sniper). The pre-#102 client never receives this field
+   * (server always sends it, but the pre-#102 decoder stops at
+   * byte 28). Post-#102: read `dv.getUint8(off + 29)`. The
+   * client's `BulletHud` (PR #103) renders the per-weapon ammo
+   * bar based on this field.
+   */
+  weaponId: number;
 }
 
 /**
@@ -187,6 +200,10 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
       new Uint8Array([p.hp & 0xff]),
       new Uint8Array([p.ammo & 0xff]),
       new Uint8Array([p.isFiring & 0xff]),
+      // PR #102 — current weapon id (0=DualPistol, 1=Shotgun,
+      // 2=Sniper). Encoded after isFiring as the new last byte of
+      // the per-player payload.
+      new Uint8Array([p.weaponId & 0xff]),
     ]),
   );
   const out = concatBytes([headerBytes, ...playerBytes]);
@@ -258,6 +275,8 @@ export function decodeSnapshot(buf: Uint8Array): Snapshot | null {
       hp: dv.getUint8(off + 26),
       ammo: dv.getUint8(off + 27),
       isFiring: dv.getUint8(off + 28),
+      // PR #102 — weapon id (0=DualPistol, 1=Shotgun, 2=Sniper).
+      weaponId: dv.getUint8(off + 29),
     });
   }
   return { serverFrame, nextServerFrame, players };

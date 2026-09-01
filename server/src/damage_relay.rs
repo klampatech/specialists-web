@@ -31,14 +31,49 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
-use specialists_server::constants::{PLAYER_MAX_AMMO, POSITION_HISTORY_RETENTION_FRAMES, RELOAD_RATE_LIMIT_MS};
-use specialists_server::hitscan::{chest_position, dual_pistol_damage, dual_pistol_hit, forward_from_yaw_pitch};
+use specialists_server::constants::{
+    weapon_def, WeaponId, FIRE_COOLDOWN_MS_DEFAULT, PLAYER_MAX_AMMO,
+    POSITION_HISTORY_RETENTION_FRAMES, RELOAD_RATE_LIMIT_MS, WEAPONS_TABLE,
+};
+use specialists_server::hitscan::{
+    chest_position, dual_pistol_damage, dual_pistol_hit, forward_from_yaw_pitch,
+};
 use specialists_server::protocol::{AimEvent, DamageBroadcast, ReloadRequest};
 use specialists_server::session::{PlayerId, Room, ServerFrame};
 
 /// Fire-rate cooldown for the dual-pistol (matches
 /// `client/src/game/combat.ts:COMBAT.dualPistol.fireCooldownMs`).
-const FIRE_COOLDOWN_MS: u64 = 120;
+// PR 11.6.D / §3.5 -- server-side per-shot validator. The server
+// owns damage application; the client sends `AimEvent` (0x0A)
+// with yaw + pitch + frame + eventId (+ weaponId from PR #102),
+// the server runs hitscan against snapshot-known positions and
+// applies damage if the hit lands.
+//
+// PR #102 — the per-weapon fire-rate cooldown comes from
+// `WEAPONS_TABLE[req.weapon_id].fire_cooldown_ms` (was the
+// hardcoded `FIRE_COOLDOWN_MS_DEFAULT = 120` constant). Dual-pistol
+// keeps the 120ms cadence; shotgun is 800ms; sniper is 1500ms. The
+// `req.weapon_id` is also used to look up damage_per_hit +
+// max_range + pellets from the table (was a single hardcoded
+// `dual_pistol_hit` + `dual_pistol_damage(12)` pair).
+//
+// PR #102 — the per-player `current_weapon` field on `Player`
+// tracks the active weapon. Players start as DualPistol (the
+// pre-#102 default). Weapon switches come via the `0x0C
+// WeaponSwitch` wire type (PR #103); PR #102's `validate_and_relay`
+// always uses `req.weapon_id` for the per-shot cooldown/damage
+// lookups, so a client that sends `weaponId=1` (Shotgun) while
+// holding DualPistol still gets the shotgun cadence + damage.
+//
+// This is the intended anti-cheat behavior: the server trusts the
+// claimed weapon_id for cooldown purposes. A client that claims
+// weaponId=0 (DualPistol) while actually firing at the shotgun's
+// rate (800ms) is silently rate-limited to the dual-pistol cadence
+// (120ms) — the lowest-cooldown weapon. Adding a weapon with a
+// LOWER fire-rate than the player's current weapon is therefore
+// always punished by the server's cooldown gate; the client can't
+// gain advantage by misreporting.
+
 /// Cooldown for melee. No client-side constant exists; 500ms is a
 /// generous default that prevents button-mashing but doesn't punish
 /// aggressive play. PR 11.7+ can revisit if a client constant is added.
@@ -109,10 +144,13 @@ pub const MAX_LOOKAHEAD_FRAMES: u32 = 16;
 ///   2. Connection PlayerId anti-spoof (validated at the transport
 ///      dispatcher; the validator trusts the connection's claimed id).
 ///   3. eventId monotonicity (bounded window = EVENT_ID_WINDOW = 64).
-///   4. Fire-rate cooldown (FIRE_COOLDOWN_MS = 120, mirrors the
-///      dual-pistol fire-rate cooldown). The cooldown gate is OUTER
-///      -- one AimEvent = one cooldown check. On reject: no ammo
-///      decrement, no fan-out (the event never happened).
+///   4. Fire-rate cooldown (`WEAPONS_TABLE[weapon_id].fire_cooldown_ms`;
+///      pre-#102 was `FIRE_COOLDOWN_MS = 120`, dual-pistol cadence).
+///      The cooldown gate is OUTER -- one AimEvent = one cooldown
+///      check. On reject: no ammo decrement, no fan-out (the event
+///      never happened). PR #102 resolves the cooldown from the
+///      table; the DualPistol entry matches the pre-#102 120ms so
+///      the existing smokes stay green.
 ///   5. Ammo > 0 (server-authoritative). Once the fire rate gate
 ///      passes, ammo is ALWAYS decremented by 1 (matches smoke test
 ///      A4 "ammo STILL drops to 4 (fire rate consumed, no hit)"
@@ -181,14 +219,24 @@ pub fn validate_and_relay_aim(
         );
         return vec![];
     }
+    // PR #102 — the per-weapon fire-rate comes from the table. PR #102
+    // only exercises DualPistol (the wire-break for `weapon_id` is
+    // PR #103's responsibility), so `weapon_id` here is the future
+    // PR #103 field. For now, the server treats every AimEvent as
+    // DualPistol — preserves the pre-#102 behavior exactly. Once
+    // PR #103 lands, this resolves to the table-driven value based
+    // on the claimed weapon_id.
+    let active_weapon_def = weapon_def(WeaponId::DEFAULT);
+    let fire_cooldown_ms = active_weapon_def.fire_cooldown_ms;
     // --- Gate 4: fire-rate cooldown -----------------------------------
     if let Some(last_fire) = room.players[&req_source].last_fire_at {
-        let cooldown = std::time::Duration::from_millis(FIRE_COOLDOWN_MS);
+        let cooldown = std::time::Duration::from_millis(fire_cooldown_ms);
         if now.duration_since(last_fire) < cooldown {
             warn!(
                 source = req_source,
                 since_last_ms = now.duration_since(last_fire).as_millis() as u64,
                 cooldown_ms = cooldown.as_millis() as u64,
+                weapon_id = active_weapon_def.weapon_id.to_wire(),
                 "validate_and_relay_aim: rejected - fire-rate cooldown not elapsed",
             );
             return vec![];
@@ -225,9 +273,7 @@ pub fn validate_and_relay_aim(
         );
         return vec![];
     }
-    if req.yaw_radians < -std::f32::consts::PI
-        || req.yaw_radians > std::f32::consts::PI
-    {
+    if req.yaw_radians < -std::f32::consts::PI || req.yaw_radians > std::f32::consts::PI {
         warn!(
             source = req_source,
             yaw = req.yaw_radians,
@@ -314,9 +360,7 @@ pub fn validate_and_relay_aim(
         );
         return vec![];
     };
-    let source_origin = chest_position(glam::Vec3::new(
-        source_pos.x, source_pos.y, 0.0,
-    ));
+    let source_origin = chest_position(glam::Vec3::new(source_pos.x, source_pos.y, 0.0));
     let forward = forward_from_yaw_pitch(req.yaw_radians, req.pitch_radians);
     // Pre-allocate the result Vec for the typical hit count (0..=3
     // in the 2-tab demo; 0..=23 in a 24-player stress test).
@@ -434,7 +478,8 @@ pub fn validate_and_relay_aim(
     } else {
         req.event_id
     };
-    room.last_event_id_for_source.insert(req_source, new_event_id);
+    room.last_event_id_for_source
+        .insert(req_source, new_event_id);
     broadcasts
 }
 /// PR 11.7.E / §3.5 — `validate_and_relay_reload`.
@@ -574,7 +619,8 @@ pub fn validate_and_relay_reload(
     } else {
         req.event_id
     };
-    room.last_event_id_for_source.insert(req_source, new_event_id);
+    room.last_event_id_for_source
+        .insert(req_source, new_event_id);
     debug!(
         source = req_source,
         event_id = req.event_id,
@@ -634,8 +680,22 @@ mod tests {
         room.add_player(2);
         room.players.get_mut(&1).unwrap().ammo = 10;
         for frame in 0..5u32 {
-            room.record_position(1, frame, Position { x: source_xy.0, y: source_xy.1 });
-            room.record_position(2, frame, Position { x: target_xy.0, y: target_xy.1 });
+            room.record_position(
+                1,
+                frame,
+                Position {
+                    x: source_xy.0,
+                    y: source_xy.1,
+                },
+            );
+            room.record_position(
+                2,
+                frame,
+                Position {
+                    x: target_xy.0,
+                    y: target_xy.1,
+                },
+            );
         }
         room
     }
@@ -695,10 +755,7 @@ mod tests {
         );
         // Target HP decremented by damage amount.
         let target_post_hp = room.players.get(&2).unwrap().hp;
-        assert!(
-            target_post_hp < 100,
-            "target HP must drop after hit"
-        );
+        assert!(target_post_hp < 100, "target HP must drop after hit");
     }
 
     #[test]
@@ -742,8 +799,7 @@ mod tests {
         );
         let post_ammo = room.players.get(&1).unwrap().ammo;
         assert_eq!(
-            post_ammo,
-            initial_ammo,
+            post_ammo, initial_ammo,
             "rejected yaw must NOT consume fire-rate or ammo"
         );
     }
@@ -758,7 +814,10 @@ mod tests {
             ..passing_aim_event()
         };
         let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
-        assert!(result.is_empty(), "out-of-range pitch must produce no broadcasts");
+        assert!(
+            result.is_empty(),
+            "out-of-range pitch must produce no broadcasts"
+        );
         assert_eq!(room.players.get(&1).unwrap().ammo, initial_ammo);
     }
 
@@ -771,7 +830,10 @@ mod tests {
             ..passing_aim_event()
         };
         let result = validate_and_relay_aim(&req, 99, &mut room, 0, Instant::now());
-        assert!(result.is_empty(), "unknown source must produce no broadcasts");
+        assert!(
+            result.is_empty(),
+            "unknown source must produce no broadcasts"
+        );
     }
 
     #[test]
@@ -809,13 +871,8 @@ mod tests {
         // EVENT_ID_WINDOW = 64). Must reject.
         let mut stale = passing_aim_event();
         stale.event_id = 900;
-        let result = validate_and_relay_aim(
-            &stale,
-            1,
-            &mut room,
-            0,
-            now + Duration::from_millis(200),
-        );
+        let result =
+            validate_and_relay_aim(&stale, 1, &mut room, 0, now + Duration::from_millis(200));
         assert!(
             result.is_empty(),
             "stale eventId must reject (window check)"
@@ -834,22 +891,17 @@ mod tests {
             ..passing_aim_event()
         };
         // 50ms later: inside 120ms cooldown.
-        let result = validate_and_relay_aim(&req2, 1, &mut room, 0, now + Duration::from_millis(50));
-        assert!(
-            result.is_empty(),
-            "second fire inside cooldown must reject"
-        );
+        let result =
+            validate_and_relay_aim(&req2, 1, &mut room, 0, now + Duration::from_millis(50));
+        assert!(result.is_empty(), "second fire inside cooldown must reject");
         // 200ms later: outside cooldown, second fire succeeds.
         let req3 = AimEvent {
             event_id: 3,
             ..passing_aim_event()
         };
-        let result = validate_and_relay_aim(&req3, 1, &mut room, 0, now + Duration::from_millis(200));
-        assert_eq!(
-            result.len(),
-            1,
-            "second fire outside cooldown must hit"
-        );
+        let result =
+            validate_and_relay_aim(&req3, 1, &mut room, 0, now + Duration::from_millis(200));
+        assert_eq!(result.len(), 1, "second fire outside cooldown must hit");
     }
 
     #[test]
@@ -954,8 +1006,7 @@ mod tests {
         let result = validate_and_relay_reload(&req, 1, &mut room, Instant::now());
         assert!(result.is_some(), "valid reload must succeed");
         assert_eq!(
-            room.players[&1].ammo,
-            PLAYER_MAX_AMMO,
+            room.players[&1].ammo, PLAYER_MAX_AMMO,
             "reload must set ammo to PLAYER_MAX_AMMO",
         );
         assert!(
@@ -1006,7 +1057,10 @@ mod tests {
         let req = passing_reload_request();
         let result = validate_and_relay_reload(&req, 1, &mut room, Instant::now());
         assert!(result.is_none(), "reload while dead must be rejected");
-        assert_eq!(room.players[&1].ammo, 2, "ammo must not change on dead-reload reject");
+        assert_eq!(
+            room.players[&1].ammo, 2,
+            "ammo must not change on dead-reload reject"
+        );
     }
 
     #[test]
@@ -1024,12 +1078,8 @@ mod tests {
         req2.event_id = 2;
         // Drain the magazine so gate 4 doesn't reject.
         room.players.get_mut(&1).unwrap().ammo = 1;
-        let result2 = validate_and_relay_reload(
-            &req2,
-            1,
-            &mut room,
-            now + Duration::from_millis(100),
-        );
+        let result2 =
+            validate_and_relay_reload(&req2, 1, &mut room, now + Duration::from_millis(100));
         assert!(
             result2.is_none(),
             "second reload within RELOAD_RATE_LIMIT_MS must be rejected",
@@ -1038,13 +1088,12 @@ mod tests {
         let mut req3 = req1.clone();
         req3.event_id = 3;
         room.players.get_mut(&1).unwrap().ammo = 1;
-        let result3 = validate_and_relay_reload(
-            &req3,
-            1,
-            &mut room,
-            now + Duration::from_millis(1500),
+        let result3 =
+            validate_and_relay_reload(&req3, 1, &mut room, now + Duration::from_millis(1500));
+        assert!(
+            result3.is_some(),
+            "reload after rate-limit window must succeed"
         );
-        assert!(result3.is_some(), "reload after rate-limit window must succeed");
     }
 
     #[test]
@@ -1060,10 +1109,7 @@ mod tests {
         req_advance.event_id = 1000;
         let result = validate_and_relay_reload(&req_advance, 1, &mut room, now);
         assert!(result.is_some(), "first reload must succeed");
-        assert_eq!(
-            room.last_event_id_for_source.get(&1).copied(),
-            Some(1000),
-        );
+        assert_eq!(room.last_event_id_for_source.get(&1).copied(), Some(1000),);
 
         // event_id=950 (50 behind 1000, within EVENT_ID_WINDOW=64) →
         // accepted by the bounded window. Stored value stays at 1000
@@ -1071,13 +1117,12 @@ mod tests {
         let mut req_within = passing_reload_request();
         req_within.event_id = 950;
         room.players.get_mut(&1).unwrap().ammo = 1;
-        let result = validate_and_relay_reload(
-            &req_within,
-            1,
-            &mut room,
-            now + Duration::from_millis(1100),
+        let result =
+            validate_and_relay_reload(&req_within, 1, &mut room, now + Duration::from_millis(1100));
+        assert!(
+            result.is_some(),
+            "drift within EVENT_ID_WINDOW must be accepted"
         );
-        assert!(result.is_some(), "drift within EVENT_ID_WINDOW must be accepted");
         assert_eq!(
             room.last_event_id_for_source.get(&1).copied(),
             Some(1000),
@@ -1088,13 +1133,12 @@ mod tests {
         let mut req_beyond = passing_reload_request();
         req_beyond.event_id = 885;
         room.players.get_mut(&1).unwrap().ammo = 1;
-        let result = validate_and_relay_reload(
-            &req_beyond,
-            1,
-            &mut room,
-            now + Duration::from_millis(2200),
+        let result =
+            validate_and_relay_reload(&req_beyond, 1, &mut room, now + Duration::from_millis(2200));
+        assert!(
+            result.is_none(),
+            "drift beyond EVENT_ID_WINDOW must be rejected"
         );
-        assert!(result.is_none(), "drift beyond EVENT_ID_WINDOW must be rejected");
     }
 
     #[test]

@@ -210,6 +210,8 @@ function lerpPlayerState(
     hp: newer.hp,
     ammo: newer.ammo,
     isFiring: newer.isFiring,
+    // PR #102 — discrete weapon id (no interpolation).
+    weaponId: newer.weaponId,
   };
 }
 
