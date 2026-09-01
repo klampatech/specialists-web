@@ -7,7 +7,7 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#103 (2026-09-01). **`main` @ `<post-#103 TBD>` — docs PR open for the TS2.0 weapon datamine (https://github.com/klampatech/specialists-web/pull/<TBD>).**
+**`You are here`**: post-PR-#104 (2026-09-01). **`main` @ `49721e4` (PR #104 squash — MERGED 2026-09-01).** TS 2.0 weapon datamine landed as docs + `docs/TS2.0-weapon-data.md`. **`You are here` summary**: PR #104 closes the "data-mine original The Specialists mod" carry-forward from PR #102. All 34 weapons' accuracy, mag, range, fire rate, cooldown, damage, fire modes extracted via `objdump -d` of `archive.org/details/ts-2.0` `mp.dll` + HL1 vanilla `skill.cfg` cvar lookup. **MVP values for PR #105 are canonical**: DualPistol (Glock-18 archetype, 8 dmg/shot, mag 10, 22m, **semi + burst3**); Shotgun (BENELLI-M3, **5 dmg × 8 pellets**, **mag 8** 8+1 tube, 114m, semi-pump); Sniper (Barrett M82A1, **200 dmg/shot, 1-hit kill**, mag 5 bolt-action, 100m, semi). Field map cross-validated against `weapons_official.txt` byte-for-byte. The previous `dual_pistol_matches_pre_102_values` test (which pinned damage=12) will fail on PR #105 when we ship TS-canonical damage=8 — **intentional behavior change**, the test was a pre-#102 pin and post-#102 we're targeting TS 2.0 fidelity, not pre-#102 backward-compat for damage.
 
 **Quick recap**: Post-PR-#102 (WEAPONS_TABLE refactor + 30-byte PlayerState wire, MERGED at `1ce8bff`), you asked to data-mine the original The Specialists Half-Life mod for authentic weapon values (damage, mag, fire rate, range, accuracy, fire modes). After hitting the wall on TS 3.0 (Cloudflare-protected installer at ModDB, no open TS 2.1+ SDK), we pulled TS 2.0 official client + Linux server from `archive.org/details/ts-2.0` (no extraction needed — TS 2.0 ships plaintext `weapons_official.txt` + `ts_fgd.fgd` + `mp.dll` with all 33 weapon classes). Reverse-engineered the constructor disassembly for every weapon (`objdump -d` + float32/int32 decode of `movl/movb $X, 0xNN(%edx)` patterns).
 
@@ -136,11 +136,18 @@ The `PlayerState` wire gains one more byte for the active fire mode:
 ### Files written
 - `docs/TS2.0-weapon-data.md` (in `pr102-weapons-server` worktree + this docs worktree, 9177 bytes)
 
-**Carry-forward for next session**:
-1. ~~Resume the RE on `FireBulletsPlayer`~~ **DONE** — all 34 weapons' damage values extracted from HL1 vanilla `skill.cfg` cvars
-2. **PR #104 spec to write** — client-side weapons wire (0x0C WeaponSwitch) + keys 1/2/3 + per-weapon HUD + `weapon-switch-smoke.mjs` + new `client-weapon-switch-smoke` CI job
-3. HP-convergence CF-N1 flake — empty-commit retrigger protocol unchanged
-4. Port 5190 vite double-boot CI bug — pre-existing infra, fix deferred
+**Open questions still needing answers** (carry-forward to PR #105):
+- Reload cancelation semantics (Q from PR #102 — remains open for PR #106+)
+- Per-weapon headshot multipliers (PR #105 ships uniform 3× per Kyle's call)
+- Knife / melee / projectile / grenades (out of MVP scope; future Phase 2 chunks)
+
+**Recommended next direction** (your call):
+- **(a) PR #105 implementation — client-side weapons wire** (`docs/PR-105-spec.md` plan-only PR open, ready to start). The spec covers `0x0C WeaponSwitch` (4-byte wire), keys 1/2/3 + B input bindings, burst state machine, per-weapon HUD, the snapshot grows another byte for `current_fire_mode` (30 → 31 bytes per player), `weapon-switch-smoke.mjs` (real-canary, 6 assertions) + new `client-weapon-switch-smoke` CI job. Uses the canonical TS 2.0 values from `docs/TS2.0-weapon-data.md`. ~3 sessions + Claude cross-vendor review.
+- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive).
+- **(c) Tier-3 Vivaldi keyboard test** (~30 min, needs you to launch Vivaldi).
+- **(d) Maintenance sweep** (cosmetic).
+
+**Status of TS 2.0 RE**: ✅ COMPLETE. Field map cross-validated, all 34 weapons' damage resolved (HL1 vanilla `skill.cfg` cvars), MVP (DualPistol/Shotgun/Sniper) values ready to bake into PR #105. PR #105 plan-only spec is open for review at https://github.com/klampatech/specialists-web/pull/105.
 
 **Status of TS 2.0 RE**: ✅ COMPLETE. Field map cross-validated, all 34 weapons' damage resolved (HL1 vanilla `skill.cfg` cvars), MVP (DualPistol/Shotgun/Sniper) values ready to bake into PR #104.
 
