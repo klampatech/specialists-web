@@ -2323,6 +2323,81 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
+  client-rig-visual-smoke:
+    name: client — rig-visual smoke (visual rig position propagation, PR #99)
+    # PR #99: closes the "visual rig position propagation (pending
+    # verification)" carry-forward from PR #98. The smoke itself was
+    # written in PR #66 (original rig-visual test), but never wired as
+    # a CI gate — running it locally showed it had a latent bug: it
+    # didn't pass `--port-http` to canary-server.sh, so it crashed on
+    # EADDRINUSE 8080 in any environment with a port-8080 listener.
+    # Now boots canary on 14435/14436/18082 + vite on 5192 (all unique
+    # to this job), 2-tab Playwright drives a Tab B → Tab A walk cycle,
+    # asserts Tab A's remote rig visualRoot tracks the snapshot's
+    # positionX/Z via the LIVE render observer hook (scene.ts:1300).
+    # Catches the PR 11.7.D3.2 regression class — closure-bound
+    # remoteCtrl vs LIVE remoteCtrl drift under StrictMode where the
+    # visual mesh would stay at world origin even though the snapshot
+    # reported new positions. ~25-40s runtime.
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — rig-visual smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Run rig-visual smoke
+        working-directory: client
+        # 5min cap: locally the smoke runs in 25-40s. CI cold-cache
+        # canary boot takes ~30s on top of vite startup. 5min leaves
+        # wide margin without consuming CI minutes if a regression
+        # hangs the smoke (lobby-real-canary smoke uses the same
+        # timeout discipline).
+        run: node tools/rig-visual-smoke.mjs
+        timeout-minutes: 5
+        env:
+          RUST_VIS_WT_PORT: 14435
+          RUST_VIS_WS_PORT: 14436
+          RUST_VIS_HTTP_PORT: 18082
+          RUST_VIS_VITE_PORT: 5192
+          # canary-server.sh defaults to release profile, but the
+          # pre-build step above produces the DEBUG binary — pass
+          # --debug so cargo run reuses the pre-built artifact
+          # instead of rebuilding release from scratch.
+          CARGO_PROFILE: debug
+      - name: Tear down canary + vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server.pid ]]; then kill "$(cat /tmp/canary-server.pid)" || true; fi
+          pkill -f canary-server.sh || true
+          pkill -f vite || true
+          for port in 14435 14436 18082 5192; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   client-canary-orchestrator-smoke:
     name: client — canary orchestrator smoke (PR #89 follow-up)
     # Depends on server-build so the canary binary is the same one
