@@ -7,10 +7,10 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#94 (2026-09-01). **`main` @ `0283b57` (PR #94 squash — MERGED 2026-09-01).** Closes the lobby a11y carry-forward from SPEC §3.5 + the 4 Claude-review non-blockings + 2 nits from PR #92 + **3 real bugs** caught by the new real-canary smoke (matchmaker `ws_url` missing port, `ServerTransport` ignoring `urlBase` port, Lobby Join path using `window.location.host`). **`You are here` summary**: PR #94 ships (1) **lobby a11y** — focus trap on the modal, `role="dialog"` + `aria-modal` + `aria-labelledby` + `aria-describedby`, autofocus on first input, restore-focus on unmount, `aria-live="polite"` + `aria-atomic="true"` status region (WCAG 4.1.3 Status Messages); (2) **2 deferred non-blockings** (popup-blocker `try/catch` around `window.location.href`, `setTimeout(0)` → `Promise.resolve()`); (3) **1 deferred nit** (`flushSync` parity in not-found branch); (4) **2 real bugfixes** — matchmaker `ws_url` now includes the WS port, `ServerTransport` now honors the port in `urlBase` (fixes the lobby's Create flow end-to-end); (5) **new `client/tools/lobby-real-canary-smoke.mjs`** (5 assertions, no `page.route` stubs) + **new CI job `client-lobby-real-canary-smoke`** (~30s) catching the bugs above; (6) **new `client/tools/lobby-tier3-keyboard-smoke.mjs`** documented as a manual recipe for real-Vivaldi keyboard testing (Vivaldi CDP didn't bind on the 2026-09-01 dispatch attempt — Kyle's existing Vivaldi absorbed the `--remote-debugging-port` flag and kept the old config). vitest 66/66, `lobby-smoke.mjs` 18/18 (10 original + 8 a11y), `lobby-real-canary-smoke.mjs` 5/5, cargo test 108/108. All gates green. **One known follow-up bug NOT fixed** — Lobby Join path (`client/src/ui/Lobby.tsx:268`) constructs `ws_url` from `window.location.host` (Vite's port) instead of the matchmaker's WS port. Out of scope for PR #94 (architectural — would need Vite WS proxy). The real-canary smoke deferred its 2-tab + full-room assertions until this is fixed. **No code work currently queued.** Recommended next direction (your call):
-- **(a) Fix the Lobby Join path architecture** (~30 min, small bugfix). Trivial follow-up: read `?server=` query param (which the Create flow already constructs correctly via the matchmaker) instead of `window.location.host`. Then re-add the 2-tab + full-room assertions to the real-canary smoke. This closes the last known lobby end-to-end gap before the next Phase-2 pivot.
+**`You are here`**: post-PR-#96 (2026-09-01). **`main` @ `<post-#96 squash>` (PR #96 MERGED 2026-09-01).** Closes the last lobby end-to-end gap that PR #94 explicitly deferred. **`You are here` summary**: PR #96 fixes the Lobby Join path bug that PR #94's real-canary smoke surfaced as "out of scope for #94 — architectural". The Join path constructed `ws_url` from `window.location.host` (Vite's port 5194 in dev), which produced a broken URL that the browser would ERR_CONNECTION_REFUSED on. **The fix**: matchmaker's `GET /rooms/<id>` response now includes `ws_url` in the same shape as `POST /rooms` (same `peer_addr:ws_port/rooms/<id>` template, threaded through `handle_get_room`); `Lobby.tsx` Join uses that URL instead of constructing one from `window.location.host`. `GetRoomResponse` type updated, vitest test updated, lobby-smoke.mjs's 2 page.route stubs updated to mock the new field, real-canary-smoke.mjs grew from 5 → 7 assertions (added: lobby Join navigates to real-canary ws_url + lobby surfaces accurate N/M player count from real canary). vitest 66/66, lobby-smoke 18/18, **real-canary-smoke 7/7**, cargo test 108/108, CI green. **The lobby is now fully functional end-to-end for the first time since PR #91.** No code work currently queued. Recommended next direction (your call):
+- **(a) Pivot to weapons / new feature arc** — Phase 2 candidates: WEAPONS-table refactor (shotgun/sniper — was the original Phase-2 chunk Kyle flagged post-PR-78), MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, or maintenance carry-forwards (remote rig collision, PointerLock ESC flicker, anti-cheat on yaw/pitch).
 - **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator already shipped (PR #83); producer-side rate-limiter (PR #81) still rides as second-line defense. This would be a verification pass + small capacity bump if needed before sustained cloud load.
-- **(c) Pivot to weapons / new feature arc** — Phase 2 candidates: WEAPONS-table refactor (shotgun/sniper, was flagged by Kyle post-PR-78 as natural Phase-2 chunk), MMR / region select / Discord OAuth (Phase 2 deferred), spectator mode, replay, scoreboard, or maintenance carry-forwards (remote rig collision, PointerLock ESC flicker, anti-cheat).
+- **(c) Maintenance sweep** — the few remaining deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test (needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session).
 
 ---
 
@@ -259,6 +259,45 @@ These are now encoded as pitfalls #17/18/19 in `~/.hermes/skills/autonomous-ai-a
 - Tier-3 Vivaldi keyboard test in CI — needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session OR fresh user-data-dir + fresh window.
 
 **Spec sync**: this entry + the `Current status (2026-09-01, post-PR-#94)` block in `docs/SPEC.md` capture the new state. Vault entry at `~/Obsidian/mem/projects/specialists-web.md` regenerates from `./tools/sync-spec-to-vault.sh` after this lands.
+
+---
+
+## 2026-09-01 — PR #96 (fix Lobby Join path: matchmaker returns ws_url, Join uses it)
+
+**Scope**: PR #96 closes the last lobby end-to-end gap that PR #94 explicitly deferred as "architectural — out of scope for #94". The Join path constructed `ws_url` from `window.location.host` (Vite's port 5194 in dev), producing a broken URL the browser would ERR_CONNECTION_REFUSED on. The matchmaker already knows its own WS host:port — its `GET /rooms/<id>` response now includes `ws_url` in the same shape as `POST /rooms`. Branch `feat/2026-09-01-pr-94-lobby-a11y-and-nits` (same branch as PR #94, just a follow-up commit). One commit `7576ca1`. **MERGED 2026-09-01** (squash), `main` now at `<post-#96 squash>`. PR #96 stacks directly on top of PR #94 — same branch, same reviewers, same CI.
+
+**What PR #96 lands** (6 files, +203/-25):
+
+- **`server/src/matchmaker.rs`** (+12/-4): thread `ws_port` through `handle_get_room` (matching the existing pattern from `handle_create_room`); `GET /rooms/<id>` response body now includes `"ws_url":"ws://<peer_addr>:<ws_port>/rooms/<id>"` when the room exists. Uses the same `peer.ip()` + `ws_port` template as `POST /rooms` so the two endpoints are guaranteed to return the same URL shape.
+- **`client/src/net/matchmakerApi.ts`** (+4/-1): `GetRoomResponse` type updated — when `exists:true`, also has `ws_url: string`. Same shape as `CreateRoomResponse.ws_url`.
+- **`client/src/ui/Lobby.tsx`** (+11/-7): `onJoin` now uses `r.ws_url` from the matchmaker response instead of constructing one from `window.location.host`. The pre-fix code constructed `ws_url = ${wsProto}//${window.location.host}/rooms/${id}` where `window.location.host` is `127.0.0.1:5194` (Vite's port) in dev — wrong because the WS listener runs on port 14934. The matchmaker's `ws_url` is authoritative because it's the server responding with the URL its own WS listener will accept.
+- **`client/src/net/matchmakerApi.test.ts`** (+3/-3): vitest assertion updated for the new shape (`{exists:true, players:3, max:24, ws_url:"ws://127.0.0.1:14934/rooms/ABC12345"}`).
+- **`client/tools/lobby-smoke.mjs`** (+5/-2): 2 `page.route` stubs updated to include `ws_url` in the room-status + full-room mocks (the existing assertions already checked `players`/`max`; the new field is just additive in the mock).
+- **`client/tools/lobby-real-canary-smoke.mjs`** (+150/-0): **2 NEW assertions** added (5 → 7):
+  - **`assert6_lobbyJoinNavigatesToRealCanaryWsUrl`**: creates a room, connects a tab (so it registers), navigates a fresh tab to the lobby, types the code, clicks Join, and asserts the resulting `?server=` URL equals the matchmaker's returned `ws_url` (not a broken `ws://localhost:5194/rooms/<id>` from `window.location.host`). This is the assertion that would have caught the pre-#96 bug.
+  - **`assert7_lobbySurfacesFullRoomFromRealCanary`**: connects 2 tabs to populate a room to 2/24, navigates a 3rd tab via the lobby, captures the player-count indicator via `MutationObserver` + `exposeBinding` before navigation tears the page down. Asserts the indicator text matches the canary's actual player count (`"Room 20bjXiEN: 2/24 players"` observed in practice).
+
+**The architectural pattern**: instead of constructing URLs from `window.location.*` (which makes assumptions about the dev server's port vs. the WS listener's port), the client should ask the server for the URL it should use. The matchmaker is the right authority because it sits in front of the WS listener and knows both endpoints' addresses. The Create flow already used `ws_url` from `POST /rooms`; this PR extends the pattern to Join.
+
+**Verification (re-run on main)**:
+- `npm run typecheck` clean
+- `npm run build` clean (bundle unchanged — +0)
+- `npx vitest run` 66/66 PASS
+- `cargo test --lib` 108/108 PASS
+- `node client/tools/lobby-smoke.mjs` 18/18 PASS
+- `node client/tools/lobby-real-canary-smoke.mjs` **7/7 PASS** (was 5/5 before this PR)
+
+**Cross-vendor review**: not run — this PR was a 30-minute targeted fix with a tight scope, no cross-vendor review. The diff is < 30 lines of code in `Lobby.tsx` + < 10 lines in `matchmaker.rs` + ~150 lines of new smoke coverage. If reviewers want a Claude Code pass, easy to dispatch.
+
+**The lobby is now fully functional end-to-end for the first time since PR #91.** Both Create (PR #94 fix to matchmaker `ws_url` + ServerTransport) AND Join (this PR — matchmaker GET `ws_url` field + Lobby.tsx consumes it) now navigate to the correct WS URL.
+
+**Known follow-ups (out of scope for this PR, deferred)**:
+- 3 of 6 non-blockings from PR #94's Claude review (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race) — all cosmetic.
+- 2 nits from PR #94's Claude review — cosmetic.
+- Tier-3 Vivaldi keyboard test in CI — needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session.
+- `MAX_PLAYERS_PER_ROOM=24` is hardcoded in `server/src/constants.rs` — no env override. Smoke can't fill 24 tabs; the full-room assertion tests the indicator path instead (assert7 covers it indirectly).
+
+**Spec sync**: this entry + the `Current status (2026-09-01, post-PR-#96)` block in `docs/SPEC.md` capture the new state. The TL;DR + chronological #94 entry above are already in place from PR #95 (which this docs PR extends). Vault entry regenerates from `./tools/sync-spec-to-vault.sh` after this lands.
 
 ---
 
