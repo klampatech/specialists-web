@@ -28,6 +28,7 @@ const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const SMOKE_NAME = "rig-visual";
 const WT_PORT = Number(process.env.RUST_VIS_WT_PORT ?? 14435);
 const WS_PORT = Number(process.env.RUST_VIS_WS_PORT ?? 14436);
+const HTTP_PORT = Number(process.env.RUST_VIS_HTTP_PORT ?? 18082);
 const VITE_PORT = Number(process.env.RUST_VIS_VITE_PORT ?? 5192);
 const ROOM = `RIGVIS_${Date.now()}`;
 
@@ -38,7 +39,7 @@ async function bootCanary() {
   const outDir = `/tmp/rig-visual-smoke-canary`;
   const proc = await spawnWithStderrCapture(
     "bash",
-    [resolve(REPO_ROOT, "tools", "canary-server.sh"), "--port-wt", String(WT_PORT), "--port-ws", String(WS_PORT)],
+    [resolve(REPO_ROOT, "tools", "canary-server.sh"), "--port-wt", String(WT_PORT), "--port-ws", String(WS_PORT), "--port-http", String(HTTP_PORT)],
     { RUST_LOG: "snapshot_debug=debug,info" },
     outDir,
     "canary",
@@ -275,6 +276,15 @@ async function main() {
     log(`  ✓ __lastInterpolatorSetPosition = (${tick.x.toFixed(2)}, ${tick.z.toFixed(2)})`);
 
     log("=== ALL RIG-VISUAL ASSERTIONS PASSED ===");
+    // Match lobby-smoke.mjs / PR #99: explicit process.exit(0)
+    // because the spawned canary + vite subprocesses keep the
+    // stdio pipes open even after kill('SIGTERM'), which holds the
+    // node event loop alive indefinitely (cargo's child outlives
+    // bash — see the "pkill canary-server.sh does NOT kill
+    // specialists-server" pitfall in skills/projects/specialists-web).
+    // CI without explicit exit waits 6 hours (the runner's default
+    // job timeout) before timing out.
+    process.exit(0);
   } finally {
     if (browserA) await browserA.close();
     if (browserB) await browserB.close();
