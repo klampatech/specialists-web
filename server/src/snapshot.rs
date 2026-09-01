@@ -11,8 +11,8 @@
 //
 // **Wire-format**: see `protocol::Snapshot` / `encode_snapshot`
 // for the on-wire byte layout. Body = 4 (serverFrame) + 4
-// (nextServerFrame) + 1 (playerCount) + player_count * 29
-// bytes per `PlayerState`. At 24p: 706 bytes per snapshot ×
+// (nextServerFrame) + 1 (playerCount) + player_count * 30
+// bytes per `PlayerState`. At 24p: 730 bytes per snapshot ×
 // 20Hz = 14.1 KB/s/server outbound.
 //
 // **Determinism**: `SnapshotGenerator::maybe_emit` is purely
@@ -109,10 +109,7 @@ impl SnapshotGenerator {
                 .map(|p| (p.hp, p.ammo))
                 .unwrap_or((100, 0));
             // Position + velocity from the physics world.
-            let pos: Position = room
-                .physics
-                .position(*player_id)
-                .unwrap_or(Position::ZERO);
+            let pos: Position = room.physics.position(*player_id).unwrap_or(Position::ZERO);
             let vel: [f32; 2] = room.physics.velocity(*player_id);
             // PR AimEvent / §3.5 — yaw/pitch are now sourced from
             // Room.players[id].yaw_radians / .pitch_radians
@@ -137,6 +134,16 @@ impl SnapshotGenerator {
                 .get(player_id)
                 .map(|p| (p.yaw_radians, p.pitch_radians))
                 .unwrap_or((0.0, 0.0));
+            // PR #102 — surface the player's currently-active weapon
+            // in the snapshot so the client can render the per-weapon
+            // HUD (PR #103) without an extra round-trip. Defaults to
+            // DualPistol until the player's first `0x0C WeaponSwitch`
+            // event (PR #103) arrives.
+            let weapon_id = room
+                .players
+                .get(player_id)
+                .map(|p| p.current_weapon.to_wire())
+                .unwrap_or(0);
             // PR 65 (debug) — log the yaw/pitch read from the room's
             // player entry. Pre-PR-65 the client's game loop never
             // sent `sendInputsServer`, so yaw/pitch were always 0.0
@@ -165,6 +172,7 @@ impl SnapshotGenerator {
                 hp,
                 ammo,
                 is_firing: 0, // PR 11.7.E wires the fire bit
+                weapon_id,    // PR #102 — from player.current_weapon (default DualPistol)
             });
         }
 
@@ -253,8 +261,7 @@ mod tests {
             // Seed the physics world with a body at origin so the
             // snapshot's position/velocity lookups return
             // sensible values.
-            room.physics
-                .add_player(*id, Position { x: 0.0, y: 0.0 });
+            room.physics.add_player(*id, Position { x: 0.0, y: 0.0 });
         }
         room
     }
@@ -390,8 +397,7 @@ mod tests {
         let mut outs = Vec::new();
         for id in ids {
             room.add_player(*id);
-            room.physics
-                .add_player(*id, Position { x: 0.0, y: 0.0 });
+            room.physics.add_player(*id, Position { x: 0.0, y: 0.0 });
             let co = crate::connection_outbound::ConnectionOutbound::with_capacity(cap);
             room.register_connection(*id, co.clone());
             outs.push(co);

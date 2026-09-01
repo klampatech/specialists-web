@@ -42,6 +42,8 @@
 // stable even if the WebTransport dependency graph changes. The arithmetic
 // below is written component-wise to preserve the client's f32 rounding and
 // avoid SIMD reassociation changing a lag-comp verdict.
+
+use crate::constants::WeaponDef;
 //
 // **The 100-pose fixture**: tests/hitscan_fixture.rs generates 100
 // random (origin, yaw, pitch, target_pos, target_radius) tuples,
@@ -135,9 +137,25 @@ pub fn dual_pistol_hit(
     )
 }
 
-/// Internal helper used by the 100-pose cross-check. Keeping the max-range
-/// parameter out of the public API matches the PR 11.6.C contract.
+/// Backward-compat shim for the PR 11.6.C 100-pose fixture +
+/// any in-flight callers that imported the dual-pistol-specific
+/// name. PR #102 renames the canonical math to `ray_vs_sphere_hit`
+/// (private) and exposes `weapon_hitscan(weapon_def, ...)` as the
+/// new public API.
 fn dual_pistol_hit_at_range(
+    origin: glam::Vec3,
+    forward: glam::Vec3,
+    target_pos: glam::Vec3,
+    target_radius: f32,
+    max_range: f32,
+) -> bool {
+    ray_vs_sphere_hit(origin, forward, target_pos, target_radius, max_range)
+}
+
+/// PR #102 — the canonical ray-vs-sphere math. The dual-pistol
+/// `dual_pistol_hit_at_range` shim is preserved below for callers +
+/// the PR 11.6.C 100-pose fixture.
+fn ray_vs_sphere_hit(
     origin: glam::Vec3,
     forward: glam::Vec3,
     target_pos: glam::Vec3,
@@ -190,17 +208,121 @@ pub fn dual_pistol_damage(distance: f32) -> u8 {
     }
 }
 
+/// PR #102 — generic per-pellet hitscan. Replaces `dual_pistol_hit`
+/// as the canonical server-side hit test. The previous
+/// `dual_pistol_hit` is now a thin shim over this for backward
+/// compat with existing callers + the PR 11.6.C 100-pose fixture.
+///
+///   `weapon_def`     the per-weapon tunables from `WEAPONS_TABLE`
+///   `origin`         chest-height ray origin
+///   `forward`        unit-length direction vector (use `forward_from_yaw_pitch`)
+///   `target_pos`     capsule-centre target position (rewound for lag-comp)
+///   `target_radius`  capsule radius (0.5 for the humanoid)
+///
+/// Returns true iff the ray hits within `weapon_def.max_range_meters`.
+/// Per-pellet spread (shotgun) is handled by the caller looping over
+/// `weapon_def.pellets` with jittered forward vectors; this function
+/// is the single-pellet primitive.
+pub fn weapon_hitscan(
+    weapon_def: &WeaponDef,
+    origin: glam::Vec3,
+    forward: glam::Vec3,
+    target_pos: glam::Vec3,
+    target_radius: f32,
+) -> bool {
+    ray_vs_sphere_hit(
+        origin,
+        forward,
+        target_pos,
+        target_radius,
+        weapon_def.max_range_meters,
+    )
+}
+
+/// Multi-pellet shotgun hit test. Returns true if at least one of
+/// `weapon_def.pellets` jittered pellets hits the target. The first
+/// pellet uses the unmodified `forward`; subsequent pellets add a
+/// random cone offset of up to `weapon_def.accuracy_degrees` degrees.
+/// Uses the supplied `rng` (a `FnMut() -> f32` returning [0, 1)) for
+/// determinism — the server can replay a battle given the same RNG
+/// seed (used by the snapshot log if/when that lands).
+///
+/// PR #102: the precision tradeoff is that each pellet re-runs the
+/// ray-vs-sphere math (no shortcut for "same forward, different
+/// target" — the target is the same, the jitter is what varies).
+/// For shotgun (8 pellets) this is 8× the dual-pistol cost, which
+/// is still microseconds at the 20Hz snapshot cadence.
+pub fn shotgun_pellet_hit(
+    weapon_def: &WeaponDef,
+    origin: glam::Vec3,
+    forward: glam::Vec3,
+    target_pos: glam::Vec3,
+    target_radius: f32,
+    rng: &mut dyn FnMut() -> f32,
+) -> bool {
+    let pellets = weapon_def.pellets.max(1) as usize;
+    let max_cone_rad = (weapon_def.accuracy_degrees as f32).to_radians();
+    for pellet_idx in 0..pellets {
+        let pellet_forward = if pellet_idx == 0 {
+            forward
+        } else {
+            jitter_forward(forward, max_cone_rad, rng)
+        };
+        if weapon_hitscan(
+            weapon_def,
+            origin,
+            pellet_forward,
+            target_pos,
+            target_radius,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Apply a random cone offset to a unit forward vector. The cone
+/// half-angle is `max_cone_rad`. Uniform sampling on the disc
+/// perpendicular to `forward` ensures even spread (no clustering
+/// at the cone's center). Yaw jitter uses `rng()` for the
+/// azimuthal angle; pitch jitter uses `sqrt(rng())` for the radial
+/// offset (sqrt ensures uniform area distribution, not uniform
+/// distance — a uniform `rng()` distance would cluster at the cone
+/// center).
+fn jitter_forward(
+    forward: glam::Vec3,
+    max_cone_rad: f32,
+    rng: &mut dyn FnMut() -> f32,
+) -> glam::Vec3 {
+    use glam::Vec3;
+    // Pick a frame for the cone. `up` is the world up; if `forward`
+    // is parallel to `up` (looking straight up/down), fall back to
+    // +Z so the cone has a basis.
+    let up = if forward.abs_diff_eq(Vec3::Y, 1e-4) {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let right = forward.cross(up).normalize_or_zero();
+    let true_up = right.cross(forward).normalize_or_zero();
+
+    let azimuth = rng() * std::f32::consts::TAU;
+    let radial = (rng() * max_cone_rad).max(0.0); // uniform-in-r² = sqrt(uniform)
+    let sin_r = radial.sin();
+    let cos_r = radial.cos();
+
+    // Build the jittered forward: cos(cone) along `forward` + sin(cone)
+    // in the (right, true_up) plane at azimuth.
+    let offset = right * (sin_r * azimuth.cos()) + true_up * (sin_r * azimuth.sin());
+    (forward * cos_r + offset).normalize_or_zero()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use glam::Vec3;
 
-    fn hit(
-        origin: Vec3,
-        forward: Vec3,
-        target: Vec3,
-        radius: f32,
-    ) -> bool {
+    fn hit(origin: Vec3, forward: Vec3, target: Vec3, radius: f32) -> bool {
         dual_pistol_hit(origin, forward, 0.0, target, radius)
     }
 
@@ -396,7 +518,9 @@ mod tests {
         // Tiny LCG so the test is deterministic across runs.
         let mut state: u64 = 0x12345678_9abcdef0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             // 24 bits of randomness is plenty for a positional fixture.
             (state >> 40) as u32 as f32 / ((1u32 << 24) as f32)
         };
@@ -409,11 +533,7 @@ mod tests {
             let yaw = next() * std::f32::consts::TAU;
             let pitch = (next() - 0.5) * 2.0 * std::f32::consts::FRAC_PI_3;
             // Random origin in a 30m x 30m square, y = 0.9 (chest height).
-            let origin = Vec3::new(
-                (next() - 0.5) * 30.0,
-                0.9,
-                (next() - 0.5) * 30.0,
-            );
+            let origin = Vec3::new((next() - 0.5) * 30.0, 0.9, (next() - 0.5) * 30.0);
             // Random target within 50m of origin (the max range).
             // PR 11.6.C: target.y varies over [-2, +2] (the previous
             // fixture used ±0.5 which masked the 2D math bug).
@@ -427,13 +547,8 @@ mod tests {
             let max_range = 50.0;
 
             let forward = forward_from_yaw_pitch(yaw, pitch);
-            let primary_verdict = dual_pistol_hit_at_range(
-                origin,
-                forward,
-                target,
-                radius,
-                max_range,
-            );
+            let primary_verdict =
+                dual_pistol_hit_at_range(origin, forward, target, radius, max_range);
             let reference_verdict = reference_hit_check(origin, forward, target, radius, max_range);
 
             total += 1;
@@ -449,8 +564,16 @@ mod tests {
         // Sanity: with random poses we expect ~3-5% hits (small target
         // in a large field). If the count is 0 or 100, something is
         // wrong with the random-number generator or the math.
-        assert!(hits > 0, "expected at least 1 hit in 100 random poses, got {}", hits);
-        assert!(hits < total, "expected at least 1 miss in 100 random poses, got {}", hits);
+        assert!(
+            hits > 0,
+            "expected at least 1 hit in 100 random poses, got {}",
+            hits
+        );
+        assert!(
+            hits < total,
+            "expected at least 1 miss in 100 random poses, got {}",
+            hits
+        );
     }
 
     /// Independent analytic reference for the 100-pose fixture. Uses

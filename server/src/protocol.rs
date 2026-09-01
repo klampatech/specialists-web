@@ -136,22 +136,21 @@ pub const DISCRIMINATOR_SNAPSHOT: u8 = 0x07;
 pub const DISCRIMINATOR_STATE_ACK: u8 = 0x08;
 pub const DISCRIMINATOR_RELOAD_REQUEST: u8 = 0x09;
 
-
 /// PR 11.7.B / §3.5 — wire-size constant for the Snapshot BODY
 /// (the disc byte is prepended by the transport router, matching
 /// the DamageBroadcast / DamageReject / etc. convention). Body = 4
 /// (serverFrame u32 BE) + 4 (nextServerFrame u32 BE) + 1
-/// (playerCount u8) = 9 bytes. Per-player payload is 29 bytes (see
+/// (playerCount u8) = 9 bytes. Per-player payload is 30 bytes (see
 /// `PLAYER_STATE_WIRE_SIZE`). Variable-length payload: total body =
-/// 9 + player_count * 29 bytes. On-the-wire size (disc + body) =
-/// 10 + player_count * 29 bytes. At 24p: 10 + 24*29 = 706 bytes; at
+/// 9 + player_count * 30 bytes. On-the-wire size (disc + body) =
+/// 10 + player_count * 30 bytes. At 24p: 10 + 24*30 = 730 bytes; at
 /// 20Hz: 14.1 KB/s/server outbound (vs 21.5 KB/s for PR 11.6.D's
 /// per-player `PositionUpdate` at 32Hz — ·2x bandwidth reduction
 /// per the plan §3.10.1 math).
 pub const SNAPSHOT_WIRE_SIZE_MIN: usize = 4 + 4 + 1;
 
 /// Per-player payload size in a `Snapshot`. 2 + 4 + 4 + 4 + 4 + 4 + 4
-/// + 1 + 1 + 1 = 29 bytes:
+/// + 1 + 1 + 1 + 1 = 30 bytes:
 ///   2  playerId u16 BE
 ///   4  positionX f32 BE
 ///   4  positionY f32 BE
@@ -163,6 +162,9 @@ pub const SNAPSHOT_WIRE_SIZE_MIN: usize = 4 + 4 + 1;
 ///   1  ammo u8
 ///   1  isFiring u8 (0 or 1 — wire-compatible bool for forward-compat
 ///      with snapshot consumers that don't need a full bool)
+///   1  weaponId u8 (PR #102 — 0=DualPistol, 1=Shotgun, 2=Sniper;
+///      pre-#102 clients won't send this byte; the decoder on the
+///      receiving side fills 0 = DualPistol as a default)
 
 // -- ReloadRequest (PR 11.7.E) ----------------------------------------------
 
@@ -206,7 +208,7 @@ pub fn decode_reload_request(buf: &[u8]) -> Option<ReloadRequest> {
         event_id: b.get_u32(),
     })
 }
-pub const PLAYER_STATE_WIRE_SIZE: usize = 29;
+pub const PLAYER_STATE_WIRE_SIZE: usize = 30;
 
 // -- AimEvent (PR AimEvent, replaces DamageRequest) -----------------------
 
@@ -222,7 +224,7 @@ pub const PLAYER_STATE_WIRE_SIZE: usize = 29;
 /// (s) for hits.
 ///
 /// The wire format does NOT carry a  field — the
-/// server iterates all OTHER players and runs 
+/// server iterates all OTHER players and runs
 /// against each. This keeps the wire packet small (19 bytes vs the
 /// 21-byte layout that included a target_player_id would require).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -559,6 +561,12 @@ pub struct PlayerState {
     pub ammo: u8,
     /// 0 = not firing, 1 = firing. Wire-compatible bool.
     pub is_firing: u8,
+    /// PR #102 — current weapon id. Wire-compatible with
+    /// `WeaponId::to_wire()` (0 = DualPistol, 1 = Shotgun, 2 = Sniper).
+    /// Defaults to 0 if a pre-#102 client sends a 29-byte PlayerState
+    /// (the wire-break at the snapshot boundary is accepted per
+    /// PR #101 plan §8.7).
+    pub weapon_id: u8,
 }
 
 /// `PlayerId` is a `u16` on the wire. Mirrored as `PlayerIdT` to
@@ -590,9 +598,8 @@ pub struct Snapshot {
 /// `PLAYER_STATE_WIRE_SIZE` constant drift if the `PlayerState`
 /// fields ever change.
 pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(
-        SNAPSHOT_WIRE_SIZE_MIN + snap.players.len() * PLAYER_STATE_WIRE_SIZE,
-    );
+    let mut buf =
+        Vec::with_capacity(SNAPSHOT_WIRE_SIZE_MIN + snap.players.len() * PLAYER_STATE_WIRE_SIZE);
     buf.put_u32(snap.server_frame);
     buf.put_u32(snap.next_server_frame);
     // playerCount: u8 (max 255; well above MAX_PLAYERS_PER_ROOM = 24).
@@ -615,6 +622,7 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         buf.put_u8(p.hp);
         buf.put_u8(p.ammo);
         buf.put_u8(p.is_firing);
+        buf.put_u8(p.weapon_id);
     }
     debug_assert_eq!(
         buf.len(),
@@ -670,6 +678,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Option<Snapshot> {
             hp: b.get_u8(),
             ammo: b.get_u8(),
             is_firing: b.get_u8(),
+            weapon_id: b.get_u8(),
         });
     }
     Some(Snapshot {
@@ -709,14 +718,17 @@ mod tests {
         let bytes = encode_aim_event(&req);
         assert_eq!(bytes.len(), AIM_EVENT_BODY_SIZE);
         assert_eq!(bytes.len(), 18, "AimEvent body is 18 bytes (2+4+4+4+4)");
-        assert_eq!(AIM_EVENT_WIRE_SIZE, 19, "wire size = body size + 1 disc byte");
+        assert_eq!(
+            AIM_EVENT_WIRE_SIZE, 19,
+            "wire size = body size + 1 disc byte"
+        );
     }
 
     #[test]
     fn aim_event_roundtrip_preserves_all_fields() {
         let original = AimEvent {
             source_player_id: 7,
-            yaw_radians: 1.5707963,  // pi/2
+            yaw_radians: 1.5707963, // pi/2
             pitch_radians: -0.5,
             frame: 0x01020304,
             event_id: 0xdeadbeef,
@@ -750,7 +762,7 @@ mod tests {
     fn aim_event_is_big_endian() {
         let req = AimEvent {
             source_player_id: 0x0102,
-            yaw_radians: 0.0,  // not asserted (f32 BE bits depend on platform)
+            yaw_radians: 0.0, // not asserted (f32 BE bits depend on platform)
             pitch_radians: 0.0,
             frame: 0x03040506,
             event_id: 0x0708090a,
@@ -811,16 +823,22 @@ mod tests {
         };
         let bytes = encode_pong(&p);
         assert_eq!(bytes.len(), PONG_WIRE_SIZE);
-
     }
 
     #[test]
     fn damage_reject_is_5_bytes_roundtrip() {
         // FIX 4: DamageReject body is event_id u32 BE + reason u8 = 5.
-        let r = DamageReject { event_id: 0xdeadbeef, reason: REJECT_REASON_FIRE_RATE };
+        let r = DamageReject {
+            event_id: 0xdeadbeef,
+            reason: REJECT_REASON_FIRE_RATE,
+        };
         let bytes = encode_damage_reject(&r);
         assert_eq!(bytes.len(), DAMAGE_REJECT_BODY_SIZE);
-        assert_eq!(bytes.len(), 5, "DamageReject body is event_id u32 + reason u8");
+        assert_eq!(
+            bytes.len(),
+            5,
+            "DamageReject body is event_id u32 + reason u8"
+        );
         let dr = decode_damage_reject(&bytes).expect("decode damage reject");
         assert_eq!(dr, r);
 
@@ -856,7 +874,6 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-
     // -- Snapshot wire type (PR 11.7.B) ---------------------------------
 
     #[test]
@@ -868,7 +885,11 @@ mod tests {
         };
         let bytes = encode_snapshot(&snap);
         assert_eq!(bytes.len(), SNAPSHOT_WIRE_SIZE_MIN);
-        assert_eq!(bytes.len(), 9, "Snapshot with 0 players is the header only: 4+4+1 = 9 bytes");
+        assert_eq!(
+            bytes.len(),
+            9,
+            "Snapshot with 0 players is the header only: 4+4+1 = 9 bytes"
+        );
     }
 
     // -- ReloadRequest wire type (PR 11.7.E) -----------------------------
@@ -955,12 +976,13 @@ mod tests {
                 hp: 88,
                 ammo: 6,
                 is_firing: 1,
+                weapon_id: 0,
             }],
         };
         let bytes = encode_snapshot(&snap);
         assert_eq!(bytes.len(), SNAPSHOT_WIRE_SIZE_MIN + PLAYER_STATE_WIRE_SIZE);
-        assert_eq!(bytes.len(), 9 + 29);
-        assert_eq!(bytes.len(), 38);
+        assert_eq!(bytes.len(), 9 + 30);
+        assert_eq!(bytes.len(), 39);
     }
 
     #[test]
@@ -987,13 +1009,18 @@ mod tests {
                     hp: 100,
                     ammo: 0,
                     is_firing: 0,
+                    weapon_id: 0,
                 })
                 .collect(),
         };
         let bytes = encode_snapshot(&snap);
-        assert_eq!(bytes.len(), 705, "24p snapshot is 9 header + 24*29 players = 705 bytes");
+        assert_eq!(
+            bytes.len(),
+            729,
+            "24p snapshot is 9 header + 24*30 players = 729 bytes (PR #102 +1 byte per player for weapon_id)"
+        );
         // And the on-the-wire size is one more (the discriminator).
-        assert_eq!(bytes.len() + 1, 706);
+        assert_eq!(bytes.len() + 1, 730);
     }
 
     #[test]
@@ -1013,6 +1040,7 @@ mod tests {
                     hp: 88,
                     ammo: 6,
                     is_firing: 1,
+                    weapon_id: 0,
                 },
                 PlayerState {
                     player_id: 2,
@@ -1025,6 +1053,7 @@ mod tests {
                     hp: 100,
                     ammo: 12,
                     is_firing: 0,
+                    weapon_id: 0,
                 },
             ],
         };
@@ -1049,6 +1078,7 @@ mod tests {
                 hp: 100,
                 ammo: 0,
                 is_firing: 0,
+                weapon_id: 0,
             }],
         };
         let bytes = encode_snapshot(&snap);

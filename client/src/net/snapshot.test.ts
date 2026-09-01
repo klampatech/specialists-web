@@ -37,6 +37,7 @@ function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
         hp: 88,
         ammo: 12,
         isFiring: 0,
+        weaponId: 0,
       },
       {
         playerId: 2,
@@ -49,6 +50,7 @@ function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
         hp: 100,
         ammo: 0,
         isFiring: 1,
+        weaponId: 0,
       },
     ],
     ...overrides,
@@ -72,7 +74,8 @@ describe("encodeSnapshot / decodeSnapshot round-trip (PR 11.7.D)", () => {
           hp: 88,
           ammo: 12,
           isFiring: 0,
-        },
+        weaponId: 0,
+      },
         {
           playerId: 2,
           positionX: -2.0,
@@ -84,7 +87,8 @@ describe("encodeSnapshot / decodeSnapshot round-trip (PR 11.7.D)", () => {
           hp: 100,
           ammo: 0,
           isFiring: 1,
-        },
+        weaponId: 0,
+      },
       ],
     });
     const wire = encodeSnapshot(s);
@@ -119,7 +123,8 @@ describe("encodeSnapshot / decodeSnapshot round-trip (PR 11.7.D)", () => {
           hp: 100 - i,
           ammo: 12,
           isFiring: 0,
-        })),
+        weaponId: 0,
+      })),
       });
       const decoded = decodeSnapshot(encodeSnapshot(s).subarray(1));
       expect(decoded).toEqual(s);
@@ -162,7 +167,8 @@ describe("encodeSnapshot / decodeSnapshot round-trip (PR 11.7.D)", () => {
           hp: 42,
           ammo: 7,
           isFiring: 1,
-        },
+        weaponId: 0,
+      },
       ],
     });
     const decoded = decodeSnapshot(encodeSnapshot(s).subarray(1));

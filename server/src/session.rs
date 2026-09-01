@@ -69,6 +69,15 @@ pub struct Player {
     /// client's last-reported pitch in radians (range -pi/2..=pi/2).
     /// Same semantics as `yaw_radians` (snapshot slot + 0x06 update).
     pub pitch_radians: f32,
+    /// PR #102 — the player's currently-active weapon. Defaults to
+    /// `WeaponId::DualPistol` (the pre-#102 behavior) so the
+    /// server's per-shot cooldown + damage lookups land on the same
+    /// values they did before the WEAPONS_TABLE refactor. The
+    /// `validate_and_relay` function uses `req.weapon_id` from the
+    /// inbound AimEvent for the actual lookups (not
+    /// `player.current_weapon`) — this field is for the snapshot
+    /// stream + the future `0x0C WeaponSwitch` handler (PR #103).
+    pub current_weapon: crate::constants::WeaponId,
 }
 
 impl Player {
@@ -94,6 +103,10 @@ impl Player {
             // see snapshot.rs::build_snapshot's prior hardcoded 0.0).
             yaw_radians: 0.0,
             pitch_radians: 0.0,
+            // PR #102 — default to DualPistol so every pre-#102 client
+            // gets the same per-shot behavior. PR #103 will mutate
+            // this on `0x0C WeaponSwitch` events.
+            current_weapon: crate::constants::WeaponId::DEFAULT,
         }
     }
 }
@@ -201,7 +214,12 @@ impl Room {
 
     /// Record a position sample for the given player. Delegates to
     /// `PositionHistory::record`.
-    pub fn record_position(&mut self, id: PlayerId, frame: ServerFrame, pos: crate::position_history::Position) {
+    pub fn record_position(
+        &mut self,
+        id: PlayerId,
+        frame: ServerFrame,
+        pos: crate::position_history::Position,
+    ) {
         let hist = self
             .position_history
             .entry(id)

@@ -213,6 +213,7 @@ export class Predictor {
       hp: 100,
       ammo: 0,
       isFiring: 0,
+      weaponId: 0,
       frame: -1,
     };
   }

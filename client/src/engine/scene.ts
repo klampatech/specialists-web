@@ -819,7 +819,8 @@ export async function createScene(
                   hp: 100,
                   ammo: 0,
                   isFiring: 0,
-                }],
+                  weaponId: 0,
+      }],
               };
               buffer.push({
                 arrivedAtMs: now,
@@ -1199,6 +1200,9 @@ export async function createScene(
               hp: localCtrl.state.hp,
               ammo: 0,
               isFiring: decoded.fireHeld ? 1 : 0,
+              // PR #102 — default to DualPistol (the pre-#102 behavior).
+              // PR #103 will populate this from the server snapshot.
+              weaponId: 0,
             };
             // Restore the live controller so the next gameSession.tick()
             // (which advances from the saved pos+vel) sees a clean

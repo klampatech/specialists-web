@@ -68,7 +68,8 @@ function makePlayer(playerId: number, x: number, y: number = 0): PlayerState {
     hp: 100,
     ammo: 0,
     isFiring: 0,
-  };
+    weaponId: 0,
+      };
 }
 
 describe("clientPredictor PR 11.7.C — prediction + reconciliation", () => {
