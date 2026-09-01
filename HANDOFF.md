@@ -7,10 +7,10 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#89 + #90 + #91 (2026-08-31). **`main` @ `1f1faf3` (PR #89 + #90 + #91 MERGED 2026-08-31, last at 17:29:55 UTC).** Closes the PR 11.6.E work AND the orchestrator CI gap. **`You are here` summary**: PR 11.6.E (cert-source dispatcher + WSS termination + systemd Funnel unit) is now SHIPPED to main. PR #90 added a `canary-orchestrator-smoke.mjs` + shell/systemd lint gates to CI that catch the two regressions that bit PR #89 at validation time (PORT_WSS shell ordering, `OptionFuture::from(None)` early-resolve). Both new CI jobs green. **No code work currently queued.** Recommended next direction (your call):
-- **(a) PR 11.9 — Matchmaker** (~1-2 sessions, next big Phase-1 surface). Lobby → queue → region select → server pick → connect. Closes the "friends can't find each other in DEVBX" UX gap. Pre-reqs are all green: cert-source + WSS from #89 (production deploy), DEVBX cleanup from #87, snapshot/HP convergence from #56. Cleanest place to start.
-- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator already shipped; this is verification + a small capacity bump if needed before sustained cloud load.
-- **(c) Pivot to weapons / new feature arc** — Phase 2 candidates: WEAPONS-table refactor (shotgun/sniper), lobby UI, spectator mode, replay, scoreboard, or any of the maintenance carry-forwards (remote rig collision, PointerLock ESC flicker, anti-cheat).
+**`You are here`**: post-PR-#92 (2026-08-31). **`main` @ `80be1fb` (PR #92 squash — MERGED 2026-08-31 22:28 UTC).** Closes the three lobby-polish carry-forwards from PR #91. **`You are here` summary**: PR #92 ships three UX items that PR #91 explicitly deferred: room-full handling (player-count indicator + "Room X is full" error, no nav), per-action busy states with inline status text ("Creating room…" / "Checking room…"), and a network-error distinction (matchmaker unreachable → friendly message vs. server-side errors → verbose operator format). Also fixes a stale-fetch race in the join path (joinSeqRef) caught by cross-vendor Claude Code review. `npx vitest run` 66/66, `client/tools/lobby-smoke.mjs` 10/10 assertions (3 original + 7 new). All gates green on main. **No code work currently queued.** Recommended next direction (your call):
+- **(a) Lobby a11y + follow-up polish** (~1 session). The Claude review deferred a few nits: popup-blocker recovery around `window.location.href` (try/catch around navigation), `setTimeout(0)` → `Promise.resolve()` (MutationObserver microtasks, not macrotasks), flushSync parity in the not-found branch, redundant `Promise.allSettled` destructure in the smoke. Plus the big one — ARIA roles, focus management, keyboard traps on the modal (was in SPEC §3.5 carry-forward).
+- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator already shipped (PR #83); producer-side rate-limiter (PR #81) still rides as second-line defense. This would be a verification pass + small capacity bump if needed before sustained cloud load.
+- **(c) Pivot to weapons / new feature arc** — Phase 2 candidates: WEAPONS-table refactor (shotgun/sniper, was flagged by Kyle post-PR-78 as natural Phase-2 chunk), MMR / region select / Discord OAuth (Phase 2 deferred), spectator mode, replay, scoreboard, or maintenance carry-forwards (remote rig collision, PointerLock ESC flicker, anti-cheat).
 
 ---
 
@@ -163,6 +163,49 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 - Room cleanup (rooms with 0 players for >1hr get pruned)
 - Two-tab cross-machine lobby smoke (covered by existing damage-server-smoke.mjs which uses pre-baked URLs)
 - roomApi.getRoom() returns `max: 24` hardcoded — should come from constants.rs
+
+---
+
+## 2026-08-31 — PR #92 (lobby polish: room-full / busy / network-error distinction)
+
+**Scope**: PR #92 ships the three lobby-polish carry-forwards from PR #91. Branch `feat/2026-08-31-pr-lobby-polish` from `main @ 99d14b2`. Two commits on top of the post-#91 baseline (squash `be0cb32` for codex's implementation + `7485bfa` for Claude-review fixes). MERGED 2026-08-31 22:28:28 UTC, squash `80be1fb`. `main` now at `80be1fb`.
+
+**What PR #92 lands** (client-only, 4 files +796/-73):
+
+- **`client/src/net/matchmakerApi.ts`** (+74/-): `MatchmakerErrorCause = "network" | "http"` discriminator on thrown Errors; `isMatchmakerNetworkError(err)` helper for callers; error messages now use the `encodeURIComponent(id)` so operator logs match what the server actually saw (was using raw `${id}` — operator-confusing for ids with slashes/spaces).
+- **`client/src/net/matchmakerApi.test.ts`** (+151, 10 vitest tests): covers both error categories (network vs http), 404 → `{exists:false}` (no throw), 200 → `{exists:true, players, max}` shape, helper true/false for Error/non-Error/cause-string variants, AND the encodeURIComponent-in-error-message regression.
+- **`client/src/ui/Lobby.tsx`** (+273/-): per-action busy states (`creating`/`joining` are independent useState pairs — other button stays clickable while one is in-flight), inline "Creating room…" / "Checking room…" status text in neutral color, player-count indicator (`N/M`) shown only after a successful getRoom (green if space, red if full), full-room short-circuit ("Room X is full (24/24 players). Try another." — no nav), `joinSeqRef` (useRef) suppresses the stale-fetch race where the user types a new code while a previous getRoom is in flight, network-error special-casing ("Matchmaker unreachable — check your connection and try again.").
+- **`client/tools/lobby-smoke.mjs`** (+371/-): extended with 7 new assertions on top of the PR #91's 3. Total **10/10 PASS**: lobby-renders, busy-state-on-create, create-navigates, scene-connects (PR #91 baseline), room-status-indicator (NEW), full-room-error (NEW), full-room-indicator (NEW), full-room-no-nav (NEW), error-renders (NEW), error-clears-on-input (NEW).
+
+**The joinSeqRef race fix** (caught by Claude Code cross-vendor review): if the user types code "ABC", clicks Join, then types "XYZ" while the fetch is in flight, the original code would re-set `roomStatus` to "ABC" even though the input now shows "XYZ". Fix: `joinSeqRef = useRef(0)` (ref, not state — needed for synchronous post-await check since React state updates are async), incremented per fetch; the post-await roomStatus write only applies if the captured seq matches the latest ref value. Same pattern is reusable for any "type-and-await" UI flow.
+
+**Cross-vendor review findings** (Claude Code on PR #92, 2026-08-31):
+
+- **Blocking (1)**: missing `data-testid="lobby-busy"` — the brief locked it as an additive testid; codex reused `data-testid="lobby-error"` with `data-kind="busy"` which worked for the smoke's combined selector but violated the brief. Fixed: added `lobby-busy` testid alongside `data-kind="busy"`, updated smoke selector.
+- **Non-blocking (4)**: stale-fetch race (fixed via joinSeqRef), encodeURIComponent in error messages (fixed), success-path try/catch around `window.location.href` for popup-blocker recovery (deferred — edge case), `setTimeout(0)` → `Promise.resolve()` (deferred — cosmetic).
+- **Nits (2)**: inconsistent flushSync in non-found branch, redundant `Promise.allSettled` destructure in smoke (both deferred to follow-up).
+- **12 verified-clean patterns**: per-action busy independence, network error classification correctness, AbortError handling (no AbortController currently used), flushSync import safety, roomStatus cleared on input, smoke `page.route` teardown (explicit `page.unroute` in assertion 2), pre-fetch prohibition honored, `lobby-error` testid preservation, testid overlap disambiguation via `data-kind`, per-action busy UI correctness, network error message wording, vitest test coverage.
+
+**Verification (re-run on main)**:
+- `npm run typecheck` clean
+- `npm run build` clean, 7,070 KiB (was 7,065 KiB pre-PR, noise)
+- `npx vitest run` 66/66 pass (10 new in matchmakerApi.test.ts)
+- `node client/tools/lobby-smoke.mjs` 10/10 assertions pass
+
+**Known follow-ups (out of scope for this PR, deferred)**:
+- Lobby a11y (ARIA roles, focus management, keyboard traps on the modal) — separate PR per brief.
+- The 4 non-blocking findings + 2 nits Claude deferred — see TL;DR option (a) above.
+- Lobby smoke still uses `page.route` to stub canary's GET /rooms/<id> for the full-room + 404 assertions — no server-side test fixtures (preferred per brief). If `matchmaker.rs`'s `GetRoomResponse` shape ever changes, vitest's pinned-shape test catches it (already in matchmakerApi.test.ts).
+
+**Why this PR was non-trivial to dispatch correctly** (skill patch landed alongside):
+- The `coding-task-routing` skill's recipe was stale on herdr CLI shape (used `--workspace` flag that current herdr no longer accepts). Current: `agent start --kind <KIND> --pane <PANE>` + `agent prompt <TARGET> "<TEXT>" --wait`.
+- Codex 0.147.0 wrapper at `/home/kyle/bin/codex` auto-updates on every startup and exits. Use the nvm binary at `/home/kyle/.nvm/versions/node/v22.22.3/bin/codex` (0.151.0).
+- `MINIMAX_API_KEY_UNUSED` is load-bearing on lampak — without it codex fails silently at first user message.
+These are now encoded as pitfalls #17/18/19 in `~/.hermes/skills/autonomous-ai-agents/coding-task-routing/SKILL.md` (v1.7.0).
+
+**Codex + Claude handoff worked**: codex did the implementation (~1h), Claude's review caught the real race I wouldn't have spotted (joinSeqRef), and the review-driven fix landed as a separate commit on top. Branch kept clean, both panes alive for Kyle to scroll back through, all gates green.
+
+**Spec sync**: this entry + the `Current status (2026-08-31, post-PR-#92)` block in `docs/SPEC.md` capture the new state. Vault entry at `~/Obsidian/mem/projects/specialists-web.md` regenerates from `./tools/sync-spec-to-vault.sh` after this lands.
 
 ---
 
