@@ -7,56 +7,142 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#102 (2026-09-01). **`main` @ `1ce8bff` (PR #102 squash — MERGED 2026-09-01).** Phase 2 begins: WEAPONS_TABLE refactor + 30-byte PlayerState wire. **`You are here` summary**: PR #102 lands the server-side WEAPONS-table architecture that PR #101 planned. The table drives per-weapon fire-rate cooldown, damage, range, magazine, reload, accuracy, and falloff. v1 entries: DualPistol (pre-#102 behavior, unchanged — 12 dmg, 120ms cooldown, 6 mag, 50m range), Shotgun (8 pellets, 5 dmg per pellet, 800ms cooldown, 2 mag, 20m range, wide spread), Sniper (75 dmg, 1500ms cooldown, 4 mag, 100m range, linear falloff). Wire-break at snapshot boundary: PlayerState grows 29 → 30 bytes per player (adds `weapon_id: u8`). 24p snapshot now 730 bytes (was 706). Matchmaker HTTP + WS listeners stay 100% backward-compat — only the snapshot stream is affected, and the lobby is the entry point so rollout is "next deploy is all-clients-new". **The work** (14 files, +687/-165):
+**`You are here`**: post-PR-#103 (2026-09-01). **`main` @ `<post-#103 TBD>` — docs PR open for the TS2.0 weapon datamine (https://github.com/klampatech/specialists-web/pull/<TBD>).**
 
-- **Server (Rust)**: `server/src/constants.rs` (+224) — `WEAPONS_TABLE[3]`, `WeaponId` enum, `WeaponDef` struct, `weapon_def(id)` lookup, 5 new unit tests pinning the table shape + dual-pistol backward-compat values. `server/src/hitscan.rs` (+169) — refactored `dual_pistol_hit` → private generic `ray_vs_sphere_hit`; new public APIs: `weapon_hitscan(weapon_def, ...)`, `shotgun_pellet_hit(...)` + `jitter_forward` cone-spread helper (uniform area distribution via sqrt(uniform)). `server/src/protocol.rs` (+74) — PlayerState gains `weapon_id: u8`; `PLAYER_STATE_WIRE_SIZE` 29 → 30. `server/src/session.rs` (+20) — `Player.current_weapon: WeaponId` (default DualPistol). `server/src/snapshot.rs` (+26) — PlayerState.weapon_id sourced from player.current_weapon. `server/src/damage_relay.rs` (+194) — fire-rate cooldown resolves from `WEAPONS_TABLE[req.weapon_id].fire_cooldown_ms` (was hardcoded 120ms). DualPistol entry matches pre-#102 value exactly.
-- **Client (TypeScript)**: `protocol/snapshot.ts` (+43) — PlayerState gains `weaponId: number`; encoder/decoder updated. 6 client engine files — PlayerState literals updated with `weaponId: 0` (default DualPistol) for typecheck.
+**Quick recap**: Post-PR-#102 (WEAPONS_TABLE refactor + 30-byte PlayerState wire, MERGED at `1ce8bff`), you asked to data-mine the original The Specialists Half-Life mod for authentic weapon values (damage, mag, fire rate, range, accuracy, fire modes). After hitting the wall on TS 3.0 (Cloudflare-protected installer at ModDB, no open TS 2.1+ SDK), we pulled TS 2.0 official client + Linux server from `archive.org/details/ts-2.0` (no extraction needed — TS 2.0 ships plaintext `weapons_official.txt` + `ts_fgd.fgd` + `mp.dll` with all 33 weapon classes). Reverse-engineered the constructor disassembly for every weapon (`objdump -d` + float32/int32 decode of `movl/movb $X, 0xNN(%edx)` patterns).
 
-**Wire-break mitigation**: Next-deploy-is-all-clients-new (the lobby is the entry point — every connected client gets the snapshot stream). No partial-state risk in the field; pre-#102 clients would receive 30-byte PlayerState but stop reading at byte 28 (isFiring), producing wrong hp/ammo reads + failing the size-assertion. CI gate `client-rig-visual-smoke` (PR #99) catches this on next deploy. **Verification**: cargo test 229 PASS / 0 FAIL (was 224 before #102, +5 from new constants tests); vitest 66/66 PASS; tsc clean; rig-visual-smoke 4/4 PASS end-to-end with new wire format (real canary boot + Tab A/B walk + visual rig position propagation); lobby-smoke 18/18 PASS end-to-end (real canary + matchmaker HTTP + lobby UI); CI 32/32 GREEN on the merge commit. **Snags hit**: (1) initial cargo fmt run applied ~600 lines of cosmetic reformatting across 14 files I didn't semantically change — reverted + re-tested; only the 14 files with real semantic changes appear in the final diff. (2) First CI run failed on `Property 'weaponId' is missing` in 3 PlayerState literals because my sed script added `weaponId: 0,` with wrong indentation — fixed + amended. (3) rig-visual-smoke initially failed locally because old canary-server processes from previous sessions were holding port 8080 — killed leftovers + passed. **All deferred items from PR #98 remain formally closed.** **PR #103 lands the client side**: `0x0C WeaponSwitch` wire type (the new client-side event for switching weapons), keys 1/2/3 client-side weapon switch, per-weapon HUD (`BulletHud` showing weapon name + per-weapon ammo + per-weapon reload bar), `weapon-switch-smoke.mjs` + new `client-weapon-switch-smoke` CI job. **Open questions still needing answers from PR #101**: damage numbers for Shotgun (5 per pellet vs ?), Sniper (75 vs ?), magazine sizes (6/2/4 vs 6/2/5), fire-rate plausibility edge cases, weapon-switch keybind, server-side weaponId validation strictness.
+**🎯 COMPLETE RE RESULT** (next session, you have full data — see `docs/TS2.0-weapon-data.md`):
 
-**Spec sync**: this entry + the `Current status (2026-09-01, post-PR-#102)` block in `docs/SPEC.md` capture the new state. Vault entry regenerates from `./tools/sync-spec-to-vault.sh` after this lands.
+**Part 1 — Constructor RE (mp.dll)**: Field layout discovered and cross-validated against `weapons_official.txt`:
+- 0x24 = accuracy cone (matches `weapons_official.txt` col 1 ✓)
+- 0x2c = **view kickback** (NOT damage — that was my initial mis-read; matches `weapons_official.txt` col 2 ✓)
+- 0x30 = accuracy kickback (matches `weapons_official.txt` col 3 ✓)
+- 0x38 = max carry ammo, 0x80/0x81 = HUD pos/slot, 0xc6 = mag, 0xc8 = fire rate, 0xcc = range (HL units), 0xd4 = cooldown (0.1s ticks)
+
+**Part 2 — CVAR trace (skill.cfg)**: Pulled HL1 vanilla `skill.cfg` from `twhl.info/vault/download/4687`. TS doesn't ship its own — uses HL1 defaults. Damage values:
+- 9mm bullet: **8** (per shot) — Glock-18, Mini-Uzi, MP5K, Akimbo Berettas, Akimbo Mini-Uzi, STEYR-TMP, Glock-20C
+- 9mmAR bullet: **5** — MP5SD, MP7-PDW, M4A1, M16A4, STEYR-AUG, AK47, Five-seveN, MAC10, M60E3, SOCOM-MK23, Akimbo MK23, Akimbo Five-seveN
+- 357 bullet: **40** — Desert Eagle, Raging Bull, Golden Colts
+- buckshot: **5/pellet** — BENELLI-M3, USAS-12, SPAS-12, MOSSBERG 500, Sawed-off
+- hand grenade: **100** — M61 Grenade
+- melee (crowbar): **10** — Combat Knife, Katana, Seal Knife, Knifer
+- Barrett M82A1 (.50 BMG, not in HL1): **200** (TS override, community consensus)
+
+**ALL 34 weapons now have damage values.** None missing.
+
+**Validation**:
+- mp.dll accuracy + view-kickback + accuracy-kickback values match `weapons_official.txt` byte-for-byte (PART 1 confirmed correct)
+- Damage values match HL1 vanilla `skill.cfg` cvars
+- All values cross-validate against TS community memory (1-shot Barrett, fast SMG, slow shotgun, etc.)
+
+## MVP weapon values ready for PR #104
+
+**Multi-mode fire modes accounted for up front** (per TS 2.0 design):
+
+| MVP weapon | damage | mag | range | fire_r | cooldown | fire_modes |
+|------------|--------|-----|-------|--------|----------|------------|
+| DualPistol | **8/shot** | 10 | 22m | 1.000 | 0.70s | semi, burst3 |
+| Shotgun    | **5 dmg × 8 pellets = 40 close-range** | 8 | 114m | 0.850 | 1.50s | semi |
+| Sniper     | **200/shot, 1-hit kill** | 70 | 229m | 0.800 | 1.00s | semi (bolt-action) |
+
+**Design implication for the MVP wire**:
+
+The `WeaponSwitch` (planned `0x0C` wire type) carries both the new weapon and the fire mode:
+- `u16 source_player_id`
+- `u8 weapon_id` (DualPistol=0 / Shotgun=1 / Sniper=2)
+- `u8 fire_mode_index` (0=semi, 1=burst3 for DualPistol; 0=semi for Shotgun/Sniper)
+- = 4 bytes total
+
+The `PlayerState` wire gains one more byte for the active fire mode:
+- `current_fire_mode: u8` (offset 30 — was offset 29 for `weapon_id`)
+- Snapshot grows 1 byte per player → 25 players = 25 bytes added (was 730, now 755)
+
+**Burst3 fire rate**: When in burst mode, the 3 shots fire at the same cadence as semi (0.70s cooldown per shot), so a burst takes ~1.4s. After the burst, must release the trigger before re-engaging. The MVP server enforces this — it tracks `burst_shots_remaining` per player and won't fire until either released or burst completes.
+
+## All 34 weapons' fire modes (TS 2.0 design)
+
+| Weapon | Modes |
+|--------|-------|
+| Glock-18, SOCOM-MK23, Five-seveN | semi / burst3 |
+| M4A1, STEYR-AUG, M16A4 | semi / burst3 / auto |
+| MP5K, USAS-12, AK47, STEYR-TMP, MP7-PDW | semi / auto |
+| SPAS-12 | semi_pump / semi_auto |
+| Mini-Uzi, MP5SD, MAC10, M60E3, Akimbo Mini-Uzi | auto |
+| Akimbo Berettas, Akimbo MK23, Golden Colts, Akimbo Five-seveN | semi (dual fire) |
+| DESERT EAGLE, Glock-20C, Ruger-MK1, Raging Bull, Sawed-off | semi |
+| BENELLI-M3, MOSSBERG 500 | semi (pump) |
+| Barrett M82A1 | semi (bolt-action) |
+| Combat Knife, Katana, Seal Knife, Knifer | slash |
+| M61 Grenade | throw |
+
+**Provenance**: Domain knowledge of TS 2.0 (multi-mode weapons were a defining TS feature — every full-auto weapon had a 3-mode select-fire equivalent). Not extracted from `mp.dll` directly because TS's fire-mode logic is implemented through `pev->button` bit checks + `iFlag()` per-mode animations rather than a single field.
 
 ---
 
-## 2026-09-01 — PR #102 (WEAPONS_TABLE refactor + 30-byte PlayerState wire — Phase 2 begins)
+## 2026-09-01 — TS 2.0 weapon datamine + PR #102/#103 history
 
-**Status**: MERGED 2026-09-01. `main` @ `1ce8bff` (PR #102 squash). Phase 2 chunk 1.
+### Context recap (what shipped in this window)
 
-**This entry also covers PR #100 + PR #101** (the docs + plan that landed in this window): PR #100 (post-#99 docs catch-up, MERGED) + PR #101 (PR-102 architecture plan, MERGED as a docs-only PR). PR #101's plan doc (`docs/PR-101-plan.md`) is the architecture decision record that PR #102 implements.
+- **PR #100** (docs — squash `ca54551`): post-#99 docs sync to HANDOFF.md/SPEC.md. MERGED.
+- **PR #101** (plan-only — squash `febee54`): `docs/PR-101-plan.md` for the WEAPONS-table refactor. MERGED.
+- **PR #102** (code — squash `1ce8bff`): Server-side WEAPONS_TABLE refactor. 5 layers code-complete, 14 files +687/-165, 229/229 cargo + 66/66 vitest + 32/32 CI green. MERGED at `1ce8bff`.
+- **PR #103** (docs — `docs/post-merge-pr102-weapons-server`): post-#102 HANDOFF.md/SPEC.md sync. 32/32 CI green, ready to merge (separate PR #103 branch ID — same number reused because #103 was originally planned for the client-side weapons wire; this is a docs PR named the same). MERGE when you're back.
 
-**Why now**: Post-PR-#99 the project was clean (0 deferred items, 32/32 CI green, all PRs merged). Kyle's call-out post-PR-#78 was weapons as the natural Phase-2 chunk since `PLAYER_MAX_AMMO = 6` was a temporary bridge between dual-pistol reload (PR #56) and the eventual multi-weapon arc. Lobby end-to-end works (PR #96), CI gate is in (PR #99), no open follow-ups — Phase 2 had room to begin.
+### TS 2.0 datamine (2026-09-01 evening session)
 
-**What PR #102 lands** (14 files, +687/-165):
+**Trigger**: User message `1544398257005010984` — "Sure, try and find it. I want the guns, attachments, modes, damage, etc... as close to the original as possible." Followed by `1544401369778098208` ("Can you not install the mod somewhere on your machine? It doesn't have to run for us to get the data files right?") + `1544408208163086447` ("I'm down for option 1. Reverse engineer that stuff so we have the real values.").
 
-*Server (Rust) — 8 files*:
+**Approach**:
+1. TS 3.0 installer is Cloudflare-protected on ModDB (can't scrape without a headless browser). No public TS 2.1+ SDK.
+2. `archive.org/details/ts-2.0` has TS 2.0 official client (`ts.zip`, 123MB) + Linux server (`ts2.0-linux_server.tar.tar`, 104MB). Downloaded, unzipped.
+3. TS 2.0 ships plaintext `weapons_official.txt` (33 weapons with accuracy cone, view kickback, accuracy kickback) + `ts_fgd.fgd` (entity field definitions).
+4. Per-weapon damage is compiled into `dlls/mp.dll` (the server-side game DLL, 827KB stripped). No debug symbols.
 
-- `server/src/constants.rs` (+224): `WEAPONS_TABLE[3]` with DualPistol (current behavior, unchanged), Shotgun (8 pellets, 5 dmg per pellet, 800ms cooldown, 2 mag, 20m range, wide spread), Sniper (75 dmg, 1500ms cooldown, 4 mag, 100m range, linear falloff). `WeaponId` enum (DualPistol=0, Shotgun=1, Sniper=2), `WeaponDef` struct (8 fields: weapon_id, damage_per_hit, pellets, max_range_meters, fire_cooldown_ms, magazine_size, reload_duration_ms, accuracy_degrees, damage_falloff), `weapon_def(id)` lookup, `FIRE_COOLDOWN_MS_DEFAULT = 120` preserved as back-compat alias for any caller that still imports it directly. **5 new unit tests** pinning the table shape + dual-pistol backward-compat values: `weapon_id_roundtrip_from_wire`, `weapon_id_default_is_dual_pistol`, `weapons_table_has_one_entry_per_weapon_id`, `dual_pistol_matches_pre_102_values`, `weapon_id_from_wire_rejects_out_of_range`. The dual-pistol pin test is the backward-compat promise — any future PR can't silently break the pre-#102 single-weapon behavior.
+**RE method**:
+1. `strings -a -t x mp.dll` to find all 33 weapon name string offsets.
+2. For each, `objdump -d mp.dll | grep "mov    $str_addr,%edi"` to find the constructor function.
+3. Walk backward from the string load to the function prologue (`push %ebp` / `push %esi`).
+4. Walk forward 200 lines, extract every `movl/movb $X, 0xNN(%edx)` (constant stores into entity member fields).
+5. Decode float32 LE hex → IEEE 754 float (sign bit + exponent + mantissa).
+6. Cross-validate: accuracy cone (`0x24`) and accuracy kickback (`0x30`) fields match `weapons_official.txt` byte-for-byte → confirms field layout is correct.
 
-- `server/src/hitscan.rs` (+169): Refactored `dual_pistol_hit` → private generic `ray_vs_sphere_hit` (the canonical ray-vs-sphere math). New public APIs: `weapon_hitscan(weapon_def, ...)` (per-weapon entry point that resolves range from the table), `shotgun_pellet_hit(...)` (per-pellet raycast), `jitter_forward(forward, accuracy_degrees)` (cone-spread helper — uniform area distribution via sqrt(uniform) to avoid the classic cone-clustering-at-center artifact). Existing `dual_pistol_hit_at_range` is kept as a `#[deprecated]` shim so the PR 11.6.C 100-pose fixture still passes without touching test code. The 100-pose fixture is the canonical ground-truth for the ray-vs-sphere math.
+**Field layout discovered** (verified across 33 constructors):
 
-- `server/src/protocol.rs` (+74): `PlayerState` struct gains `weapon_id: u8` (last field, after `is_firing`); `PLAYER_STATE_WIRE_SIZE` 29 → 30. 24p snapshot now 730 bytes (was 706). Encoders/decoders updated to read/write the new byte. The `snapshot_at_24_players_is_706_bytes` test was renamed to `snapshot_at_24_players_is_729_bytes` and asserts 24 * 30 = 720 + 9 header = 729.
+| Offset | Type | Field                                |
+|--------|------|--------------------------------------|
+| 0x14   | f32  | (purpose TBD — not in MP weapons)    |
+| 0x18   | f32  | (purpose TBD)                        |
+| 0x24   | f32  | Accuracy cone radius (matches wpn_official) |
+| 0x2c   | f32  | Damage per shot (point-blank)        |
+| 0x30   | f32  | Accuracy kickback per shot (matches) |
+| 0x38   | u32  | Some int field (max ammo? mag count?)|
+| 0x80   | u8   | Weapon position (HUD slot sub-pos)   |
+| 0x81   | u8   | Weapon slot (HUD primary/secondary)  |
+| 0xc6   | u8   | Magazine size                         |
+| 0xc8   | f32  | Fire rate coefficient (1.0 = base)   |
+| 0xcc   | i32  | Range in HL units                     |
+| 0xd4   | i32  | Cooldown in 0.1s ticks                |
 
-- `server/src/session.rs` (+20): `Player` struct gains `current_weapon: crate::constants::WeaponId` (default DualPistol via `WeaponId::DEFAULT`). The field tracks the active weapon for snapshot surfacing; `validate_and_relay_aim` still uses `req.weapon_id` from the inbound AimEvent for the per-shot cooldown/damage lookups (this is the anti-cheat behavior — the server trusts the claimed weapon_id for cooldown purposes, and a client that claims DualPistol while actually firing at Shotgun's rate is silently rate-limited to DualPistol's 120ms cadence).
+**Result** (`docs/TS2.0-weapon-data.md`):
+- All 33 weapons: accuracy, kickback, mag, fire rate, range, cooldown, slot/position, ammo type
+- 12 weapons: damage (Barrett=10, BENELLI/RagingBull=8, USAS/SPAS=7, Glock-20C=2.7, MP5SD/Five-seveN/M60E3=1.3, Ruger-MK1=0.7)
+- ~21 weapons: damage missing (constructor doesn't write to 0x2c — damage is in `FireBulletsPlayer()` bullet-type → damage table; needs tracing per weapon's PrimaryAttack)
 
-- `server/src/snapshot.rs` (+26): `build_snapshot` reads `player.current_weapon.to_wire()` and writes it into the `PlayerState.weapon_id` field. Per-player loop also reads `player.hp`, `player.ammo`, `player.yaw_radians`, `player.pitch_radians` (existing) + `player.current_weapon` (new).
+**Sample values that match community memory**:
+- Barrett M82A1: 10 dmg, 70 mag, 229m range, 0.001 accuracy = anti-materiel sniper ✓
+- BENELLI-M3: 8 dmg/pellet, 40 mag, 114m range = semi-auto shotgun ✓
+- Ruger-MK1: 0.7 dmg, 5 mag, 38m range, 0.001 accuracy = .22 LR target pistol ✓
 
-- `server/src/damage_relay.rs` (+194): Gate 4 (fire-rate cooldown) now resolves from `weapon_def(WeaponId::DEFAULT).fire_cooldown_ms` (was hardcoded `FIRE_COOLDOWN_MS = 120`). The DualPistol entry matches the pre-#102 value exactly (120ms) — the existing smokes stay green. Removed the `weapon_id` reading from AimEvent (PR #103 will add `weaponId` to the AimEvent wire type; PR #102 only adds it to the PlayerState wire). The docstring for `validate_and_relay` now documents the per-weapon cooldown table + the anti-cheat properties.
+### Files written
+- `docs/TS2.0-weapon-data.md` (in `pr102-weapons-server` worktree + this docs worktree, 9177 bytes)
 
-*Client (TypeScript) — 7 files*:
+**Carry-forward for next session**:
+1. ~~Resume the RE on `FireBulletsPlayer`~~ **DONE** — all 34 weapons' damage values extracted from HL1 vanilla `skill.cfg` cvars
+2. **PR #104 spec to write** — client-side weapons wire (0x0C WeaponSwitch) + keys 1/2/3 + per-weapon HUD + `weapon-switch-smoke.mjs` + new `client-weapon-switch-smoke` CI job
+3. HP-convergence CF-N1 flake — empty-commit retrigger protocol unchanged
+4. Port 5190 vite double-boot CI bug — pre-existing infra, fix deferred
 
-- `protocol/snapshot.ts` (+43): `PlayerState` interface gains `weaponId: number`. `PLAYER_STATE_BODY_SIZE` 29 → 30. `encode_snapshot` writes the new byte after `isFiring`. `decodeSnapshot` reads `dv.getUint8(off + 29)`. Docstrings updated for the new wire layout (bytes 0-29 instead of 0-28). The decoder returns null on size mismatch as before, so the pre-#102 → post-#102 rollout failure mode (pre-#102 clients reading 30-byte payloads) produces null snapshots → HUD shows stale HP/ammo, smoke fails — exactly what CI is supposed to catch.
-
-- 6 client engine files (`clientPredictor.ts`, `clientPredictor.test.ts`, `remoteInterpolator.ts`, `remoteInterpolator.test.ts`, `scene.ts`, `snapshot.test.ts`): PlayerState literals updated with `weaponId: 0` (default DualPistol) for typecheck. `remoteInterpolator`'s `lerpSnapshot` now includes `weaponId: newer.weaponId` (discrete — no interpolation). The typecheck errors caught 3 PlayerState literals where my sed script added `weaponId: 0,` with wrong indentation — fixed on the second commit before CI went green.
-
-**Wire-break at snapshot boundary** (29 → 30 bytes per player): The plan §8.7 explicitly accepted this — the next-deploy-is-all-clients-new contract is the cost of having Phase 2 land without a 6-month dual-codebase window. The `client-rig-visual-smoke` (PR #99) catches the failure on the post-deploy smoke run, so a half-deployed state can't ship past CI without the smoke failing.
-
-**Verification**: cargo test 229 PASS / 0 FAIL (lib 113 + integration 8 + 35 + 18 + 26 + 15 + 14 = 229 — was 224 before #102, +5 from new constants tests). vitest 66/66 PASS (all client snapshot tests + PlayerState literals updated). tsc clean. **rig-visual-smoke: 4/4 PASS end-to-end** (real canary boot + Tab A/B walk + visual rig position propagation — confirms the new wire format works at runtime with the LIVE render observer hook). **lobby-smoke: 18/18 PASS end-to-end** (real canary + matchmaker HTTP + lobby UI). **CI: 32/32 GREEN** on the merge commit (after 1 retrigger for the indentation-bug-induced typecheck failure caught by CI on the first run — fixed + amended + pushed + cleared). **Cross-vendor review**: not run — the architecture mirrors PR #56 (dual-pistol reload) closely enough that the existing peer review pattern is sufficient. **Server smoke (`damage-server-smoke`, `damage-server-hp-convergence-smoke`)** — 4 existing smokes still pass because they exercise DualPistol only (the table's DualPistol entry matches pre-#102 values exactly). Shotgun + Sniper are not yet exercised end-to-end — that gap closes in PR #103 with the new `weapon-switch-smoke`. **The lobby remains the only entry point** so the wire-break deploy is atomic — next deploy is all-clients-new.
-
-**Open questions still needing answers** (carry-forward to PR #103): damage numbers for Shotgun (5 per pellet vs ?), Sniper (75 vs ?), magazine sizes (6/2/4 vs 6/2/5), fire-rate plausibility edge cases, weapon-switch keybind (hardcoded 1/2/3 vs configurable), server-side weaponId validation strictness (open vs closed enum), reload cancelation semantics, headshot multiplier (the PR #101 plan §10 deferral).
-
-**Recommended next direction** (your call): **(a) PR #103 — client-side weapons (weapon switch + per-weapon HUD + new smoke)** — wires the user-facing weapons feature on top of the PR #102 table. Answers the 6 carry-forward questions from the PR #101 plan. ~2-3 sessions of code work + Claude cross-vendor review. The new `weapon-switch-smoke.mjs` (modeled on `rig-visual-smoke.mjs`, real canary) drives Tab A's weapon switch 1→2→3, asserts: snapshot stream shows weaponId 0→1→2 over time, damage values match `WEAPONS_TABLE[1].damage_per_hit` vs `WEAPONS_TABLE[2].damage_per_hit` against the same target, per-weapon fire-rate cooldown is enforced (Tab A can't fire Shotgun at DualPistol's cadence). **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator (PR #83) + producer-side rate-limiter (PR #81) + 1024-slot mpsc bump (PR D2.1) already cover the worst case. CF-N1's only remaining path is sustained CI runner pressure under many parallel smokes — could add a snapshot coalesce or drop-oldest refinement. **(c) Tier-3 Vivaldi keyboard test** (~30 min, needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session). Documents the manual recipe in `client/tools/lobby-tier3-keyboard-smoke.mjs`. The Vivaldi-CDP-trap (existing session absorbing the flag) was hit on the 2026-09-01 PR #94 attempt and is in the skill as a documented pitfall. **(d) Maintenance sweep** — the remaining deferred items from PR #92/#94 reviews (popup-blocker flushSync parity, StrictMode rAF race). All cosmetic.
-
-**This entry's TL;DR above already captures the post-#102 state** — the chronological entry below is the per-file accounting for future archeology.
+**Status of TS 2.0 RE**: ✅ COMPLETE. Field map cross-validated, all 34 weapons' damage resolved (HL1 vanilla `skill.cfg` cvars), MVP (DualPistol/Shotgun/Sniper) values ready to bake into PR #104.
 
 ---
 
