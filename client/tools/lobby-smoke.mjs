@@ -308,10 +308,13 @@ async function main() {
         .then(() => true)
         .catch(() => false);
       await createBtn.click();
+      // Use the first element of the allSettled results directly — no
+      // need to re-shape via `.then((results) => [results[0], results[1]])`
+      // just to destructure two entries from a 2-tuple.
       const [busySeen, _navResult] = await Promise.allSettled([
         busySeenPromise,
         navPromise,
-      ]).then((results) => [results[0], results[1]]);
+      ]);
       if (busySeen.status !== "fulfilled" || busySeen.value !== true) {
         fail(`busy state did not appear within ${BUSY_TIMEOUT_MS}ms of clicking Create`);
         recordFail("busy-state-on-create", "busy state never became visible");
