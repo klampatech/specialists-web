@@ -34,12 +34,15 @@
 // no-nav (3 assertions), error-renders, error-clears-on-input.
 // Total 10.
 //
-// PR 94 (lobby a11y) adds 5 more (assertions 8-12): role-dialog-
-// testid (lobby div has role="dialog" + aria-modal="true"),
-// focus-trap-tab (Tab from Join -> Code), focus-trap-shift-tab
-// (Shift+Tab from Code -> Join), first-input-autofocus (code input
-// focused on mount), aria-label-input (code input has aria-label=
-// "Room code"). Total 15.
+// PR 94 (lobby a11y) adds 8 more (assertions 8-15): role-dialog-
+// testid (lobby div has role="dialog" + aria-modal="true"), aria-
+// label-input (code input has aria-label="Room code"), first-input-
+// autofocus (code input focused on mount), aria-describedby-
+// integrity (#lobby-code-help exists with help text), aria-labelledby-
+// integrity (#lobby-title exists with title), live-region-attrs
+// (aria-live="polite" + aria-atomic="true"), focus-trap-tab (Tab
+// from Join -> Code), focus-trap-shift-tab (Shift+Tab from Code ->
+// Join). Total 18.
 //
 // The smoke is a single tab (NOT two-tab) because the matchmaker
 // surface itself is single-player-shaped (you create a room, you
@@ -561,9 +564,10 @@ async function main() {
     // ----- PR 94 (lobby a11y) new assertions -----
     // The lobby React tree is replaced for each a11y assertion so
     // refs + focus state from earlier tests don't leak. Tests run
-    // 8 -> 12 (role-dialog-testid, focus-trap-tab, focus-trap-shift-
-    // tab, first-input-autofocus, aria-label-input). Total smoke
-    // passes 10 -> 15.
+    // 8 -> 15 (role-dialog-testid, aria-label-input, first-input-
+    // autofocus, aria-describedby-integrity, aria-labelledby-
+    // integrity, live-region-attrs, focus-trap-tab, focus-trap-
+    // shift-tab). Total smoke passes 10 -> 18.
 
     // Assertion 8: role=dialog + aria-modal=true on the outer lobby
     // div. The smoke uses the existing `lobby` testid so we don't
@@ -636,14 +640,83 @@ async function main() {
       await page2.close();
     }
 
-    // Assertions 11 + 12: focus trap. Tab from Join -> Code, Shift+Tab
+    // Assertion 11: the code input's aria-describedby target
+    // (#lobby-code-help) exists in the DOM with the help text.
+    // A dangling describedby would leave screen readers with no
+    // help text at all. Pinned by Claude Code cross-vendor review.
+    log(`ASSERTION 11: code input's aria-describedby target (#lobby-code-help) renders with help text`);
+    page2 = await openLobbyPage(context);
+    try {
+      const help = await page2.evaluate(() => {
+        const el = document.querySelector("#lobby-code-help");
+        return el ? el.textContent : null;
+      });
+      if (!help || !help.includes("Ask the host for the room code")) {
+        fail(`#lobby-code-help should contain "Ask the host for the room code" (got: ${JSON.stringify(help)})`);
+        recordFail("aria-describedby-integrity", `help=${JSON.stringify(help)}`);
+      } else {
+        log(`  ✓ #lobby-code-help renders with help text`);
+        recordPass("aria-describedby-integrity");
+      }
+    } finally {
+      await page2.close();
+    }
+
+    // Assertion 12: the dialog's aria-labelledby target (#lobby-title)
+    // exists in the DOM with the dialog title. A dangling labelledby
+    // causes screen readers to announce the dialog with no title.
+    // Pinned by Claude Code cross-vendor review.
+    log(`ASSERTION 12: dialog's aria-labelledby target (#lobby-title) renders with title`);
+    page2 = await openLobbyPage(context);
+    try {
+      const title = await page2.evaluate(() => {
+        const el = document.querySelector("#lobby-title");
+        return el ? el.textContent : null;
+      });
+      if (!title || !title.includes("Specialists")) {
+        fail(`#lobby-title should contain "Specialists" (got: ${JSON.stringify(title)})`);
+        recordFail("aria-labelledby-integrity", `title=${JSON.stringify(title)}`);
+      } else {
+        log(`  ✓ #lobby-title renders with title`);
+        recordPass("aria-labelledby-integrity");
+      }
+    } finally {
+      await page2.close();
+    }
+
+    // Assertion 13: the live region div has aria-live="polite" AND
+    // aria-atomic="true" — both attributes are load-bearing for
+    // WCAG 4.1.3 (Status Messages). Pinned by Claude Code review.
+    log(`ASSERTION 13: live region has aria-live="polite" + aria-atomic="true"`);
+    page2 = await openLobbyPage(context);
+    try {
+      const liveAttrs = await page2.evaluate(() => {
+        const el = document.querySelector('[data-testid="lobby-live-region"]');
+        if (!el) return null;
+        return {
+          live: el.getAttribute("aria-live"),
+          atomic: el.getAttribute("aria-atomic"),
+        };
+      });
+      if (!liveAttrs || liveAttrs.live !== "polite" || liveAttrs.atomic !== "true") {
+        fail(`live region should have aria-live="polite" + aria-atomic="true" (got: ${JSON.stringify(liveAttrs)})`);
+        recordFail("live-region-attrs", `attrs=${JSON.stringify(liveAttrs)}`);
+      } else {
+        log(`  ✓ live region has aria-live="polite" + aria-atomic="true"`);
+        recordPass("live-region-attrs");
+      }
+    } finally {
+      await page2.close();
+    }
+
+    // Assertions 14 + 15: focus trap. Tab from Join -> Code, Shift+Tab
     // from Code -> Join. The PR 94 a11y pass wires a keydown listener
     // on the modal container that preventDefaults the default Tab
-    // behavior when focus is on the trap boundaries. Test 11 asserts
-    // focus moves from Join -> Code; test 12 asserts Code -> Join.
+    // behavior when focus is on the trap boundaries. Test 14 asserts
+    // focus moves from Join -> Code; test 15 asserts Code -> Join.
     // Both tests share a single page session so we can chain
     // focus calls without React re-mounting.
-    log(`ASSERTIONS 11+12: focus trap -- Tab from Join -> Code, Shift+Tab from Code -> Join`);
+    log(`ASSERTIONS 14+15: focus trap -- Tab from Join -> Code, Shift+Tab from Code -> Join`);
     page2 = await openLobbyPage(context);
     try {
       // The Join button is disabled until a code is typed (the
