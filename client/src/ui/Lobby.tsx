@@ -121,7 +121,21 @@ export function Lobby() {
       // navigates away on the next tick.)
       const target = new URL(window.location.href);
       target.searchParams.set("server", ws_url);
-      window.location.href = target.toString();
+      // Popup-blocker / sandboxed-frame / etc. recovery (NB #3). The
+      // browser can throw on `window.location.href = ...` if it
+      // refuses the navigation. Without this try/catch, a blocked
+      // nav would leave `creating: true` forever with no error —
+      // the button would just sit greyed out. Reset state + surface
+      // a friendly message so the user can retry.
+      try {
+        window.location.href = target.toString();
+      } catch (navErr) {
+        setStatus(null);
+        setError(
+          "Navigation blocked. Click again or allow popups for this site.",
+        );
+        setCreating(false);
+      }
     } catch (e) {
       setStatus(null);
       if (isMatchmakerNetworkError(e)) {
@@ -169,9 +183,18 @@ export function Lobby() {
         return;
       }
       if (!r.exists) {
-        setError(`Room "${id}" not found. Ask the host to share a fresh link.`);
-        setRoomStatus(null);
-        setJoining(false);
+        // flushSync parity with the full-room branch directly below:
+        // the 3 setStates here are the "not found" path's terminal
+        // state write, and we want them committed to the DOM BEFORE
+        // the function returns (so the smoke's 10ms polling catches
+        // them deterministically). Without flushSync, React 18 batches
+        // them and a fast click race can leave the DOM stale for a
+        // frame — caught by Claude Code cross-vendor review (Nit #1).
+        flushSync(() => {
+          setError(`Room "${id}" not found. Ask the host to share a fresh link.`);
+          setRoomStatus(null);
+          setJoining(false);
+        });
         return;
       }
       if (r.players >= r.max) {
@@ -213,8 +236,15 @@ export function Lobby() {
       // catch it at all (the navigation races the
       // requestAnimationFrame poll). The yield is invisible
       // to the user (sub-millisecond) but enough for the
-      // browser to commit the React-driven DOM update.
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      // browser to commit the React-driven DOM update. We
+      // use Promise.resolve() (a microtask) instead of
+      // setTimeout(0) (a macrotask) because React's
+      // concurrent renderer + MutationObserver callbacks
+      // both run as microtasks — setTimeout(0) would
+      // over-yield into a 4ms+ idle window the smoke
+      // didn't need. Caught by Claude Code cross-vendor
+      // review (NB #4).
+      await Promise.resolve();
       // Build ws:// URL. We don't know the server's host:port from
       // the GET response (it intentionally doesn't echo them to
       // keep the API minimal). Default to `${origin}/rooms/<id>` —
@@ -225,7 +255,19 @@ export function Lobby() {
       const ws_url = `${wsProto}//${wsHost}/rooms/${id}`;
       const target = new URL(window.location.href);
       target.searchParams.set("server", ws_url);
-      window.location.href = target.toString();
+      // Same popup-blocker recovery shape as onCreate above:
+      // a throw here means the browser refused the navigation
+      // (popup blocker, sandboxed iframe, etc.) and we need to
+      // unwind the joining=true state + surface a clear error.
+      try {
+        window.location.href = target.toString();
+      } catch (navErr) {
+        setStatus(null);
+        setError(
+          "Navigation blocked. Click again or allow popups for this site.",
+        );
+        setJoining(false);
+      }
     } catch (e) {
       setStatus(null);
       setRoomStatus(null);
