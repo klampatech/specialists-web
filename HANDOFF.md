@@ -7,10 +7,48 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#96 (2026-09-01). **`main` @ `c246de3` (PR #96 squash — MERGED 2026-09-01).** Closes the last lobby end-to-end gap that PR #94 explicitly deferred. **`You are here` summary**: PR #96 fixes the Lobby Join path bug that PR #94's real-canary smoke surfaced as "out of scope for #94 — architectural". The Join path constructed `ws_url` from `window.location.host` (Vite's port 5194 in dev), which produced a broken URL that the browser would ERR_CONNECTION_REFUSED on. **The fix**: matchmaker's `GET /rooms/<id>` response now includes `ws_url` in the same shape as `POST /rooms` (same `peer_addr:ws_port/rooms/<id>` template, threaded through `handle_get_room`); `Lobby.tsx` Join uses that URL instead of constructing one from `window.location.host`. `GetRoomResponse` type updated, vitest test updated, lobby-smoke.mjs's 2 page.route stubs updated to mock the new field, real-canary-smoke.mjs grew from 5 → 7 assertions (added: lobby Join navigates to real-canary ws_url + lobby surfaces accurate N/M player count from real canary). vitest 66/66, lobby-smoke 18/18, **real-canary-smoke 7/7**, cargo test 108/108, CI green. **The lobby is now fully functional end-to-end for the first time since PR #91.** No code work currently queued. Recommended next direction (your call):
-- **(a) Pivot to weapons / new feature arc** — Phase 2 candidates: WEAPONS-table refactor (shotgun/sniper — was the original Phase-2 chunk Kyle flagged post-PR-78), MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, or maintenance carry-forwards (remote rig collision, PointerLock ESC flicker, anti-cheat on yaw/pitch).
-- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator already shipped (PR #83); producer-side rate-limiter (PR #81) still rides as second-line defense. This would be a verification pass + small capacity bump if needed before sustained cloud load.
-- **(c) Maintenance sweep** — the few remaining deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test (needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session).
+**`You are here`**: post-PR-#99 (2026-09-01). **`main` @ `51d5355` (PR #99 squash — MERGED 2026-09-01).** Closes the "visual rig position propagation (pending verification)" carry-forward from PR #98. **`You are here` summary**: PR #99 wires the existing `client/tools/rig-visual-smoke.mjs` (PR #66) as a CI gate so the wire → Havok → visualRoot → snapshot-position pipeline can't silently regress. The smoke itself had two latent bugs that prevented it from running anywhere with a port-8080 listener: (a) it didn't pass `--port-http` to `canary-server.sh` so the canary crashed on EADDRINUSE 8080; (b) the spawned canary + vite subprocesses held their stdio pipes open after `kill('SIGTERM')` (cargo's child outlives bash — same pitfall already documented in skills/projects/specialists-web), so node couldn't exit and CI waited the full runner timeout. **The fix** (2 files, +86/-1): `client/tools/rig-visual-smoke.mjs` (+4) — added `RUST_VIS_HTTP_PORT` env var (default 18082) + the `--port-http` flag invocation + `process.exit(0)` on the success path (after the finally-block cleanup, mirroring lobby-smoke.mjs); `.github/workflows/ci.yml` (+82) — added `client-rig-visual-smoke` CI job modeled on the lobby-real-canary-smoke structure, boots canary on 14435/14436/18082 + vite on 5192 (all unique ports), 2-tab Playwright drives a Tab B → Tab A walk cycle, asserts Tab A's remote rig visualRoot tracks the snapshot's positionX/Z via the LIVE render observer hook (`scene.ts:1300`). `CARGO_PROFILE=debug` env so the canary reuses the pre-built debug binary instead of rebuilding release from scratch. `timeout-minutes: 5` to fail-fast on any regression that hangs the smoke. **Smoke stays at 4 assertions** (liveHook-set + snapshot-updates-as-rig-moves + second-move + lastTick-matches-snapshot). **Catches the PR 11.7.D3.2 regression class** — closure-bound remoteCtrl vs LIVE remoteCtrl drift under StrictMode where the visual mesh would stay at world origin even though the snapshot reported new positions. **CI: 32/32 GREEN on the merge commit** (the first run had 1 CF-N1 flake on HP-convergence smoke — same pre-existing intermittent as PR #98/95, cleared on the rebase-triggered re-run per the standard empty-commit + retrigger protocol). **All deferred items from PR #98 are now formally closed.** Recommended next direction (your call):
+- **(a) Pivot to weapons / new feature arc** — Phase 2 candidates: WEAPONS-table refactor (shotgun/sniper — was the original Phase-2 chunk Kyle flagged post-PR-78), MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat on yaw/pitch, `0x0B MeleeEvent` wire type, visual rig collision (blue-rig clips through boxes), or PointerLock ESC flicker fix.
+- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator (PR #83) + producer-side rate-limiter (PR #81) + 1024-slot mpsc bump (PR D2.1) already cover the worst case. CF-N1's only remaining path is sustained CI runner pressure under many parallel smokes — could add a snapshot coalesce or drop-oldest refinement.
+- **(c) Tier-3 Vivaldi keyboard test** (~30 min, needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session). Documents the manual recipe in `client/tools/lobby-tier3-keyboard-smoke.mjs`. The Vivaldi-CDP-trap (existing session absorbing the flag) was hit on the 2026-09-01 PR #94 attempt and is in the skill as a documented pitfall.
+- **(d) Maintenance sweep** — the remaining deferred items from PR #92/#94 reviews that PR #98 didn't close (popup-blocker flushSync parity, StrictMode rAF race). All cosmetic.
+
+---
+
+## 2026-09-01 — PR #99 (wire rig-visual-smoke as CI gate + fix --port-http + debug profile + explicit exit)
+
+**Scope**: Closes the "visual rig position propagation (pending verification)" carry-forward from PR #98 (the pre-cloud cleanup PR). The smoke itself was written in PR #66 (the original rig-visual test) but never wired as a CI gate. **MERGED 2026-09-01** (squash), `main` now at `51d5355`.
+
+**What PR #99 lands** (2 files, +86/-1):
+
+**1. `client/tools/rig-visual-smoke.mjs` (+4)**:
+- **Added `RUST_VIS_HTTP_PORT` env var** (default 18082) + the `--port-http` flag to the canary invocation. The smoke was previously crashing on EADDRINUSE 8080 in any environment with a port-8080 listener (matching the lobby-smoke.mjs pattern). The canary defaults to port 8080 for the matchmaker HTTP listener; without `--port-http` any CI runner with a port-8080 listener (load balancers, sidecar proxies) would fail to boot.
+- **Added `process.exit(0)`** on the success path (after the finally-block cleanup, mirroring `lobby-smoke.mjs`). The spawned canary + vite subprocesses hold their stdio pipes open after `kill('SIGTERM')` because cargo's child outlives bash (the same pitfall already documented in `skills/projects/specialists-web` under "pkill -f canary-server.sh does NOT kill specialists-server"). Without explicit exit the smoke passes locally in 25-40s but CI waits the full runner timeout (default 6 hours).
+
+**2. `.github/workflows/ci.yml` (+82)**:
+- **New `client-rig-visual-smoke` job** modeled on `client-lobby-real-canary-smoke`. Boots canary on 14435/14436/18082 + vite on 5192 (all unique to this job). 2-tab Playwright drives a Tab B → Tab A walk cycle, asserts Tab A's remote rig visualRoot tracks the snapshot's positionX/Z via the LIVE render observer hook (`scene.ts:1300`).
+- **`CARGO_PROFILE=debug` env** on the run step. `canary-server.sh` defaults to release profile, but the pre-build step above produces the debug binary — without this override, `cargo run` inside the smoke would rebuild release from scratch and time out the 15s boot poll.
+- **`timeout-minutes: 5`** to fail-fast if a regression hangs the smoke. CI smoke runs in ~1m45s in steady state.
+
+**Regression class caught**: The PR 11.7.D3.2 (visual rig position propagation) fix shipped a LIVE render observer hook that mirrors the snapshot position onto the visualRoot every frame. If a future PR accidentally:
+- Detaches the LIVE observer from the closure-bound interpolatorTickHook
+- Re-introduces `window.location.host` assumptions
+- Reverts `setVisualPosition` writes from the render path
+- Breaks the `__lastInterpolatorSetPosition` debug hook
+
+…the smoke fails on its very next CI run. 4 assertions cover the full wire → Havok → visual pipeline.
+
+**Verification**: typecheck clean, vitest 66/66 PASS, `cargo test 224/224 PASS`, `rig-visual-smoke.mjs` **4/4 PASS** locally (multiple runs, all clean exit 0). CI on the PR commit: **32/32 GREEN on the post-rebase run** (the first run had 1 CF-N1 flake on HP-convergence smoke — same pre-existing intermittent as PR #98/95, cleared on the rebase-triggered re-run per the standard empty-commit + retrigger protocol).
+
+**Cross-vendor review**: not run — tight scope, low risk. The 4 fixes are all direct-edit to existing files. The smoke's pre-existing assertions are unchanged.
+
+**Out of scope (carried in HANDOFF TL;DR + Deferred section)**:
+- The mpsc 256→512 bump from PR #98's deferral list was already done in PR D2.1 (capacity is now 1024). No work needed.
+- Tier-3 Vivaldi keyboard test still needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session.
+
+**Lesson captured**: the "explicit `process.exit(0)` after success when spawning long-lived subprocesses via `spawnWithStderrCapture`" pattern is now in skill `coding-task-routing` as an inline note — any smoke that spawns canary + vite via `spawnWithStderrCapture` SHOULD `process.exit(0)` on the success path to avoid the stdio-pipe-held-open hang. `lobby-smoke.mjs`, `lobby-real-canary-smoke.mjs`, `two-tab-smoke.mjs` already do this; rig-visual-smoke.mjs was the outlier.
+
+**Spec sync**: this entry + the `Current status (2026-09-01, post-PR-#99)` block in `docs/SPEC.md` capture the new state. The TL;DR above is rewritten to post-PR-#99. Vault entry regenerates from `./tools/sync-spec-to-vault.sh` after this lands.
 
 ---
 
