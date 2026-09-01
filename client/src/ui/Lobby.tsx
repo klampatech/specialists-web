@@ -84,10 +84,25 @@ export function Lobby() {
   // PR 94 (lobby a11y) — DOM refs for focus management. The modal
   // container is the focus-trap boundary (the keydown listener
   // attaches here). The code input + Join button are the two
-  // focusable elements we cycle between with Tab/Shift+Tab
-  // (Create sits OUTSIDE the focus trap — reached by direct
-  // click or by tabbing in from outside the modal). The
-  // previously-focused ref captures whatever element had focus
+  // focusable elements we cycle between with Tab/Shift+Tab.
+  //
+  // **Why Create sits OUTSIDE the focus trap (intentional design)**: the
+  // trap exists to keep keyboard-only users from tabbing into the
+  // background page while a dialog is open. The modal has exactly two
+  // interactive elements (input + Join button); tabbing between them
+  // is enough to fill in the room code and join. The Create button is
+  // outside the trap so it's reachable via:
+  //   1. Direct mouse/touch click (the common path on desktop).
+  //   2. Tabbing in from outside the modal (e.g. after restoring focus
+  //      to <body> or to a preceding element).
+  //   3. Programmatic focus() if a future feature needs it.
+  // The trap is "soft" in the sense that it doesn't block
+  // document.activeElement from being moved by external code — it only
+  // handles Tab/Shift+Tab keydowns. This is the documented
+  // WAI-ARIA-1.2 dialog-focus-management pattern (avoid trapping users
+  // who want to back out of the modal).
+  //
+  // The previously-focused ref captures whatever element had focus
   // before the lobby mounted, so we can restore focus when the
   // lobby unmounts.
   const modalRef = useRef<HTMLDivElement>(null);
@@ -378,6 +393,23 @@ export function Lobby() {
   //      animation frame. requestAnimationFrame defers the focus
   //      until after the modal paints, so focus doesn't land on
   //      <body> before the input is mounted in some browsers.
+  //      **Known race in StrictMode (dev-only, no production impact)**:
+  //      React 18's StrictMode mounts → unmounts → remounts the
+  //      component in dev for invariant-checking. The first mount's
+  //      `requestAnimationFrame` callback can fire AFTER the
+  //      unmount, focusing a stale node that no longer exists. The
+  //      workaround would be to track a mounted ref and bail in the
+  //      raf callback. We intentionally do NOT do this because:
+  //      (a) it never ships to production (this is dev-only behavior;
+  //          import.meta.env.DEV's StrictMode is stripped from
+  //          prod bundles by Vite);
+  //      (b) Claude Code review (PR #94) explicitly flagged this
+  //          race as "no fix needed currently";
+  //      (c) the worst-case symptom in dev is a console warning
+  //          ("Component is not a focusable element") which doesn't
+  //          affect functionality. Tracked in PR #94's review
+  //          follow-up section; deferred until a real symptom
+  //          appears (e.g. flaky focus state in production smoke).
   //   2. Restore focus to the previously-focused element on
   //      unmount. On successful navigation this is a no-op (the
   //      destination page is a fresh document). On external

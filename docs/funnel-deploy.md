@@ -138,6 +138,15 @@ cert-rotation watcher — likely a `path-exists` systemd path unit
 that watches the cert file in `/var/lib/tailscale/files/` and
 triggers `ExecReload`. Filed as carry-forward.
 
+> **Pre-cloud-cleanup status (2026-09-01)**: this is **formally
+> deferred** as of the pre-cloud-cleanup PR (PR #98). The
+> `systemctl --user restart` workaround is operator-bearable
+> because Funnel certs rotate on a ~60-90 day cadence, not a
+> continuous rate. The watcher PR will be opened when there's a
+> real operational symptom (e.g. cert expires during a playtest
+> and the operator wasn't watching). Until then, the workaround
+> is documented here and in HANDOFF.md §Deferred.
+
 ### Funnel policy gate
 
 If the tailnet admin disables Funnel (e.g., for an audit), the next
