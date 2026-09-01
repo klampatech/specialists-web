@@ -112,16 +112,16 @@ describe("matchmakerApi — error cause discriminator", () => {
     expect(r).toEqual({ exists: false });
   });
 
-  it("getRoom returns {exists:true,players,max} on 200", async () => {
+  it("getRoom returns {exists:true,players,max,ws_url} on 200", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
-      new Response('{"exists":true,"players":3,"max":24}', {
+      new Response('{"exists":true,"players":3,"max":24,"ws_url":"ws://127.0.0.1:14934/rooms/ABC12345"}', {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
     ) as unknown as typeof fetch;
 
     const r = await roomApi.getRoom("http://127.0.0.1:18080", "ABC12345");
-    expect(r).toEqual({ exists: true, players: 3, max: 24 });
+    expect(r).toEqual({ exists: true, players: 3, max: 24, ws_url: "ws://127.0.0.1:14934/rooms/ABC12345" });
   });
 });
 

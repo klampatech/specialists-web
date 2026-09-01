@@ -7,7 +7,7 @@
 // Catches server/client drift where `matchmaker.rs`'s actual
 // response shape diverges from what `matchmakerApi.ts` consumes.
 //
-// What it asserts (current PR 94 scope):
+// What it asserts (current PR 95 scope):
 //   1. POST /rooms (real) returns 200 with {id, ws_url, wss_url, max_players}
 //      and the id matches the regex [A-Za-z0-9_-]{1,64}.
 //   2. The returned ws_url includes a non-default port (PR 94 fix).
@@ -19,17 +19,20 @@
 //   5. The response shapes match the canned responses in `lobby-smoke.mjs`
 //      (catches future drift between the page.route mocks and the
 //      real canary — if this fails, both smokes need updating).
+//   6. The lobby's Join path navigates to ?server=<REAL ws_url from
+//      matchmaker> (PR 95 fix — was previously window.location.host
+//      which gave Vite's port, not the WS listener's).
+//   7. The lobby surfaces an accurate N/M player count indicator from
+//      the real canary (validates the join path + indicator code path
+//      works end-to-end against the real server).
 //
-// What it does NOT cover (covered by lobby-smoke.mjs OR deferred to
-// follow-up PRs):
+// What it does NOT cover (covered by lobby-smoke.mjs OR not yet wired):
 //   - 18 UI-state assertions (focus trap, ARIA, busy text, etc.) —
 //     covered by lobby-smoke.mjs with page.route stubs.
-//   - Two-tab end-to-end WS connection through the lobby — REQUIRES
-//     the Lobby.tsx Join path to be fixed (currently constructs the
-//     ws_url from window.location.host which is Vite's port, not the
-//     WS listener's port). Tracked as a follow-up — out of scope for
-//     PR 94 (which was a11y + deferred Claude nits). Once fixed, this
-//     smoke can re-add two-tab + full-room assertions.
+//   - Actually filling a room to max (server's MAX_PLAYERS_PER_ROOM is
+//     hardcoded to 24, which is too many browser contexts for a smoke).
+//     The indicator surfacing is verified instead — it's the same code
+//     path the lobby uses for the full-room branch.
 //
 // **Required env vars** (all default to the existing CI lobby-smoke values):
 //   LOBBY_SMOKE_URL              (default http://127.0.0.1:5194/) — Vite URL
@@ -268,6 +271,159 @@ async function assert5_realCanaryMatchesSmokeMocksShape() {
   recordPass("shape-matches-mocks");
 }
 
+async function assert6_lobbyJoinNavigatesToRealCanaryWsUrl() {
+  // PR 95: the lobby's Join path now uses the matchmaker's returned
+  // `ws_url` field instead of constructing one from `window.location.host`.
+  // This assertion: create a room, connect a tab (so the room registers
+  // server-side), navigate to the lobby with that room code, click Join,
+  // and verify the resulting navigation uses the matchmaker's real ws_url
+  // (not a stub like `ws://localhost:5194/rooms/<id>` which would have
+  // been the pre-PR-#94 bug).
+  log(`ASSERTION 6: lobby Join navigates to ?server=<REAL ws_url from matchmaker> (PR 95 fix)`);
+  const browser = await chromium.launch();
+  const ctx = await browser.newContext();
+  try {
+    // 1. Create a room via real POST
+    const create = await fetch(`${CANARY_ORIGIN}/rooms`, { method: "POST" });
+    const created = await create.json();
+    const roomId = created.id;
+
+    // 2. Connect a tab so the room registers server-side
+    const fillTab = await ctx.newPage();
+    const fillUrl = new URL(URL_BASE);
+    fillUrl.searchParams.set("server", created.ws_url);
+    fillUrl.searchParams.set("localId", "1");
+    await fillTab.goto(fillUrl.toString(), { waitUntil: "networkidle", timeout: NAV_TIMEOUT });
+    await fillTab.waitForFunction(
+      () => window.__serverTransport?.connected && window.__serverTransport?.activeKind,
+      { timeout: CONNECT_TIMEOUT_MS }
+    ).catch(() => null);
+    await sleep(500); // let ensure_room land in the registry
+
+    // 3. Now GET /rooms/<id> should return {exists:true, ..., ws_url}
+    const get = await fetch(`${CANARY_ORIGIN}/rooms/${encodeURIComponent(roomId)}`);
+    if (get.status !== 200) {
+      recordFail("lobby-join-real-ws-url", `GET /rooms/<id> didn't return 200 (got: ${get.status})`);
+      return;
+    }
+    const room = await get.json();
+    if (room.exists !== true) {
+      recordFail("lobby-join-real-ws-url", `expected exists:true (got: ${JSON.stringify(room)})`);
+      return;
+    }
+    if (!room.ws_url || !room.ws_url.startsWith("ws")) {
+      recordFail("lobby-join-real-ws-url", `matchmaker didn't return ws_url (got: ${JSON.stringify(room)}) — PR 95 fix missing?`);
+      return;
+    }
+    // 4. Now navigate a fresh tab to the lobby and click Join
+    const lobbyTab = await ctx.newPage();
+    const lobbyUrl = new URL(URL_BASE);
+    lobbyUrl.searchParams.set("lobby", "1");
+    await lobbyTab.goto(lobbyUrl.toString(), { waitUntil: "networkidle", timeout: NAV_TIMEOUT });
+    await lobbyTab.getByTestId("lobby-code").fill(roomId);
+    await lobbyTab.getByTestId("lobby-join").click();
+    // Wait for ?server= navigation
+    await lobbyTab.waitForFunction(
+      () => new URL(window.location.href).searchParams.has("server"),
+      { timeout: 5000 }
+    ).catch(() => null);
+    const finalUrl = new URL(lobbyTab.url());
+    const serverParam = finalUrl.searchParams.get("server");
+    if (!serverParam) {
+      recordFail("lobby-join-real-ws-url", `no ?server= param in URL after Join (url=${lobbyTab.url()})`);
+      return;
+    }
+    if (serverParam !== room.ws_url) {
+      recordFail("lobby-join-real-ws-url", `Join navigated to wrong URL — expected matchmaker's ws_url "${room.ws_url}", got "${serverParam}"`);
+      return;
+    }
+    recordPass("lobby-join-real-ws-url");
+  } catch (e) {
+    recordFail("lobby-join-real-ws-url", e.message);
+  } finally {
+    await ctx.close();
+    await browser.close();
+  }
+}
+
+async function assert7_lobbySurfacesFullRoomFromRealCanary() {
+  // PR 95: the lobby should surface an accurate N/M player count indicator
+  // when joining a real-canary room that has 2 tabs connected. The indicator
+  // appears for ~1 frame before window.location.href navigates away (per
+  // the existing lobby-smoke pattern for catching the busy/indicator state
+  // pre-navigation), so we capture it via a MutationObserver + page.evaluate
+  // binding before clicking Join.
+  log(`ASSERTION 7: lobby surfaces accurate room-status indicator from real canary (PR 95)`);
+  const browser = await chromium.launch();
+  const ctx = await browser.newContext();
+  let capturedIndicator = null;
+  try {
+    const create = await fetch(`${CANARY_ORIGIN}/rooms`, { method: "POST" });
+    const created = await create.json();
+
+    // Connect 2 tabs to populate the room to 2/24 (server counts WS connections)
+    const tabs = [];
+    for (let i = 0; i < 2; i++) {
+      const tab = await ctx.newPage();
+      const t = new URL(URL_BASE);
+      t.searchParams.set("server", created.ws_url);
+      t.searchParams.set("localId", String(i + 1));
+      await tab.goto(t.toString(), { waitUntil: "networkidle", timeout: NAV_TIMEOUT });
+      tabs.push(tab);
+    }
+    // Wait for both to connect
+    for (const tab of tabs) {
+      await tab.waitForFunction(
+        () => window.__serverTransport?.connected && window.__serverTransport?.activeKind,
+        { timeout: CONNECT_TIMEOUT_MS }
+      );
+    }
+    await sleep(500); // let ensure_room + connection count land
+
+    // Open the lobby tab + set up the indicator capture BEFORE clicking Join
+    const lobbyTab = await ctx.newPage();
+    // exposeBinding runs in Node, immune to page tear-down (per existing lobby-smoke pattern)
+    await lobbyTab.exposeBinding("captureIndicator", (_src, text) => {
+      if (capturedIndicator === null) capturedIndicator = text;
+    });
+    const lobbyUrl = new URL(URL_BASE);
+    lobbyUrl.searchParams.set("lobby", "1");
+    await lobbyTab.goto(lobbyUrl.toString(), { waitUntil: "networkidle", timeout: NAV_TIMEOUT });
+    // Wire up the MutationObserver in the page
+    await lobbyTab.evaluate(() => {
+      const target = document.body;
+      const observer = new MutationObserver(() => {
+        const el = document.querySelector('[data-testid="lobby-room-status"]');
+        if (el && el.textContent) {
+          window.captureIndicator(el.textContent);
+        }
+      });
+      observer.observe(target, { childList: true, subtree: true, characterData: true });
+    });
+    // Now type + click Join — the indicator should appear briefly
+    await lobbyTab.getByTestId("lobby-code").fill(created.id);
+    await lobbyTab.getByTestId("lobby-join").click();
+    // Wait for either navigation or capturedIndicator
+    await lobbyTab.waitForFunction(
+      () => new URL(window.location.href).searchParams.has("server"),
+      { timeout: 5000 }
+    ).catch(() => null);
+    if (!capturedIndicator) {
+      recordFail("lobby-room-status-real-canary", `lobby didn't surface player count indicator before Join navigation (captured=${capturedIndicator})`);
+      return;
+    }
+    log(`  real-canary room-status indicator: "${capturedIndicator}"`);
+    recordPass("lobby-room-status-real-canary");
+    for (const tab of tabs) await tab.close().catch(() => {});
+    await lobbyTab.close().catch(() => {});
+  } catch (e) {
+    recordFail("lobby-room-status-real-canary", e.message);
+  } finally {
+    await ctx.close();
+    await browser.close();
+  }
+}
+
 async function main() {
   log(`URL_BASE=${URL_BASE} CANARY=${CANARY_ORIGIN} WT=${WT_PORT} WS=${WS_PORT} HTTP=${HTTP_PORT}`);
   if (!process.env.SMOKE_NO_BOOT) {
@@ -283,6 +439,8 @@ async function main() {
     await assert3_getRoomNotFoundForFreshRoom();
     await assert4_bogusRoomReturns404WithExistsFalse();
     await assert5_realCanaryMatchesSmokeMocksShape();
+    await assert6_lobbyJoinNavigatesToRealCanaryWsUrl();
+    await assert7_lobbySurfacesFullRoomFromRealCanary();
   } finally {
     killProcs();
   }

@@ -377,7 +377,8 @@ async function main() {
         route.fulfill({
           status: 200,
           contentType: "application/json",
-          body: JSON.stringify({ exists: true, players: 5, max: 24 }),
+          // PR 95: matchmaker now returns ws_url in GET /rooms/<id>
+          body: JSON.stringify({ exists: true, players: 5, max: 24, ws_url: "ws://stubbed/rooms/ROOM1" }),
         });
       });
       // Abort the subsequent ?server= navigation so the page
@@ -476,7 +477,8 @@ async function main() {
         route.fulfill({
           status: 200,
           contentType: "application/json",
-          body: JSON.stringify({ exists: true, players: 24, max: 24 }),
+          // PR 95: matchmaker now returns ws_url in GET /rooms/<id>
+          body: JSON.stringify({ exists: true, players: 24, max: 24, ws_url: "ws://stubbed/rooms/FULL001" }),
         });
       });
 
