@@ -365,7 +365,7 @@ pub async fn run_server(
         Some(tokio::spawn({
             let rooms = rooms.clone();
             async move {
-                if let Err(e) = specialists_server::matchmaker::run_matchmaker_http(port_http, rooms).await {
+                if let Err(e) = specialists_server::matchmaker::run_matchmaker_http(port_http, port_ws, rooms).await {
                     warn!("run_matchmaker_http exited: {e:?}");
                     Err(e)
                 } else {

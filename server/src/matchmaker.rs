@@ -60,8 +60,16 @@ const ROOM_ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 const ROOM_ID_LEN: usize = 8;
 
 /// Bound the HTTP listener. Returns Err on bind failure.
+///
+/// `ws_port` is the port the WebSocket listener is bound to on
+/// the same host (matchmaker and WS listeners share a host but may
+/// use different ports). The matchmaker includes it in the
+/// `ws_url` / `wss_url` it returns so the lobby can connect
+/// directly without needing to construct the URL locally. See
+/// `handle_create_room` for the bug this fixes.
 pub async fn run_matchmaker_http(
     port: u16,
+    ws_port: u16,
     rooms: RoomRegistry,
 ) -> Result<()> {
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -81,7 +89,7 @@ pub async fn run_matchmaker_http(
                 // are one-shot endpoints, and a keep-alive state
                 // machine would inflate the surface by ~3x.
                 tokio::spawn(async move {
-                    if let Err(e) = handle_http_connection(stream, peer, rooms).await {
+                    if let Err(e) = handle_http_connection(stream, peer, rooms, ws_port).await {
                         debug!(%peer, "matchmaker HTTP connection ended: {e:?}");
                     }
                 });
@@ -101,6 +109,7 @@ async fn handle_http_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
     rooms: RoomRegistry,
+    ws_port: u16,
 ) -> Result<()> {
     debug!(%peer, "handle_http_connection entered");
     // Read up to MAX_REQUEST_LINE_BYTES + MAX_HEADERS_BYTES, or until
@@ -196,7 +205,7 @@ async fn handle_http_connection(
         ("GET", "/health") => {
             write_response(&mut stream, 200, "OK", "text/plain", b"ok").await
         }
-        ("POST", "/rooms") => handle_create_room(&mut stream, peer).await,
+        ("POST", "/rooms") => handle_create_room(&mut stream, peer, ws_port).await,
         ("GET", p) if p.starts_with("/rooms/") => {
             let id = &p[7..]; // strip "/rooms/"
             handle_get_room(&mut stream, peer, id, rooms).await
@@ -221,12 +230,22 @@ async fn handle_http_connection(
 /// is created lazily on the first WS/WT connection (via
 /// `ensure_room` in transport). This avoids the stale-room
 /// problem entirely for v1.
-async fn handle_create_room(stream: &mut TcpStream, peer: SocketAddr) -> Result<()> {
+///
+/// `listen_port` is the port the WS/WT listeners are bound to on
+/// the SAME address as this matchmaker (they share `peer_addr`).
+/// We include it in the returned `ws_url` / `wss_url` so the lobby
+/// can navigate directly. Caught by the real-canary smoke
+/// (`client/tools/lobby-real-canary-smoke.mjs`) on 2026-08-31 —
+/// without the port, the lobby's Create flow produced a URL like
+/// `ws://127.0.0.1/rooms/<id>` which the browser tried to resolve
+/// on port 80 (default WS) and got ERR_CONNECTION_REFUSED.
+async fn handle_create_room(stream: &mut TcpStream, peer: SocketAddr, listen_port: u16) -> Result<()> {
     let id = mint_room_id();
     let body = format!(
-        r#"{{"id":"{id}","ws_url":"ws://{peer_addr}/rooms/{id}","wss_url":"wss://{peer_addr}/rooms/{id}","max_players":{max}}}"#,
+        r#"{{"id":"{id}","ws_url":"ws://{peer_addr}:{port}/rooms/{id}","wss_url":"wss://{peer_addr}:{port}/rooms/{id}","max_players":{max}}}"#,
         id = id,
         peer_addr = peer.ip(),
+        port = listen_port,
         max = MAX_PLAYERS_PER_ROOM,
     );
     info!(%peer, room_id = %id, "POST /rooms → minted");

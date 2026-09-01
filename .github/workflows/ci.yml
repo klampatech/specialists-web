@@ -2256,6 +2256,73 @@ jobs:
   # whether `tools/canary-server.sh` accepts the new PR-#89 flags
   # (--port-wss, --cert-source) by grepping the script source, so
   # it works on main today AND on PR branches.
+  client-lobby-real-canary-smoke:
+    name: client — lobby real-canary smoke (PR #94 follow-up)
+    # PR #94 follow-up: catches server/client drift where matchmaker.rs's
+    # actual response shape diverges from what matchmakerApi.ts consumes.
+    # Drives the lobby's matchmaker HTTP endpoints (POST /rooms, GET
+    # /rooms/<id>) against a running canary WITHOUT page.route stubs —
+    # the existing client-lobby-smoke stubs the canary and would miss
+    # real-server bugs (caught ws_url missing-port bug + ServerTransport
+    # ignoring urlBase port bug on 2026-08-31). Boots canary + vite itself,
+    # so no SMOKE_NO_BOOT needed. ~30s runtime. Pure HTTP + Playwright
+    # (no WS/WT required for the assertions in current scope).
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — real-canary smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Run lobby real-canary smoke
+        working-directory: client
+        run: node tools/lobby-real-canary-smoke.mjs
+        env:
+          LOBBY_SMOKE_URL: http://localhost:5194/
+          CANARY_SERVER_PORT_WT: 14433
+          CANARY_SERVER_PORT_WS: 14434
+          CANARY_SERVER_PORT_HTTP: 18080
+          SMOKE_PNG: client/tools/lobby-real-canary-smoke.png
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lobby-real-canary-smoke-screenshot
+          path: client/tools/lobby-real-canary-smoke.png
+          if-no-files-found: warn
+      - name: Tear down canary + vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server.pid ]]; then kill "$(cat /tmp/canary-server.pid)" || true; fi
+          pkill -f canary-server.sh || true
+          pkill -f vite || true
+          for port in 14433 14434 18080 5194; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   client-canary-orchestrator-smoke:
     name: client — canary orchestrator smoke (PR #89 follow-up)
     # Depends on server-build so the canary binary is the same one

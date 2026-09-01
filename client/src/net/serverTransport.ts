@@ -240,6 +240,17 @@ export class ServerTransport {
   constructor(urlBase: string, roomId: string) {
     const u = new URL(urlBase);
     const host = u.hostname;
+    // PR 94 follow-up / real-canary smoke: honor the port from `urlBase`
+    // when it carries a non-default port (e.g. lobby's ?server= URL has
+    // ws://host:14934/rooms/<id>). Previously the transport IGNORED the
+    // port and always used `__damageServerPorts` defaults (14433/14434),
+    // which broke the lobby's end-to-end Create flow whenever the
+    // canary's WS port wasn't 14434. Now: if `urlBase` has an explicit
+    // port, use it; else fall back to `__damageServerPorts` (the legacy
+    // smoke-harness override). For WSS, default to wsPort+1 (the canary's
+    // convention) unless explicitly overridden.
+    //
+    // Original PR 11.6.C comment block, kept verbatim below.
     // WebTransport: HTTPS + UDP/4433. We need the TLS port; the
     // canary server's `--port-wt` flag determines this. The smoke
     // uses 14433 by default — but for the proxy-mounted case (vite
@@ -249,8 +260,17 @@ export class ServerTransport {
     // The transport reads the WT port from a global probe the smoke
     // sets (`window.__damageServerPorts`), defaulting to 14433.
     const ports = (globalThis as unknown as {__damageServerPorts?: {wt?: number; ws?: number; wss?: number}}).__damageServerPorts;
-    const wtPort = ports?.wt ?? 14433;
-    const wsPort = ports?.ws ?? 14434;
+    // PR 94 follow-up / real-canary smoke: when `urlBase` carries a
+    // non-default port AND no smoke-harness override is set, honor
+    // the urlBase port. This unbreaks the lobby's end-to-end Create
+    // flow whenever the canary's WS port isn't 14434 (the lobby's
+    // ?server= URL is `ws://host:<actual_port>/rooms/<id>`, and
+    // before this fix the transport IGNORED that port). If a smoke
+    // harness has set `__damageServerPorts.ws` (the historical
+    // PR 11.6.C override path), use that instead.
+    const urlPort = u.port !== "" ? Number(u.port) : undefined;
+    const wtPort = ports?.wt ?? urlPort ?? 14433;
+    const wsPort = ports?.ws ?? urlPort ?? 14434;
     this.wtUrl = `https://${host}:${wtPort}/rooms/${roomId}`;
     // PR 11.6.E / Session 2 — WSS URL. When the page is loaded over
     // HTTPS and the browser falls back from WebTransport to

@@ -35,7 +35,7 @@
 //   - Errors clear on the next user interaction (typing or
 //     clicking either button) — cleanest UX without a timer.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   isMatchmakerNetworkError,
@@ -81,6 +81,19 @@ export function Lobby() {
   // previous fetch is still in flight (caught by Claude Code
   // review, 2026-08-31).
   const joinSeqRef = useRef(0);
+  // PR 94 (lobby a11y) — DOM refs for focus management. The modal
+  // container is the focus-trap boundary (the keydown listener
+  // attaches here). The code input + Join button are the two
+  // focusable elements we cycle between with Tab/Shift+Tab
+  // (Create sits OUTSIDE the focus trap — reached by direct
+  // click or by tabbing in from outside the modal). The
+  // previously-focused ref captures whatever element had focus
+  // before the lobby mounted, so we can restore focus when the
+  // lobby unmounts.
+  const modalRef = useRef<HTMLDivElement>(null);
+  const codeInputRef = useRef<HTMLInputElement>(null);
+  const joinButtonRef = useRef<HTMLButtonElement>(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Inline status text shown while a fetch is in flight. Lives
   // in the same data-testid slot as `error` but with a neutral
@@ -121,7 +134,21 @@ export function Lobby() {
       // navigates away on the next tick.)
       const target = new URL(window.location.href);
       target.searchParams.set("server", ws_url);
-      window.location.href = target.toString();
+      // Popup-blocker / sandboxed-frame / etc. recovery (NB #3). The
+      // browser can throw on `window.location.href = ...` if it
+      // refuses the navigation. Without this try/catch, a blocked
+      // nav would leave `creating: true` forever with no error —
+      // the button would just sit greyed out. Reset state + surface
+      // a friendly message so the user can retry.
+      try {
+        window.location.href = target.toString();
+      } catch (navErr) {
+        setStatus(null);
+        setError(
+          "Navigation blocked. Click again or allow popups for this site.",
+        );
+        setCreating(false);
+      }
     } catch (e) {
       setStatus(null);
       if (isMatchmakerNetworkError(e)) {
@@ -169,9 +196,18 @@ export function Lobby() {
         return;
       }
       if (!r.exists) {
-        setError(`Room "${id}" not found. Ask the host to share a fresh link.`);
-        setRoomStatus(null);
-        setJoining(false);
+        // flushSync parity with the full-room branch directly below:
+        // the 3 setStates here are the "not found" path's terminal
+        // state write, and we want them committed to the DOM BEFORE
+        // the function returns (so the smoke's 10ms polling catches
+        // them deterministically). Without flushSync, React 18 batches
+        // them and a fast click race can leave the DOM stale for a
+        // frame — caught by Claude Code cross-vendor review (Nit #1).
+        flushSync(() => {
+          setError(`Room "${id}" not found. Ask the host to share a fresh link.`);
+          setRoomStatus(null);
+          setJoining(false);
+        });
         return;
       }
       if (r.players >= r.max) {
@@ -213,8 +249,15 @@ export function Lobby() {
       // catch it at all (the navigation races the
       // requestAnimationFrame poll). The yield is invisible
       // to the user (sub-millisecond) but enough for the
-      // browser to commit the React-driven DOM update.
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      // browser to commit the React-driven DOM update. We
+      // use Promise.resolve() (a microtask) instead of
+      // setTimeout(0) (a macrotask) because React's
+      // concurrent renderer + MutationObserver callbacks
+      // both run as microtasks — setTimeout(0) would
+      // over-yield into a 4ms+ idle window the smoke
+      // didn't need. Caught by Claude Code cross-vendor
+      // review (NB #4).
+      await Promise.resolve();
       // Build ws:// URL. We don't know the server's host:port from
       // the GET response (it intentionally doesn't echo them to
       // keep the API minimal). Default to `${origin}/rooms/<id>` —
@@ -225,7 +268,19 @@ export function Lobby() {
       const ws_url = `${wsProto}//${wsHost}/rooms/${id}`;
       const target = new URL(window.location.href);
       target.searchParams.set("server", ws_url);
-      window.location.href = target.toString();
+      // Same popup-blocker recovery shape as onCreate above:
+      // a throw here means the browser refused the navigation
+      // (popup blocker, sandboxed iframe, etc.) and we need to
+      // unwind the joining=true state + surface a clear error.
+      try {
+        window.location.href = target.toString();
+      } catch (navErr) {
+        setStatus(null);
+        setError(
+          "Navigation blocked. Click again or allow popups for this site.",
+        );
+        setJoining(false);
+      }
     } catch (e) {
       setStatus(null);
       setRoomStatus(null);
@@ -312,9 +367,75 @@ export function Lobby() {
     );
   };
 
+  // PR 94 (lobby a11y) — focus management. Three effects:
+  //
+  //   1. Capture previously-focused element on mount + focus the
+  //      code input (the modal's first focusable) on the next
+  //      animation frame. requestAnimationFrame defers the focus
+  //      until after the modal paints, so focus doesn't land on
+  //      <body> before the input is mounted in some browsers.
+  //   2. Restore focus to the previously-focused element on
+  //      unmount. On successful navigation this is a no-op (the
+  //      destination page is a fresh document). On external
+  //      `?lobby=1` removal the previously-focused element is
+  //      stale (about to unmount) but the .focus() call is still
+  //      cheap and safe.
+  //   3. Focus trap: Tab from Join → Code, Shift+Tab from Code →
+  //      Join. Plain keydown listener on the modal container
+  //      (matches the brief's recommended simpler approach vs
+  //      <dialog> element + polyfills). The Create button sits
+  //      outside the trap — direct click or external tab-in.
+  useEffect(() => {
+    previouslyFocusedRef.current =
+      document.activeElement as HTMLElement | null;
+    const raf = requestAnimationFrame(() => {
+      codeInputRef.current?.focus();
+    });
+    return () => {
+      cancelAnimationFrame(raf);
+      previouslyFocusedRef.current?.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    const modal = modalRef.current;
+    if (!modal) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Tab") return;
+      const code = codeInputRef.current;
+      const join = joinButtonRef.current;
+      if (!code || !join) return;
+      const active = document.activeElement;
+      if (e.shiftKey) {
+        // Shift+Tab from Code → Join.
+        if (active === code) {
+          e.preventDefault();
+          join.focus();
+        }
+      } else {
+        // Tab from Join → Code.
+        if (active === join) {
+          e.preventDefault();
+          code.focus();
+        }
+      }
+    };
+    modal.addEventListener("keydown", onKey);
+    return () => modal.removeEventListener("keydown", onKey);
+  }, []);
+
   return (
     <div
       data-testid="lobby"
+      // PR 94 (lobby a11y) — role=dialog + aria-modal=true tells
+      // assistive tech this is a modal surface (focus is trapped,
+      // outside content is inert). aria-labelledby points to the
+      // <h1> below so screen readers announce "Specialists" as
+      // the modal title when it opens.
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="lobby-title"
+      ref={modalRef}
       style={{
         position: "fixed",
         inset: 0,
@@ -328,7 +449,7 @@ export function Lobby() {
         zIndex: 100,
       }}
     >
-      <h1 style={{ fontSize: "1.6rem", margin: "0 0 0.4rem" }}>Specialists</h1>
+      <h1 id="lobby-title" style={{ fontSize: "1.6rem", margin: "0 0 0.4rem" }}>Specialists</h1>
       <p style={{ margin: 0, opacity: 0.7, fontSize: "0.9rem" }}>
         Server-authoritative combat · 24-player target
       </p>
@@ -346,6 +467,7 @@ export function Lobby() {
           data-testid="lobby-create"
           onClick={onCreate}
           disabled={creating}
+          aria-label="Create a new room"
           style={{
             padding: "0.8rem 1rem",
             background: creating ? "#444" : "#3563d3",
@@ -366,6 +488,9 @@ export function Lobby() {
             placeholder="Room code"
             spellCheck={false}
             autoComplete="off"
+            aria-label="Room code"
+            aria-describedby="lobby-code-help"
+            ref={codeInputRef}
             style={{
               flex: 1,
               padding: "0.8rem",
@@ -381,6 +506,8 @@ export function Lobby() {
             data-testid="lobby-join"
             onClick={onJoin}
             disabled={joining || !joinCode.trim()}
+            aria-label="Join an existing room by code"
+            ref={joinButtonRef}
             style={{
               padding: "0.8rem 1rem",
               background: joining || !joinCode.trim() ? "#444" : "#2c8c4d",
@@ -395,8 +522,38 @@ export function Lobby() {
           </button>
         </div>
 
+        {/*
+         * PR 94 (lobby a11y) — input help text. The code input's
+         * `aria-describedby="lobby-code-help"` points here so
+         * screen readers announce the hint alongside the input's
+         * accessible name ("Room code"). Visible to sighted
+         * users too — visible help text is more discoverable than
+         * tooltip-only patterns. The brief specifies this exact id.
+         */}
+        <p
+          id="lobby-code-help"
+          style={{ margin: 0, opacity: 0.7, fontSize: "0.8rem" }}
+        >
+          Ask the host for the room code.
+        </p>
+
         {renderRoomStatus()}
-        {renderInlineMessage()}
+        {/*
+         * PR 94 (lobby a11y) — aria-live="polite" wrapper around the
+         * inline message slot. Screen readers announce status /
+         * error changes ("Creating room…", "Matchmaker unreachable")
+         * without stealing focus. WCAG 4.1.3 (Status Messages). The
+         * wrapper is always present in the DOM; the inner <p>
+         * (lobby-busy or lobby-error) mounts/unmounts based on
+         * status / error state.
+         */}
+        <div
+          aria-live="polite"
+          aria-atomic="true"
+          data-testid="lobby-live-region"
+        >
+          {renderInlineMessage()}
+        </div>
       </div>
 
       <p style={{ marginTop: "2rem", fontSize: "0.75rem", opacity: 0.5 }}>
