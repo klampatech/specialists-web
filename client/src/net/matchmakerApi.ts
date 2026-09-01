@@ -25,7 +25,12 @@ export type CreateRoomResponse = {
 
 export type GetRoomResponse =
   | { exists: false }
-  | { exists: true; players: number; max: number };
+  // PR 95 follow-up: when exists:true, the matchmaker includes the
+  // ws_url so the lobby's Join path can navigate to the correct WS
+  // server without constructing it from `window.location.host`
+  // (which is the lobby page's host:port — Vite in dev, not the WS
+  // listener's port). Same shape as POST /rooms' `ws_url` field.
+  | { exists: true; players: number; max: number; ws_url: string };
 
 /** Error categories the matchmaker API can throw. Mirrored on
  *  the `cause` field of the thrown Error instance so the

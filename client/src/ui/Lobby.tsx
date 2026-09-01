@@ -258,14 +258,18 @@ export function Lobby() {
       // didn't need. Caught by Claude Code cross-vendor
       // review (NB #4).
       await Promise.resolve();
-      // Build ws:// URL. We don't know the server's host:port from
-      // the GET response (it intentionally doesn't echo them to
-      // keep the API minimal). Default to `${origin}/rooms/<id>` —
-      // matchmaker and game server share the same domain in
-      // production (PR 11.9 §3.5 architecture).
-      const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsHost = window.location.host;
-      const ws_url = `${wsProto}//${wsHost}/rooms/${id}`;
+      // Build ws:// URL from the matchmaker's response. The matchmaker
+      // knows its own WS listener's host:port (it's the one serving
+      // this GET), so it returns `ws_url` in the same shape as
+      // POST /rooms. Previously this used `window.location.host` —
+      // i.e. the lobby page's host:port — which is Vite's dev-server
+      // port (5194) in dev, NOT the WS listener's port (14934). That
+      // would have navigated the lobby to a broken URL and the
+      // browser would have ERR_CONNECTION_REFUSED on join. The
+      // matchmaker's ws_url (PR 95 fix to GET /rooms/<id>) is the
+      // authoritative answer. Caught by the real-canary smoke on
+      // 2026-09-01 (PR #94 follow-up).
+      const ws_url = r.ws_url;
       const target = new URL(window.location.href);
       target.searchParams.set("server", ws_url);
       // Same popup-blocker recovery shape as onCreate above:

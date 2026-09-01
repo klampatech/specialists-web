@@ -208,7 +208,7 @@ async fn handle_http_connection(
         ("POST", "/rooms") => handle_create_room(&mut stream, peer, ws_port).await,
         ("GET", p) if p.starts_with("/rooms/") => {
             let id = &p[7..]; // strip "/rooms/"
-            handle_get_room(&mut stream, peer, id, rooms).await
+            handle_get_room(&mut stream, peer, id, rooms, ws_port).await
         }
         _ => {
             write_response(
@@ -265,6 +265,7 @@ async fn handle_get_room(
     peer: SocketAddr,
     id: &str,
     rooms: RoomRegistry,
+    ws_port: u16,
 ) -> Result<()> {
     // Validate the ID against the same regex `parse_room_id` uses.
     // Anything else is a 400, not a 404 — it means the client is
@@ -305,10 +306,18 @@ async fn handle_get_room(
             .unwrap_or(0)
     };
 
+    // PR 95 follow-up: include `ws_url` in the response so the lobby's
+    // Join path can navigate to the correct WS server without
+    // constructing it from `window.location.host` (which is the lobby
+    // page's host:port — Vite in dev, not the WS listener's port).
+    // Same shape as POST /rooms' `ws_url` field — `ws://<peer_ip>:<ws_port>/rooms/<id>`.
     let body = format!(
-        r#"{{"exists":true,"players":{players},"max":{max}}}"#,
+        r#"{{"exists":true,"players":{players},"max":{max},"ws_url":"ws://{peer_addr}:{ws_port}/rooms/{id}"}}"#,
         players = players,
         max = MAX_PLAYERS_PER_ROOM,
+        peer_addr = peer.ip(),
+        ws_port = ws_port,
+        id = id,
     );
     debug!(%peer, room_id = %id, players, "GET /rooms/<id> → 200");
     write_response(stream, 200, "OK", "application/json", body.as_bytes()).await
