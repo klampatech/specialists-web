@@ -379,6 +379,66 @@ fn jitter_forward(
     (forward * cos_r + offset).normalize_or_zero()
 }
 
+// -- PR #114 — MeleeEvent proximity-cone hit detection --------------------
+//
+// Mirrors the client-side `isWithinMeleeCone` in
+// `client/src/game/combat.ts:384-400`. The cone math is identical:
+// a target is in the cone iff `forward.dot(delta_normalized) >=
+// cos(halfCone)` AND `delta.length() <= rangeMeters`.
+//
+// Server-side implementation exists for ONE reason: validation. The
+// server doesn't trust the client's claim that a melee landed (the
+// client could lie about yaw/pitch). The server re-runs the same
+// cone math against snapshot-known positions for every OTHER player
+// in the room. If the cone check passes, damage applies.
+//
+// Without this gate, a client could send a MeleeEvent claiming a hit
+// from across the map and the server would just apply damage.
+// Mitigation: server-side `melee_cone_hit` is the canonical authority.
+//
+// (Pre-PR-#114 the melee path was client-side-only per
+// `validate_and_relay_aim`'s docstring; `MELEE_MAX_RANGE_METERS = 1.5`
+// was defined but unused. PR #114 is what activates it.)
+
+/// PR #114 — proximity-cone melee hit detection. Same math as the
+/// client's `isWithinMeleeCone`. Returns `true` iff `target_pos` is
+/// within `max_range_meters` of `attacker_pos` AND inside the
+/// `cone_radians`-wide cone around `forward` (a unit vector).
+///
+/// **Range**: uses straight-line distance, not the ray's `t`
+/// projection (a target BEHIND the attacker at distance 0.5m is
+/// still 0.5m away — the cone math handles the behind-vs-front
+/// distinction via the dot product).
+///
+/// **Cone half-angle**: `cone_radians / 2`. The client's `COMBAT.melee`
+/// uses `coneRadians: Math.PI / 3` (= 60° total, ±30° from forward).
+/// Server's `MELEE_CONE_RADIANS = PI/3` mirrors this exactly. The
+/// dot product compares against `cos(halfCone)` = `cos(PI/6)` ≈ 0.866.
+pub fn melee_cone_hit(
+    attacker_pos: glam::Vec3,
+    forward: glam::Vec3,
+    target_pos: glam::Vec3,
+    cone_radians: f32,
+    max_range_meters: f32,
+) -> bool {
+    if !max_range_meters.is_finite() || cone_radians <= 0.0 {
+        return false;
+    }
+    let delta = target_pos - attacker_pos;
+    let distance = delta.length();
+    if distance > max_range_meters || distance <= 0.0 {
+        return false;
+    }
+    // forward should already be unit-length (from `forward_from_yaw_pitch`).
+    // delta should NOT be normalized yet — we already used its length above.
+    // Normalize delta now for the dot-product check.
+    let delta_n = delta / distance;
+    // Dot of two unit vectors = cosine of the angle between them.
+    // Target is inside the cone iff cosine >= cos(halfCone).
+    let cos_half = (cone_radians * 0.5).cos();
+    forward.dot(delta_n) >= cos_half
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

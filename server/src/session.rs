@@ -98,6 +98,13 @@ pub struct Player {
     /// this to enforce 1 switch/sec/player rate limit
     /// (`WEAPON_SWITCH_RATE_LIMIT_MS`).
     pub last_weapon_switch_at: Option<Instant>,
+    /// PR #114 — server-side per-player melee rate-limit timestamp.
+    /// The validator (`validate_and_relay_melee`) rejects any melee
+    /// request whose `last_melee_at` is within `MELEE_COOLDOWN_MS`
+    /// (220ms) of `now`. `None` means "has never swung" — first
+    /// swing always passes the rate-limit gate. Mirrors the
+    /// `last_reload_at` shape exactly.
+    pub last_melee_at: Option<Instant>,
     /// PR #106 — set by the recent AimEvent's `is_firing: 0` flag.
     /// Cleared when the next AimEvent reports `is_firing: 1` and
     /// the burst/fire-mode gate has fired its shots.
@@ -142,6 +149,9 @@ impl Player {
             // PR #106 — weapon-switch rate limit starts at None
             // (player hasn't switched yet → first switch always passes).
             last_weapon_switch_at: None,
+            // PR #114 — first melee swing passes the rate-limit
+            // gate (`None` means "has never swung").
+            last_melee_at: None,
             // PR #106 — trigger not held initially. Set to `true` when
             // the damage_relay sees `is_firing: 1`; cleared on
             // `is_firing: 0` or after the burst completes.

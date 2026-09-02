@@ -18,12 +18,15 @@
 //      against the TARGET's `PositionHistory`. The shooter's
 //      historical position is also rewound (same frame).
 //   3. Fire-rate cooldown — 120ms for fire (mirrors
-//      `COMBAT.dualPistol.fireCooldownMs`), 500ms for melee
-//      (documented choice — there's no client-side melee cooldown
-//      const so we pick a generous default that still prevents
-//      button-mashing exploits).
+//      `COMBAT.dualPistol.fireCooldownMs`), 220ms for melee
+//      (PR #114 — matches `COMBAT.melee.swingDurationMs = 220`,
+//      the client's swing animation duration; the bound is
+//      symmetrical — client can't send faster than its animation,
+//      server won't accept faster than its rate-limit).
 //   4. Ammo gate — `ammo` decrements by 1 per successful fire;
-//      reload is out of scope (PR 11.7+).
+//      reload is out of scope (PR 11.7+). Melee is exempt from
+//      the ammo gate (it's free to swing, per the original game's
+//      "no-ammo-melee" design).
 //   5. eventId monotonicity — the source tab issues a monotonic u32;
 //      the server rejects stale eventIds per source.
 
@@ -37,8 +40,11 @@ use specialists_server::constants::{
 };
 use specialists_server::hitscan::{
     chest_position, dual_pistol_damage, dual_pistol_hit, forward_from_yaw_pitch,
+    melee_cone_hit,
 };
-use specialists_server::protocol::{AimEvent, DamageBroadcast, ReloadRequest, WeaponSwitch};
+use specialists_server::protocol::{
+    AimEvent, DamageBroadcast, MeleeEvent, ReloadRequest, WeaponSwitch,
+};
 use specialists_server::session::{PlayerId, Room, ServerFrame};
 
 /// Fire-rate cooldown for the dual-pistol (matches
@@ -74,10 +80,16 @@ use specialists_server::session::{PlayerId, Room, ServerFrame};
 // always punished by the server's cooldown gate; the client can't
 // gain advantage by misreporting.
 
-/// Cooldown for melee. No client-side constant exists; 500ms is a
-/// generous default that prevents button-mashing but doesn't punish
-/// aggressive play. PR 11.7+ can revisit if a client constant is added.
-const MELEE_COOLDOWN_MS: u64 = 500;
+/// Cooldown for melee. PR #114 — matches the client-side
+/// `COMBAT.melee.swingDurationMs = 220` (the animation duration).
+/// The bound is symmetrical: client can't send faster than its
+/// swing animation; server won't accept faster than its rate-limit.
+/// Pre-#114 the value was 500ms (a speculative default per the
+/// PR 11.6.D brief); PR #114 retunes it to 220ms now that the
+/// client-side constant exists. The earlier value is still seen
+/// in git history (`MELEE_COOLDOWN_MS: u64 = 500` in the pre-#114
+/// damage_relay.rs) — kept in mind when bisecting regressions.
+pub const MELEE_COOLDOWN_MS: u32 = 220;
 /// Generous upper bound on `req.amount`. The current dual-pistol
 /// damage is 12 (`DUAL_PISTOL_DAMAGE`), melee is 25. 100 covers any
 /// future damage type the wire format allows (u8).
@@ -103,6 +115,12 @@ pub const MELEE_DAMAGE: u8 = 25;
 /// The 50m pistol range would allow a "melee" hit from across
 /// the map — clearly wrong.
 pub const MELEE_MAX_RANGE_METERS: f32 = 1.5;
+/// PR #114 — melee cone half-angle (full cone width is 60° = π/3).
+/// Matches `client/src/game/combat.ts:COMBAT.melee.coneRadians =
+/// Math.PI / 3`. Server's `melee_cone_hit` in `hitscan.rs` uses
+/// this constant; the dot-product compares against `cos(halfCone)`
+/// = `cos(π/6)` ≈ 0.866.
+pub const MELEE_CONE_RADIANS: f32 = std::f32::consts::PI / 3.0;
 /// PR 11.7.E / §3.5 — bounded window for the eventId monotonicity
 /// gate on `validate_and_relay_reload`. Mirrors
 /// `EVENT_ID_WINDOW` from the AimEvent path -- allows tab reloads
@@ -781,6 +799,194 @@ pub fn validate_and_relay_weapon_switch(
     );
     true
 }
+
+// PR #114 — MeleeEvent validator. The melee path is
+// "client-sends-intent → server-runs-cone-check → server-broadcasts
+// damage". Mirrors `validate_and_relay_aim`'s 8-gate structure but
+// with melee-specific gates: no ammo, no fire-rate, but yes cone
+// + range + cooldown.
+//
+// **Differences from validate_and_relay_aim**:
+//   - Gate 4 (fire-rate cooldown) → **melee cooldown** (220ms,
+//     mirrors client swing animation duration).
+//   - Gate 5 (ammo) → **REMOVED**. Melee is free to swing; no
+//     `ammo` decrement on success.
+//   - Gate 9-10 (raycast hit + damage application) → **cone hit**
+//     (proximity-based, not ray-vs-sphere). Damage = MELEE_DAMAGE
+//     (25, single fixed value matching client-side COMBAT.melee).
+//
+// **Why no lag-comp rewind for melee?** The cone hit is proximity-
+// based (`melee_cone_hit` checks target position at the server's
+// latest snapshot, not the rewound position). At 1.5m range + a
+// 220ms swing cooldown, the target can move at most ~0.5m in that
+// window (typical player speed) — well within the 60° cone at 1.5m
+// distance (the cone radius is ~1.5m at the edge). Lag-comp on
+// melee is unnecessary complexity for the precision gain. If the
+// play test reveals lag-feel issues, add rewind later.
+pub fn validate_and_relay_melee(
+    req: &MeleeEvent,
+    source_player_id: PlayerId,
+    room: &mut Room,
+    _client_rtt_ms: u32,
+    now: Instant,
+) -> Vec<DamageBroadcast> {
+    // --- Gate 1: source in room -----------------------------------------
+    let req_source = req.source_player_id;
+    if !room.players.contains_key(&req_source) {
+        warn!(
+            source = req_source,
+            "validate_and_relay_melee: rejected - source not in room",
+        );
+        return vec![];
+    }
+    // --- Gate 2: connection PlayerId anti-spoof ------------------------
+    if source_player_id != req_source {
+        warn!(
+            connection_id = source_player_id,
+            req_source = req_source,
+            "validate_and_relay_melee: rejected - connection PlayerId mismatch",
+        );
+        return vec![];
+    }
+    // --- Gate 3: eventId bounded-window per source -------------------
+    let last_event_id = room
+        .last_event_id_for_source
+        .get(&req_source)
+        .copied()
+        .unwrap_or(0);
+    if req.event_id.saturating_add(EVENT_ID_WINDOW) < last_event_id {
+        warn!(
+            source = req_source,
+            event_id = req.event_id,
+            last_event_id = last_event_id,
+            window = EVENT_ID_WINDOW,
+            "validate_and_relay_melee: rejected - eventId more than EVENT_ID_WINDOW behind last_event_id",
+        );
+        return vec![];
+    }
+    // --- Gate 4: melee cooldown (PR #114 — independent of fire-rate) -
+    if let Some(last_melee) = room.players[&req_source].last_melee_at {
+        let cooldown = std::time::Duration::from_millis(MELEE_COOLDOWN_MS as u64);
+        if now.duration_since(last_melee) < cooldown {
+            debug!(
+                source = req_source,
+                since_last_ms = now.duration_since(last_melee).as_millis() as u64,
+                cooldown_ms = MELEE_COOLDOWN_MS,
+                "validate_and_relay_melee: rejected - melee cooldown not elapsed",
+            );
+            return vec![];
+        }
+    }
+    // --- Gate 5: source is alive (no ammo gate for melee) -------------
+    if room.players[&req_source].hp == 0 {
+        warn!(
+            source = req_source,
+            "validate_and_relay_melee: rejected - source HP is 0 (dead)",
+        );
+        return vec![];
+    }
+    // --- Gate 6: yaw/pitch/frame validity -----------------------------
+    if !req.yaw_radians.is_finite() || !req.pitch_radians.is_finite() {
+        warn!(
+            source = req_source,
+            "validate_and_relay_melee: rejected - non-finite yaw/pitch",
+        );
+        return vec![];
+    }
+    // --- Gate 7: per-player eventId update + last_melee_at stamp ------
+    // All gates before this point are zero-cost when they fail (no
+    // side effects). This is the first point where we mutate state,
+    // so it's the natural commit point.
+    let new_last_event_id = req.event_id.max(last_event_id);
+    room.last_event_id_for_source
+        .insert(req_source, new_last_event_id);
+    room.players.get_mut(&req_source).unwrap().last_melee_at = Some(now);
+
+    // --- Gate 8: cone-vs-position hit detection ------------------------
+    // Derive the source's forward direction from the claim's yaw +
+    // pitch (server trusts this claim for melee — anti-cheat is
+    // Phase 4 / PR 11.10). Iterate all OTHER players in the room
+    // and run `melee_cone_hit` against each. If a target is in the
+    // cone, emit a DamageBroadcast for that target.
+    //
+    // Position source: `room.position_history[source].snapshot_at(LATEST)`.
+    // Melee doesn't lag-comp (proximity-based; the cone is wide
+    // enough that a single-tick target offset doesn't matter). The
+    // `PositionHistory::snapshot_at(frame)` API accepts `u32::MAX`
+    // and returns the latest recorded position.
+    let source_pos = match room.position_history[&req_source].snapshot_at(u32::MAX) {
+        Some(pos) => chest_position(glam::Vec3::new(pos.x, pos.y, 0.0)),
+        None => {
+            // Source hasn't sent any PositionUpdates yet. Without a
+            // position we can't run the cone check. Skip — same as
+            // the AimEvent path's "target history empty" branch.
+            warn!(
+                source = req_source,
+                "validate_and_relay_melee: skipped - source has no position history",
+            );
+            return Vec::new();
+        }
+    };
+    let forward = forward_from_yaw_pitch(req.yaw_radians, req.pitch_radians);
+    let mut broadcasts = Vec::new();
+    let target_ids: Vec<PlayerId> = room
+        .players
+        .keys()
+        .copied()
+        .filter(|&id| id != req_source)
+        .collect();
+    for target_id in target_ids {
+        let target = &room.players[&target_id];
+        // Skip dead targets — no point damaging a corpse.
+        if target.hp == 0 {
+            continue;
+        }
+        let Some(target_pos_2d) = room.position_history[&target_id].snapshot_at(u32::MAX) else {
+            // Target hasn't sent any PositionUpdates yet (the
+            // snapshot's slot for this player is missing). Skip —
+            // can't compute a cone check without a position.
+            continue;
+        };
+        // The game is 2D-on-y (fixed chest-height per `chest_position`'s
+        // +0.45 offset) — mirror the AimEvent path's z-handling
+        // (target_pos.z = source_origin.z so the raycast stays on
+        // the attacker's horizontal plane).
+        let target_pos = chest_position(glam::Vec3::new(
+            target_pos_2d.x,
+            target_pos_2d.y,
+            source_pos.z,
+        ));
+        if melee_cone_hit(
+            source_pos,
+            forward,
+            target_pos,
+            MELEE_CONE_RADIANS,
+            MELEE_MAX_RANGE_METERS,
+        ) {
+            // Hit! Emit a DamageBroadcast for this target.
+            let bc = DamageBroadcast {
+                server_frame: room.next_server_frame,
+                server_seq: room.next_seq(),
+                source_player_id: req_source,
+                target_player_id: target_id,
+                source: 1, // 1 = melee (per `DAMAGE_SOURCE_MELEE`)
+                amount: MELEE_DAMAGE,
+                origin_event_id: req.event_id,
+            };
+            broadcasts.push(bc);
+        }
+    }
+    if !broadcasts.is_empty() {
+        debug!(
+            source = req_source,
+            hits = broadcasts.len(),
+            "validate_and_relay_melee: applied ({} hit(s))",
+            broadcasts.len(),
+        );
+    }
+    broadcasts
+}
+
 pub fn relay_broadcast(bc: &DamageBroadcast) -> Vec<u8> {
     let body = specialists_server::protocol::encode_damage_broadcast(bc);
     let mut out = Vec::with_capacity(1 + body.len());
