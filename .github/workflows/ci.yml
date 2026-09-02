@@ -2462,6 +2462,71 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
+  client-crosshair-smoke:
+    name: client — crosshair smoke (weapon-aware color/spread + recoil, PR #110)
+    # PR #110: closes the "no crosshair in the codebase" gap that
+    # PR #108 explicitly deferred as a feature-add. Boots canary on
+    # 14447/14448/18086 + vite on 5196 (next slot after weapon-switch
+    # per docs/PR-105-spec.md §2.4), 2-tab Playwright drives Tab A's
+    # weapon-switch + LMB keypress sequence, asserts the crosshair's
+    # data-* attributes reflect the per-weapon color + spread
+    # (DualPistol grey ~18px, Shotgun orange ~31px, Sniper red ~14px)
+    # AND the recoil-spread cue widens to ~1.6× while LMB is held.
+    # Catches the PR #110 contract:
+    #   - Crosshair component renders with correct per-weapon color
+    #   - Crosshair is reactive to snapshot-driven weapon switches
+    #   - Crosshair widens on fire (recoil cue, 1.6×)
+    #   - Crosshair does NOT eat pointer events (LMB fires successfully
+    #     and the 1.6× recoil cue is observable end-to-end)
+    # ~30-50s runtime.
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — crosshair smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Run crosshair smoke
+        working-directory: client
+        # 5min cap: locally the smoke runs in 30-50s. CI cold-cache
+        # canary boot takes ~30s on top of vite startup. 5min leaves
+        # wide margin without consuming CI minutes if a regression
+        # hangs the smoke.
+        run: node tools/crosshair-smoke.mjs
+        timeout-minutes: 5
+      - name: Tear down canary + vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server.pid ]]; then kill "$(cat /tmp/canary-server.pid)" || true; fi
+          pkill -f canary-server.sh || true
+          pkill -f vite || true
+          for port in 14447 14448 18086 5196; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   client-canary-orchestrator-smoke:
     name: client — canary orchestrator smoke (PR #89 follow-up)
     # Depends on server-build so the canary binary is the same one

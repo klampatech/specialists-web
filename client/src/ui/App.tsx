@@ -22,6 +22,7 @@ import { createScene, type SceneHandle } from "../engine/scene";
 import { PLAYER_MAX_AMMO } from "../engine/characterConfig";
 import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
+import { Crosshair } from "./Crosshair"; // PR #110 — center-screen weapon-aware crosshair.
 import { DebugHud } from "./DebugHud";
 import { PauseMenu } from "./PauseMenu";
 import { Lobby } from "./Lobby";
@@ -82,8 +83,13 @@ interface HudState {
    *  `_setLocalWeaponStateFromSnapshot`). */
   weaponId: number;
   /** PR #108 — current fire-mode index (0=Semi, 1=Burst3 on DualPistol).
-   *  Same source as `weaponId`. */
+   *  Drives the BulletHud chip's fire-mode label ("SEMI" / "BURST"). */
   fireModeIndex: number;
+  /** PR #110 — local fire-held flag. Drives `<Crosshair>`'s recoil-
+   *  spread cue (1.6× radius while LMB is held). Sourced from
+   *  `gameSession.getFireHeld()` which returns the most recent
+   *  tick's `input.fireHeld`. */
+  fireHeld: boolean;
 }
 
 export function App() {
@@ -167,6 +173,9 @@ export function App() {
     // authoritative state differs.
     weaponId: 0, // DualPistol
     fireModeIndex: 0, // Semi
+    // PR #110 — no local fire held at page load; first tick
+    // overwrites via `session.getFireHeld()`.
+    fireHeld: false,
   });
 
   // PR 11.7.D2 / §3.10 — WebRTC peer / __peer / __smokeSignal /
@@ -306,6 +315,10 @@ export function App() {
             fireModeIndex: session.getLocalWeaponState
               ? session.getLocalWeaponState().fireModeIndex
               : h.fireModeIndex,
+            // PR #110 — local fire-held flag for the Crosshair's
+            // recoil-spread cue. Polled at the same 10Hz cadence as
+            // the rest of the HUD state.
+            fireHeld: session.getFireHeld ? session.getFireHeld() : h.fireHeld,
           }));
         }, 100);
         // Stash the timer on the scene ref so unmount can clear it.
@@ -388,6 +401,17 @@ export function App() {
             reloadProgressMs={1500}
             weaponId={hud.weaponId}
             fireModeIndex={hud.fireModeIndex}
+          />
+          {/* PR #110 — center-screen weapon-aware crosshair.
+              Reads weaponId/fireModeIndex/fireHeld from the same
+              HudState that drives BulletHud (coherent data
+              source). Renders nothing extra in dev — the crosshair
+              is always on (even pre-pointer-lock) so the player
+              can see their weapon state from the lobby. */}
+          <Crosshair
+            weaponId={hud.weaponId}
+            fireModeIndex={hud.fireModeIndex}
+            fireHeld={hud.fireHeld}
           />
           {/* PR 11.2: pause / loadout menu overlay. Visible when the
               pointer is unlocked AND the user has locked at least once
