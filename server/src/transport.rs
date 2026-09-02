@@ -75,10 +75,11 @@ use specialists_server::constants::DEVBX_ROOM_ID;
 use specialists_server::position_history::Position;
 use specialists_server::protocol::{
     decode_aim_event, decode_inputs_server, decode_ping, decode_position_update,
-    decode_reload_request, encode_pong, DISCRIMINATOR_AIM_EVENT,
+    decode_reload_request, decode_weapon_switch, encode_pong, DISCRIMINATOR_AIM_EVENT,
     DISCRIMINATOR_DAMAGE_BROADCAST, DISCRIMINATOR_DAMAGE_REQUEST, DISCRIMINATOR_INPUTS, DISCRIMINATOR_INPUTS_SERVER,
     DISCRIMINATOR_PING, DISCRIMINATOR_PONG, DISCRIMINATOR_POSITION_UPDATE,
-    DISCRIMINATOR_RELOAD_REQUEST, DISCRIMINATOR_SNAPSHOT, Pong,
+    DISCRIMINATOR_RELOAD_REQUEST, DISCRIMINATOR_SNAPSHOT,
+    DISCRIMINATOR_WEAPON_SWITCH, Pong,
 };
 use specialists_server::session::{EncodedInput, PlayerId, Room, ServerFrame};
 
@@ -1524,6 +1525,55 @@ pub(super) async fn handle_binary(
             );
             vec![]
         }
+        DISCRIMINATOR_WEAPON_SWITCH => {
+            // PR #107 — `0x0C WeaponSwitch` wire. Body is 4 bytes
+            // (source_player_id u16 + weapon_id u8 + fire_mode_index u8).
+            // The handler is server-side authoritative: validate 5
+            // gates (source-in-room, anti-spoof, rate-limit,
+            // weapon-id-known, fire-mode-index-in-range) then mutate
+            // `room.players[source]` via `apply_weapon_switch`. The
+            // mutation lands in the next 20Hz snapshot — no private
+            // ack packet.
+            let Some(req) = decode_weapon_switch(&payload[1..]) else {
+                warn!("weaponSwitch: decoder rejected malformed payload");
+                return vec![];
+            };
+            // Anti-spoof — same pattern as ReloadRequest: prefer
+            // the connection's claimed_player_id (set by the first
+            // DamageRequest), fall back to the request's claimed
+            // source if the connection hasn't sent any other
+            // packet yet.
+            let claimed_player_id = {
+                let conn = connection_state.lock().unwrap();
+                conn.claimed_player_id.get()
+            };
+            let connection_player_id = match claimed_player_id {
+                Some(id) => id,
+                None => req.source_player_id,
+            };
+            let room_id = connection_state.lock().unwrap().room_id();
+            let room_arc = ensure_room(rooms, &room_id).await;
+            let mut room_guard = room_arc.write().await;
+            // Auto-register the source (mirrors the ReloadRequest
+            // path — a tab that hasn't sent any other packet yet
+            // should still be able to switch weapons).
+            room_guard.add_player(connection_player_id);
+            let now = Instant::now();
+            let applied = specialists_server::damage_relay::validate_and_relay_weapon_switch(
+                &req,
+                connection_player_id,
+                &mut *room_guard,
+                now,
+            );
+            debug!(
+                source = req.source_player_id,
+                applied,
+                weapon_id = req.weapon_id,
+                fire_mode_index = req.fire_mode_index,
+                "weaponSwitch processed"
+            );
+            vec![]
+        }
         other => {
             warn!(
                 discriminator = other,
@@ -1764,6 +1814,7 @@ mod tests {
             pitch_radians: 0.0,
             frame: 10,
             event_id: 0xcafebabe,
+            is_firing: 1, // PR #107
         };
         let mut payload = vec![DISCRIMINATOR_AIM_EVENT];
         payload.extend(encode_aim_event(&req));

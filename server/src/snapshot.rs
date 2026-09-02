@@ -173,6 +173,7 @@ impl SnapshotGenerator {
                 ammo,
                 is_firing: 0, // PR 11.7.E wires the fire bit
                 weapon_id,    // PR #102 — from player.current_weapon (default DualPistol)
+                current_fire_mode: 0, // PR #107 — default to first mode (Semi)
             });
         }
 

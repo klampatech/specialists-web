@@ -23,7 +23,9 @@ fn aim_event_is_19_bytes() {
         pitch_radians: -0.456,
         frame: 0xdeadbeef,
         event_id: 0x12345678,
-    };
+        is_firing: 1,
+        }
+;
     let body = encode_aim_event(&req);
     assert_eq!(body.len(), AIM_EVENT_BODY_SIZE);
     assert_eq!(body.len(), 18, "AimEvent body must be 18 bytes (2+4+4+4+4)");
@@ -36,13 +38,15 @@ fn aim_event_is_19_bytes() {
 }
 
 #[test]
-fn aim_event_roundtrip_preserves_all_fields() {
-    let original = AimEvent {
+fn aim_event_roundtrip_preserves_all_fieAimEvent {
         source_player_id: 7,
         yaw_radians: 1.5707963, // pi/2
         pitch_radians: -0.5,
         frame: 0xfeedface,
         event_id: 0x01020304,
+        is_firing: 1,
+        }
+event_id: 0x01020304,
     };
     let bytes = encode_aim_event(&original);
     let decoded = decode_aim_event(&bytes).expect("decode must succeed");
@@ -53,12 +57,15 @@ fn aim_event_roundtrip_preserves_all_fields() {
     assert_eq!(decoded.event_id, original.event_id);
 }
 
-#[test]
-fn aim_event_rejects_wrong_size() {
-    let req = AimEvent {
+#[teAimEvent {
         source_player_id: 1,
         yaw_radians: 0.0,
         pitch_radians: 0.0,
+        frame: 1,
+        event_id: 1,
+        is_firing: 1,
+        }
+ans: 0.0,
         frame: 1,
         event_id: 1,
     };
@@ -76,11 +83,15 @@ fn aim_event_rejects_wrong_size() {
 #[test]
 fn aim_event_is_big_endian() {
     // §3.5: AimEvent wire layout = [disc][source u16 BE][yaw f32 BE]
-    // [pitch f32 BE][frame u32 BE][event_id u32 BE]. Total 19 bytes.
-    let req = AimEvent {
+   AimEvent {
         source_player_id: 0x0506,
         yaw_radians: 0.0,    // f32 bits = 0x00000000
         pitch_radians: 0.0,  // f32 bits = 0x00000000
+        frame: 0x01020304,
+        event_id: 0x0a0b0c0d,
+        is_firing: 1,
+        }
+ bits = 0x00000000
         frame: 0x01020304,
         event_id: 0x0a0b0c0d,
     };
