@@ -307,6 +307,7 @@ async function runSmoke() {
           pitchRadians: 0.0,
           frame: currentFrame,
           eventId,
+          isFiring: 1, // PR #107 — Burst state machine: trigger-press
         });
         // Also probe the underlying transport directly to confirm
         // the wire encoder + transport send path are healthy post-#59.
@@ -325,8 +326,8 @@ async function runSmoke() {
     if (!aimFireResult.ok) {
       throw new Error(`sendAimEvent failed: ${aimFireResult.reason}`);
     }
-    if (aimFireResult.wireSize !== 19) {
-      throw new Error(`AimEvent wire size = ${aimFireResult.wireSize} (expected 19: 1 disc + 18 body)`);
+    if (aimFireResult.wireSize !== 20) {
+      throw new Error(`AimEvent wire size = ${aimFireResult.wireSize} (expected 20: 1 disc + 19 body — PR #107 added the is_firing byte)`);
     }
     log(`AimEvent sent (wire=${aimFireResult.wireSize} bytes, eventId=0x${aimEventId.toString(16)})`);
 
