@@ -508,7 +508,9 @@ async function runSmoke() {
     // (rejected with a `warn!()` log per server/src/transport.rs:589).
     // PR 11.7.D2 / §3.5 — `lastInputsSeq` trailer makes inputsServer
     // wire size 21 (was 17 pre-D2).
-    const EXPECTED = { aimEvent: 19, damageRequest: 15, damageBroadcast: 19, positionUpdate: 15, ping: 5, inputsServer: 21 };
+    // PR #107 — `is_firing` byte added to AimEvent (body 18→19 bytes,
+    // wire 19→20 bytes). See protocol/damage.ts::AIM_EVENT_WIRE_SIZE.
+    const EXPECTED = { aimEvent: 20, damageRequest: 15, damageBroadcast: 19, positionUpdate: 15, ping: 5, inputsServer: 21 };
     for (const [k, v] of Object.entries(EXPECTED)) {
       if (wireSizes[k] !== v) {
         throw new Error(`Wire size mismatch for ${k}: got ${wireSizes[k]}, expected ${v}`);
