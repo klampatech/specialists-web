@@ -202,7 +202,15 @@ async function sendMeleeSwing(page, yawRadians) {
   // The smoke's job is to verify the WIRE round-trip, not the
   // keyboard binding. Keyboard binding has its own coverage in
   // the input listener's vitest boundary tests.
-  return await page.evaluate(({ yawRadians, eventId }) => {
+  //
+  // **eventId monotonicity**: use `bus.nextMeleeEventId()` (the
+  // per-tab monotonic counter from `damageBus.ts`) instead of
+  // a random u32. The server's `validate_and_relay_melee` gate #3
+  // rejects eventIds more than EVENT_ID_WINDOW (=64) behind the
+  // last seen per source — random u32s almost always fail this
+  // check. The monotonic counter starts at 1 and increments, so
+  // every eventId is always > last_event_id + window.
+  return await page.evaluate(({ yawRadians }) => {
     const bus = (window).__damageBus;
     const snap = (window).__latestSnap?.();
     if (!bus) return { ok: false, reason: "no __damageBus" };
@@ -213,8 +221,12 @@ async function sendMeleeSwing(page, yawRadians) {
         busKeys: Object.keys(bus).slice(0, 20),
       };
     }
+    if (typeof bus.nextMeleeEventId !== "function") {
+      return { ok: false, reason: "bus.nextMeleeEventId is not a function" };
+    }
     if (!snap) return { ok: false, reason: "no __latestSnap" };
     try {
+      const eventId = bus.nextMeleeEventId();
       const result = bus.sendMeleeEvent({
         sourcePlayerId: (window).__localPlayerId ?? 1,
         yawRadians: yawRadians ?? 0,
@@ -226,7 +238,7 @@ async function sendMeleeSwing(page, yawRadians) {
     } catch (e) {
       return { ok: false, reason: `sendMeleeEvent threw: ${String(e)}` };
     }
-  }, { yawRadians: yawRadians ?? Math.PI / 2, eventId: Math.floor(Math.random() * 0xFFFFFFFF) });
+  }, { yawRadians: yawRadians ?? Math.PI / 2 });
 }
 
 async function faceAway(page, yawRadians) {

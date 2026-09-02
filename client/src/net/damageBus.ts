@@ -554,6 +554,16 @@ export interface DamageBusProbe {
   decodePositionUpdate: typeof decodePositionUpdate;
   decodePing: typeof decodePing;
   decodePong: typeof decodePong;
+  /** PR #114 — monotonic per-tab counter for MeleeEvent eventIds.
+   *  Exposed on the probe so the smoke's `sendMeleeSwing` can
+   *  pull a fresh eventId instead of using a random u32 (which
+   *  the server's `validate_and_relay_melee` gate #3 rejects
+   *  via the EVENT_ID_WINDOW check). */
+  nextMeleeEventId: typeof nextMeleeEventId;
+  /** PR #107 / PR #59 — same shape, for AimEvent. */
+  nextAimEventId: typeof nextAimEventId;
+  /** PR 11.7.E — same shape, for ReloadRequest. */
+  nextReloadEventId: typeof nextReloadEventId;
 }
 
 export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
@@ -602,5 +612,15 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
     decodePositionUpdate,
     decodePing,
     decodePong,
+    /** PR #114 — monotonic per-tab counter for MeleeEvent eventIds.
+     *  Exposed on the probe so the smoke's `sendMeleeSwing` can
+     *  pull a fresh eventId instead of using a random u32 (which
+     *  the server's `validate_and_relay_melee` gate #3 rejects
+     *  via the EVENT_ID_WINDOW check). */
+    nextMeleeEventId,
+    /** PR #107 / PR #59 — same shape, for AimEvent. */
+    nextAimEventId,
+    /** PR 11.7.E — same shape, for ReloadRequest. */
+    nextReloadEventId,
   };
 }
