@@ -58,12 +58,36 @@ export const DISCRIMINATOR_INPUTS_SERVER = 0x06;
  *  client-raycast-verified `DamageRequest` (0x01) path -- PR #59
  *  drops the 0x01 path entirely. */
 export const DISCRIMINATOR_AIM_EVENT = 0x0A;
-// PR 11.7.B: bumped from 0x07 to 0x0C. The brief locks
-// DISCRIMINATOR_SNAPSHOT = 0x07 and the plan §3.5 reserves 0x07-0x0B
-// for PR 11.7 types (Snapshot/StateAck/InputSeq/ReloadRequest/
-// StateResyncRequest). 0x0C is the next free slot. Server-side
-// `server/src/protocol.rs::DISCRIMINATOR_DAMAGE_REJECT` moves in
-// lockstep.
+// PR #107 — weapon-switch wire type. The brief locks
+// `DISCRIMINATOR_SNAPSHOT = 0x07` and the plan §3.5 reserves
+// 0x07-0x0B for PR 11.7 types (Snapshot/StateAck/InputSeq/
+// ReloadRequest/StateResyncRequest). 0x0C is the next free slot
+// after those reservations.
+//
+// **PR #107 reclaims the 0x0C slot from `DAMAGE_REJECT`** (see
+// `DISCRIMINATOR_DAMAGE_REJECT` below). DamageReject was a
+// vestigial type from PR 11.6.D — defined + encoder present but
+// the transport router never had a matching dispatcher arm. The
+// server-side tombstone (with `#[deprecated]`) keeps the encoder
+// around for source compatibility; the client mirror follows the
+// same pattern (see `DAMAGE_REJECT_BODY_SIZE` /
+// `encodeDamageReject` / `decodeDamageReject`).
+//
+// **No client-side `0x0C → DamageReject` fallback decoder in PR
+// #108** (per Kyle's call on the PR #107 carry-forward). The
+// `next-deploy-is-all-clients-new` mitigation in
+// `docs/PR-105-spec.md` §2.4 assumes all client tabs refresh
+// within the deploy window — anyone with a cached JS bundle is
+// broken anyway because PlayerState also changed shape (30→31).
+// The `DAMAGE_REJECT` slot becomes `WeaponSwitch`, full stop.
+export const DISCRIMINATOR_WEAPON_SWITCH = 0x0C;
+// PR #107 — tombstone for the old DAMAGE_REJECT discriminator.
+// The 0x0C slot was reclaimed by PR #107's `WeaponSwitch` wire;
+// DAMAGE_REJECT was a vestigial type from PR 11.6.D (encoder
+// present but never sent on the wire). The constant + the
+// `encodeDamageReject` / `decodeDamageReject` pair are retained
+// for source compatibility but are no longer dispatched by the
+// transport router. Future cleanup PR can delete them.
 export const DISCRIMINATOR_DAMAGE_REJECT = 0x0C;
 
 // -- Body-size constants (mirror of server/src/protocol.rs) ----------------
@@ -80,12 +104,16 @@ export const PONG_BODY_SIZE = 8;
 /** PR 11.6.D FIX 4: body size of `DamageReject` (event_id u32 BE +
  *  reason u8 = 5 bytes). Wire-format stable — server `ca9f177`. */
 export const DAMAGE_REJECT_BODY_SIZE = 5;
-/** PR #59 / §3.5 — body size of `AimEvent`. Body = 2 (source_player_id
- *  u16 BE) + 4 (yaw_radians f32 BE) + 4 (pitch_radians f32 BE) +
- *  4 (frame u32 BE) + 4 (event_id u32 BE) = 18 bytes. No
- *  `target_player_id` field on the wire — the server iterates all
- *  OTHER players in the room. */
-export const AIM_EVENT_BODY_SIZE = 2 + 4 + 4 + 4 + 4;
+/** PR #59 / §3.5 + PR #107 — body size of `AimEvent`. Body = 2
+ *  (source_player_id u16 BE) + 4 (yaw_radians f32 BE) + 4
+ *  (pitch_radians f32 BE) + 4 (frame u32 BE) + 4 (event_id u32 BE)
+ *  + 1 (is_firing u8 — PR #107) = 19 bytes. The `is_firing` byte
+ *  drives the server-side burst state machine in
+ *  `damage_relay::validate_and_relay_aim`: Semi/Burst require the
+ *  trigger to release (`is_firing: 0`) before another pull
+ *  re-engages; Auto doesn't. No `target_player_id` field on the
+ *  wire — the server iterates all OTHER players in the room. */
+export const AIM_EVENT_BODY_SIZE = 2 + 4 + 4 + 4 + 4 + 1;
 /** PR 11.6.D FIX 4: reject reason codes. Wire-format stable —
  *  mirror of `server/src/protocol.rs::REJECT_REASON_*`. New codes
  *  may be added without breaking older clients (they just log
@@ -281,17 +309,27 @@ export interface DamageReject {
 }
 
 /**
- * PR #59 / §3.5 — Tab → Server. "I fired at this yaw + pitch on
- * this frame." Replaces `DamageRequest` (PR 11.6.D) — the server is
- * now the sole hit-detection authority.
+ * PR #59 / §3.5 + PR #107 — Tab → Server. "I fired at this yaw +
+ * pitch on this frame." Replaces `DamageRequest` (PR 11.6.D) — the
+ * server is now the sole hit-detection authority.
  *
- * Wire layout (19 bytes — see `AIM_EVENT_WIRE_SIZE`):
+ * Wire layout (20 bytes — see `AIM_EVENT_WIRE_SIZE`, was 19 pre-PR
+ * #107):
  *   byte 0        discriminator 0x0A
  *   byte 1..2     sourcePlayerId (u16 BE)
  *   byte 3..6     yawRadians (f32 BE)
  *   byte 7..10    pitchRadians (f32 BE)
  *   byte 11..14   frame (u32 BE)
  *   byte 15..18   eventId (u32 BE)
+ *   byte 19       isFiring (u8 — PR #107; 0 or 1. Drives the server
+ *                 burst state machine in
+ *                 `damage_relay::validate_and_relay_aim`. Press
+ *                 events send `1`; trigger-release events send
+ *                 `0`. Pre-PR #107 clients send no byte here, so
+ *                 pre-#107 servers read a stale byte and the burst
+ *                 state machine never progresses. Post-PR #108 the
+ *                 client always sends `isFiring` — see
+ *                 `damageBus.ts` AimEvent emitter.)
  *
  * No `targetPlayerId` — the server iterates all OTHER players in
  * the room. Mirrors the Rust `AimEvent` in `server/src/protocol.rs`.
@@ -309,6 +347,10 @@ export interface AimEvent {
   /** Monotonic per-tab counter (resets on tab reload; the server
    *  applies a bounded window of tolerance). */
   eventId: number;
+  /** PR #107 — `1` on a trigger-press event, `0` on trigger release.
+   *  The server's burst state machine requires `isFiring: 0` between
+   *  burst pulls — see `validate_and_relay_aim` Semi/Burst arms. */
+  isFiring: number;
 }
 
 // -- Encoder / decoder pair ----------------------------------------------
@@ -590,13 +632,14 @@ export function decodeDamageReject(buf: Uint8Array): DamageReject | null {
   };
 }
 
-/** Encode an `AimEvent` to a 19-byte wire-format `Uint8Array`
- *  (discriminator 0x0A + 18-byte body). Mirrors the Rust
+/** Encode an `AimEvent` to a 20-byte wire-format `Uint8Array`
+ *  (discriminator 0x0A + 19-byte body). Mirrors the Rust
  *  `encode_aim_event` body layout byte-for-byte.
  *
  *  Layout (matches the wire-format table in the JSDoc above):
  *    [disc 1B][source u16 BE 2B][yaw f32 BE 4B][pitch f32 BE 4B]
- *    [frame u32 BE 4B][event_id u32 BE 4B] = 19 bytes total. */
+ *    [frame u32 BE 4B][event_id u32 BE 4B][is_firing u8 1B] =
+ *    20 bytes total. PR #107 added the trailing `is_firing` byte. */
 export function encodeAimEvent(req: AimEvent): Uint8Array {
   const bytes = concatBytes([
     new Uint8Array([DISCRIMINATOR_AIM_EVENT]), // disc 0x0A
@@ -605,6 +648,9 @@ export function encodeAimEvent(req: AimEvent): Uint8Array {
     f32BE(req.pitchRadians),                    // BE f32 pitchRadians
     u32BE(req.frame),                           // BE u32 frame
     u32BE(req.eventId),                         // BE u32 eventId
+    // PR #107 — `is_firing` byte drives the burst state machine.
+    // Press event: `1`; trigger-release event: `0`.
+    new Uint8Array([req.isFiring & 0xff]),
   ]);
   console.assert(
     bytes.length === AIM_EVENT_WIRE_SIZE,
@@ -613,7 +659,7 @@ export function encodeAimEvent(req: AimEvent): Uint8Array {
   return bytes;
 }
 
-/** Decode an 18-byte body buffer (discriminator already stripped)
+/** Decode a 19-byte body buffer (discriminator already stripped)
  *  to an `AimEvent`. Returns null on size mismatch. Mirrors the
  *  Rust `decode_aim_event` exactly. */
 export function decodeAimEvent(buf: Uint8Array): AimEvent | null {
@@ -625,5 +671,118 @@ export function decodeAimEvent(buf: Uint8Array): AimEvent | null {
     pitchRadians: dv.getFloat32(6, false),
     frame: dv.getUint32(10, false),
     eventId: dv.getUint32(14, false),
+    // PR #107 — burst state machine input.
+    isFiring: dv.getUint8(18),
+  };
+}
+
+// =====================================================================
+// PR #107 / PR #108 — `WeaponSwitch` (0x0C) wire type.
+//
+// Tab → Server. "I want to switch to weapon N, fire mode M."
+//
+// Closes the open question from PR #102 §3.9 / PR #105 §2.1. The
+// server validates via `damage_relay::validate_and_relay_weapon_switch`
+// (5 gates paralleling `validate_and_relay_reload`):
+//   1. source-in-room
+//   2. anti-spoof (source_player_id matches the tab's claimed id)
+//   3. rate-limit (`WEAPON_SWITCH_RATE_LIMIT_MS` = 1 Hz per player)
+//   4. weapon-id-known (`weaponId` ∈ `WeaponId`)
+//   5. fire-mode-index-in-range
+//      (`fire_mode_index < WEAPONS_TABLE[weaponId].fire_modes.length`)
+//
+// On success, the server mutates
+// `room.players[source].{weapon_id, current_fire_mode}` and the
+// next 20Hz Snapshot fan-out (0x07) carries the new state to every
+// connected tab. No private ack packet (PR #107 locked decision
+// #4 — mirrors ReloadRequest).
+//
+// **No client-side `0x0C → DamageReject` fallback decoder** — see
+// the discriminator-table note above.
+// =====================================================================
+
+/** PR #107 / PR #108 — body size for `WeaponSwitch` BODY
+ *  (without the discriminator). Layout (big-endian):
+ *    byte 0..1   source_player_id (u16 BE)
+ *    byte 2      weapon_id (u8 — see `WeaponId` enum in
+ *                `protocol/constants.ts`)
+ *    byte 3      fire_mode_index (u8 — index into
+ *                `WEAPONS_TABLE[weapon_id].fire_modes[]`; 0 = first
+ *                mode)
+ *  Math: 2 + 1 + 1 = 4 bytes. */
+export const WEAPON_SWITCH_BODY_SIZE = 4;
+
+/** PR #107 / PR #108 — full on-the-wire packet (disc + body) = 5
+ *  bytes. */
+export const WEAPON_SWITCH_WIRE_SIZE = WEAPON_SWITCH_BODY_SIZE + 1;
+
+/**
+ * Tab → Server. "Switch my weapon to N, fire mode to M."
+ *
+ * Wire layout (5 bytes — `WEAPON_SWITCH_WIRE_SIZE`):
+ *   byte 0       discriminator 0x0C
+ *   byte 1..2    sourcePlayerId (u16 BE)
+ *   byte 3       weaponId (u8 — `WeaponId` enum)
+ *   byte 4       fireModeIndex (u8 — index into
+ *                `WEAPONS_TABLE[weaponId].fire_modes[]`; 0 = first
+ *                mode)
+ *
+ * The server's `validate_and_relay_weapon_switch` runs 5 gates
+ * (see file-level doc above); on success it mutates the player's
+ * state and the next Snapshot carries the new values to all
+ * connected tabs.
+ */
+export interface WeaponSwitch {
+  sourcePlayerId: number;
+  /** 0 = DualPistol, 1 = Shotgun, 2 = Sniper. See `WeaponId`
+   *  enum in `protocol/constants.ts`. */
+  weaponId: number;
+  /** Index into `WEAPONS_TABLE[weaponId].fire_modes[]`. 0 = first
+   *  mode (e.g. Semi on DualPistol); 1 = second mode (e.g. Burst3
+   *  on DualPistol). Server-side gate #5 rejects out-of-range
+   *  values silently. */
+  fireModeIndex: number;
+}
+
+/** Encode a `WeaponSwitch` to a 5-byte wire-format `Uint8Array`
+ *  (discriminator 0x0C + 4-byte body). Mirrors the Rust
+ *  `encode_weapon_switch` body layout byte-for-byte.
+ *
+ *  **Caller responsibility**: the client is responsible for
+ *  rate-limiting weapon switches to
+ *  `WEAPON_SWITCH_RATE_LIMIT_MS` (1 Hz per player) so it doesn't
+ *  burn the server-side rate-limit gate. The server gate is
+ *  authoritative; the local gate just avoids wasted packets. */
+export function encodeWeaponSwitch(req: WeaponSwitch): Uint8Array {
+  const bytes = concatBytes([
+    new Uint8Array([DISCRIMINATOR_WEAPON_SWITCH]), // disc 0x0C
+    u16BE(req.sourcePlayerId),                     // BE u16 source_player_id
+    new Uint8Array([req.weaponId & 0xff]),         // u8 weapon_id
+    new Uint8Array([req.fireModeIndex & 0xff]),    // u8 fire_mode_index
+  ]);
+  console.assert(
+    bytes.length === WEAPON_SWITCH_WIRE_SIZE,
+    `encodeWeaponSwitch: expected ${WEAPON_SWITCH_WIRE_SIZE} bytes, got ${bytes.length}`,
+  );
+  return bytes;
+}
+
+/** Decode a 4-byte body buffer (discriminator already stripped)
+ *  to a `WeaponSwitch`. Returns null on size mismatch. Mirrors
+ *  the Rust `decode_weapon_switch` exactly.
+ *
+ *  The client transport (`serverTransport.ts`) does NOT receive
+ *  WeaponSwitch inbound (only the server decodes them) — this
+ *  decoder exists for symmetry with `decodeDamageBroadcast` /
+ *  `decodeDamageReject` and for the cross-language `cargo test` ↔
+ *  vitest round-trip guard (the smoke's wire-byte assertions use
+ *  it indirectly). */
+export function decodeWeaponSwitch(buf: Uint8Array): WeaponSwitch | null {
+  if (buf.length !== WEAPON_SWITCH_BODY_SIZE) return null;
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  return {
+    sourcePlayerId: dv.getUint16(0, false),
+    weaponId: dv.getUint8(2),
+    fireModeIndex: dv.getUint8(3),
   };
 }

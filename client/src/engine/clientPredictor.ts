@@ -214,6 +214,7 @@ export class Predictor {
       ammo: 0,
       isFiring: 0,
       weaponId: 0,
+      currentFireMode: 0,
       frame: -1,
     };
   }

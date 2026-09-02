@@ -1203,6 +1203,9 @@ export async function createScene(
               // PR #102 — default to DualPistol (the pre-#102 behavior).
               // PR #103 will populate this from the server snapshot.
               weaponId: 0,
+              // PR #107 — default to Semi (the pre-#107 behavior).
+              // PR #108 will populate this from the server snapshot.
+              currentFireMode: 0,
             };
             // Restore the live controller so the next gameSession.tick()
             // (which advances from the saved pos+vel) sees a clean

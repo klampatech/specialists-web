@@ -44,6 +44,7 @@ import type {
   Ping,
   Pong,
   PositionUpdate,
+  WeaponSwitch,
 } from "../../../protocol/damage";
 // PR 11.7.E / §3.5 — ReloadRequest encoder/decoder. Mirror of the
 // Rust `encode_reload_request` / `decode_reload_request`. The
@@ -76,6 +77,7 @@ export {
   encodeInputsServer,
   encodePing,
   encodePositionUpdate,
+  encodeWeaponSwitch,
   DISCRIMINATOR_AIM_EVENT,
   DISCRIMINATOR_DAMAGE_BROADCAST,
   DISCRIMINATOR_DAMAGE_REJECT,
@@ -85,6 +87,7 @@ export {
   DISCRIMINATOR_PING,
   DISCRIMINATOR_PONG,
   DISCRIMINATOR_POSITION_UPDATE,
+  DISCRIMINATOR_WEAPON_SWITCH,
   AIM_EVENT_WIRE_SIZE,
   DAMAGE_BROADCAST_WIRE_SIZE,
   DAMAGE_REJECT_WIRE_SIZE,
@@ -98,6 +101,8 @@ export {
   REJECT_REASON_FIRE_RATE,
   REJECT_REASON_LAG_MISS,
   REJECT_REASON_NO_HISTORY,
+  WEAPON_SWITCH_BODY_SIZE,
+  WEAPON_SWITCH_WIRE_SIZE,
 } from "../../../protocol/damage";
 
 /** Maximum outbound damage requests queued before oldest are dropped. */
@@ -258,6 +263,36 @@ export function nextReloadEventId(): number {
  *  the vitest boundary tests, not a runtime API. */
 export function _resetReloadEventIdForTests(next: number = 1): void {
   _nextReloadEventId = next;
+}
+
+/**
+ * PR #107 + PR #108 — send a typed `WeaponSwitch` over the transport.
+ *
+ * The server validates via
+ * `damage_relay::validate_and_relay_weapon_switch` (5 gates:
+ * source-in-room, anti-spoof, rate-limit, weapon-id-known,
+ * fire-mode-index-in-range). On success the server mutates
+ * `room.players[source].{current_weapon, current_fire_mode,
+ * burst_shots_remaining, trigger_held}` and the next 20Hz Snapshot
+ * fan-out (0x07) carries the new state to every connected tab. No
+ * private ack packet (PR #107 locked decision #4 — mirrors
+ * ReloadRequest).
+ *
+ * **Caller responsibility**: the client is responsible for the
+ * local rate-limit gate (`WEAPON_SWITCH_RATE_LIMIT_MS` = 1 Hz per
+ * player) so it doesn't burn the server-side rate-limit gate.
+ * The server gate is authoritative; the local gate just avoids
+ * wasted packets.
+ *
+ * See `inputListener.ts` for the 1/2/3 + B key handlers that
+ * invoke this; see `state.ts` for the React-state mirror that
+ * holds the optimistic local copy.
+ */
+export function sendWeaponSwitch(
+  t: ServerTransport,
+  req: WeaponSwitch,
+): void {
+  t.sendWeaponSwitch(req);
 }
 
 // -- Broadcast handler ----------------------------------------------------

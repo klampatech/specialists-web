@@ -69,6 +69,7 @@ function makePlayer(playerId: number, x: number, y: number = 0): PlayerState {
     ammo: 0,
     isFiring: 0,
     weaponId: 0,
+    currentFireMode: 0,
       };
 }
 

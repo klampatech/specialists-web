@@ -43,12 +43,27 @@ export const DISCRIMINATOR_STATE_ACK = 0x08;
  *  `PLAYER_STATE_BODY_SIZE`. */
 export const SNAPSHOT_BODY_SIZE = 9;
 
-/** PR 11.7.B / §3.5 — per-player payload size. 2 (playerId
- *  u16 BE) + 4 (positionX f32 BE) + 4 (positionY f32 BE) + 4
- *  (velocityX f32 BE) + 4 (velocityY f32 BE) + 4 (yaw f32 BE) +
- *  4 (pitch f32 BE) + 1 (hp u8) + 1 (ammo u8) + 1 (isFiring
- *  u8) = 29 bytes. */
-export const PLAYER_STATE_BODY_SIZE = 30;
+/** PR 11.7.B / §3.5 + PR #107 — per-player payload size. Layout
+ *  (pre-PR #107 = 30 bytes; PR #107 added a `currentFireMode`
+ *  byte at offset 30):
+ *   2  playerId u16 BE
+ *   4  positionX f32 BE
+ *   4  positionY f32 BE
+ *   4  velocityX f32 BE
+ *   4  velocityY f32 BE
+ *   4  yaw f32 BE (radians; 0..2π on the client, signed f32 here)
+ *   4  pitch f32 BE (radians; -π/2..+π/2 on the client)
+ *   1  hp u8
+ *   1  ammo u8
+ *   1  isFiring u8 (0 or 1 — wire-compatible bool for forward-compat
+ *      with snapshot consumers that don't need a full bool)
+ *   1  weaponId u8 (PR #102 — 0=DualPistol, 1=Shotgun, 2=Sniper;
+ *      pre-#102 clients won't send this byte; the decoder on the
+ *      receiving side fills 0 = DualPistol as a default)
+ *   1  currentFireMode u8 (PR #107 — index into
+ *      `WEAPONS_TABLE[weaponId].fire_modes[]`. 0 = first mode.)
+ *  Math: 2 + 4 + 4 + 4 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1 = 31 bytes. */
+export const PLAYER_STATE_BODY_SIZE = 31;
 
 // -- Wire-size constants (disc + body — full packet) ------------
 
@@ -68,7 +83,8 @@ export function snapshotWireSize(playerCount: number): number {
  * Per-player state inside a Snapshot. Mirrors
  * `server/src/protocol.rs::PlayerState`.
  *
- * Wire layout (30 bytes — `PLAYER_STATE_BODY_SIZE`):
+ * Wire layout (31 bytes — `PLAYER_STATE_BODY_SIZE`, PR #107 grew
+ * from 30 to 31 to carry `currentFireMode` at offset 30):
  *   byte 0..1   playerId (u16 BE)
  *   byte 2..5   positionX (f32 BE)
  *   byte 6..9   positionY (f32 BE)
@@ -80,9 +96,9 @@ export function snapshotWireSize(playerCount: number): number {
  *   byte 27     ammo (u8)
  *   byte 28     isFiring (u8 — 0 or 1)
  *   byte 29     weaponId (u8 — PR #102; 0=DualPistol, 1=Shotgun,
- *              2=Sniper; pre-#102 clients won't receive this byte
- *              but the post-#102 server always sends it — see
- *              `protocol/damage.ts` + `server/src/protocol.rs`.)
+ *              2=Sniper)
+ *   byte 30     currentFireMode (u8 — PR #107; index into
+ *              `WEAPONS_TABLE[weaponId].fire_modes[]`. 0 = first mode.)
  */
 export interface PlayerState {
   playerId: number;
@@ -100,13 +116,19 @@ export interface PlayerState {
   isFiring: number;
   /**
    * PR #102 — current weapon id (0=DualPistol, 1=Shotgun,
-   * 2=Sniper). The pre-#102 client never receives this field
-   * (server always sends it, but the pre-#102 decoder stops at
-   * byte 28). Post-#102: read `dv.getUint8(off + 29)`. The
-   * client's `BulletHud` (PR #103) renders the per-weapon ammo
+   * 2=Sniper). Post-#102: read `dv.getUint8(off + 29)`. The
+   * client's `BulletHud` (PR #108) renders the per-weapon ammo
    * bar based on this field.
    */
   weaponId: number;
+  /**
+   * PR #107 — index into `WEAPONS_TABLE[weaponId].fire_modes[]`.
+   * 0 = first mode (e.g. Semi on DualPistol); 1 = second mode
+   * (e.g. Burst3 on DualPistol). The actual fire-mode behaviour
+   * is driven by `WEAPONS_TABLE[weaponId].fire_modes[currentFireMode]`.
+   * Read at byte offset 30 (`off + 30`).
+   */
+  currentFireMode: number;
 }
 
 /**
@@ -185,9 +207,10 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
     u32BE(snap.nextServerFrame),
     new Uint8Array([snap.players.length & 0xff]),
   ]);
-  // Per-player payload: 29 bytes each, concatBytes builds the
-  // total incrementally so the size assertion below catches
-  // drift.
+  // Per-player payload: 31 bytes each (was 30 pre-PR-#107; the
+  // `currentFireMode` byte at offset 30 is the PR #107 addition).
+  // concatBytes builds the total incrementally so the size
+  // assertion below catches drift.
   const playerBytes = snap.players.map((p) =>
     concatBytes([
       u16BE(p.playerId),
@@ -201,9 +224,11 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
       new Uint8Array([p.ammo & 0xff]),
       new Uint8Array([p.isFiring & 0xff]),
       // PR #102 — current weapon id (0=DualPistol, 1=Shotgun,
-      // 2=Sniper). Encoded after isFiring as the new last byte of
-      // the per-player payload.
+      // 2=Sniper).
       new Uint8Array([p.weaponId & 0xff]),
+      // PR #107 — current fire-mode INDEX (not the discriminant;
+      // index into `WEAPONS_TABLE[weaponId].fire_modes[]`).
+      new Uint8Array([p.currentFireMode & 0xff]),
     ]),
   );
   const out = concatBytes([headerBytes, ...playerBytes]);
@@ -277,6 +302,9 @@ export function decodeSnapshot(buf: Uint8Array): Snapshot | null {
       isFiring: dv.getUint8(off + 28),
       // PR #102 — weapon id (0=DualPistol, 1=Shotgun, 2=Sniper).
       weaponId: dv.getUint8(off + 29),
+      // PR #107 — current fire-mode INDEX (into
+      // `WEAPONS_TABLE[weaponId].fire_modes[]`).
+      currentFireMode: dv.getUint8(off + 30),
     });
   }
   return { serverFrame, nextServerFrame, players };
