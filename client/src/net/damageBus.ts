@@ -32,6 +32,7 @@ import {
   encodeDamageBroadcast,
   encodeDamageRequest,
   encodeInputsServer,
+  encodeMeleeEvent,
   encodePing,
   encodePositionUpdate,
 } from "../../../protocol/damage";
@@ -491,6 +492,14 @@ export interface DamageBusProbe {
    *  intent (yaw + pitch); the server runs the hitscan. Replaces
    *  `sendDamageRequest`. */
   sendAimEvent: (req: AimEvent) => number;
+  /** PR #114 — pure-send MeleeEvent. The client sends its intent
+   *  (yaw + pitch); the server runs the proximity-cone check. The
+   *  smoke drives this directly via `window.__damageBus.sendMeleeEvent`
+   *  (mirrors the AimEvent probe pattern) so the test doesn't
+   *  depend on the input listener + pointer-lock + RMB-mousedown
+   *  event chain — the smoke is verifying the wire round-trip,
+   *  not the keyboard binding. */
+  sendMeleeEvent: (req: MeleeEvent) => number;
   /** Send a typed `PositionUpdate` through the live transport. */
   sendPositionUpdate: (pu: PositionUpdate) => void;
   /** PR 11.6.D / §3.10: throttled PositionUpdate sender. */
@@ -532,6 +541,11 @@ export interface DamageBusProbe {
    *  inspect wire bytes without re-importing `protocol/damage`. */
   encodeDamageRequest: typeof encodeDamageRequest;
   encodeAimEvent: typeof encodeAimEvent;
+  /** PR #114 — encode MeleeEvent to wire bytes (used by smoke harnesses
+   *  that build the wire packet locally + assert against the canary
+   *  log's decoded bytes). Mirrors `encodeAimEvent` / `encodeDamageRequest`
+   *  in the probe surface. */
+  encodeMeleeEvent: typeof encodeMeleeEvent;
   encodePositionUpdate: typeof encodePositionUpdate;
   encodePing: typeof encodePing;
   encodeDamageBroadcast: typeof encodeDamageBroadcast;
@@ -550,6 +564,7 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
       return sendDamageRequest(t, req);
     },
     sendAimEvent: (req: AimEvent) => sendAimEvent(t, req),
+    sendMeleeEvent: (req: MeleeEvent) => sendMeleeEvent(t, req),
     sendPositionUpdate: (pu) => sendPositionUpdate(t, pu),
     sendPositionUpdateThrottled: (frameCounter, playerId, positionX, positionY) =>
       sendPositionUpdateThrottled(t, frameCounter, playerId, positionX, positionY),
@@ -578,6 +593,7 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
     pendingApplyCount: () => 0, // PR 11.7.D: no pending map. Removed in B3.
     encodeDamageRequest,
     encodeAimEvent,
+    encodeMeleeEvent,
     encodePositionUpdate,
     encodePing,
     encodeDamageBroadcast,

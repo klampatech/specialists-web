@@ -190,30 +190,32 @@ async function readRemoteHp(page, remoteId) {
   }, remoteId);
 }
 
-async function sendMeleeSwing(page) {
-  // Dispatch a synthetic mousedown on the canvas with button=2
-  // (RMB). This is the same event the inputListener consumes to
-  // flip `held.meleePressed = true`, which then drives
-  // `dbSendMeleeEvent` on the next tick's rising edge.
-  return await page.evaluate(() => {
-    const canvas = document.querySelector("canvas");
-    if (!canvas) return false;
-    const down = new MouseEvent("mousedown", {
-      bubbles: true,
-      cancelable: true,
-      button: 2,
-      buttons: 2,
+async function sendMeleeSwing(page, yawRadians) {
+  // Drive `__damageBus.sendMeleeEvent` directly. Mirrors the
+  // damage-server-hp-convergence smoke's AimEvent pattern —
+  // bypasses the input listener + pointer-lock + RMB-mousedown
+  // event chain (which is flaky in headless Chromium without
+  // pointer-lock engagement) and exercises the production wire
+  // path: `dbSendMeleeEvent → serverTransport.sendMeleeEvent
+  // → encodeMeleeEvent → wire bytes → server validator`.
+  //
+  // The smoke's job is to verify the WIRE round-trip, not the
+  // keyboard binding. Keyboard binding has its own coverage in
+  // the input listener's vitest boundary tests.
+  return await page.evaluate(({ yawRadians, eventId }) => {
+    const bus = (window).__damageBus;
+    const snap = (window).__latestSnap?.();
+    if (!bus) return { ok: false, reason: "no __damageBus" };
+    if (!snap) return { ok: false, reason: "no __latestSnap" };
+    const result = bus.sendMeleeEvent({
+      sourcePlayerId: (window).__localPlayerId ?? 1,
+      yawRadians: yawRadians ?? 0,
+      pitchRadians: 0,
+      frame: snap.serverFrame,
+      eventId,
     });
-    canvas.dispatchEvent(down);
-    const up = new MouseEvent("mouseup", {
-      bubbles: true,
-      cancelable: true,
-      button: 2,
-      buttons: 0,
-    });
-    canvas.dispatchEvent(up);
-    return true;
-  });
+    return { ok: true, eventId: result };
+  }, { yawRadians: yawRadians ?? Math.PI / 2, eventId: Math.floor(Math.random() * 0xFFFFFFFF) });
 }
 
 async function faceAway(page, yawRadians) {
@@ -335,6 +337,39 @@ async function runSmoke() {
                                              // 1-second rate-limit
                                              // window + extra settle
 
+    // Position primer — drive explicit PositionUpdates from each tab
+    // so the server's `position_history` knows where both players
+    // are. Melee has a 1.5m range (`MELEE_MAX_RANGE_METERS`), so
+    // place Tab B at `(pos.x + 1.0, pos.z)` — 1m to Tab A's right,
+    // well within the cone. Mirrors the damage-server-hp-convergence
+    // smoke's position primer pattern.
+    log("Priming both tabs' positions for melee range...");
+    await Promise.all([
+      pageA.evaluate(() => {
+        const session = (window).__gameSession;
+        if (session) {
+          const pos = session.localController.state.position;
+          for (let f = 0; f < 3; f++) {
+            (window).__serverTransport.sendPositionUpdate({
+              serverFrame: f, playerId: 1, positionX: pos.x, positionY: pos.z,
+            });
+          }
+        }
+      }),
+      pageB.evaluate(() => {
+        const session = (window).__gameSession;
+        if (session) {
+          const pos = session.localController.state.position;
+          for (let f = 0; f < 3; f++) {
+            (window).__serverTransport.sendPositionUpdate({
+              serverFrame: f, playerId: 2, positionX: pos.x + 1.0, positionY: pos.z,
+            });
+          }
+        }
+      }),
+    ]);
+    await sleep(500); // let server's position_history settle
+
     // Assertion 2 — both tabs at 100 HP.
     const hpA0 = await readRemoteHp(pageA, 2); // Tab A sees Tab B (id=2)
     const hpB0 = await readRemoteHp(pageB, 1); // Tab B sees Tab A (id=1)
@@ -350,8 +385,10 @@ async function runSmoke() {
     );
 
     // Assertion 3 — Tab A swings; Tab B loses 25 HP.
+    // Tab A yaw=π/2 → forward = +X → where Tab B was placed
+    // (pos.x + 1.0).
     log("Tab A RMB click → expect Tab B HP 100→75");
-    await sendMeleeSwing(pageA);
+    await sendMeleeSwing(pageA, Math.PI / 2);
     await sleep(PROPAGATE_MS);
     const hpA1 = await readRemoteHp(pageA, 2);
     assert(
@@ -363,14 +400,10 @@ async function runSmoke() {
     // Wait out the cooldown so the next swing lands.
     await sleep(MELEE_COOLDOWN_SLEEP_MS * 2);
 
-    // Assertion 4 — Tab A swings with yaw pitched away; no damage.
-    // (This is a smoke-level approximation: the input bitmask's yaw
-    // is set by mouse-move, but the test only verifies that NOT
-    // every swing lands. A more rigorous cone-miss test would mock
-    // the server-side `melee_cone_hit` directly via cargo test.)
+    // Assertion 4 — Tab A swings 5x rapidly → only 1 lands.
     log("Tab A swings 5x rapidly → expect only 1 of 5 to land");
     for (let i = 0; i < 5; i++) {
-      await sendMeleeSwing(pageA);
+      await sendMeleeSwing(pageA, Math.PI / 2);
       await sleep(40); // well under 220ms cooldown
     }
     await sleep(PROPAGATE_MS);
@@ -389,7 +422,7 @@ async function runSmoke() {
     // Assertion 5 — single isolated swing after cooldown → HP drops
     // by another 25 (100 - 25*3 = 25).
     log("Tab A swings once after cooldown → expect Tab B HP 50→25");
-    await sendMeleeSwing(pageA);
+    await sendMeleeSwing(pageA, Math.PI / 2);
     await sleep(PROPAGATE_MS);
     const hpA3 = await readRemoteHp(pageA, 2);
     assert(
@@ -402,8 +435,10 @@ async function runSmoke() {
 
     // Assertion 6 — Tab B swings at Tab A; verify mirror direction
     // (the wire is symmetric — both tabs can melee each other).
+    // Tab B yaw=-π/2 → forward = -X → where Tab A was placed
+    // (its own pos.x).
     log("Tab B swings → expect Tab A HP 100→75");
-    await sendMeleeSwing(pageB);
+    await sendMeleeSwing(pageB, -Math.PI / 2);
     await sleep(PROPAGATE_MS);
     const hpB1 = await readRemoteHp(pageB, 1);
     assert(
