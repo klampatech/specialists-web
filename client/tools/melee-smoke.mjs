@@ -86,19 +86,23 @@ mkdirSync(dirname(SCREENSHOT_PATH), { recursive: true });
 async function bootCanary() {
   // Use the canary-server wrapper script (same as the other smokes).
   // It boots the Rust server in dev mode with the right RUST_LOG +
-  // room id + ports.
+  // room id + ports. Flag names: --port-wt / --port-ws / --port-http
+  // (NOT --port / --wt-port / --ws-port — those don't exist; the
+  // earlier --port pattern was a typo that exited with "unknown flag"
+  // before any canary process spawned).
   const canary = spawn(
     "bash",
     [
-      "tools/canary-server.sh",
-      "--port",
-      String(HTTP_PORT),
-      "--wt-port",
-      String(WT_PORT),
-      "--ws-port",
-      String(WS_PORT),
+      resolve(REPO_ROOT, "tools", "canary-server.sh"),
+      "--port-wt", String(WT_PORT),
+      "--port-ws", String(WS_PORT),
+      "--port-http", String(HTTP_PORT),
     ],
-    { cwd: REPO_ROOT, stdio: ["ignore", "pipe", "pipe"] },
+    {
+      cwd: REPO_ROOT,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, CARGO_PROFILE: "debug" },
+    },
   );
   canary.stdout.on("data", (b) =>
     process.stdout.write(`[canary] ${b.toString()}`),
@@ -155,18 +159,17 @@ async function teardown(canary, vite) {
 // ---------------------------------------------------------------------------
 
 async function waitForProbe(page, timeoutMs) {
-  // Wait for the `__damageServerConnected` probe that scene.ts sets
-  // when the ServerTransport's `connect()` resolves.
+  // Wait for `__serverTransport.getStats().connected === true` —
+  // the probe that scene.ts sets when ServerTransport.connect()
+  // resolves (used by every other smoke in this repo).
   return await page.evaluate(async (timeoutMs) => {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      if (
-        (window).__damageServerConnected === true ||
-        (window).__forceServerTransportConnected === true
-      ) {
+      const t = (window).__serverTransport;
+      if (t && t.getStats && t.getStats().connected) {
         return true;
       }
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 100));
     }
     return false;
   }, timeoutMs);
