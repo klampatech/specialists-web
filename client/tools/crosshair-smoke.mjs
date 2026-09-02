@@ -583,14 +583,17 @@ async function runSmoke() {
       fail("pageerror events during smoke:", errors);
     }
   } finally {
-    await teardown();
     await browser.close();
+    // Note: teardown of canary + vite is the orchestrator's job,
+    // not runSmoke's. The weapon-switch-smoke pattern has the
+    // outer (async () => { ... }) wrapper own the process lifecycle
+    // — keeping it here means the orchestrator's teardown runs
+    // even when runSmoke succeeds, AND vice versa. The double
+    // teardown in CI killed an already-dead vite process and
+    // produced a nonzero exit code despite 0 smoke failures.
   }
 
-  log(`Final: ${pass} pass, ${failCount} fail`);
-  if (failCount > 0) {
-    process.exit(1);
-  }
+  return failCount === 0;
 }
 
 (async () => {
