@@ -49,7 +49,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
-const URL = process.env.WEAPON_SMOKE_URL ?? "http://localhost:5195/";
+// Renamed from `URL` to `VITE_URL` — the global `URL` class is
+// shadowed by `import { chromium } from "playwright"`'s implicit
+// types in some bundlers; using `new URL(VITE_URL)` throws "URL is
+// not a constructor". `VITE_URL` is unambiguous.
+const VITE_URL = process.env.WEAPON_SMOKE_URL ?? "http://localhost:5195/";
 const WT_PORT = Number(process.env.WEAPON_SMOKE_WT_PORT ?? 14445);
 const WS_PORT = Number(process.env.WEAPON_SMOKE_WS_PORT ?? 14446);
 const HTTP_PORT = Number(process.env.WEAPON_SMOKE_HTTP_PORT ?? 18084);
@@ -110,9 +114,9 @@ async function bootCanary() {
 }
 
 async function bootVite() {
-  log(`Booting vite on ${URL}...`);
+  log(`Booting vite on ${VITE_URL}...`);
   // Extract port from URL for the strictPort flag.
-  const port = new URL(URL).port || "5195";
+  const port = new URL(VITE_URL).port || "5195";
   viteProc = spawn(
     "npm",
     ["run", "dev", "--", "--host", "127.0.0.1", "--port", port, "--strictPort"],
@@ -126,7 +130,7 @@ async function bootVite() {
   for (let i = 0; i < 60; i++) {
     await sleep(1000);
     try {
-      const resp = await fetch(URL);
+      const resp = await fetch(VITE_URL);
       if (resp.ok) {
         log(`Vite ready after ${i + 1}s`);
         return;
@@ -215,8 +219,8 @@ async function runSmoke() {
   onPageError(pageA, "Tab A");
   onPageError(pageB, "Tab B");
 
-  const urlA = `${URL}?server=${URL}&localId=1&peerId=2&roomId=${room}`;
-  const urlB = `${URL}?server=${URL}&localId=2&peerId=1&roomId=${room}`;
+  const urlA = `${VITE_URL}?server=${VITE_URL}&localId=1&peerId=2&roomId=${room}`;
+  const urlB = `${VITE_URL}?server=${VITE_URL}&localId=2&peerId=1&roomId=${room}`;
 
   // Init scripts — set `__forceServerTransport = true` BEFORE the
   // page loads so PeerOverlay bypasses the lobby modal and connects
@@ -228,7 +232,7 @@ async function runSmoke() {
       content: `
           window.__forceServerTransport = true;
           window.__damageServerPorts = { wt: ${WT_PORT}, ws: ${WS_PORT} };
-          window.__damageServerUrl = ${JSON.stringify(URL)};
+          window.__damageServerUrl = ${JSON.stringify(VITE_URL)};
           window.__damageServerRoomId = "${room}";
           window.__localPlayerId = ${localId};
           window.__peerPlayerId = ${peerId};
@@ -250,8 +254,44 @@ async function runSmoke() {
     }
 
     // Wait for both tabs to see each other in the snapshot stream.
-    // The primer fan-out + initial snapshot arrives within ~200ms.
+    // The snapshot only shows "promoted" players (those who have
+    // sent at least one DamageRequest/AimEvent/WeaponSwitch — the
+    // server's `room.connections` skips placeholder IDs 1000+).
+    // Without a primer, both tabs remain placeholders and the
+    // snapshot only shows their own placeholder.
+    //
+    // Primer: drive a no-op WeaponSwitch from each tab. This is
+    // the natural primer for PR #108 (we're testing weapon
+    // switches anyway — and sending one is harmless). The server
+    // processes it, mutates player state (no-op if already
+    // DualPistol+Semi), and promotes the player to a real ID
+    // (1 / 2).
+    log("Driving WeaponSwitch primer to register both players...");
     await sleep(300);
+    const primerA = await pageA.evaluate(() => {
+      const s = (window).__gameSession;
+      if (!s || typeof s.tryStartWeaponSwitch !== "function") {
+        return { ok: false, reason: "no tryStartWeaponSwitch" };
+      }
+      s.tryStartWeaponSwitch(0, 0); // DualPistol + Semi — no-op state change
+      return { ok: true };
+    });
+    const primerB = await pageB.evaluate(() => {
+      const s = (window).__gameSession;
+      if (!s || typeof s.tryStartWeaponSwitch !== "function") {
+        return { ok: false, reason: "no tryStartWeaponSwitch" };
+      }
+      s.tryStartWeaponSwitch(0, 0);
+      return { ok: true };
+    });
+    if (!primerA.ok || !primerB.ok) {
+      throw new Error(`Primer failed: Tab A=${JSON.stringify(primerA)}, Tab B=${JSON.stringify(primerB)}`);
+    }
+    // Wait out the server's 1-second rate-limit window (the
+    // primer counted as a switch for the purpose of 5-gate #3).
+    // The first real assertion needs to be ≥ 1000ms after the
+    // primer to avoid the server dropping the next switch.
+    await sleep(1100);
 
     // ---- Assertion 1: both tabs see each other; Tab A's snapshot
     // reports DualPistol (weapon_id=0, currentFireMode=0).
@@ -331,6 +371,12 @@ async function runSmoke() {
       throw new Error(`Tab A snapshot did not converge to Shotgun within ${SWITCH_SETTLE_MS}ms.`);
     }
     log(`Assertion 2 PASS: Tab A switched to Shotgun in ${SWITCH_SETTLE_MS}ms.`);
+    // Wait out the server's 1-second rate-limit window before the
+    // next switch (the local rate-limit at the input listener is
+    // bypassed here — we call gameSession.tryStartWeaponSwitch
+    // directly — so the server's 5-gate #3 is the only gate, and
+    // it requires ≥ 1000ms between switches per player).
+    await sleep(1100);
 
     // ---- Assertion 3: Tab A switches to Sniper (weapon_id=2).
     log("Tab A: switching to Sniper (key 3)...");
@@ -341,6 +387,7 @@ async function runSmoke() {
       throw new Error(`Tab A snapshot did not converge to Sniper within ${SWITCH_SETTLE_MS}ms.`);
     }
     log(`Assertion 3 PASS: Tab A switched to Sniper in ${SWITCH_SETTLE_MS}ms.`);
+    await sleep(1100);
 
     // ---- Assertion 4: Tab A back to DualPistol, then B cycles to Burst3.
     log("Tab A: switching to DualPistol (key 1)...");
@@ -350,6 +397,7 @@ async function runSmoke() {
     if (!v4a) {
       throw new Error(`Tab A snapshot did not converge back to DualPistol within ${SWITCH_SETTLE_MS}ms.`);
     }
+    await sleep(1100);
     log("Tab A: cycling fire mode to Burst3 (key B)...");
     // fireModeIndex=-1 is the cycle sentinel — gameSession resolves
     // it to the next valid index in WEAPONS_TABLE[0].fireModes =
@@ -361,6 +409,7 @@ async function runSmoke() {
       throw new Error(`Tab A snapshot did not converge to DualPistol+Burst3 within ${SWITCH_SETTLE_MS}ms.`);
     }
     log(`Assertion 4 PASS: Tab A switched to DualPistol then Burst3 (fire_mode_index=1).`);
+    await sleep(1100);
 
     // ---- Assertion 5: Tab A presses B again, returns to Semi.
     log("Tab A: cycling fire mode back to Semi (key B)...");
@@ -371,6 +420,7 @@ async function runSmoke() {
       throw new Error(`Tab A snapshot did not converge back to Semi within ${SWITCH_SETTLE_MS}ms.`);
     }
     log(`Assertion 5 PASS: Tab A cycled back to Semi (fire_mode_index=0).`);
+    await sleep(1100);
 
     // ---- Assertion 6: rate-limit gate. Press `1` then `2` within
     // 500ms → server's 5-gate #3 rate-limit drops the second
@@ -379,7 +429,6 @@ async function runSmoke() {
     // Switch to Shotgun first so the rate-limit window starts fresh
     // (otherwise the prior cycle's last switch is < 1s ago and the
     // first press would already be rate-limited).
-    await sleep(1100); // WEAPON_SWITCH_RATE_LIMIT_MS = 1000
     const swFresh = await sendSwitch(1, 0); // Shotgun
     if (!swFresh.ok) throw new Error(`Pre-rate-limit Shotgun switch failed: ${swFresh.reason}`);
     await pollWeaponId(1, 0, SWITCH_SETTLE_MS);
