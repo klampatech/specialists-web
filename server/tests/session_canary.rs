@@ -196,9 +196,8 @@ async fn router_dispatches_aim_event_returns_broadcast() {
         pitch_radians: 0.0,
         frame: 1, // any frame 0..3 has a snapshot
         event_id: 0xcafebabe,
-        is_firing: 1,
-        }
-;
+        is_firing: 1, // PR #107
+    };
     let mut payload = vec![DISCRIMINATOR_AIM_EVENT];
     payload.extend(encode_aim_event(&req));
 
@@ -285,16 +284,15 @@ async fn validator_rejects_zero_ammo_in_room() {
     {
         let room_arc = rooms.read().await.get(specialists_server::constants::DEVBX_ROOM_ID).unwrap().clone();
         let mut room_guard = room_arc.write().await;
-        room_guard.players.get_mut(&7).unwrap().ammAimEvent {
+        room_guard.players.get_mut(&7).unwrap().ammo = 0;
+    }
+    let req = AimEvent {
         source_player_id: 7,
         yaw_radians: std::f32::consts::FRAC_PI_2,
         pitch_radians: 0.0,
         frame: 1,
         event_id: 1,
-        is_firing: 1,
-        }
-
-        event_id: 1,
+        is_firing: 1, // PR #107
     };
     let mut payload = vec![DISCRIMINATOR_AIM_EVENT];
     payload.extend(encode_aim_event(&req));
@@ -312,35 +310,30 @@ async fn validator_rejects_fire_rate_violation_in_room() {
     use transport::{handle_binary, RoomRegistry};
 
     let rooms: RoomRegistry = RoomRegistry::default();
-    seed_room_for_validator(&rooms, 7, Some(9), (0.0, 0.0), Some((5.0, 0.0)))AimEvent {
+    seed_room_for_validator(&rooms, 7, Some(9), (0.0, 0.0), Some((5.0, 0.0))).await;
+    // First request succeeds.
+    let req1 = AimEvent {
         source_player_id: 7,
         yaw_radians: std::f32::consts::FRAC_PI_2,
         pitch_radians: 0.0,
         frame: 1,
         event_id: 1,
-        is_firing: 1,
-        }
-ans: 0.0,
-        frame: 1,
-        event_id: 1,
+        is_firing: 1, // PR #107
     };
     let mut payload1 = vec![DISCRIMINATOR_AIM_EVENT];
     payload1.extend(encode_aim_event(&req1));
     let reply1 = handle_binary(&payload1, &rooms, 0, transport::ConnectionState::new(0) /* placeholder */).await;
     assert!(!reply1.is_empty(), "first AimEvent must produce a broadcast");
 
-    // Second request with a freshAimEvent {
+    // Second request with a fresh eventId but no time elapsed --
+    // inside the 120ms cooldown.
+    let req2 = AimEvent {
         source_player_id: 7,
         yaw_radians: std::f32::consts::FRAC_PI_2,
         pitch_radians: 0.0,
         frame: 1,
         event_id: 2,
-        is_firing: 1,
-        }
-AC_PI_2,
-        pitch_radians: 0.0,
-        frame: 1,
-        event_id: 2,
+        is_firing: 1, // PR #107
     };
     let mut payload2 = vec![DISCRIMINATOR_AIM_EVENT];
     payload2.extend(encode_aim_event(&req2));
@@ -814,18 +807,16 @@ fn hitscan_rewinds_through_rapier_history_mid_air() {
         room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
         room.record_position(2, frame, Position { x: 0.0, y: 0.0 });
     }
-    // Advance next_server_frame so req.frameAimEvent {
+    // Advance next_server_frame so req.frame=100 is within the
+    // MAX_LOOKAHEAD_FRAMES (16) window.
+    room.next_server_frame = 100;
+    let req = AimEvent {
         source_player_id: 1,
         yaw_radians: std::f32::consts::FRAC_PI_2,
         pitch_radians: 0.0,
         frame: 100,
         event_id: 1,
-        is_firing: 1,
-        }
-ans: std::f32::consts::FRAC_PI_2,
-        pitch_radians: 0.0,
-        frame: 100,
-        event_id: 1,
+        is_firing: 1, // PR #107
     };
     let result = validate_and_relay_aim(
         &req, 1, &mut room, 0,

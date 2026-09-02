@@ -100,17 +100,19 @@ fn snapshot_wire_format_roundtrip() {
     // (disc is prepended by the transport router, matching
     // the DamageBroadcast pattern). For 1 player:
     //   4 (serverFrame) + 4 (nextServerFrame) + 1
-    //   (playerCount) + 30 (player payload) = 39 bytes (PR #102:
-    //   +1 byte for weapon_id).
-    // The on-the-wire size (disc + body) is 40 bytes — see
+    //   (playerCount) + 29 (player payload) = 38 bytes.
+    // The on-the-wire size (disc + body) is 39 bytes — see
     // `SNAPSHOT_WIRE_SIZE_MIN + 1 * PLAYER_STATE_WIRE_SIZE`
-    // in the protocol module.
-    assert_eq!(bytes.len(), 9 + 1 * 30);
-    assert_eq!(
-        bytes.len(),
-        specialists_server::protocol::SNAPSHOT_WIRE_SIZE_MIN
-            + 1 * specialists_server::protocol::PLAYER_STATE_WIRE_SIZE
-    );
+    // PR 11.7.B / PR #107 — pinned wire format. Header is 9 bytes;
+    // per-player is 30 bytes (PR #106) + 1 byte for current_fire_mode
+    // (PR #107). Total = 9 + 1 * 31 = 40 for 1 player.
+        let bytes = encode_snapshot(&snap);
+        assert_eq!(bytes.len(), 9 + 1 * 31);
+        assert_eq!(
+            bytes.len(),
+            specialists_server::protocol::SNAPSHOT_WIRE_SIZE_MIN
+                + 1 * specialists_server::protocol::PLAYER_STATE_WIRE_SIZE
+        );
 }
 
 /// PR 11.7.B — first call within the 50ms interval returns
@@ -223,36 +225,14 @@ async fn broadcast_snapshot_drops_oldest_on_full_channel() {
     let room_arc = std::sync::Arc::new(tokio::sync::RwLock::new(room));
 
     // Pre-fill the channel with 4 snapshots (saturating the queue).
-    let initial_snap = vec![
-        DISCRIMINATOR_SNAPSHOT,
-        0xAA,
-        0xAA,
-        0xAA,
-        0xAA,
-        0xAA,
-        0xAA,
-        0xAA,
-        0xAA,
-        0xAA,
-    ];
+    let initial_snap = vec![DISCRIMINATOR_SNAPSHOT, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA];
     for _ in 0..4 {
         // try_send is async (returns Future<Output = Result<(), ()>>).
         co.try_send(initial_snap.clone()).await.expect("prefill ok");
     }
 
     // The new snapshot — different byte pattern so we can identify it.
-    let new_snap = vec![
-        DISCRIMINATOR_SNAPSHOT,
-        0xBB,
-        0xBB,
-        0xBB,
-        0xBB,
-        0xBB,
-        0xBB,
-        0xBB,
-        0xBB,
-        0xBB,
-    ];
+    let new_snap = vec![DISCRIMINATOR_SNAPSHOT, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB];
 
     // broadcast_snapshot should drop one of the pre-filled snapshots
     // and queue the new one. No panic, no thread block.
@@ -359,13 +339,8 @@ fn snapshot_is_deterministic_across_runs() {
         let mut room = Room::new("DEVBX");
         for id in [1u16, 2, 3, 4, 5] {
             room.add_player(id);
-            room.physics.add_player(
-                id,
-                Position {
-                    x: id as f32,
-                    y: id as f32,
-                },
-            );
+            room.physics
+                .add_player(id, Position { x: id as f32, y: id as f32 });
             let co = specialists_server::connection_outbound::ConnectionOutbound::with_capacity(8);
             room.register_connection(id, co);
         }
@@ -428,10 +403,7 @@ fn should_store_frame_predicate_matches_32hz_at_64hz_physics() {
             stored += 1;
         }
     }
-    assert_eq!(
-        stored, 32,
-        "expected 32 stored frames over 64 physics frames"
-    );
+    assert_eq!(stored, 32, "expected 32 stored frames over 64 physics frames");
 }
 
 /// PR 11.7.B — `Snapshot` carries yaw/pitch as 0.0 default (the
@@ -466,21 +438,9 @@ fn snapshot_carries_yaw_pitch_populated_from_room() {
     let mut gen = SnapshotGenerator::new();
     let snap = gen.maybe_emit(&room, 100).expect("emit");
     // PR #59: snapshot MUST carry the populated yaw/pitch (not 0.0).
-    let p1 = snap
-        .players
-        .iter()
-        .find(|p| p.player_id == 1)
-        .expect("player 1 in snap");
-    assert!(
-        (p1.yaw - 1.234).abs() < 0.001,
-        "yaw must mirror Room.players[1].yaw_radians (got {})",
-        p1.yaw
-    );
-    assert!(
-        (p1.pitch - (-0.567)).abs() < 0.001,
-        "pitch must mirror Room.players[1].pitch_radians (got {})",
-        p1.pitch
-    );
+    let p1 = snap.players.iter().find(|p| p.player_id == 1).expect("player 1 in snap");
+    assert!((p1.yaw - 1.234).abs() < 0.001, "yaw must mirror Room.players[1].yaw_radians (got {})", p1.yaw);
+    assert!((p1.pitch - (-0.567)).abs() < 0.001, "pitch must mirror Room.players[1].pitch_radians (got {})", p1.pitch);
 }
 
 /// PR 11.7.B — sanity check on the integration interval math:

@@ -120,11 +120,8 @@ async fn integration_full_round_trip_aim_event_to_broadcast() {
         pitch_radians: 0.0,
         frame: 1,
         event_id: 1,
-        is_firing: 1,
-        }
-   is_firing: 1,
-        }
-;
+        is_firing: 1, // PR #107
+    };
     ws.send(Message::Binary(encode_aim_event(&req).into()))
         .await
         .expect("aim send");
@@ -206,19 +203,14 @@ async fn integration_lag_comp_rewinds_target_position_aim_event() {
 
     let url = format!("ws://127.0.0.1:{port}");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("WS");
-    // AimEventspecialists_server::protocol::AimEvent {
+    // AimEvent at frame 2 (target in-range position).
+    let req = specialists_server::protocol::AimEvent {
         source_player_id: 7,
         yaw_radians: std::f32::consts::FRAC_PI_2,
         pitch_radians: 0.0,
         frame: 2,
         event_id: 1,
-        is_firing: 1,
-        }
-   is_firing: 1,
-        }
-ans: 0.0,
-        frame: 2,
-        event_id: 1,
+        is_firing: 1, // PR #107
     };
     ws.send(Message::Binary(encode_aim_event(&req).into()))
         .await
@@ -290,20 +282,15 @@ async fn integration_two_tab_convergence_aim_event() {
     let (mut ws_a, _) = tokio_tungstenite::connect_async(&url).await.expect("WS A");
     let (mut ws_b, _) = tokio_tungstenite::connect_async(&url).await.expect("WS B");
 
-    // Tab A sends an AimEvent. Thspecialists_server::protocol::AimEvent {
+    // Tab A sends an AimEvent. The validator emits a broadcast
+    // that fans out to BOTH connections (both are registered).
+    let req = specialists_server::protocol::AimEvent {
         source_player_id: 7,
         yaw_radians: std::f32::consts::FRAC_PI_2,
         pitch_radians: 0.0,
         frame: 1,
         event_id: 1,
-        is_firing: 1,
-        }
-   is_firing: 1,
-        }
-dians: std::f32::consts::FRAC_PI_2,
-        pitch_radians: 0.0,
-        frame: 1,
-        event_id: 1,
+        is_firing: 1, // PR #107
     };
     ws_a.send(Message::Binary(encode_aim_event(&req).into())).await.expect("A send");
 
