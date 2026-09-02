@@ -100,12 +100,13 @@ fn snapshot_wire_format_roundtrip() {
     // (disc is prepended by the transport router, matching
     // the DamageBroadcast pattern). For 1 player:
     //   4 (serverFrame) + 4 (nextServerFrame) + 1
-    //   (playerCount) + 30 (player payload) = 39 bytes (PR #102:
-    //   +1 byte for weapon_id).
-    // The on-the-wire size (disc + body) is 40 bytes — see
+    //   (playerCount) + 31 (player payload) = 40 bytes (PR #106:
+    //   +1 byte per player for current_fire_mode; PR #102 was 30
+    //   and PR #59 was 29).
+    // The on-the-wire size (disc + body) is 41 bytes — see
     // `SNAPSHOT_WIRE_SIZE_MIN + 1 * PLAYER_STATE_WIRE_SIZE`
     // in the protocol module.
-    assert_eq!(bytes.len(), 9 + 1 * 30);
+    assert_eq!(bytes.len(), 9 + 1 * 31);
     assert_eq!(
         bytes.len(),
         specialists_server::protocol::SNAPSHOT_WIRE_SIZE_MIN

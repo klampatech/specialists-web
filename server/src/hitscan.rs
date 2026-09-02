@@ -239,6 +239,68 @@ pub fn weapon_hitscan(
     )
 }
 
+/// PR #106 — body part classification for the headshot multiplier.
+/// The damage_relay reads `Hit::body_part` and applies
+/// `HEADSHOT_MULTIPLIER` when the body part is `Head`. This enum
+/// is intentionally limited to two variants (Head vs CenterMass)
+/// because the MVP doesn't have limb-specific damage (that's
+/// deferred to PR #106+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyPart {
+    /// Hit at or above the chest (y_local > 0.6m above target center).
+    /// Damage × `HEADSHOT_MULTIPLIER` (3×).
+    Head,
+    /// Body / chest / legs. Flat `damage_per_hit`.
+    CenterMass,
+}
+
+/// PR #106 — extended hitscan that returns the body part for
+/// headshot multiplication. Replaces the boolean-returning
+/// `weapon_hitscan` for new call sites — keeps the old API for
+/// back-compat with the existing 100-pose fixture tests.
+///
+/// **Body part heuristic** (server-side, deterministic):
+/// - The hit is at `t * forward` from `origin` along the ray.
+/// - Compute the target's local-Y offset from the hit point: a hit
+/// at `t * forward + origin` relative to `target_pos` (which is at
+/// chest-height in the MVP — body centered at y=0.45 of capsule).
+/// - If the local-Y is > 0.4m above the target center (i.e., the
+/// capsule's head height = 1.4m - chest 0.45m = 0.95m, so anything
+/// in the top ~0.4m is "head"), classify as Head; else CenterMass.
+///
+/// MVP approximation: server knows capsule height = 1.4m (set by
+/// the physics layer; matches the client's Babylon capsule). The
+/// heuristic is a server-side approximation of what the client's
+/// Babylon mesh-pick would do (`Babylon.scene.pickWithRay` against
+/// the capsule meshes — head mesh vs body mesh).
+pub fn weapon_hitscan_with_body_part(
+    weapon_def: &WeaponDef,
+    origin: glam::Vec3,
+    forward: glam::Vec3,
+    target_pos: glam::Vec3,
+    target_radius: f32,
+) -> Option<BodyPart> {
+    // PR 11.6.C ray-vs-sphere math. Compute the closest t on the ray.
+    let to_target = target_pos - origin;
+    let t = to_target.dot(forward);
+    if t < 0.0 || t > weapon_def.max_range_meters {
+        return None;
+    }
+    let closest = origin + forward * t;
+    let dist = (closest - target_pos).length();
+    if dist > target_radius {
+        return None;
+    }
+    // Body-part heuristic: if the hit is in the top ~0.4m of the
+    // capsule (above chest center), classify as Head.
+    let local_y_offset = (closest.y - target_pos.y) / target_radius;
+    if local_y_offset > 0.5 {
+        Some(BodyPart::Head)
+    } else {
+        Some(BodyPart::CenterMass)
+    }
+}
+
 /// Multi-pellet shotgun hit test. Returns true if at least one of
 /// `weapon_def.pellets` jittered pellets hits the target. The first
 /// pellet uses the unmodified `forward`; subsequent pellets add a

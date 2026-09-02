@@ -120,6 +120,7 @@ async fn integration_full_round_trip_aim_event_to_broadcast() {
         pitch_radians: 0.0,
         frame: 1,
         event_id: 1,
+        is_firing: 1,
     };
     ws.send(Message::Binary(encode_aim_event(&req).into()))
         .await
@@ -209,6 +210,7 @@ async fn integration_lag_comp_rewinds_target_position_aim_event() {
         pitch_radians: 0.0,
         frame: 2,
         event_id: 1,
+        is_firing: 1,
     };
     ws.send(Message::Binary(encode_aim_event(&req).into()))
         .await
@@ -288,6 +290,7 @@ async fn integration_two_tab_convergence_aim_event() {
         pitch_radians: 0.0,
         frame: 1,
         event_id: 1,
+        is_firing: 1,
     };
     ws_a.send(Message::Binary(encode_aim_event(&req).into())).await.expect("A send");
 
