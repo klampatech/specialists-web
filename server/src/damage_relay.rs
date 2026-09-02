@@ -726,7 +726,6 @@ mod tests {
             pitch_radians: 0.0,
             frame: 4,
             event_id: 1,
-            is_firing: 1,
         }
     }
 
@@ -933,7 +932,6 @@ mod tests {
             pitch_radians: 0.0,
             frame: 40,
             event_id: 1,
-            is_firing: 1,
         };
         // RTT=400ms -> lag_frames=12 -> rewind to frame 28 (in range).
         let result = validate_and_relay_aim(&req, 1, &mut room, 400, Instant::now());

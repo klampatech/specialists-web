@@ -14,8 +14,6 @@ use specialists_server::*;
 #[test]
 fn aim_event_is_19_bytes() {
     // PR #59 / §3.5: wire size = 1 (disc) + 2 (source u16) +
-    // PR #106 — wire size = 1 + 2 + 4 + 4 + 4 + 4 + 1 (is_firing)
-    // = 1 (disc) + 19 (body) = 20 bytes total.
     // 4 (yaw f32) + 4 (pitch f32) + 4 (frame u32) + 4 (event_id u32)
     // = 19 bytes. `encode_aim_event` returns the 18-byte body
     // (no disc); the transport router prepends the disc byte.
@@ -25,17 +23,16 @@ fn aim_event_is_19_bytes() {
         pitch_radians: -0.456,
         frame: 0xdeadbeef,
         event_id: 0x12345678,
-        is_firing: 1,
     };
     let body = encode_aim_event(&req);
     assert_eq!(body.len(), AIM_EVENT_BODY_SIZE);
-    assert_eq!(body.len(), 19, "AimEvent body must be 19 bytes (2+4+4+4+4+1, PR #106 +1 byte for is_firing)");
+    assert_eq!(body.len(), 18, "AimEvent body must be 18 bytes (2+4+4+4+4)");
     // Wire size = body + disc.
     let mut wire = Vec::with_capacity(AIM_EVENT_WIRE_SIZE);
     wire.push(DISCRIMINATOR_AIM_EVENT);
     wire.extend(body);
     assert_eq!(wire.len(), AIM_EVENT_WIRE_SIZE);
-    assert_eq!(wire.len(), 20, "AimEvent must be 20 bytes on the wire (PR #106)");
+    assert_eq!(wire.len(), 19, "AimEvent must be 19 bytes on the wire");
 }
 
 #[test]
@@ -46,7 +43,6 @@ fn aim_event_roundtrip_preserves_all_fields() {
         pitch_radians: -0.5,
         frame: 0xfeedface,
         event_id: 0x01020304,
-        is_firing: 1,
     };
     let bytes = encode_aim_event(&original);
     let decoded = decode_aim_event(&bytes).expect("decode must succeed");
@@ -65,11 +61,10 @@ fn aim_event_rejects_wrong_size() {
         pitch_radians: 0.0,
         frame: 1,
         event_id: 1,
-        is_firing: 1,
     };
     let bytes = encode_aim_event(&req);
-    // Body is 19 bytes (PR #106); trim to 18 to test off-by-one rejection.
-    let truncated = &bytes[..18];
+    // Body is 18 bytes; trim to 17 to test the off-by-one rejection.
+    let truncated = &bytes[..17];
     assert!(
         decode_aim_event(truncated).is_none(),
         "decoder must reject 17-byte body buffer (off-by-one case)"
@@ -81,22 +76,20 @@ fn aim_event_rejects_wrong_size() {
 #[test]
 fn aim_event_is_big_endian() {
     // §3.5: AimEvent wire layout = [disc][source u16 BE][yaw f32 BE]
-    // [pitch f32 BE][frame u32 BE][event_id u32 BE][is_firing u8].
-    // PR #106 — body grew 18 → 19 bytes; wire = 1 (disc) + 19 = 20 bytes.
+    // [pitch f32 BE][frame u32 BE][event_id u32 BE]. Total 19 bytes.
     let req = AimEvent {
-           source_player_id: 0x0506,
-           yaw_radians: 0.0, // f32 bits = 0x00000000
-           pitch_radians: 0.0, // f32 bits = 0x00000000
-           frame: 0x01020304,
-           event_id: 0x0a0b0c0d,
-           is_firing: 1,
-       };
-       let body = encode_aim_event(&req);
-       // AimEvent on-the-wire = disc + 19-byte body = 20 bytes total (PR #106).
-       let mut bytes = Vec::with_capacity(20);
-       bytes.push(DISCRIMINATOR_AIM_EVENT);
-       bytes.extend(&body);
-       assert_eq!(bytes.len(), 20, "AimEvent wire size = 20 (PR #106)");
+        source_player_id: 0x0506,
+        yaw_radians: 0.0,    // f32 bits = 0x00000000
+        pitch_radians: 0.0,  // f32 bits = 0x00000000
+        frame: 0x01020304,
+        event_id: 0x0a0b0c0d,
+    };
+    let body = encode_aim_event(&req);
+    // AimEvent on-the-wire = disc + 18-byte body = 19 bytes total.
+    let mut bytes = Vec::with_capacity(19);
+    bytes.push(DISCRIMINATOR_AIM_EVENT);
+    bytes.extend(&body);
+    assert_eq!(bytes.len(), 19, "AimEvent wire size = 19");
     // byte 0 = disc 0x0A
     assert_eq!(bytes[0], DISCRIMINATOR_AIM_EVENT);
     // byte 1..2 = source_player_id BE: 05 06

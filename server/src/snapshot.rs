@@ -171,9 +171,8 @@ impl SnapshotGenerator {
                 pitch,
                 hp,
                 ammo,
-                is_firing: 0,         // PR 11.7.E wires the fire bit
-                weapon_id,            // PR #102 — from player.current_weapon (default DualPistol)
-                current_fire_mode: 0, // PR #106 — default Semi (index 0 for all MVP weapons)
+                is_firing: 0, // PR 11.7.E wires the fire bit
+                weapon_id,    // PR #102 — from player.current_weapon (default DualPistol)
             });
         }
 

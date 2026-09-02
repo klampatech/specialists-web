@@ -1764,7 +1764,6 @@ mod tests {
             pitch_radians: 0.0,
             frame: 10,
             event_id: 0xcafebabe,
-            is_firing: 1,
         };
         let mut payload = vec![DISCRIMINATOR_AIM_EVENT];
         payload.extend(encode_aim_event(&req));
