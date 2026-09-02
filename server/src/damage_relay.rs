@@ -32,13 +32,13 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use specialists_server::constants::{
-    weapon_def, WeaponId, FIRE_COOLDOWN_MS_DEFAULT, PLAYER_MAX_AMMO,
+    weapon_def, FireMode, WeaponId, FIRE_COOLDOWN_MS_DEFAULT, PLAYER_MAX_AMMO,
     POSITION_HISTORY_RETENTION_FRAMES, RELOAD_RATE_LIMIT_MS, WEAPONS_TABLE,
 };
 use specialists_server::hitscan::{
     chest_position, dual_pistol_damage, dual_pistol_hit, forward_from_yaw_pitch,
 };
-use specialists_server::protocol::{AimEvent, DamageBroadcast, ReloadRequest};
+use specialists_server::protocol::{AimEvent, DamageBroadcast, ReloadRequest, WeaponSwitch};
 use specialists_server::session::{PlayerId, Room, ServerFrame};
 
 /// Fire-rate cooldown for the dual-pistol (matches
@@ -459,11 +459,70 @@ pub fn validate_and_relay_aim(
     // behavior treat ammo as the cost of firing regardless
     // of hit/miss (matches PR 11.7.D's "12 damage per
     // confirmed shot" ammo model from §4.2).
+    // PR #107 — Burst state machine (driven by AimEvent's new
+    // `is_firing` byte at offset 19). For Semi mode, every AimEvent
+    // that passes Gate 4 fires one shot and decrements ammo by 1.
+    // For Burst{N} mode, the first AimEvent that passes Gate 4
+    // starts a fresh burst (consumes 1 ammo + sets
+    // `burst_shots_remaining = N - 1`); subsequent AimEvents in the
+    // same burst at the semi-cadence are accepted but consume NO
+    // ammo (the burst was paid upfront). For Auto mode (not used by
+    // any MVP weapon but supported), every AimEvent is a fresh shot.
+    //
+    // PR #107 trade-off: trigger release (is_firing: 0) resets the
+    // burst state on the next AimEvent (the player has to pull the
+    // trigger again to start a new burst). This matches TS 2.0's
+    // burst-fire semantics.
+    let mut burst_mid_shot = false;
+    {
+        let player = room
+            .players
+            .get_mut(&req_source)
+            .expect("gate 1 invariant violated - req_source not in room");
+        let fm = active_weapon_def.fire_modes[player.current_fire_mode as usize];
+        match fm {
+            FireMode::Semi => {
+                if req.is_firing == 0 {
+                    // Trigger release — the player pulled the
+                    // trigger between AimEvents but isn't firing
+                    // right now. Accept the AimEvent as a no-op
+                    // (don't fire) and reset burst state.
+                    player.burst_shots_remaining = 0;
+                    player.trigger_held = false;
+                    return vec![];
+                }
+                player.trigger_held = true;
+            }
+            FireMode::Burst { count } => {
+                if req.is_firing == 0 {
+                    // Trigger released — reset burst.
+                    player.burst_shots_remaining = 0;
+                    player.trigger_held = false;
+                    return vec![];
+                }
+                if !player.trigger_held {
+                    // Fresh burst — first shot.
+                    player.trigger_held = true;
+                    player.burst_shots_remaining = count.saturating_sub(1);
+                } else {
+                    // Mid-burst — subsequent shots don't consume ammo.
+                    burst_mid_shot = true;
+                    player.burst_shots_remaining =
+                        player.burst_shots_remaining.saturating_sub(1);
+                }
+            }
+            FireMode::Auto => {
+                player.trigger_held = req.is_firing != 0;
+            }
+        }
+    }
     let player = room
         .players
         .get_mut(&req_source)
         .expect("gate 1 invariant violated - req_source not in room");
-    player.ammo = player.ammo.saturating_sub(1);
+    if !burst_mid_shot {
+        player.ammo = player.ammo.saturating_sub(1);
+    }
     player.last_fire_at = Some(now);
     // Saturating stamp on last_event_id_for_source (mirror
     // of the damage path's stamp_saturates_does_not_wrap
@@ -630,9 +689,98 @@ pub fn validate_and_relay_reload(
     Some(())
 }
 
-/// Encode a `DamageBroadcast` to on-the-wire bytes (discriminator
-/// prepended). The transport fan-out uses this so the broadcast
-/// reaches every connection in the room with consistent bytes.
+/// Validate a `WeaponSwitch` request and apply the switch server-side.
+/// Returns `true` on success (player switched weapons/fire mode), `false`
+/// on rejection (no mutation).
+///
+/// PR #107 — `0x0C WeaponSwitch` wire (disc = 0x0C, body = 4 bytes:
+/// source_player_id u16 + weapon_id u8 + fire_mode_index u8).
+///
+/// Gates (5):
+///   1. Source in room.
+///   2. Connection PlayerId matches request source (anti-spoof).
+///   3. Rate limit: <1 sec since the player's last switch
+///      (WEAPON_SWITCH_RATE_LIMIT_MS).
+///   4. weapon_id is a known WeaponId (open-enum: any unknown value
+///      is rejected — anti-cheat).
+///   5. fire_mode_index is in range for the weapon's fire_modes[].
+///
+/// On success, mutates `room.players[source]` via
+/// `Player::apply_weapon_switch` (resets burst state).
+pub fn validate_and_relay_weapon_switch(
+    req: &WeaponSwitch,
+    connection_player_id: PlayerId,
+    room: &mut Room,
+    now: Instant,
+) -> bool {
+    use specialists_server::constants::WEAPON_SWITCH_RATE_LIMIT_MS;
+    // Gate 1: source in room.
+    if !room.players.contains_key(&req.source_player_id) {
+        warn!(
+            source = req.source_player_id,
+            "weapon_switch: rejected — source not in room",
+        );
+        return false;
+    }
+    // Gate 2: anti-spoof — connection's PlayerId must match the request's.
+    if connection_player_id != req.source_player_id {
+        warn!(
+            connection = connection_player_id,
+            claimed = req.source_player_id,
+            "weapon_switch: rejected — connection / claimed source mismatch",
+        );
+        return false;
+    }
+    // Gate 3: rate limit.
+    let player = &room.players[&req.source_player_id];
+    if let Some(last_switch) = player.last_weapon_switch_at {
+        let elapsed = now.duration_since(last_switch);
+        if elapsed < std::time::Duration::from_millis(WEAPON_SWITCH_RATE_LIMIT_MS) {
+            warn!(
+                source = req.source_player_id,
+                elapsed_ms = elapsed.as_millis() as u64,
+                rate_limit_ms = WEAPON_SWITCH_RATE_LIMIT_MS,
+                "weapon_switch: rejected — rate limit not elapsed",
+            );
+            return false;
+        }
+    }
+    // Gate 4: weapon_id is a known WeaponId (open-enum rejection).
+    let new_weapon = match WeaponId::from_wire(req.weapon_id) {
+        Some(w) => w,
+        None => {
+            warn!(
+                source = req.source_player_id,
+                claimed = req.weapon_id,
+                "weapon_switch: rejected — unknown weapon_id",
+            );
+            return false;
+        }
+    };
+    // Gate 5: fire_mode_index in range for the weapon's fire_modes[].
+    let weapon_def = weapon_def(new_weapon);
+    let fm_idx = req.fire_mode_index as usize;
+    if fm_idx >= weapon_def.fire_modes.len() {
+        warn!(
+            source = req.source_player_id,
+            fire_mode_idx = req.fire_mode_index,
+            fire_modes_len = weapon_def.fire_modes.len(),
+            "weapon_switch: rejected — fire_mode_index out of range",
+        );
+        return false;
+    }
+    // All gates passed — apply the switch.
+    let player = room.players.get_mut(&req.source_player_id).unwrap();
+    player.apply_weapon_switch(new_weapon, req.fire_mode_index);
+    player.last_weapon_switch_at = Some(now);
+    debug!(
+        source = req.source_player_id,
+        new_weapon = new_weapon.to_wire(),
+        fire_mode_index = req.fire_mode_index,
+        "weapon_switch: applied",
+    );
+    true
+}
 pub fn relay_broadcast(bc: &DamageBroadcast) -> Vec<u8> {
     let body = specialists_server::protocol::encode_damage_broadcast(bc);
     let mut out = Vec::with_capacity(1 + body.len());
@@ -652,11 +800,19 @@ pub fn relay_broadcast(bc: &DamageBroadcast) -> Vec<u8> {
 /// (discriminator prepended). The transport sends this to the
 /// source tab only (not broadcast) so the source can revert its
 /// optimistic apply.
+///
+/// PR #107 — DEPRECATED. DamageReject was never wired (the
+/// DamageRequest path was replaced by AimEvent in PR #59; DamageReject
+/// was defined as a follow-up but the transport never got a sender).
+/// PR #107 reclaimed 0x0C for WeaponSwitch. This function remains
+/// compiled for source compatibility but is unreachable from the
+/// hot path. Safe to delete in a future cleanup PR.
+#[allow(deprecated)]
 pub fn relay_reject(event_id: u32, reason: u8) -> Vec<u8> {
     let r = specialists_server::protocol::DamageReject { event_id, reason };
     let body = specialists_server::protocol::encode_damage_reject(&r);
     let mut out = Vec::with_capacity(1 + body.len());
-    out.push(specialists_server::protocol::DISCRIMINATOR_DAMAGE_REJECT);
+    out.push(specialists_server::protocol::DAMAGE_REJECT);
     out.extend(body);
     debug_assert_eq!(
         out.len(),
@@ -726,6 +882,7 @@ mod tests {
             pitch_radians: 0.0,
             frame: 4,
             event_id: 1,
+            is_firing: 1, // PR #107 — defaults to "trigger pulled" for tests
         }
     }
 
@@ -932,6 +1089,7 @@ mod tests {
             pitch_radians: 0.0,
             frame: 40,
             event_id: 1,
+            is_firing: 1, // PR #107
         };
         // RTT=400ms -> lag_frames=12 -> rewind to frame 28 (in range).
         let result = validate_and_relay_aim(&req, 1, &mut room, 400, Instant::now());

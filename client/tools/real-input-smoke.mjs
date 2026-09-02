@@ -310,6 +310,7 @@ async function runSmoke() {
         pitchRadians: 0,
         frame: snap?.serverFrame ?? 0,
         eventId: 0xCAFE1234,
+        isFiring: 1, // PR #107 — Burst state machine: trigger-press
       });
       return { ok: true };
     });

@@ -196,6 +196,7 @@ async fn router_dispatches_aim_event_returns_broadcast() {
         pitch_radians: 0.0,
         frame: 1, // any frame 0..3 has a snapshot
         event_id: 0xcafebabe,
+        is_firing: 1, // PR #107
     };
     let mut payload = vec![DISCRIMINATOR_AIM_EVENT];
     payload.extend(encode_aim_event(&req));
@@ -291,6 +292,7 @@ async fn validator_rejects_zero_ammo_in_room() {
         pitch_radians: 0.0,
         frame: 1,
         event_id: 1,
+        is_firing: 1, // PR #107
     };
     let mut payload = vec![DISCRIMINATOR_AIM_EVENT];
     payload.extend(encode_aim_event(&req));
@@ -316,6 +318,7 @@ async fn validator_rejects_fire_rate_violation_in_room() {
         pitch_radians: 0.0,
         frame: 1,
         event_id: 1,
+        is_firing: 1, // PR #107
     };
     let mut payload1 = vec![DISCRIMINATOR_AIM_EVENT];
     payload1.extend(encode_aim_event(&req1));
@@ -330,6 +333,7 @@ async fn validator_rejects_fire_rate_violation_in_room() {
         pitch_radians: 0.0,
         frame: 1,
         event_id: 2,
+        is_firing: 1, // PR #107
     };
     let mut payload2 = vec![DISCRIMINATOR_AIM_EVENT];
     payload2.extend(encode_aim_event(&req2));
@@ -812,6 +816,7 @@ fn hitscan_rewinds_through_rapier_history_mid_air() {
         pitch_radians: 0.0,
         frame: 100,
         event_id: 1,
+        is_firing: 1, // PR #107
     };
     let result = validate_and_relay_aim(
         &req, 1, &mut room, 0,

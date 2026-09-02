@@ -406,6 +406,7 @@ async function runSmoke() {
           pitchRadians: 0.0,
           frame: currentFrame,
           eventId,
+          isFiring: 1, // PR #107 — Burst state machine: trigger-press
         });
         return { ok: true, frame: currentFrame };
       } catch (e) {
@@ -530,6 +531,7 @@ async function runSmoke() {
           pitchRadians: 0.0,
           frame: currentFrame,
           eventId,
+          isFiring: 1, // PR #107 — Burst state machine: trigger-press
         });
         return { ok: true };
       } catch (e) {

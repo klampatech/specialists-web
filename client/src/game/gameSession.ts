@@ -390,6 +390,14 @@ export function createGameSession(
   let lastRenderedIdx = 0;
   /** Previous `input.fireHeld` value — tracks rising edges. */
   let wasFiring = false;
+  /** PR #107 — separate tracker for falling edges (release-event
+   *  emission). Distinct from `wasFiring` because `wasFiring` is
+   *  set to the CURRENT frame's `fireHeld` inside the same
+   *  function, so by the time the release check runs `wasFiring`
+   *  is already updated. `wasFiringPrev` is updated AFTER the
+   *  release check, so the check sees the value from the PREVIOUS
+   *  frame. */
+  let wasFiringPrev = false;
   /** Previous `input.meleePressed` value — tracks rising edges. */
    let wasMelee = false;
    // PR 65 — track the snapshot's serverFrame when we last read it,
@@ -648,6 +656,12 @@ export function createGameSession(
           pitchRadians: gameInput.pitchRadians ?? 0,
           frame: reqFrame,
           eventId: nextAimEventIdLocal++,
+          // PR #107 — burst state machine input. Press event (rising
+          // edge of `fireHeld`): `isFiring: 1` starts the burst. The
+          // server's `validate_and_relay_aim` requires `isFiring: 0`
+          // between burst pulls (Semi/Burst arms). The matching
+          // release event is emitted below on the falling edge.
+          isFiring: 1,
         };
         lastSnapshotFrameSeen = snapFrame;
         dbSendAimEvent(serverTransport, req);
@@ -706,6 +720,38 @@ export function createGameSession(
     }
     wasFiring = gameInput.fireHeld;
     wasMelee = input.meleePressed;
+
+    // PR #107 — emit a release AimEvent on the falling edge of
+    // `fireHeld`. The server's `validate_and_relay_aim` requires
+    // `isFiring: 0` between burst pulls (Semi/Burst arms);
+    // without this release signal the burst state machine would
+    // treat the next rising edge as a continuation of the held
+    // trigger and skip the shot.
+    //
+    // `wasFiringPrev` holds the value of `gameInput.fireHeld`
+    // from the PREVIOUS frame (before the assignment above
+    // updated `wasFiring`). Falling edge =
+    // `wasFiringPrev === true && gameInput.fireHeld === false`.
+    //
+    // We always have a valid `snap`/`snapFrame` at this point
+    // (the snapshot primer fan-out happens at connect-time), so
+    // reuse the same `reqFrame` math as the press event for
+    // consistency with the lag-comp rewind.
+    if (wasFiringPrev && !gameInput.fireHeld && serverTransport) {
+      const snap = (window as Window & { __latestSnap?: () => unknown }).__latestSnap?.() as { serverFrame?: number } | null;
+      const snapFrame = snap?.serverFrame ?? 0;
+      const localDelta = advanced.frame - lastSnapshotFrameSeen;
+      const reqFrame = Math.max(snapFrame, snapFrame + localDelta - 16);
+      dbSendAimEvent(serverTransport, {
+        sourcePlayerId: localPlayerId,
+        yawRadians: gameInput.yawRadians ?? 0,
+        pitchRadians: gameInput.pitchRadians ?? 0,
+        frame: reqFrame,
+        eventId: nextAimEventIdLocal++,
+        isFiring: 0,
+      });
+    }
+    wasFiringPrev = gameInput.fireHeld;
 
     // PR 10: symmetric damage flow on the REMOTE input. Both clients run
     // the same lockstep, so this runs identically on both ends — the

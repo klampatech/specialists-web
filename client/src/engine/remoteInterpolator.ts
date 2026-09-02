@@ -212,6 +212,8 @@ function lerpPlayerState(
     isFiring: newer.isFiring,
     // PR #102 — discrete weapon id (no interpolation).
     weaponId: newer.weaponId,
+    // PR #107 — discrete fire-mode index (no interpolation).
+    currentFireMode: newer.currentFireMode,
   };
 }
 

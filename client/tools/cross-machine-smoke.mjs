@@ -518,6 +518,7 @@ async function main() {
         pitchRadians: 0,
         frame: snap.serverFrame,
         eventId,
+        isFiring: 1, // PR #107 — Burst state machine: trigger-press
       });
       return { ok: true, eventId, frame: snap.serverFrame };
     }, { yaw: aimYaw });

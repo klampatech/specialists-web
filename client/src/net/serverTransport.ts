@@ -59,6 +59,7 @@ import {
   encodeInputsServer,
   encodePing,
   encodePositionUpdate,
+  encodeWeaponSwitch,
 } from "../../../protocol/damage";
 // PR 11.7.E / §3.5 — ReloadRequest wire type. The client only
 // SENDS ReloadRequests (no inbound 0x09 dispatch — the server is
@@ -73,7 +74,8 @@ import type {
   InputsServer,
   Ping,
   PositionUpdate,
- } from "../../../protocol/damage";
+  WeaponSwitch,
+} from "../../../protocol/damage";
 
 /** Underlying transport type reported by `getStats()`. */
 export type TransportKind = "webtransport" | "websocket";
@@ -435,6 +437,26 @@ export class ServerTransport {
    */
   sendReloadRequest(p: Uint8Array | ReloadRequest): void {
     const bytes = p instanceof Uint8Array ? p : encodeReloadRequest(p);
+    this.sendRaw(bytes);
+  }
+
+  /**
+   * PR #107 + PR #108 — send a typed `WeaponSwitch` over the
+   * transport. The server validates
+   * (`damage_relay::validate_and_relay_weapon_switch`, 5 gates:
+   * source-in-room, anti-spoof, rate-limit, weapon-id-known,
+   * fire-mode-index-in-range). On success the server mutates
+   * `room.players[source].{current_weapon, current_fire_mode,
+   * burst_shots_remaining, trigger_held}` and the next 20Hz
+   * Snapshot broadcast (discriminator 0x07) carries the new
+   * state to every connected tab — no private ack packet.
+   *
+   * **Caller responsibility**: local rate-limit gate at
+   * `WEAPON_SWITCH_RATE_LIMIT_MS` (1 Hz per player) so the
+   * server-side rate-limit isn't burned.
+   */
+  sendWeaponSwitch(p: Uint8Array | WeaponSwitch): void {
+    const bytes = p instanceof Uint8Array ? p : encodeWeaponSwitch(p);
     this.sendRaw(bytes);
   }
 
