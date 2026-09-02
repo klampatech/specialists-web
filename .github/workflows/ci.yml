@@ -999,6 +999,76 @@ jobs:
             pids=$(lsof -ti:${port} 2>/dev/null || true)
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
+
+  # PR 112 — CF-N1 sustained-load stress smoke. Boots canary on
+  # 14449/14450/18087 + vite on 5197 (next slot after crosshair
+  # per docs/PR-105-spec.md §2.4), 2-tab Playwright drives Tab A's
+  # sustained spam-fire (100 AimEvents at 120ms cooldown over ~12s),
+  # asserts the server's drop-oldest counter stays at 0 AND the
+  # rate-limited counter stays bounded — the EXACT load profile that
+  # triggers the CF-N1 flake on `damage-server-hp-convergence` (see
+  # post-#98 SPEC entry). Catches the CF-N1 class BEFORE it hits the
+  # next CI run. Opt-in nightly (mirrors `client-stress-24p-smoke`'s
+  # opt-in pattern) — full sustained-load smokes are expensive on CI
+  # runners; `damage-server-hp-convergence` stays as the required
+  # gate. ~30-50s runtime.
+  client-cfn1-sustained-stress-smoke:
+    name: client — CF-N1 sustained-stress smoke (PR 112, opt-in)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — CF-N1 sustained smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Run CF-N1 sustained-stress smoke
+        # Spam-fire: 100 shots at 120ms cooldown over ~12s sustained.
+        # Mirrors the post-#98 CF-N1 failure profile. 1.5s post-spam
+        # settle so the final shots + snapshot fan-out catch up.
+        # CANARY_STATS_INTERVAL_MS=2000 so we see ~5-7 [stress-stats]
+        # lines during the spam window.
+        run: node ./tools/cfn1-sustained-stress-smoke.mjs
+        env:
+          CFN1_SMOKE_SPAM_SHOTS: "100"
+          CFN1_SMOKE_COOLDOWN_MS: "120"
+          CFN1_SMOKE_POST_SPAM_SETTLE_MS: "1500"
+          SMOKE_CONNECT_TIMEOUT_MS: "5000"
+          CANARY_STATS_INTERVAL_MS: "2000"
+        timeout-minutes: 3
+      - name: Tear down canary + Vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server.pid ]]; then kill "$(cat /tmp/canary-server.pid)" || true; fi
+          pkill -f canary-server.sh || true
+          pkill -f vite || true
+          for port in 14449 14450 18087 5197; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   client-jump-smoke:
     name: client — jump regression smoke (PR 8)
     runs-on: ubuntu-latest

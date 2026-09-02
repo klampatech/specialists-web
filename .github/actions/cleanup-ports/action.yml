@@ -46,7 +46,7 @@ runs:
         # Range 5174-5200 covers all Vite dev ports used by the
         # current client smokes (see grep '5190\|5191\|5193\|5194'
         # in client/tools/*.mjs).
-        for port in 14433 14434 14445 14446 14447 14448 18080 18084 18086 5174 5175 5180 5184 5185 5186 5187 5188 5189 5190 5191 5192 5193 5194 5195 5196 5197 5198 5199 5200; do
+        for port in 14433 14434 14445 14446 14447 14448 14449 14450 18080 18084 18086 18087 5174 5175 5180 5184 5185 5186 5187 5188 5189 5190 5191 5192 5193 5194 5195 5196 5197 5198 5199 5200; do
           pids=$(lsof -ti:${port} 2>/dev/null || true)
           if [[ -n "$pids" ]]; then
             echo "[cleanup] freeing port ${port}: $(echo $pids | tr '\n' ' ')"
