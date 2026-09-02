@@ -206,15 +206,26 @@ async function sendMeleeSwing(page, yawRadians) {
     const bus = (window).__damageBus;
     const snap = (window).__latestSnap?.();
     if (!bus) return { ok: false, reason: "no __damageBus" };
+    if (typeof bus.sendMeleeEvent !== "function") {
+      return {
+        ok: false,
+        reason: "bus.sendMeleeEvent is not a function (probe surface not extended?)",
+        busKeys: Object.keys(bus).slice(0, 20),
+      };
+    }
     if (!snap) return { ok: false, reason: "no __latestSnap" };
-    const result = bus.sendMeleeEvent({
-      sourcePlayerId: (window).__localPlayerId ?? 1,
-      yawRadians: yawRadians ?? 0,
-      pitchRadians: 0,
-      frame: snap.serverFrame,
-      eventId,
-    });
-    return { ok: true, eventId: result };
+    try {
+      const result = bus.sendMeleeEvent({
+        sourcePlayerId: (window).__localPlayerId ?? 1,
+        yawRadians: yawRadians ?? 0,
+        pitchRadians: 0,
+        frame: snap.serverFrame,
+        eventId,
+      });
+      return { ok: true, eventId: result };
+    } catch (e) {
+      return { ok: false, reason: `sendMeleeEvent threw: ${String(e)}` };
+    }
   }, { yawRadians: yawRadians ?? Math.PI / 2, eventId: Math.floor(Math.random() * 0xFFFFFFFF) });
 }
 
@@ -388,7 +399,8 @@ async function runSmoke() {
     // Tab A yaw=π/2 → forward = +X → where Tab B was placed
     // (pos.x + 1.0).
     log("Tab A RMB click → expect Tab B HP 100→75");
-    await sendMeleeSwing(pageA, Math.PI / 2);
+    const swing3 = await sendMeleeSwing(pageA, Math.PI / 2);
+    log(`  sendMeleeSwing result: ${JSON.stringify(swing3)}`);
     await sleep(PROPAGATE_MS);
     const hpA1 = await readRemoteHp(pageA, 2);
     assert(
