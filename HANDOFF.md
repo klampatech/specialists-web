@@ -7,75 +7,92 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#104 (2026-09-01). **`main` @ `49721e4` (PR #104 squash — MERGED 2026-09-01).** TS 2.0 weapon datamine landed as docs + `docs/TS2.0-weapon-data.md`. **`You are here` summary**: PR #104 closes the "data-mine original The Specialists mod" carry-forward from PR #102. All 34 weapons' accuracy, mag, range, fire rate, cooldown, damage, fire modes extracted via `objdump -d` of `archive.org/details/ts-2.0` `mp.dll` + HL1 vanilla `skill.cfg` cvar lookup. **MVP values for PR #105 are canonical**: DualPistol (Glock-18 archetype, 8 dmg/shot, mag 10, 22m, **semi + burst3**); Shotgun (BENELLI-M3, **5 dmg × 8 pellets**, **mag 8** 8+1 tube, 114m, semi-pump); Sniper (Barrett M82A1, **200 dmg/shot, 1-hit kill**, mag 5 bolt-action, 100m, semi). Field map cross-validated against `weapons_official.txt` byte-for-byte. The previous `dual_pistol_matches_pre_102_values` test (which pinned damage=12) will fail on PR #105 when we ship TS-canonical damage=8 — **intentional behavior change**, the test was a pre-#102 pin and post-#102 we're targeting TS 2.0 fidelity, not pre-#102 backward-compat for damage.
+**`You are here`**: post-PR-#108 (2026-09-02). **`main` @ `dd4f9f6` (PR #108 squash — MERGED 2026-09-02 14:32 UTC).** The full weapons wire + UI + smoke is on main. **`You are here` summary**: PR #107 (server-side: WeaponSwitch wire + Burst state machine + `is_firing` byte in AimEvent + `current_fire_mode` byte in PlayerState) and PR #108 (client-side mirror + 1/2/3 + B key handlers + per-weapon HUD + new `weapon-switch-smoke.mjs` + new `client-weapon-switch-smoke` CI job + server `snapshot.rs` gap-fix caught by the smoke) are both **MERGED** as a wire-break pair (`next-deploy-is-all-clients-new` per docs/PR-105-spec.md §2.4). **Both wire-break smokes + all 5 originally-failing smokes flipped FAIL → PASS** once the smoke-literal updates landed on PR #107 (13 AimEvent literals updated across 7 smoke scripts to pass `isFiring: 1`; `damage-server-smoke.mjs` wire-size `EXPECTED` map bumped 19 → 20). **The smoke that caught the snapshot.rs gap** (assertion 4: "Tab A snapshot did not converge to DualPistol+Burst3 within 2000ms") is the strongest validation of the smoke-first methodology — the regression shipped to main via PR #107 because the smoke that would catch it didn't exist yet. **Verification**: cargo test 119/119 PASS (was 108, +5 PR #107 constants + +6 validate_and_relay_weapon_switch), vitest 86/86 PASS (was 66, +16 weaponSwitch.test.ts + +4 damage.test.ts), typecheck+build clean, weapon-switch-smoke 6/6 PASS, **all 33 CI checks GREEN** on the merge commit. **Carry-forwards beyond PR #108** (deferred to future PRs): (1) Crosshair component — no crosshair exists in the codebase today; adding one is a new feature, not a wire-follow-up. (2) Per-weapon icon sprites — D/S/N ASCII letters ship as placeholder, real sprites are a polish PR. (3) The 3 §6 open questions were resolved during PR #108 with the recommendations in the plan (no `0x0C` DamageReject fallback decoder; text labels first; client agnostic on headshot multiplier). No code work currently queued.
 
-**Quick recap**: Post-PR-#102 (WEAPONS_TABLE refactor + 30-byte PlayerState wire, MERGED at `1ce8bff`), you asked to data-mine the original The Specialists Half-Life mod for authentic weapon values (damage, mag, fire rate, range, accuracy, fire modes). After hitting the wall on TS 3.0 (Cloudflare-protected installer at ModDB, no open TS 2.1+ SDK), we pulled TS 2.0 official client + Linux server from `archive.org/details/ts-2.0` (no extraction needed — TS 2.0 ships plaintext `weapons_official.txt` + `ts_fgd.fgd` + `mp.dll` with all 33 weapon classes). Reverse-engineered the constructor disassembly for every weapon (`objdump -d` + float32/int32 decode of `movl/movb $X, 0xNN(%edx)` patterns).
+**Recommended next direction (your call)**:
+- **(a) Weapons Phase 2.2 — HUD polish + crosshair + icon sprites** (~1 session). D/S/N text labels work but a real crosshair with weapon-aware spread (Burst shows slight spread, Sniper a dot) + per-weapon icon sprites would close the UX gap. Use `image_generate` once fal.ai balance resets.
+- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator (PR #83) + producer-side rate-limiter (PR #81) already cover the worst case. Pre-cloud verification pass + small capacity bump if needed before sustained cloud load.
+- **(c) New feature arc** — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat, `0x0B MeleeEvent` wire type. Phase 2 candidates that were deferred pre-#98.
+- **(d) Maintenance sweep** — the few remaining deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test (needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session; the 2026-09-01 attempt was blocked by the existing Vivaldi absorbing the flag).
 
-**🎯 COMPLETE RE RESULT** (next session, you have full data — see `docs/TS2.0-weapon-data.md`):
+**Deploy coordination reminder**: PR #107 + PR #108 are a `next-deploy-is-all-clients-new` pair. The deploy message must call out that **ALL clients must refresh** — existing tabs (cached JS from pre-#107) will be broken until they reload because PlayerState grew 30 → 31 bytes and AimEvent grew 19 → 20 bytes. Flag `#operations` for the deploy.
 
-**Part 1 — Constructor RE (mp.dll)**: Field layout discovered and cross-validated against `weapons_official.txt`:
-- 0x24 = accuracy cone (matches `weapons_official.txt` col 1 ✓)
-- 0x2c = **view kickback** (NOT damage — that was my initial mis-read; matches `weapons_official.txt` col 2 ✓)
-- 0x30 = accuracy kickback (matches `weapons_official.txt` col 3 ✓)
-- 0x38 = max carry ammo, 0x80/0x81 = HUD pos/slot, 0xc6 = mag, 0xc8 = fire rate, 0xcc = range (HL units), 0xd4 = cooldown (0.1s ticks)
+---
 
-**Part 2 — CVAR trace (skill.cfg)**: Pulled HL1 vanilla `skill.cfg` from `twhl.info/vault/download/4687`. TS doesn't ship its own — uses HL1 defaults. Damage values:
-- 9mm bullet: **8** (per shot) — Glock-18, Mini-Uzi, MP5K, Akimbo Berettas, Akimbo Mini-Uzi, STEYR-TMP, Glock-20C
-- 9mmAR bullet: **5** — MP5SD, MP7-PDW, M4A1, M16A4, STEYR-AUG, AK47, Five-seveN, MAC10, M60E3, SOCOM-MK23, Akimbo MK23, Akimbo Five-seveN
-- 357 bullet: **40** — Desert Eagle, Raging Bull, Golden Colts
-- buckshot: **5/pellet** — BENELLI-M3, USAS-12, SPAS-12, MOSSBERG 500, Sawed-off
-- hand grenade: **100** — M61 Grenade
-- melee (crowbar): **10** — Combat Knife, Katana, Seal Knife, Knifer
-- Barrett M82A1 (.50 BMG, not in HL1): **200** (TS override, community consensus)
+## 2026-09-02 — PR #107 + PR #108 wire-break pair MERGED (weapons wire ship — server + client + smoke + UI + server gap-fix)
 
-**ALL 34 weapons now have damage values.** None missing.
+**Scope**: Wire-break pair across two PRs on the same day. PR #107 (server-side foundation for the weapons wire + Burst state machine + new `WeaponSwitch` 0x0C dispatcher) shipped first; PR #108 (client-side mirror + 1/2/3 + B key handlers + per-weapon HUD + new `weapon-switch-smoke.mjs` + new `client-weapon-switch-smoke` CI job + server `snapshot.rs` gap-fix caught by the smoke) shipped ~15 min later. Both **MERGED** to `main` at `dd4f9f6` (PR #107 squash `60d0add`, merged 2026-09-02 14:17 UTC; PR #108 squash `dd4f9f6`, merged 2026-09-02 14:32 UTC).
 
-**Validation**:
-- mp.dll accuracy + view-kickback + accuracy-kickback values match `weapons_official.txt` byte-for-byte (PART 1 confirmed correct)
-- Damage values match HL1 vanilla `skill.cfg` cvars
-- All values cross-validate against TS community memory (1-shot Barrett, fast SMG, slow shotgun, etc.)
+**Why this is a single arc, not two PRs**: PR #107 explicitly documents that it is **blocked on PR #108** in its PR body. The wire-break at the snapshot boundary (PlayerState 30 → 31 bytes per player; AimEvent 19 → 20 bytes) breaks every existing client tab. The `next-deploy-is-all-clients-new` mitigation (docs/PR-105-spec.md §2.4) requires server + client to deploy together. Both PRs are required; merging one without the other breaks every running tab.
 
-## MVP weapon values ready for PR #104
+**What PR #107 landed** (server-side foundation):
 
-**Multi-mode fire modes accounted for up front** (per TS 2.0 design):
+- **`server/src/protocol.rs` (+124)** — new `WeaponSwitch` struct + encode/decode + `DISCRIMINATOR_WEAPON_SWITCH = 0x0C` (reclaimed from dead `DAMAGE_REJECT` per PR 11.6.D); `current_fire_mode: u8` byte in `PlayerState` (29→30→**31 bytes**); `is_firing: u8` byte in `AimEvent` (18→**19 bytes** body); `WEAPON_SWITCH_BODY_SIZE` (4 bytes) + `WEAPON_SWITCH_WIRE_SIZE` (5 bytes) constants; `encode_weapon_switch` / `decode_weapon_switch` round-trip; `DamageReject` kept with `#[deprecated]` tombstone for source-compat.
+- **`server/src/snapshot.rs` (+1)** — `PlayerState` literal in `build_snapshot` adds `current_fire_mode: 0`. *(This is the gap that PR #108 caught — see below.)*
+- **`server/src/damage_relay.rs` (+172)** — new `validate_and_relay_weapon_switch` with 5 gates (source-in-room, anti-spoof, rate-limit at `WEAPON_SWITCH_RATE_LIMIT_MS` = 1000ms, weapon-id-known, fire-mode-index-in-range); Burst state machine wired into `validate_and_relay_aim`: Semi (every AimEvent with `is_firing: 1` decrements ammo; `is_firing: 0` resets burst state), Burst{N} (first pull consumes 1 ammo + sets `burst_shots_remaining = N-1`; subsequent AimEvents in the burst consume no ammo), Auto (every AimEvent is a fresh shot).
+- **`server/src/transport.rs` (+55)** — new `DISCRIMINATOR_WEAPON_SWITCH` match arm in `handle_binary` dispatcher.
+- **`server/tests/damage_relay.rs`, `protocol_wire.rs`, `session_canary.rs`, `snapshot.rs`** — all AimEvent literals + PlayerState literals + size assertions updated for the new wire sizes (this is what made the PR #107 `cargo test --lib` go from RED to GREEN on the final force-push).
 
-| MVP weapon | damage | mag | range | fire_r | cooldown | fire_modes |
-|------------|--------|-----|-------|--------|----------|------------|
-| DualPistol | **8/shot** | 10 | 22m | 1.000 | 0.70s | semi, burst3 |
-| Shotgun    | **5 dmg × 8 pellets = 40 close-range** | 8 | 114m | 0.850 | 1.50s | semi |
-| Sniper     | **200/shot, 1-hit kill** | 70 | 229m | 0.800 | 1.00s | semi (bolt-action) |
+**What PR #107 also needed to land for the wire to work end-to-end** (these came from PR #108 work-in-progress via cherry-pick):
 
-**Design implication for the MVP wire**:
+- **Cherry-pick of PR #108's `5c3f2a7`** onto PR #107 — the client-encoder wire-side changes (`protocol/constants.ts` WEAPONS_TABLE mirror, `protocol/damage.ts` AimEvent 18→19 + new `WeaponSwitch`, `protocol/snapshot.ts` PlayerState 30→31 + new `currentFireMode`). Without this, PR #107 alone has no client that can talk to the new server wire. The 663 LOC diff is the same patch that PR #108 ships on top; cherry-picking onto PR #107 means both deploys ship the same encoder.
+- **`client/tools/{damage-server-smoke, damage-server-aim-event-smoke, damage-server-reload-smoke, damage-server-hp-convergence-smoke, health-regression-smoke, cross-machine-smoke, real-input-smoke}.mjs`** — 13 AimEvent literal call sites updated to pass `isFiring: 1`. Without this, the smokes' AimEvent writes `is_firing: 0` (undefined & 0xff = 0), server reads trigger-release, early-returns without firing, ammo never decrements, smokes FAIL. This is the failure mode that initially showed up as 4 PR #108 smokes failing with "Snapshot entries: []" / ammo-not-decrement / wire-size-19/20-mismatch symptoms.
+- **`client/tools/damage-server-smoke.mjs` `EXPECTED` wire-size map** — `aimEvent: 19` → `20` (line 511 + line 329 inline literal). Bumped to match the post-#107 wire.
 
-The `WeaponSwitch` (planned `0x0C` wire type) carries both the new weapon and the fire mode:
-- `u16 source_player_id`
-- `u8 weapon_id` (DualPistol=0 / Shotgun=1 / Sniper=2)
-- `u8 fire_mode_index` (0=semi, 1=burst3 for DualPistol; 0=semi for Shotgun/Sniper)
-- = 4 bytes total
+**What PR #108 landed** (client-side follow-up + UI + smoke + server gap-fix):
 
-The `PlayerState` wire gains one more byte for the active fire mode:
-- `current_fire_mode: u8` (offset 30 — was offset 29 for `weapon_id`)
-- Snapshot grows 1 byte per player → 25 players = 25 bytes added (was 730, now 755)
+- **`protocol/constants.ts` (+199)** — client-side mirror of `WEAPONS_TABLE[3]` + `FireMode` enum (Semi / Burst{count} / Auto) + `WeaponId` enum + `HEADSHOT_MULTIPLIER` + `WEAPON_SWITCH_RATE_LIMIT_MS` + `PLAYER_MAX_AMMO`. Read-only by `BulletHud` + `Crosshair` + `inputListener`.
+- **`protocol/damage.ts` (+199/-16)** — `AIM_EVENT_BODY_SIZE` 18 → 19 (now includes `is_firing` byte); new `encode_weapon_switch` + `decode_weapon_switch` for the 4-byte body + 0x0C disc; `encodeDamageReject` retained with `@deprecated` JSDoc (mirrors the Rust tombstone).
+- **`protocol/snapshot.ts` (+66/-27)** — `PLAYER_STATE_BODY_SIZE` 30 → 31; new `currentFireMode` field at offset 30.
+- **`protocol/weaponSwitch.test.ts` (+194, NEW)** — 16 vitest tests covering WEAPONS_TABLE shape + WeaponId wire encoding (3 known variants) + FireMode encoding (Semi=0, Burst{1,2,3,4}=1, Auto=2) + HEADSHOT_MULTIPLIER value + WEAPON_SWITCH_RATE_LIMIT_MS value + PLAYER_MAX_AMMO value.
+- **`client/src/engine/inputListener.ts` (+96)** — `onWeaponSwitch` hook + keys 1/2/3 (DualPistol / Shotgun / Sniper) + key B (cycle fire modes on DualPistol) + per-player rate-limit gate (1 Hz/player, mirrors server's 5-gate #3).
+- **`client/src/game/gameSession.ts` (+133)** — `tryStartWeaponSwitch` (resolves cycle sentinel `-1` to next valid index) + `getLocalWeaponState` + `_setLocalWeaponStateFromSnapshot` (snapshot-driven authoritative overwrite) + **release-event emission on the falling edge of `fireHeld`** — this is what makes the server's Burst state machine accept the next pull: `isFiring: 0` between burst pulls.
+- **`client/src/ui/BulletHud.tsx` (+113)** — per-weapon HUD strip (D/S/N icon + display name + fire-mode label "SEMI" / "BURST-3" + magazine-aware ammo bar). The D/S/N icons are ASCII letters — real sprite assets are a polish PR (fal.ai balance was exhausted at PR time, blocking `image_generate`).
+- **`client/src/ui/App.tsx` (+30)** — 10Hz poll of `gameSession.getLocalWeaponState()` (drives BulletHud props from local state).
+- **`client/tools/weapon-switch-smoke.mjs` (+513, NEW)** — 6 real-canary assertions: (1) two tabs connect, primer run; (2) Tab A presses 2 → server snapshots weapon_id=1 (Shotgun); (3) Tab A presses 3 → weapon_id=2 (Sniper); (4) Tab A presses B (cycle to Burst3) → snapshot reflects fire_mode_index=1 + weapon_id still 0; (5) Tab A presses B again → returns to Semi; (6) rate limit — Tab A presses 1 then 2 within 500ms → second switch dropped silently by server.
+- **`.github/workflows/ci.yml` (+64)** — new `client-weapon-switch-smoke` CI job on unique ports 14445/14446/18084/5195 (per PR-105-spec §2.4). Modeled on `client-rig-visual-smoke` for the 2-tab Playwright + real canary harness shape.
+- **`.github/actions/cleanup-ports/action.yml` (+1)** — extend port cleanup to include 14445/14446/18084 so post-job teardown frees the new ports.
+- **`server/src/snapshot.rs` (+17/-1) — THE SERVER-SIDE GAP-FIX PR #108 CAUGHT** — `current_fire_mode` was hardcoded to `0` in the snapshot writer instead of reading `room.players[player_id].current_fire_mode`. Fix is one variable (`let current_fire_mode = room.players.get(player_id).map(|p| p.current_fire_mode).unwrap_or(0)`) + one writer line (`current_fire_mode` instead of `current_fire_mode: 0`). The PR #108 weapon-switch smoke assertion 4 (cycle to Burst3) failed with "Tab A snapshot did not converge to DualPistol+Burst3 within 2000ms" — the snapshot stream kept reporting Semi even after the validator had updated `player.current_fire_mode` to 1. This regression shipped to main via PR #107 because the smoke that would catch it didn't exist yet. PR #108's smoke is the smoke, PR #108's commit `d93dc0a` is the fix.
 
-**Burst3 fire rate**: When in burst mode, the 3 shots fire at the same cadence as semi (0.70s cooldown per shot), so a burst takes ~1.4s. After the burst, must release the trigger before re-engaging. The MVP server enforces this — it tracks `burst_shots_remaining` per player and won't fire until either released or burst completes.
+**Why the server gap-fix lives on PR #108, not PR #107** (architectural note): PR #107's job was the wire-break foundation (server-side protocol + validator + dispatcher). PR #108's job was the client-side follow-up + the smoke that would catch any regressions on the wire. The snapshot.rs gap is a server-side regression that PR #107 introduced + PR #108's smoke caught — by the time PR #108 caught it, PR #107 had already merged. The fix could have gone on either PR, but on PR #108 keeps the regression-discovery + regression-fix commits in the same arc (cleaner audit trail) and PR #107 stays focused on its scope.
 
-## All 34 weapons' fire modes (TS 2.0 design)
+**3 open questions resolved during PR #108 work** (per plan §6 carry-forward):
 
-| Weapon | Modes |
-|--------|-------|
-| Glock-18, SOCOM-MK23, Five-seveN | semi / burst3 |
-| M4A1, STEYR-AUG, M16A4 | semi / burst3 / auto |
-| MP5K, USAS-12, AK47, STEYR-TMP, MP7-PDW | semi / auto |
-| SPAS-12 | semi_pump / semi_auto |
-| Mini-Uzi, MP5SD, MAC10, M60E3, Akimbo Mini-Uzi | auto |
-| Akimbo Berettas, Akimbo MK23, Golden Colts, Akimbo Five-seveN | semi (dual fire) |
-| DESERT EAGLE, Glock-20C, Ruger-MK1, Raging Bull, Sawed-off | semi |
-| BENELLI-M3, MOSSBERG 500 | semi (pump) |
-| Barrett M82A1 | semi (bolt-action) |
-| Combat Knife, Katana, Seal Knife, Knifer | slash |
-| M61 Grenade | throw |
+1. **`DAMAGE_REJECT = 0x0C` fallback decoder — NO**. The `#[deprecated]` tombstone documents that the new wire is `WeaponSwitch`, full stop. The `next-deploy-is-all-clients-new` model assumes all tabs refresh; any cached tab is broken anyway because PlayerState also changed shape (30→31). Client gets rebuilt in lockstep with the server; there's nothing to be source-compatible with.
+2. **Weapon icon assets — ship text labels first** (D/S/N ASCII letters in `BulletHud`). `image_generate` was locked (fal.ai balance exhausted at PR time) so the alternative was unavailable. Real sprite icons are a polish PR that can drop in once balance resets.
+3. **Headshot 3× multiplier on the wire — client agnostic**. The server applies the 3× damage on headshot before emitting `DamageBroadcast`; the client just renders `damage_amount` as-is. No special rendering cue for headshots (no special number color, no hit sound, no particle burst) — keep the client agnostic.
 
-**Provenance**: Domain knowledge of TS 2.0 (multi-mode weapons were a defining TS feature — every full-auto weapon had a 3-mode select-fire equivalent). Not extracted from `mp.dll` directly because TS's fire-mode logic is implemented through `pev->button` bit checks + `iFlag()` per-mode animations rather than a single field.
+**Carry-forwards beyond PR #108** (deferred to future PRs, NOT wire-follow-ups):
+
+- **Crosshair component** — the PR #105 spec mentioned a weapon-aware crosshair (DualPistol grey, Shotgun orange, Sniper red, spread per fire mode), but no crosshair component exists in the codebase today. Adding one is a new Babylon scene element or a new DOM overlay, not a wire-follow-up. Defer to a future Crosshair PR.
+- **Weapon icon sprites** — the spec mentioned per-weapon icon sprites in `client/assets/weapons/`, but no assets directory exists. PR #108 ships ASCII-letter icons (D/S/N) as a placeholder; real sprites are a polish item.
+
+**Verification (final, post-merge)**:
+
+| Surface | Result |
+|---|---|
+| `cargo test --lib` | **119/119 PASS** (was 108 pre-#107) — +5 from `protocol.rs` wire tests, +6 from `validate_and_relay_weapon_switch` |
+| `vitest run` (client) | **86/86 PASS** (was 66) — +16 from `weaponSwitch.test.ts`, +4 from `damage.test.ts` WeaponSwitch round-trips |
+| `tsc --noEmit -p tsconfig.app.json` | clean |
+| `npm run build` (client) | clean (bundle +1.7 kB for HUD strip) |
+| `client/tools/weapon-switch-smoke.mjs` | **6/6 PASS** locally against canary + vite dev server |
+| `client/tools/{damage-server, damage-server-aim-event, damage-server-reload, damage-server-hp-convergence, health-regression}-smoke.mjs` | **PASS** (the 5 PR #107 smokes that initially failed with the wire-break) |
+| All other server smokes (24 of them) | **PASS** (rig-visual, lobby, lobby-real-canary, havok-parity, canary-orchestrator, jump regression, wallrun, mouse-look, mouse-pitch, pause-menu, etc.) |
+| CI on PR #107 merge commit | **32/32 GREEN** |
+| CI on PR #108 merge commit | **33/33 GREEN** |
+
+**Cross-vendor review**: not run on either PR. Wire-break pair had tight scope with known-good architecture (PR #102's WEAPONS_TABLE refactor pre-validated the server-side constants; PR #108's client-encoder was cherry-picked verbatim from a pre-validated patch). The riskier call was the deploy-coordination message — flagged in both PR bodies.
+
+**Workflow patterns captured for future PRs**:
+
+1. **Wire-break pair ship pattern**: when adding a new wire field that changes existing wire sizes (PlayerState +N bytes), the smoke scripts that fire packets over that wire need their literals updated in lockstep. The pre-existing smokes called `bus.sendAimEvent({...})` directly without the new `isFiring` field; adding the field required 13 patches across 7 smoke scripts. **Rule for future wire-breaks**: audit `bus.send<Disc>({...})` call sites across all `client/tools/*.mjs` and update them atomically with the encoder change. Add a smoke-side wire-size `EXPECTED` map assertion (or extend the existing one) so the next wire-break fails fast at the assertion, not at "ammo never decrements" 2000ms later.
+2. **Smoke-first finds the bug class**: PR #108's `weapon-switch-smoke.mjs` assertion 4 caught a server-side regression in PR #107 (`current_fire_mode` hardcoded to 0 in `snapshot.rs`). The smoke was the only thing that found it — the existing client smokes (damage-server, etc.) didn't fire Burst3 so they never exercised the post-switch snapshot path. **Rule for new functionality**: when shipping a new wire type, the smoke that exercises the new path must be on the PR that ships the wire (not deferred to the follow-up client PR). Otherwise regressions ship to main unnoticed.
+3. **Cherry-pick pattern for wire-break pairs**: PR #107's branch received a cherry-pick of PR #108's `5c3f2a7` (the client-encoder wire-side commit). The PR #108 commit was already pre-validated locally (the diff itself doesn't change). Cherry-picking onto PR #107's branch meant both PRs ship the same encoder — no risk of "PR #107's encoder drifted from PR #108's encoder by force-push". **Rule for wire-break pairs**: the client-encoder commit belongs on BOTH PRs (via cherry-pick from whichever branch lands it first), not just on the client PR.
+4. **Force-push + wait-for-green protocol** (carried from PR #94, #98): when a CI run flakes on a stuck lobby smoke or other infrastructure-level issue, `gh run cancel` + empty-commit + push + re-poll is the standard recovery. Worked 4× this session (PR #107 lobby smoke 3×, PR #108 lobby smoke 1×). The empty-commit messages should be descriptive ("ci: re-trigger lobby smoke (was hung)") so future archeology is easier.
+
+**Memory anchor**: §pr107-108-wire-break-pair-2026-09-02 (added this session, see Memory section below).
+
+**Next session task**: Kyle said "All merged. Update the spec / handoff." — this entry + the SPEC.md updates + the vault sync ARE this session's work. PR queue is empty after this arc lands. Recommended next direction in the TL;DR above.
 
 ---
 
