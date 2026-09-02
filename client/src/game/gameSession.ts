@@ -282,6 +282,15 @@ export interface GameSession {
    */
   getLocalWeaponState?: () => { weaponId: number; fireModeIndex: number };
   /**
+   * PR #110 — read the current `input.fireHeld` flag. The HUD's
+   * `<Crosshair>` component uses this to widen the spread while
+   * firing (a 1.6× cone expansion for ~120ms after each fire
+   * press, simulating recoil). Always returns false before the
+   * first input frame; default false when unset (pre-session /
+   * single-player).
+   */
+  getFireHeld?: () => boolean;
+  /**
    * PR #108 — overwrite the optimistic local weapon state with
    * the snapshot's authoritative value. Called from scene.ts's
    * `onSnapshot` listener after every snapshot arrives. No-op
@@ -426,6 +435,12 @@ export function createGameSession(
   let lastRenderedIdx = 0;
   /** Previous `input.fireHeld` value — tracks rising edges. */
   let wasFiring = false;
+  /** PR #110 — most-recently-submitted local InputState. The HUD's
+   *  `<Crosshair>` polls `getFireHeld()` which reads
+   *  `lastInput.fireHeld`. Kept separate from `wasFiring` so the
+   *  HUD sees the raw current input (not the rising-edge-detected
+   *  value). Updated each tick. */
+  let lastInput: InputState = makeEmptyInputState();
   /** PR #107 — separate tracker for falling edges (release-event
    *  emission). Distinct from `wasFiring` because `wasFiring` is
    *  set to the CURRENT frame's `fireHeld` inside the same
@@ -551,6 +566,15 @@ export function createGameSession(
     deltaSeconds: number,
     nowMs: number,
   ): SessionFrame => {
+    // PR #110 — stash the most-recent input frame for the HUD's
+    // `getFireHeld()` getter (used by `<Crosshair>` for the
+    // firing-spread cue). Copy is unnecessary because the caller
+    // mutates `input` between ticks but the values we read
+    // (fireHeld in particular) only matter at the moment of the
+    // tick — by the next tick, `input` will have been replaced
+    // again. Keep the reference rather than a clone to avoid a
+    // per-tick alloc.
+    lastInput = input;
     // PR 10: cache `nowMs` so `getHealthSnapshot()` can compute the
     // remaining respawn countdown without re-reading the wall clock.
     lastNowMs = nowMs;
@@ -1090,6 +1114,19 @@ export function createGameSession(
         localFireModeIndex = fireModeIndex;
       }
     },
+    /**
+     * PR #110 — read the current `input.fireHeld` flag (true while
+     * LMB is held). The HUD's `<Crosshair>` uses this to widen
+     * the spread cone for the duration of a fire press, simulating
+     * recoil. Lives next to `getLocalWeaponState` because both
+     * are the HUD's read-only surface into the session.
+     *
+     * `lastInput` is updated in `tick()` (line ~559 below) so the
+     * getter always reflects the most-recently-submitted input
+     * frame. Returns false before the first tick (matches the
+     * `makeEmptyInputState()` defaults).
+     */
+    getFireHeld: (): boolean => lastInput.fireHeld,
     /**
      * PR #108 — weapon-switch dispatch (1/2/3 + B key handlers).
      *
