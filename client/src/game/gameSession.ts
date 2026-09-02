@@ -79,10 +79,12 @@ import {
   sendInputsServer as dbSendInputsServer,
   sendPositionUpdateThrottled as dbSendPositionUpdateThrottled,
   sendReloadRequest as dbSendReloadRequest,
+  sendWeaponSwitch as dbSendWeaponSwitch,
   nextReloadEventId as dbNextReloadEventId,
 } from "../net/damageBus";
 import type { AimEvent } from "../../../protocol/damage";
 import type { ServerTransport } from "../net/serverTransport";
+import { WEAPONS_TABLE, FireMode } from "../../../protocol/constants";
 
 /** One combat event the HUD / tracer render can react to. */
 export type CombatEvent =
@@ -254,6 +256,40 @@ export interface GameSession {
    * `ammo === PLAYER_MAX_AMMO` (the reload completed server-side).
    */
   tryStartReload?: () => void;
+  /**
+   * PR #108 — weapon-switch dispatch (1/2/3 + B key handlers).
+   * Resolves the cycle sentinel `fireModeIndex === -1` (set by
+   * the input listener when B is pressed) to the next valid
+   * index in `WEAPONS_TABLE[weaponId].fire_modes[]`, then calls
+   * `sendWeaponSwitch` + updates the optimistic local state
+   * (`held.currentWeaponId` / `held.currentFireModeIndex`).
+   *
+   * The local rate-limit gate is enforced at the input listener
+   * (see `inputListener.ts`'s `lastWeaponSwitchAtMs`); this
+   * function just resolves + emits.
+   *
+   * Pass `fireModeIndex: 0` to reset a weapon's fire mode back
+   * to its default (Semi); pass `-1` for cycle (the next index
+   * in the array, wrapping).
+   */
+  tryStartWeaponSwitch?: (weaponId: number, fireModeIndex: number) => void;
+  /**
+   * PR #108 — read the optimistic local weapon state (weapon id
+   * + fire-mode index). Used by the `BulletHud` chip so the
+   * displayed weapon updates immediately on keypress (the
+   * server's authoritative state arrives ~50ms later on the
+   * next 20Hz snapshot).
+   */
+  getLocalWeaponState?: () => { weaponId: number; fireModeIndex: number };
+  /**
+   * PR #108 — overwrite the optimistic local weapon state with
+   * the snapshot's authoritative value. Called from scene.ts's
+   * `onSnapshot` listener after every snapshot arrives. No-op
+   * when the value matches the current local state (avoids a
+   * spurious BulletHud re-render every 50ms when nothing
+   * changed).
+   */
+  _setLocalWeaponStateFromSnapshot?: (weaponId: number, fireModeIndex: number) => void;
   /**
    * PR 11.7.E / §3.5 — read the current reload-progress timestamp
    * (ms; `performance.now()`-relative) or `null` when idle. The
@@ -471,6 +507,32 @@ export function createGameSession(
   // (lastSentReloadEventId tracking removed — the bus's module-level
   //  nextReloadEventId is the canonical counter; nothing on this side
   //  needs to mirror it for the smoke's assertions.)
+
+  /**
+   * PR #108 — optimistic local weapon state. Mirrors the
+   * server-side snapshot's `currentWeapon` / `currentFireMode`
+   * fields. Updated on:
+   *   - Every `__latestSnap` tick (snapshot is authoritative)
+   *   - Every successful `tryStartWeaponSwitch` call (optimistic
+   *     update so the HUD reflects the keypress immediately)
+   *
+   * The HUD reads via `getLocalWeaponState()`; the input
+   * listener's B-key handler reads via the window probe
+   * `__localWeaponState` so it knows which fire-mode to cycle
+   * to next.
+   */
+  let localWeaponId = 0; // WeaponId.DualPistol
+  let localFireModeIndex = 0; // Semi
+  /** PR #108 — DEV probe: expose the optimistic local weapon
+   *  state to the BulletHud chip (and any smoke that wants to
+   *  assert against it). The `_setLocalWeaponStateFromSnapshot`
+   *  internal hook overwrites this on every 20Hz snapshot. */
+  if (typeof window !== "undefined") {
+    (window as Window & { __localWeaponState?: unknown }).__localWeaponState = () => ({
+      weaponId: localWeaponId,
+      fireModeIndex: localFireModeIndex,
+    });
+  }
 
   /**
    * One tick: encode local input → submit → advance → apply decoded inputs to
@@ -1003,6 +1065,77 @@ export function createGameSession(
       dbSendReloadRequest(serverTransport, { playerId: localPlayerId, eventId });
     },
     getReloadingUntilMs: (): number | null => reloadingUntilMs,
+    /**
+     * PR #108 — read the optimistic local weapon state (weapon id
+     * + fire-mode index). Used by the `BulletHud` chip so the
+     * displayed weapon updates immediately on keypress (the
+     * server's authoritative state arrives ~50ms later on the
+     * next 20Hz snapshot).
+     */
+    getLocalWeaponState: (): { weaponId: number; fireModeIndex: number } => ({
+      weaponId: localWeaponId,
+      fireModeIndex: localFireModeIndex,
+    }),
+    /**
+     * PR #108 — overwrite the optimistic local weapon state with
+     * the snapshot's authoritative value. No-op when the value
+     * matches (avoids a BulletHud re-render every 50ms when
+     * nothing changed). The `_` prefix is the project's
+     * convention for "internal hook not on the public probe
+     * surface" (matches `_clearReloadingUntilMs` above).
+     */
+    _setLocalWeaponStateFromSnapshot: (weaponId: number, fireModeIndex: number): void => {
+      if (localWeaponId !== weaponId || localFireModeIndex !== fireModeIndex) {
+        localWeaponId = weaponId;
+        localFireModeIndex = fireModeIndex;
+      }
+    },
+    /**
+     * PR #108 — weapon-switch dispatch (1/2/3 + B key handlers).
+     *
+     * The input listener already gated on pointer-locked +
+     * !e.repeat + the local rate-limit
+     * (`WEAPON_SWITCH_RATE_LIMIT_MS`); this just resolves +
+     * emits.
+     *
+     * The `fireModeIndex: -1` sentinel means "cycle to the next
+     * valid index" (used by the B key). For 1/2/3 the caller
+     * passes `fireModeIndex: 0` (the default Semi for each
+     * weapon).
+     *
+     * Optimistic local state is updated IMMEDIATELY so the HUD
+     * reflects the keypress; the server's authoritative state
+     * arrives on the next 20Hz snapshot and overwrites this
+     * via the `__latestSnap` listener (see below).
+     */
+    tryStartWeaponSwitch: (weaponId: number, fireModeIndex: number): void => {
+      if (!serverTransport) return;
+      // Resolve cycle sentinel (-1) to the next valid index in
+      // WEAPONS_TABLE[weaponId].fire_modes[]. The cycle wraps
+      // (after the last mode it goes back to 0). Weapons with
+      // only one mode (Shotgun, Sniper) effectively have a
+      // single-element cycle and B is a no-op for them — the
+      // listener already rate-limit-gates so we don't burn a
+      // packet on a self-cycle.
+      if (fireModeIndex === -1) {
+        const modes = WEAPONS_TABLE[weaponId]?.fireModes ?? [FireMode.Semi];
+        fireModeIndex = (localFireModeIndex + 1) % modes.length;
+      }
+      // Bounds-check: weaponId ∈ [0, 2], fireModeIndex ∈ [0, fireModes.length).
+      // The server's gate 5 rejects out-of-range values silently,
+      // so we skip the emission rather than burn a packet.
+      const def = WEAPONS_TABLE[weaponId];
+      if (!def || fireModeIndex >= def.fireModes.length) return;
+      // Optimistic update — HUD reflects the keypress before the
+      // server's snapshot arrives.
+      localWeaponId = weaponId;
+      localFireModeIndex = fireModeIndex;
+      dbSendWeaponSwitch(serverTransport, {
+        sourcePlayerId: localPlayerId,
+        weaponId,
+        fireModeIndex,
+      });
+    },
     /**
      * DEV-only — scene.ts's `onSnapshot` listener calls this when
      * the snapshot reports `local ammo === PLAYER_MAX_AMMO`. Clears
