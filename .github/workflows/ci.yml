@@ -2646,12 +2646,14 @@ jobs:
         timeout-minutes: 3
       - name: Run melee smoke
         working-directory: client
-        # 5min cap: locally the smoke runs in 30-60s. CI cold-cache
-        # canary boot takes ~30s on top of vite startup. 5min leaves
-        # wide margin without consuming CI minutes if a regression
-        # hangs the smoke.
+        # PR #114 — 6min cap: locally the smoke runs in 30-60s, but
+        # the 4 pollRemoteHp cycles (up to 1.5s each) + 4 cooldown
+        # waits + teleportBothTabs + setup add up to ~15-20s. CI cold
+        # boot of canary (cargo run --quiet) takes another ~30s. 6min
+        # leaves wide margin (vs the previous 5min that timed out
+        # once on a CI flake).
         run: node tools/melee-smoke.mjs
-        timeout-minutes: 5
+        timeout-minutes: 6
       - name: Tear down canary + vite
         if: always()
         run: |

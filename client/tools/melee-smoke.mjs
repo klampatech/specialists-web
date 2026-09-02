@@ -199,26 +199,11 @@ async function readRemoteHp(page, remoteId) {
 async function pollRemoteHp(page, remoteId, expectedHp, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let lastHp = null;
-  let lastSnap = null;
   while (Date.now() < deadline) {
-    const result = await page.evaluate((remoteId) => {
-      const snap = (window).__latestSnap?.();
-      if (!snap) return { hp: null, snapFrame: null };
-      const players = snap.players ?? [];
-      const target = players.find(
-        (p) => p.playerId === remoteId || p.player_id === remoteId,
-      );
-      return {
-        hp: target ? (target.hp ?? target.HP ?? null) : null,
-        snapFrame: snap.serverFrame ?? null,
-      };
-    }, remoteId);
-    lastHp = result.hp;
-    lastSnap = result.snapFrame;
+    lastHp = await readRemoteHp(page, remoteId);
     if (lastHp === expectedHp) return lastHp;
     await sleep(50);
   }
-  log(`  pollRemoteHp: last hp=${lastHp} snapFrame=${lastSnap} (expected ${expectedHp})`);
   return lastHp;
 }
 
@@ -499,7 +484,7 @@ async function runSmoke() {
     log(`  sendMeleeSwing result: ${JSON.stringify(swing3)}`);
     // Poll for the HP drop (20Hz snapshot = 50ms interval; allow
     // up to 2s for the new HP to land in the snapshot stream).
-    const hpA1 = await pollRemoteHp(pageA, 2, 75, 2000);
+    const hpA1 = await pollRemoteHp(pageA, 2, 75, 1500);
     assert(
       "Tab B HP drops by 25 after Tab A's swing",
       hpA1 === 75,
@@ -514,7 +499,7 @@ async function runSmoke() {
     log("Tab B RMB click → expect Tab A HP 100→75");
     await teleportBothTabs(pageA, pageB, tabAPos);
     await sendMeleeSwing(pageB, -Math.PI / 2);
-    const hpB1 = await pollRemoteHp(pageB, 1, 75, 2000);
+    const hpB1 = await pollRemoteHp(pageB, 1, 75, 1500);
     assert(
       "Tab B's swing drops Tab A HP by 25 (symmetric wire)",
       hpB1 === 75,
@@ -528,7 +513,7 @@ async function runSmoke() {
     log("Tab A swings once after cooldowns → expect Tab B HP 75→50");
     await teleportBothTabs(pageA, pageB, tabAPos);
     await sendMeleeSwing(pageA, Math.PI / 2);
-    const hpA2 = await pollRemoteHp(pageA, 2, 50, 2000);
+    const hpA2 = await pollRemoteHp(pageA, 2, 50, 1500);
     assert(
       "Tab A's second swing drops Tab B HP by 25",
       hpA2 === 50,
@@ -556,13 +541,12 @@ async function runSmoke() {
     ]);
     // Poll for HP to drop from 75 to 50 (the second swing lands;
     // the next 4 are rate-limit-gated).
-    const hpB2 = await pollRemoteHp(pageB, 1, 50, 2000);
+    const hpB2 = await pollRemoteHp(pageB, 1, 50, 1500);
     assert(
       "5 rapid swings → only 1 lands (rate-limit)",
       hpB2 === 50,
       `expected 50, got ${hpB2}`,
     );
-
     await sleep(MELEE_COOLDOWN_SLEEP_MS * 2);
 
     // Assertion 7 — single isolated swing after cooldown → HP drops
@@ -570,7 +554,7 @@ async function runSmoke() {
     log("Tab B swings once after cooldown → expect Tab A HP 50→25");
     await teleportBothTabs(pageA, pageB, tabAPos);
     await sendMeleeSwing(pageB, -Math.PI / 2);
-    const hpB3 = await pollRemoteHp(pageB, 1, 25, 2000);
+    const hpB3 = await pollRemoteHp(pageB, 1, 25, 1500);
     assert(
       "Single post-cooldown swing drops Tab A HP by 25",
       hpB3 === 25,
