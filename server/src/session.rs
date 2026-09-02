@@ -78,6 +78,30 @@ pub struct Player {
     /// `player.current_weapon`) — this field is for the snapshot
     /// stream + the future `0x0C WeaponSwitch` handler (PR #103).
     pub current_weapon: crate::constants::WeaponId,
+    /// PR #106 — current fire mode index into
+    /// `WEAPONS_TABLE[current_weapon].fire_modes[]`. 0 = Semi for
+    /// all 3 MVP weapons; 1 = Burst{3} for DualPistol only.
+    /// Defaults to 0 (Semi) so the wire-break at the snapshot
+    /// boundary is silent — post-#106 clients get the default,
+    /// pre-#106 clients ignore the new byte.
+    pub current_fire_mode: u8,
+    /// PR #106 — burst state machine. When the player is in Burst{N}
+    /// mode and the trigger is held, this counts down from
+    /// `fire_mode.burst_count` to 0 as the burst fires. If
+    /// `burst_shots_remaining > 0` and `trigger_held = true`, the
+    /// next AimEvent fires one more burst shot at the cooldown
+    /// cadence. `trigger_release` resets this to 0 + clears
+    /// `trigger_held = false`.
+    pub burst_shots_remaining: u8,
+    /// PR #106 — last time the player pressed the weapon-switch
+    /// key (1/2/3 + B). The `0x0C WeaponSwitch` server handler uses
+    /// this to enforce 1 switch/sec/player rate limit
+    /// (`WEAPON_SWITCH_RATE_LIMIT_MS`).
+    pub last_weapon_switch_at: Option<Instant>,
+    /// PR #106 — set by the recent AimEvent's `is_firing: 0` flag.
+    /// Cleared when the next AimEvent reports `is_firing: 1` and
+    /// the burst/fire-mode gate has fired its shots.
+    pub trigger_held: bool,
 }
 
 impl Player {
@@ -104,10 +128,50 @@ impl Player {
             yaw_radians: 0.0,
             pitch_radians: 0.0,
             // PR #102 — default to DualPistol so every pre-#102 client
-            // gets the same per-shot behavior. PR #103 will mutate
-            // this on `0x0C WeaponSwitch` events.
+            // gets the same per-shot behavior. PR #106 mutates this on
+            // `0x0C WeaponSwitch` events.
             current_weapon: crate::constants::WeaponId::DEFAULT,
+            // PR #106 — default Semi (fire mode index 0 for all MVP
+            // weapons). The DualPistol Burst{3} mode is reached via
+            // a `0x0C WeaponSwitch` event with `fire_mode_index: 1`.
+            current_fire_mode: 0,
+            // PR #106 — burst state machine starts at 0 (no burst in
+            // progress). The damage_relay resets this when a new burst
+            // starts; clears when the trigger releases.
+            burst_shots_remaining: 0,
+            // PR #106 — weapon-switch rate limit starts at None
+            // (player hasn't switched yet → first switch always passes).
+            last_weapon_switch_at: None,
+            // PR #106 — trigger not held initially. Set to `true` when
+            // the damage_relay sees `is_firing: 1`; cleared on
+            // `is_firing: 0` or after the burst completes.
+            trigger_held: false,
         }
+    }
+
+    /// PR #106 — apply a weapon switch event. Called by the `0x0C
+    /// WeaponSwitch` server handler (in `transport.rs`). The caller is
+    /// responsible for the closed-enum + rate-limit validations; this
+    /// method just mutates the player state. Returns silently on success
+    /// (no return type — validation happens at the transport layer).
+    ///
+    /// Effects:
+    /// - `current_weapon` ← `new_weapon`
+    /// - `current_fire_mode` ← `new_fire_mode_idx`
+    /// - `burst_shots_remaining` ← 0 (any in-flight burst is cancelled)
+    /// - `trigger_held` ← false (forces the next AimEvent with
+    ///   `is_firing: 1` to start a fresh trigger press, not resume an
+    ///   old burst — this is a UX courtesy, the validator would handle
+    ///   either case correctly)
+    pub fn apply_weapon_switch(
+        &mut self,
+        new_weapon: crate::constants::WeaponId,
+        new_fire_mode_idx: u8,
+    ) {
+        self.current_weapon = new_weapon;
+        self.current_fire_mode = new_fire_mode_idx;
+        self.burst_shots_remaining = 0;
+        self.trigger_held = false;
     }
 }
 

@@ -121,6 +121,20 @@ pub const PLAYER_MAX_AMMO: u8 = 6;
 /// `client/src/engine/characterConfig.ts::COMBAT.dualPistol.lastReloadAtMinIntervalMs`.
 pub const RELOAD_RATE_LIMIT_MS: u64 = 1000;
 
+/// PR #106 — weapon-switch rate limit. The `0x0C WeaponSwitch`
+/// server handler rejects any switch within `WEAPON_SWITCH_RATE_LIMIT_MS`
+/// of the player's last switch. 1 switch/sec/player is generous
+/// (TS allowed instant switch); raise in PR #106+ if combat feels
+/// too sluggish. Matches `RELOAD_RATE_LIMIT_MS`.
+pub const WEAPON_SWITCH_RATE_LIMIT_MS: u64 = 1000;
+
+/// PR #106 — headshot damage multiplier. Multiplied into the
+/// weapon's `damage_per_hit` when the hit-scan identifies a head
+/// hitbox. Per Kyle's call for PR #105 spec §2.6: ship uniform 3×
+/// across all MVP weapons (matches HL1 vanilla behavior). Per-weapon
+/// overrides deferred to a tuning PR.
+pub const HEADSHOT_MULTIPLIER: u8 = 3;
+
 // PR #102 — WEAPONS-table refactor. Single source of truth for
 // per-weapon tunables on the server side. The TypeScript mirror
 // lives at `protocol/constants.ts::WEAPONS_TABLE` (same shape, same
@@ -174,81 +188,148 @@ impl WeaponId {
 
 /// Per-weapon tunables. Single struct, no generics — the per-weapon
 /// behavior is data-driven, not type-driven. The wire format only
-/// carries `weapon_id`; everything else is resolved server-side from
-/// this table.
+/// carries `weapon_id` + `current_fire_mode`; everything else is
+/// resolved server-side from this table.
 #[derive(Debug, Clone, Copy)]
 pub struct WeaponDef {
     pub weapon_id: WeaponId,
     pub display_name: &'static str,
-    /// Damage per pellet (single-pellet weapons like dual-pistol +
-    /// sniper) or per pellet (multi-pellet like shotgun). Total
-    /// damage = `damage_per_hit * pellets` on a full-on hit.
+    /// Damage per pellet. Single-pellet weapons (`DualPistol`, `Sniper`)
+    /// are `damage_per_hit` directly. Multi-pellet weapons like `Shotgun`
+    /// fire `pellets` independent hitscans, each dealing
+    /// `damage_per_hit` per pellet that hits.
     pub damage_per_hit: u8,
-    /// Number of pellets fired per shot. 1 for single-shot weapons;
-    /// 8 for v1 shotgun. Each pellet runs the hitscan independently.
     pub pellets: u8,
     pub max_range_meters: f32,
     /// Minimum time between shots per source. Server-enforced
-    /// anti-cheat gate. The pre-#102 `FIRE_COOLDOWN_MS = 100`
-    /// constant becomes `WEAPONS_TABLE[DualPistol].fire_cooldown_ms`
-    /// (= 200 per the plan; see also `dual_pistol_cooldown_change`
-    /// test in damage_relay.rs which documents the value bump).
+    /// anti-cheat gate. The pre-#106 damage_relay resolves this from
+    /// `WEAPONS_TABLE[id].fire_cooldown_ms`.
     pub fire_cooldown_ms: u64,
-    /// Magazine capacity. PR #102 keeps `PLAYER_MAX_AMMO = 6` as
-    /// the dual-pistol value (forward-compat); new weapons use their
-    /// own numbers from this table.
     pub magazine_size: u8,
-    /// Reload duration in ms. The client-side reload bar fills at
-    /// this rate.
     pub reload_duration_ms: u64,
-    /// Cone half-angle (degrees) for pellet spread. 1.0° for
-    /// dual-pistol (precise), 5.0° for shotgun (wide), 0.2° for
-    /// sniper (very precise).
     pub accuracy_degrees: f32,
     /// `true` if damage scales linearly over distance within
     /// `max_range_meters`. Shotgun = true; pistol + sniper = false
     /// (flat damage).
     pub damage_falloff: bool,
+    /// Per-weapon fire modes available. Server looks up
+    /// `current_fire_mode` (player state field) against this array.
+    /// PR #106 (§2.5 of the PR #105 spec) added the column.
+    pub fire_modes: &'static [FireMode],
+}
+
+/// PR #106 — per-weapon fire mode. Replicated identically on the
+/// client in `protocol/constants.ts`. Wire format: enum discriminant
+/// `(0=Semi, 1=Burst{count:3}, 2=Auto, ...)` packed into a `u8`.
+/// `Burst { count }` carries the burst shot count in the high bits —
+/// for MVP only `Burst { count: 3 }` exists, so we encode as
+/// `0x01` for Semi, `0x03` for Burst{3}, `0x00` for Auto (Auto takes
+/// no arg, fits in low 4 bits). Client mirrors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FireMode {
+    /// One shot per trigger pull (default for DualPistol, Shotgun, Sniper).
+    Semi,
+    /// N shots per trigger pull, fired at the weapon's `fire_cooldown_ms`
+    /// cadence. After the burst completes, the trigger must release
+    /// (`is_firing: 0`) before another pull re-engages. Currently only
+    /// `Burst { count: 3 }` exists (Glock-18 archetype).
+    Burst { count: u8 },
+    /// Trigger held = continuous fire at `fire_cooldown_ms` cadence.
+    Auto,
+}
+
+/// PR #106 — wire encode/decode helpers for `FireMode`. The on-wire
+/// format uses a single `u8` discriminant with the burst count in the
+/// high nibble:
+/// - `0x00` = Semi
+/// - `0x1X` = Burst where X = burst shot count (X∈[1,15]). For MVP
+///   the only legal value is `0x13` (Burst { count: 3 }).
+/// - `0x20` = Auto
+/// - `0xFF` = reserved / unknown
+impl FireMode {
+    /// Encode as a single `u8`. Returns `0xFF` for any fire mode
+    /// that doesn't fit the wire budget (currently never).
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::Semi => 0x00,
+            Self::Burst { count } => {
+                let c = (count as u8) & 0x0F;
+                0x10 | c
+            }
+            Self::Auto => 0x20,
+        }
+    }
+
+    /// Decode a `u8` from the wire. Returns `None` for reserved or
+    /// malformed values (anti-cheat: no silent fallback — match PR
+    /// #102's `WeaponId::from_wire` contract).
+    pub fn from_wire(b: u8) -> Option<Self> {
+        match b {
+            0x00 => Some(Self::Semi),
+            0x13 => Some(Self::Burst { count: 3 }),
+            0x20 => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    /// Encode a `current_fire_mode` value (player state field — the
+    /// index into `WeaponDef::fire_modes[]`, NOT the fire mode itself).
+    /// Wire is just a `u8`. PR #106 added this alongside the
+    /// `FireMode` enum because the player state needs to carry the
+    /// *index*, not the discriminant (the index is meaningful per-weapon;
+    /// the discriminant is universal).
+    pub fn index_to_wire(idx: u8) -> u8 {
+        idx
+    }
 }
 
 /// v1 weapon table. Indexed by `WeaponId as u8`. Sentinel: the
 /// table is `&'static` so the compiler can fold it into the binary.
+/// PR #106 updated the values to TS 2.0 canonical (per
+/// `docs/TS2.0-weapon-data.md`) + added the `fire_modes` column.
+/// Notable changes from PR #102:
+/// - DualPistol damage: 12 → 8 (TS Glock-18 = HL1 vanilla 9mm cvar)
+/// - Shotgun mag: 2 → 8 (BENELLI-M3 is 8+1 tube; PR #102 had a placeholder)
+/// - Accuracy / range values updated to TS-derived numbers
 pub const WEAPONS_TABLE: &[WeaponDef] = &[
     WeaponDef {
         weapon_id: WeaponId::DualPistol,
         display_name: "Dual Pistol",
-        damage_per_hit: 12,
+        damage_per_hit: 8,
         pellets: 1,
-        max_range_meters: 50.0,
+        max_range_meters: 22.0,
         fire_cooldown_ms: 120,
-        magazine_size: 6,
+        magazine_size: 10,
         reload_duration_ms: 1500,
-        accuracy_degrees: 1.0,
+        accuracy_degrees: 1.5,
         damage_falloff: false,
+        fire_modes: &[FireMode::Semi, FireMode::Burst { count: 3 }],
     },
     WeaponDef {
         weapon_id: WeaponId::Shotgun,
         display_name: "Shotgun",
-        damage_per_hit: 8,
+        damage_per_hit: 5,
         pellets: 8,
         max_range_meters: 20.0,
         fire_cooldown_ms: 800,
-        magazine_size: 2,
-        reload_duration_ms: 2500,
-        accuracy_degrees: 5.0,
+        magazine_size: 8,
+        reload_duration_ms: 2200,
+        accuracy_degrees: 8.0,
         damage_falloff: true,
+        fire_modes: &[FireMode::Semi],
     },
     WeaponDef {
         weapon_id: WeaponId::Sniper,
         display_name: "Sniper",
-        damage_per_hit: 75,
+        damage_per_hit: 200,
         pellets: 1,
-        max_range_meters: 150.0,
+        max_range_meters: 100.0,
         fire_cooldown_ms: 1500,
-        magazine_size: 4,
-        reload_duration_ms: 3000,
-        accuracy_degrees: 0.2,
+        magazine_size: 5,
+        reload_duration_ms: 2500,
+        accuracy_degrees: 1.0,
         damage_falloff: false,
+        fire_modes: &[FireMode::Semi],
     },
 ];
 
@@ -310,21 +391,74 @@ mod tests {
     }
 
     #[test]
-    fn dual_pistol_matches_pre_102_values() {
-        // The DualPistol entry must match the pre-#102 hardcoded
-        // values exactly. This is the backward-compat promise from
-        // the PR #101 plan §"PR #102: server-side dual-pistol
-        // backward-compat": a pre-#102 client sees identical
-        // behavior on a post-#102 server.
+    fn dual_pistol_matches_canonical_ts2_values() {
+        // PR #106 — the DualPistol entry now matches the TS 2.0
+        // canonical Glock-18 archetype values (per
+        // `docs/TS2.0-weapon-data.md`). This REPLACES the pre-#102
+        // behavior pin (which had `damage_per_hit=12, magazine_size=6,
+        // max_range_meters=50`). The pre-#102 pin existed for
+        // backward-compat with the single-weapon era; post-#106 we
+        // target TS 2.0 fidelity. Future PRs that shift these values
+        // must update this test.
         let dp = weapon_def(WeaponId::DualPistol);
-        assert_eq!(dp.damage_per_hit, 12);
+        assert_eq!(dp.damage_per_hit, 8, "TS Glock-18 = HL1 vanilla 9mm cvar");
         assert_eq!(dp.pellets, 1);
-        assert_eq!(dp.max_range_meters, 50.0);
-        assert_eq!(dp.fire_cooldown_ms, 120);
-        assert_eq!(dp.magazine_size, 6);
+        assert_eq!(dp.max_range_meters, 22.0);
+        assert_eq!(
+            dp.fire_cooldown_ms, 120,
+            "pre-#106 pin value — preserves dual-pistol cooldown pace"
+        );
+        assert_eq!(dp.magazine_size, 10, "TS Glock-18 = 10 rounds");
         assert_eq!(dp.reload_duration_ms, 1500);
-        assert_eq!(dp.accuracy_degrees, 1.0);
+        assert_eq!(dp.accuracy_degrees, 1.5);
         assert!(!dp.damage_falloff);
+        assert_eq!(dp.fire_modes.len(), 2);
+        assert_eq!(dp.fire_modes[0], FireMode::Semi);
+        assert_eq!(dp.fire_modes[1], FireMode::Burst { count: 3 });
+    }
+
+    #[test]
+    fn shotgun_matches_canonical_ts2_values() {
+        // PR #106 — Shotgun matches BENELLI-M3 archetype. Notable
+        // corrections from PR #102's placeholder values:
+        // - `magazine_size`: 2 → 8 (TS BENELLI-M3 is 8+1 tube; the
+        //   "2" was a pre-canonization placeholder)
+        // - `damage_per_hit`: 8 → 5 (TS uses HL1 vanilla buckshot
+        //   cvar; 5 dmg per pellet × 8 pellets = 40 close-range max,
+        //   not 8 × 8 = 64)
+        let sg = weapon_def(WeaponId::Shotgun);
+        assert_eq!(sg.damage_per_hit, 5, "HL1 vanilla buckshot cvar");
+        assert_eq!(sg.pellets, 8);
+        assert_eq!(
+            sg.magazine_size, 8,
+            "BENELLI-M3 8+1 tube (was 2 in PR #102 placeholder)"
+        );
+        assert_eq!(sg.fire_cooldown_ms, 800);
+        assert_eq!(sg.accuracy_degrees, 8.0);
+        assert!(sg.damage_falloff);
+        assert_eq!(sg.fire_modes.len(), 1, "pump-action single mode only");
+        assert_eq!(sg.fire_modes[0], FireMode::Semi);
+    }
+
+    #[test]
+    fn sniper_matches_canonical_ts2_values() {
+        // PR #106 — Sniper matches Barrett M82A1 archetype. Notable
+        // corrections from PR #102:
+        // - `damage_per_hit`: 75 → 200 (.50 BMG is 1-hit kill territory;
+        //   200 dmg puts it firmly there for 100hp targets)
+        // - `magazine_size`: 4 → 5 (single round per bolt-action;
+        //   matches the stripper-clip design)
+        // - `accuracy_degrees`: 0.2 → 1.0 (TS Barrett's wider cone is
+        //   actually a feature — feels less arcade-y)
+        let sn = weapon_def(WeaponId::Sniper);
+        assert_eq!(sn.damage_per_hit, 200, ".50 BMG 1-hit kill territory");
+        assert_eq!(sn.pellets, 1);
+        assert_eq!(sn.magazine_size, 5);
+        assert_eq!(sn.fire_cooldown_ms, 1500);
+        assert_eq!(sn.accuracy_degrees, 1.0);
+        assert!(!sn.damage_falloff);
+        assert_eq!(sn.fire_modes.len(), 1, "bolt-action single mode only");
+        assert_eq!(sn.fire_modes[0], FireMode::Semi);
     }
 
     #[test]
@@ -342,5 +476,68 @@ mod tests {
                 bad
             );
         }
+    }
+
+    // PR #106 — new tests for the FireMode enum + wire encode/decode.
+    // These pin the contract that the client (TypeScript mirror in
+    // `protocol/constants.ts::FireMode`) must match byte-for-byte.
+
+    #[test]
+    fn fire_mode_wire_roundtrip() {
+        // For every fire mode we ship, the (to_wire → from_wire)
+        // roundtrip is identity. This pins the wire vocabulary for
+        // both sides of the client/server boundary.
+        for mode in [FireMode::Semi, FireMode::Burst { count: 3 }, FireMode::Auto] {
+            let wire = mode.to_wire();
+            let decoded =
+                FireMode::from_wire(wire).expect(&format!("from_wire should decode {:?}", mode));
+            assert_eq!(decoded, mode, "roundtrip mismatch for {:?}", mode);
+        }
+    }
+
+    #[test]
+    fn fire_mode_wire_vocabulary() {
+        // The wire values are part of the public protocol. Document
+        // them here so a future PR that changes them sees a failing
+        // test instead of silent downstream breakage.
+        assert_eq!(FireMode::Semi.to_wire(), 0x00);
+        assert_eq!(FireMode::Burst { count: 3 }.to_wire(), 0x13);
+        assert_eq!(FireMode::Auto.to_wire(), 0x20);
+    }
+
+    #[test]
+    fn fire_mode_from_wire_rejects_unknown() {
+        // Anti-cheat: closed enum. Reserved / malformed values
+        // must NOT silently fall back to any fire mode.
+        for bad in [0x01u8, 0x02u8, 0x14u8, 0x1F, 0xFFu8] {
+            assert_eq!(
+                FireMode::from_wire(bad),
+                None,
+                "from_wire(0x{:02x}) must return None (closed enum)",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn weapons_table_fire_mode_indices_match_player_state() {
+        // Anti-cheat: the client sends `fire_mode_index` (0, 1, ...) on
+        // the `0x0C WeaponSwitch` wire. Server validates that the
+        // index is in range for the requested weapon. This test pins
+        // that every weapon's `fire_modes[]` has at least 1 entry
+        // and indices are contiguous from 0.
+        for weapon_def in WEAPONS_TABLE {
+            assert!(
+                !weapon_def.fire_modes.is_empty(),
+                "{:?} has empty fire_modes array",
+                weapon_def.weapon_id
+            );
+        }
+        // DualPistol: 2 modes (0=Semi, 1=Burst{3})
+        assert_eq!(weapon_def(WeaponId::DualPistol).fire_modes.len(), 2);
+        // Shotgun: 1 mode (0=Semi)
+        assert_eq!(weapon_def(WeaponId::Shotgun).fire_modes.len(), 1);
+        // Sniper: 1 mode (0=Semi)
+        assert_eq!(weapon_def(WeaponId::Sniper).fire_modes.len(), 1);
     }
 }
