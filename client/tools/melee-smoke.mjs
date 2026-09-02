@@ -186,8 +186,90 @@ async function readRemoteHp(page, remoteId) {
       (p) => p.playerId === remoteId || p.player_id === remoteId,
     );
     if (!target) return null;
-    return target.hp ?? null;
+    return target.hp ?? target.HP ?? null;
   }, remoteId);
+}
+
+/**
+ * Poll for a specific HP value on the remote tab. Mirrors the
+ * damage-server-aim-event smoke's HP-poll pattern — the
+ * snapshot is 20Hz (50ms interval) and the read must not race
+ * the snapshot stream. Returns the final HP observed.
+ */
+async function pollRemoteHp(page, remoteId, expectedHp, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastHp = null;
+  let lastSnap = null;
+  while (Date.now() < deadline) {
+    const result = await page.evaluate((remoteId) => {
+      const snap = (window).__latestSnap?.();
+      if (!snap) return { hp: null, snapFrame: null };
+      const players = snap.players ?? [];
+      const target = players.find(
+        (p) => p.playerId === remoteId || p.player_id === remoteId,
+      );
+      return {
+        hp: target ? (target.hp ?? target.HP ?? null) : null,
+        snapFrame: snap.serverFrame ?? null,
+      };
+    }, remoteId);
+    lastHp = result.hp;
+    lastSnap = result.snapFrame;
+    if (lastHp === expectedHp) return lastHp;
+    await sleep(50);
+  }
+  log(`  pollRemoteHp: last hp=${lastHp} snapFrame=${lastSnap} (expected ${expectedHp})`);
+  return lastHp;
+}
+
+/**
+ * Teleport BOTH tabs to a known co-located position via Havok's
+ * `setPosition` + zero velocity. Used by `teleportBothTabs` and
+ * by each per-swing re-teleport so that Havok drift + snapshot
+ * interpolation don't move the players apart between assertions.
+ * Co-locates Tab A at `pos`, Tab B at `pos.x + 0.5` (50cm gap).
+ */
+async function teleportBothTabs(pageA, pageB, pos) {
+  await Promise.all([
+    pageA.evaluate(({ pos }) => {
+      const session = (window).__gameSession;
+      if (session) {
+        const ctrl = session.localController;
+        const p = ctrl.havok.getPosition().clone();
+        p.x = pos.x;
+        p.z = pos.z;
+        ctrl.havok.setPosition(p);
+        const v = ctrl.havok.getVelocity().clone();
+        v.set(0, 0, 0);
+        ctrl.havok.setVelocity(v);
+        // Drive a fresh PositionUpdate so the server's
+        // `position_history` LATEST frame is ours (Havok's
+        // internal tick might race otherwise).
+        (window).__serverTransport.sendPositionUpdate({
+          serverFrame: 0, playerId: 1, positionX: pos.x, positionY: pos.z,
+        });
+      }
+    }, { pos }),
+    pageB.evaluate(({ pos }) => {
+      const session = (window).__gameSession;
+      if (session) {
+        const ctrl = session.localController;
+        const p = ctrl.havok.getPosition().clone();
+        p.x = pos.x + 0.5;
+        p.z = pos.z;
+        ctrl.havok.setPosition(p);
+        const v = ctrl.havok.getVelocity().clone();
+        v.set(0, 0, 0);
+        ctrl.havok.setVelocity(v);
+        (window).__serverTransport.sendPositionUpdate({
+          serverFrame: 0, playerId: 2, positionX: pos.x + 0.5, positionY: pos.z,
+        });
+      }
+    }, { pos }),
+  ]);
+  // Brief settle so the PositionUpdate + setPosition settle
+  // before the next swing.
+  await sleep(50);
 }
 
 async function sendMeleeSwing(page, yawRadians) {
@@ -224,17 +306,28 @@ async function sendMeleeSwing(page, yawRadians) {
     if (typeof bus.nextMeleeEventId !== "function") {
       return { ok: false, reason: "bus.nextMeleeEventId is not a function" };
     }
+    if (typeof bus.encodeMeleeEvent !== "function") {
+      return { ok: false, reason: "bus.encodeMeleeEvent is not a function" };
+    }
     if (!snap) return { ok: false, reason: "no __latestSnap" };
     try {
       const eventId = bus.nextMeleeEventId();
-      const result = bus.sendMeleeEvent({
+      const req = {
         sourcePlayerId: (window).__localPlayerId ?? 1,
         yawRadians: yawRadians ?? 0,
         pitchRadians: 0,
         frame: snap.serverFrame,
         eventId,
-      });
-      return { ok: true, eventId: result };
+      };
+      const wireBytes = bus.encodeMeleeEvent(req);
+      const result = bus.sendMeleeEvent(req);
+      return {
+        ok: true,
+        eventId: result,
+        wireLen: wireBytes.length,
+        wireBytes: Array.from(wireBytes).slice(0, 8).map(b => b.toString(16).padStart(2, "0")).join(" "),
+        frame: snap.serverFrame,
+      };
     } catch (e) {
       return { ok: false, reason: `sendMeleeEvent threw: ${String(e)}` };
     }
@@ -360,38 +453,25 @@ async function runSmoke() {
                                              // 1-second rate-limit
                                              // window + extra settle
 
-    // Position primer — drive explicit PositionUpdates from each tab
-    // so the server's `position_history` knows where both players
-    // are. Melee has a 1.5m range (`MELEE_MAX_RANGE_METERS`), so
-    // place Tab B at `(pos.x + 1.0, pos.z)` — 1m to Tab A's right,
-    // well within the cone. Mirrors the damage-server-hp-convergence
-    // smoke's position primer pattern.
-    log("Priming both tabs' positions for melee range...");
-    await Promise.all([
-      pageA.evaluate(() => {
-        const session = (window).__gameSession;
-        if (session) {
-          const pos = session.localController.state.position;
-          for (let f = 0; f < 3; f++) {
-            (window).__serverTransport.sendPositionUpdate({
-              serverFrame: f, playerId: 1, positionX: pos.x, positionY: pos.z,
-            });
-          }
-        }
-      }),
-      pageB.evaluate(() => {
-        const session = (window).__gameSession;
-        if (session) {
-          const pos = session.localController.state.position;
-          for (let f = 0; f < 3; f++) {
-            (window).__serverTransport.sendPositionUpdate({
-              serverFrame: f, playerId: 2, positionX: pos.x + 1.0, positionY: pos.z,
-            });
-          }
-        }
-      }),
-    ]);
-    await sleep(500); // let server's position_history settle
+    // Read Tab A's CURRENT Havok position once, then teleport both
+    // tabs to that pos (Tab A at pos, Tab B at pos.x + 0.5). All
+    // subsequent teleportBothTabs calls reuse this anchor so the
+    // smoke stays deterministic across re-runs.
+    log("Capturing Tab A anchor position...");
+    const tabAPos = await pageA.evaluate(() => {
+      const session = (window).__gameSession;
+      if (session) {
+        const pos = session.localController.state.position;
+        return { x: pos.x, z: pos.z };
+      }
+      return null;
+    });
+    if (!tabAPos) {
+      throw new Error("could not read Tab A's Havok position");
+    }
+    log(`Tab A anchor: (${tabAPos.x.toFixed(2)}, ${tabAPos.z.toFixed(2)})`);
+    // Initial teleport — co-locate both tabs at the anchor + 50cm.
+    await teleportBothTabs(pageA, pageB, tabAPos);
 
     // Assertion 2 — both tabs at 100 HP.
     const hpA0 = await readRemoteHp(pageA, 2); // Tab A sees Tab B (id=2)
@@ -409,66 +489,92 @@ async function runSmoke() {
 
     // Assertion 3 — Tab A swings; Tab B loses 25 HP.
     // Tab A yaw=π/2 → forward = +X → where Tab B was placed
-    // (pos.x + 1.0).
+    // (pos.x + 0.5 — but Havok drift may have moved Tab B).
+    // RE-TELEPORT right before each swing to keep both tabs
+    // co-located (Havok physics tick + position snapshot
+    // interpolation drift them away between assertions).
     log("Tab A RMB click → expect Tab B HP 100→75");
+    await teleportBothTabs(pageA, pageB, tabAPos);
     const swing3 = await sendMeleeSwing(pageA, Math.PI / 2);
     log(`  sendMeleeSwing result: ${JSON.stringify(swing3)}`);
-    await sleep(PROPAGATE_MS);
-    const hpA1 = await readRemoteHp(pageA, 2);
+    // Poll for the HP drop (20Hz snapshot = 50ms interval; allow
+    // up to 2s for the new HP to land in the snapshot stream).
+    const hpA1 = await pollRemoteHp(pageA, 2, 75, 2000);
     assert(
       "Tab B HP drops by 25 after Tab A's swing",
       hpA1 === 75,
       `expected 75, got ${hpA1}`,
     );
 
-    // Wait out the cooldown so the next swing lands.
+    // Wait out Tab A's cooldown so Tab B's swing lands.
     await sleep(MELEE_COOLDOWN_SLEEP_MS * 2);
 
-    // Assertion 4 — Tab A swings 5x rapidly → only 1 lands.
-    log("Tab A swings 5x rapidly → expect only 1 of 5 to land");
-    for (let i = 0; i < 5; i++) {
-      await sendMeleeSwing(pageA, Math.PI / 2);
-      await sleep(40); // well under 220ms cooldown
-    }
-    await sleep(PROPAGATE_MS);
-    const hpA2 = await readRemoteHp(pageA, 2);
-    // First swing from assertion 3 already landed (75). Subsequent
-    // rapid swings should be rate-limit-gated — only 1 of the 5
-    // should land. Total expected: 75 - 25 = 50.
+    // Assertion 4 — Tab B swings; Tab A loses 25 HP.
+    // Verifies the wire is symmetric (both tabs can melee).
+    log("Tab B RMB click → expect Tab A HP 100→75");
+    await teleportBothTabs(pageA, pageB, tabAPos);
+    await sendMeleeSwing(pageB, -Math.PI / 2);
+    const hpB1 = await pollRemoteHp(pageB, 1, 75, 2000);
     assert(
-      "5 rapid swings → only 1 lands (rate-limit)",
+      "Tab B's swing drops Tab A HP by 25 (symmetric wire)",
+      hpB1 === 75,
+      `expected 75, got ${hpB1}`,
+    );
+
+    // Wait out Tab B's cooldown so Tab A's next swing lands.
+    await sleep(MELEE_COOLDOWN_SLEEP_MS * 2);
+
+    // Assertion 5 — Tab A swings again after both cooldowns elapsed.
+    log("Tab A swings once after cooldowns → expect Tab B HP 75→50");
+    await teleportBothTabs(pageA, pageB, tabAPos);
+    await sendMeleeSwing(pageA, Math.PI / 2);
+    const hpA2 = await pollRemoteHp(pageA, 2, 50, 2000);
+    assert(
+      "Tab A's second swing drops Tab B HP by 25",
       hpA2 === 50,
       `expected 50, got ${hpA2}`,
     );
 
     await sleep(MELEE_COOLDOWN_SLEEP_MS * 2);
 
-    // Assertion 5 — single isolated swing after cooldown → HP drops
-    // by another 25 (100 - 25*3 = 25).
-    log("Tab A swings once after cooldown → expect Tab B HP 50→25");
-    await sendMeleeSwing(pageA, Math.PI / 2);
-    await sleep(PROPAGATE_MS);
-    const hpA3 = await readRemoteHp(pageA, 2);
+    // Assertion 6 — Tab B swings again (rate-limit smoke).
+    // Fire 5 swings IN PARALLEL via Promise.all — each call's
+    // round-trip via page.evaluate takes ~50ms, so a sequential
+    // for-loop would space them >200ms apart and the 220ms
+    // cooldown would let 2 of 5 land. Promise.all sends them
+    // concurrently, so all 5 wire packets go out within ~1ms
+    // — the server's Gate 4 (220ms cooldown) gates all but
+    // the first one.
+    log("Tab B swings 5x rapidly → expect only 1 of 5 to land");
+    await teleportBothTabs(pageA, pageB, tabAPos);
+    await Promise.all([
+      sendMeleeSwing(pageB, -Math.PI / 2),
+      sendMeleeSwing(pageB, -Math.PI / 2),
+      sendMeleeSwing(pageB, -Math.PI / 2),
+      sendMeleeSwing(pageB, -Math.PI / 2),
+      sendMeleeSwing(pageB, -Math.PI / 2),
+    ]);
+    // Poll for HP to drop from 75 to 50 (the second swing lands;
+    // the next 4 are rate-limit-gated).
+    const hpB2 = await pollRemoteHp(pageB, 1, 50, 2000);
     assert(
-      "Single post-cooldown swing drops Tab B HP by 25",
-      hpA3 === 25,
-      `expected 25, got ${hpA3}`,
+      "5 rapid swings → only 1 lands (rate-limit)",
+      hpB2 === 50,
+      `expected 50, got ${hpB2}`,
     );
 
     await sleep(MELEE_COOLDOWN_SLEEP_MS * 2);
 
-    // Assertion 6 — Tab B swings at Tab A; verify mirror direction
-    // (the wire is symmetric — both tabs can melee each other).
-    // Tab B yaw=-π/2 → forward = -X → where Tab A was placed
-    // (its own pos.x).
-    log("Tab B swings → expect Tab A HP 100→75");
+    // Assertion 7 — single isolated swing after cooldown → HP drops
+    // by another 25 (Tab B 50→25).
+    log("Tab B swings once after cooldown → expect Tab A HP 50→25");
+    await teleportBothTabs(pageA, pageB, tabAPos);
     await sendMeleeSwing(pageB, -Math.PI / 2);
-    await sleep(PROPAGATE_MS);
-    const hpB1 = await readRemoteHp(pageB, 1);
+    const hpB3 = await pollRemoteHp(pageB, 1, 25, 2000);
     assert(
-      "Tab B's swing drops Tab A HP by 25 (symmetric wire)",
-      hpB1 === 75,
-      `expected 75, got ${hpB1}`,
+      "Single post-cooldown swing drops Tab A HP by 25",
+      hpB3 === 25,
+      `expected 25, got ${hpB3}`,
     );
 
     // Assertion 7 — no JS page errors throughout the smoke.

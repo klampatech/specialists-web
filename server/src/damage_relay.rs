@@ -974,13 +974,26 @@ pub fn validate_and_relay_melee(
                 origin_event_id: req.event_id,
             };
             broadcasts.push(bc);
+            // PR #114 — Target HP decrement on EVERY melee hit. Mirrors
+            // the AimEvent path's `target_player.hp = target_player.hp
+            // .saturating_sub(amount)` (line 459). Pre-fix: melee
+            // events emitted a DamageBroadcast but never decremented
+            // the server-side `target_player.hp`, so the snapshot's HP
+            // value stayed at 100 — the smoke's HP-drop assertions
+            // failed even when the cone hit. The DamageBroadcast is
+            // now also the trigger for the HP state mutation.
+            let target_player = room
+                .players
+                .get_mut(&target_id)
+                .expect("target_id from keys() invariant violated");
+            target_player.hp = target_player.hp.saturating_sub(MELEE_DAMAGE);
         }
     }
     if !broadcasts.is_empty() {
         debug!(
             source = req_source,
             hits = broadcasts.len(),
-            "validate_and_relay_melee: applied ({} hit(s))",
+            "meleeEvent applied ({} hit(s))",
             broadcasts.len(),
         );
     }

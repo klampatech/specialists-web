@@ -1604,8 +1604,6 @@ pub(super) async fn handle_binary(
                 warn!("meleeEvent: decoder rejected malformed payload");
                 return vec![];
             };
-            // Anti-spoof: connection's REAL PlayerId from the first
-            // successful inbound arm (PositionUpdate / Ping /
             // AimEvent / ReloadRequest / WeaponSwitch). Mirrors the
             // AimEvent arm's claim-check pattern.
             let claimed_player_id = {
