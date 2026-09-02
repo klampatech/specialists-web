@@ -2398,6 +2398,70 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
+  client-weapon-switch-smoke:
+    name: client — weapon-switch smoke (0x0C wire + Burst state, PR #108)
+    # PR #108: closes the wire-break PR #107 left on the client side.
+    # Boots canary on 14445/14446/18084 + vite on 5195 (all unique
+    # per docs/PR-105-spec.md §2.4), 2-tab Playwright drives Tab A's
+    # WeaponSwitch key sequence (1/2/3 + B), asserts the server's
+    # 5-gate validator accepts each switch + the next 20Hz snapshot
+    # carries the new `weapon_id` / `current_fire_mode` fields to
+    # both tabs. Catches the PR #107 + PR #108 contract:
+    #   - 0x0C WeaponSwitch wire (disc + u16 source + u8 weapon_id +
+    #     u8 fire_mode_index, 5 bytes total) round-trips end-to-end
+    #   - server-side `validate_and_relay_weapon_switch` 5 gates
+    #   - server-side player-state mutation
+    #   - 20Hz snapshot fan-out carries the new state to all tabs
+    #   - server rate-limit gate (5-gate #3) drops bursts within 1s
+    # ~30-50s runtime.
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — weapon-switch smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Run weapon-switch smoke
+        working-directory: client
+        # 5min cap: locally the smoke runs in 30-50s. CI cold-cache
+        # canary boot takes ~30s on top of vite startup. 5min leaves
+        # wide margin without consuming CI minutes if a regression
+        # hangs the smoke.
+        run: node tools/weapon-switch-smoke.mjs
+        timeout-minutes: 5
+      - name: Tear down canary + vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server.pid ]]; then kill "$(cat /tmp/canary-server.pid)" || true; fi
+          pkill -f canary-server.sh || true
+          pkill -f vite || true
+          for port in 14445 14446 18084 5195; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   client-canary-orchestrator-smoke:
     name: client — canary orchestrator smoke (PR #89 follow-up)
     # Depends on server-build so the canary binary is the same one

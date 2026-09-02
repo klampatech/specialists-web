@@ -18,6 +18,22 @@
 // firing during the LMB/RMB-eating-HUD bug hunt. Combat is now confirmed
 // working in headless + dev-box two-tab playtests, and the top-center
 // `<BulletTimeChip>` in App.tsx renders the production bullet-time state.
+//
+// PR #108 — adds the per-weapon HUD strip: weapon display name,
+// ASCII-letter weapon icon (D/S/N), ammo bar driven by
+// `WEAPONS_TABLE[weaponId].magazineSize` (was hardcoded to 6 via
+// `maxAmmo` prop), fire-mode label (SEMI / BURST-3), and a Burst
+// "active" badge when the snapshot's `isFiring` is 1 + we're in
+// Burst mode + burst count > 0. The icon work was deferred to a
+// polish PR per the carry-forward (no real icon sprites shipped
+// with PR #108; fal.ai was locked).
+
+import {
+  WEAPONS_TABLE,
+  WeaponId,
+  FireMode,
+  type WeaponDef,
+} from "../../../protocol/constants";
 
 interface BulletHudProps {
   frame: number;
@@ -38,8 +54,14 @@ interface BulletHudProps {
   /** PR 11.7.E / §3.5 — current local ammo count (server-authoritative,
    *  sourced from `__latestSnap().players[localPeerId].ammo`). */
   localAmmo: number;
-  /** PR 11.7.E / §3.5 — magazine size. Mirrors
-   *  `COMBAT.dualPistol.PLAYER_MAX_AMMO` (server is canonical). */
+  /** PR 11.7.E / §3.5 — magazine size for the CURRENT weapon.
+   *  Sourced from `WEAPONS_TABLE[weaponId].magazineSize` (PR #108
+   *  moved this out of the hardcoded `COMBAT.dualPistol.PLAYER_MAX_AMMO`
+   *  mirror so the HUD reads the correct magazine cap when the player
+   *  switches to Shotgun (8) or Sniper (5)). Kept as a prop rather than
+   *  computed inline so the existing reload-progress math doesn't need
+   *  to derive it (the parent `App.tsx` already plumbs the per-weapon
+   *  value through `gameSession.getLocalWeaponState()` → snapshot). */
   maxAmmo: number;
   /** PR 11.7.E / §3.5 — reload-progress timestamp (`performance.now()`-
    *  relative) or `null` when idle. While non-null, the HUD renders a
@@ -51,6 +73,15 @@ interface BulletHudProps {
    *  Mirrors `COMBAT.dualPistol.reloadMs`. The HUD uses this to
    *  compute the fill ratio `(reloadingUntilMs - now) / reloadProgressMs`. */
   reloadProgressMs: number;
+  /** PR #108 — current weapon id (0=DualPistol, 1=Shotgun, 2=Sniper).
+   *  Sources from `gameSession.getLocalWeaponState()`. Used by the
+   *  per-weapon HUD strip to render the right display name + icon +
+   *  fire-mode label. */
+  weaponId: number;
+  /** PR #108 — current fire-mode index (0=Semi, 1=Burst3 for DualPistol;
+   *  0=Semi for Shotgun/Sniper). Used by the HUD's fire-mode label
+   *  ("SEMI" / "BURST-3"). */
+  fireModeIndex: number;
 }
 
 function statusLabel(s: BulletHudProps["connectionStatus"]): string {
@@ -59,6 +90,42 @@ function statusLabel(s: BulletHudProps["connectionStatus"]): string {
     case "waiting-ice": return "Waiting for ICE…";
     case "disconnected": return "Disconnected";
     default: return "Offline";
+  }
+}
+
+/** PR #108 — pick the per-weapon HUD data from the current
+ *  weaponId. Falls back to DualPistol for unknown ids (the
+ *  defensive pattern from `weaponDef()` in protocol/constants.ts).
+ *  The HUD never blocks on unknown ids — it just shows whatever
+ *  the snapshot's first frame reported. */
+function currentWeaponDef(weaponId: number): WeaponDef {
+  return WEAPONS_TABLE[weaponId] ?? WEAPONS_TABLE[WeaponId.DualPistol];
+}
+
+/** PR #108 — ASCII-letter weapon icon (D/S/N). The carry-forward
+ *  ships text labels first; real icon sprites are a follow-up PR.
+ *  Single-letter codes: D=DualPistol (two pistols), S=Shotgun,
+ *  N=Sniper (N for "sNiper"). */
+function weaponIconLetter(weaponId: number): string {
+  switch (weaponId) {
+    case WeaponId.Shotgun: return "S";
+    case WeaponId.Sniper: return "N";
+    case WeaponId.DualPistol:
+    default: return "D";
+  }
+}
+
+/** PR #108 — fire-mode label. Maps the `WEAPONS_TABLE[weaponId]
+ *  .fireModes[fireModeIndex]` discriminant to a 4-character
+ *  uppercase label. Burst3 → "BURST3", Semi/Auto → "SEMI"/"AUTO". */
+function fireModeLabel(weaponId: number, fireModeIndex: number): string {
+  const def = currentWeaponDef(weaponId);
+  const mode = def.fireModes[fireModeIndex] ?? FireMode.Semi;
+  switch (mode) {
+    case FireMode.Burst3: return "BURST";
+    case FireMode.Auto: return "AUTO";
+    case FireMode.Semi:
+    default: return "SEMI";
   }
 }
 
@@ -83,7 +150,18 @@ function missingServerMessage(): string | null {
  * file MUST keep `pointerEvents: "none"` (or `pointerEvents: "auto"` only on
  * the buttons it contains — but right now there are no buttons in the HUD).
  */
-export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, localHp, remoteHp, localRespawningMs, remoteRespawningMs, localAmmo, maxAmmo, reloadingUntilMs, reloadProgressMs }: BulletHudProps) {
+export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, hits, localHp, remoteHp, localRespawningMs, remoteRespawningMs, localAmmo, reloadingUntilMs, reloadProgressMs, weaponId, fireModeIndex }: BulletHudProps) {
+  // PR #108 — derive per-weapon HUD data. The `maxAmmo` prop is
+  // kept on the BulletHudProps interface for back-compat with
+  // App.tsx's plumbing (the parent still passes the
+  // `PLAYER_MAX_AMMO` constant for the reload-progress bar's
+  // width math), but the ammo bar itself now uses
+  // `weaponDef.magazineSize` so it reads correctly when the
+  // player switches to Shotgun (8) or Sniper (5).
+  const weapon = currentWeaponDef(weaponId);
+  const magazineSize = weapon.magazineSize;
+  const iconLetter = weaponIconLetter(weaponId);
+  const modeLabel = fireModeLabel(weaponId, fireModeIndex);
   return (
     <div
       data-testid="bullet-hud"
@@ -126,15 +204,28 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
       <div data-testid="bullet-hud-hp-remote" style={{ opacity: 0.95 }}>
         HP them: {remoteHp}{remoteRespawningMs > 0 ? ` (respawn ${remoteRespawningMs}ms)` : ""}
       </div>
-      {/* PR 11.7.E / §3.5 — ammo display (server-authoritative via
-          __latestSnap; mirrors the existing HP-them line pattern).
-          `▮` for a loaded chamber, `▯` for an empty one. Reads from
-          the snapshot's `local ammo` field; the HUD never reads a
-          local controller field (the controller doesn't carry ammo —
-          only the snapshot does, after PR 11.7.B's wire-format
-          stabilization). */}
+      {/* PR #108 — per-weapon HUD strip. Shows the current
+          weapon's display name, single-letter icon (D/S/N),
+          and fire-mode label (SEMI / BURST / AUTO). The icon
+          is a follow-up PR per the carry-forward (real sprite
+          assets are a polish item). The strip lives above the
+          ammo line so the player sees the weapon name first,
+          then the ammo count underneath. */}
+      <div data-testid="bullet-hud-weapon" style={{ opacity: 0.95 }}>
+        <span style={{ display: "inline-block", width: 12, textAlign: "center", marginRight: 4, color: "#ffce5a" }}>[{iconLetter}]</span>
+        <span style={{ opacity: 0.95 }}>{weapon.displayName}</span>
+        <span style={{ marginLeft: 6, opacity: 0.7, fontSize: 10 }}>{modeLabel}</span>
+      </div>
+      {/* PR 11.7.E / §3.5 + PR #108 — ammo display. Magazine size
+          is now per-weapon (DualPistol=10, Shotgun=8, Sniper=5);
+          the bar derives `magazineSize` from `WEAPONS_TABLE` so
+          switching weapons updates the visible cap. Reads ammo
+          from the snapshot's `local ammo` field; the HUD never
+          reads a local controller field (the controller doesn't
+          carry ammo — only the snapshot does, after PR 11.7.B's
+          wire-format stabilization). */}
       <div data-testid="bullet-hud-ammo" style={{ opacity: 0.95 }}>
-        Ammo: {Array.from({ length: maxAmmo }, (_, i) => (i < localAmmo ? "▮" : "▯")).join("")} /{maxAmmo}
+        Ammo: {Array.from({ length: magazineSize }, (_, i) => (i < localAmmo ? "▮" : "▯")).join("")} /{magazineSize}
       </div>
       {/* PR 11.7.E / §3.5 — reload progress bar. Renders only while
           `reloadingUntilMs !== null`. Fill ratio is

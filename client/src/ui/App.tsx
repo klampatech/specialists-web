@@ -76,6 +76,14 @@ interface HudState {
    *  listener in scene.ts when the snapshot reports
    *  `localAmmo === PLAYER_MAX_AMMO`. */
   reloadingUntilMs: number | null;
+  /** PR #108 — current weapon id (0=DualPistol, 1=Shotgun, 2=Sniper).
+   *  Sourced from `gameSession.getLocalWeaponState()` (the
+   *  optimistic local mirror; updated on every 20Hz snapshot via
+   *  `_setLocalWeaponStateFromSnapshot`). */
+  weaponId: number;
+  /** PR #108 — current fire-mode index (0=Semi, 1=Burst3 on DualPistol).
+   *  Same source as `weaponId`. */
+  fireModeIndex: number;
 }
 
 export function App() {
@@ -152,6 +160,13 @@ export function App() {
     // ammo via __latestSnap; this is just the pre-first-snapshot value.
     localAmmo: 6,
     reloadingUntilMs: null,
+    // PR #108 — initial weapon state mirrors DualPistol + Semi
+    // (the pre-PR-#108 behavior). The first 20Hz snapshot
+    // arrival (within ~50ms of connect) overwrites these via
+    // `_setLocalWeaponStateFromSnapshot` if the server's
+    // authoritative state differs.
+    weaponId: 0, // DualPistol
+    fireModeIndex: 0, // Semi
   });
 
   // PR 11.7.D2 / §3.10 — WebRTC peer / __peer / __smokeSignal /
@@ -278,6 +293,19 @@ export function App() {
             isPointerLocked: chase.isPointerLocked,
             everLocked: chase.everLocked,
             viewMode: chase.viewMode,
+            // PR #108 — pull the optimistic local weapon state
+            // from the GameSession (mirrors the snapshot's
+            // authoritative values via `_setLocalWeaponStateFromSnapshot`).
+            // Polling at 10Hz is the same cadence as the rest of
+            // the HUD state above; the snapshot listener's
+            // no-op-when-unchanged gate (in gameSession.ts)
+            // prevents BulletHud re-renders on identical values.
+            weaponId: session.getLocalWeaponState
+              ? session.getLocalWeaponState().weaponId
+              : h.weaponId,
+            fireModeIndex: session.getLocalWeaponState
+              ? session.getLocalWeaponState().fireModeIndex
+              : h.fireModeIndex,
           }));
         }, 100);
         // Stash the timer on the scene ref so unmount can clear it.
@@ -358,6 +386,8 @@ export function App() {
             maxAmmo={PLAYER_MAX_AMMO}
             reloadingUntilMs={hud.reloadingUntilMs}
             reloadProgressMs={1500}
+            weaponId={hud.weaponId}
+            fireModeIndex={hud.fireModeIndex}
           />
           {/* PR 11.2: pause / loadout menu overlay. Visible when the
               pointer is unlocked AND the user has locked at least once

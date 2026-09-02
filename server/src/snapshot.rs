@@ -144,6 +144,22 @@ impl SnapshotGenerator {
                 .get(player_id)
                 .map(|p| p.current_weapon.to_wire())
                 .unwrap_or(0);
+            // PR #107 — surface the player's currently-active fire
+            // mode INDEX (not the discriminant; the index is
+            // meaningful per-weapon — see `FireMode::index_to_wire`).
+            // The client decodes this as
+            // `WEAPONS_TABLE[weaponId].fireModes[currentFireMode]`.
+            // PR #107 originally hardcoded `current_fire_mode: 0`
+            // here, which left the snapshot stuck on Semi even after
+            // a successful `0x0C WeaponSwitch` to Burst3 — caught by
+            // PR #108's `weapon-switch-smoke.mjs` (assertion 4). Fix:
+            // read the player's authoritative current_fire_mode.
+            // Default 0 (Semi) for players who haven't switched yet.
+            let current_fire_mode = room
+                .players
+                .get(player_id)
+                .map(|p| p.current_fire_mode)
+                .unwrap_or(0);
             // PR 65 (debug) — log the yaw/pitch read from the room's
             // player entry. Pre-PR-65 the client's game loop never
             // sent `sendInputsServer`, so yaw/pitch were always 0.0
@@ -173,7 +189,7 @@ impl SnapshotGenerator {
                 ammo,
                 is_firing: 0, // PR 11.7.E wires the fire bit
                 weapon_id,    // PR #102 — from player.current_weapon (default DualPistol)
-                current_fire_mode: 0, // PR #107 — default to first mode (Semi)
+                current_fire_mode, // PR #108 — was hardcoded 0 in PR #107 (see above)
             });
         }
 

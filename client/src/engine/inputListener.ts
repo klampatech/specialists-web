@@ -55,6 +55,24 @@ export interface InputHooks {
    *     not the input listener — debug HUD state isn't owned here)
    */
   onReload?: () => void;
+  /**
+   * PR #108 / PR #107 — weapon-switch key handler. Fires on:
+   *   - 1/2/3 keys → switch to DualPistol / Shotgun / Sniper
+   *     respectively (fire-mode index 0 = default Semi).
+   *   - B key → cycle fire modes on the CURRENT weapon (no-op
+   *     if the weapon has only one mode — Shotgun, Sniper).
+   *
+   * The listener applies the local rate-limit gate at
+   * `WEAPON_SWITCH_RATE_LIMIT_MS` (1 Hz per player) so it doesn't
+   * burn the server-side gate (5-gate #3). The `weaponId` arg
+   * is the `WeaponId` enum value (0/1/2); the `fireModeIndex`
+   * is the index into `WEAPONS_TABLE[weaponId].fire_modes[]`.
+   *
+   * Filtered for `!e.repeat` so auto-repeat doesn't fire
+   * rapid switches. preventDefault'd on 1/2/3/B to avoid
+   * browser-key conflicts.
+   */
+  onWeaponSwitch?: (weaponId: number, fireModeIndex: number) => void;
 }
 
 /** Returned by `createInputListener`. */
@@ -87,6 +105,22 @@ interface HeldState {
    *  boundary. Mirrored from document.pointerLockElement via the
    *  `pointerlockchange` listener above. */
   pointerLocked: boolean;
+  /** PR #108 — last time `onWeaponSwitch` fired (for the local
+   *  rate-limit gate at `WEAPON_SWITCH_RATE_LIMIT_MS` = 1 Hz per
+   *  player). Mirrors the server-side gate (`damage_relay::
+   *  validate_and_relay_weapon_switch` 5-gate #3). `undefined` =
+   *  "never switched" — first switch always passes. */
+  lastWeaponSwitchAtMs?: number;
+  /** PR #108 — current weapon id + fire-mode index for the B key
+   *  (fire-mode cycle). The host (`gameSession.ts`) initializes
+   *  these to the local defaults (`WeaponId.DualPistol` + fire
+   *  mode 0 = Semi) and updates them on every successful switch
+   *  via the `__localWeaponState` window-side probe (parallel to
+   *  the existing `__latestSnap` pattern). Read by the B-key
+   *  handler to compute the next fire-mode index in
+   *  `WEAPONS_TABLE[weaponId].fire_modes[]`. */
+  currentWeaponId: number;
+  currentFireModeIndex: number;
 }
 
 const KEY_FORWARD = new Set(["w", "W", "ArrowUp"]);
@@ -98,6 +132,13 @@ const KEY_DIVE = new Set(["Shift"]);
 const KEY_SLIDE = new Set(["c", "C"]);
 const KEY_WALLRUN = new Set(["q", "Q"]);
 const KEY_CAMERA_TOGGLE = new Set(["v", "V"]);
+// PR #108 — weapon-switch keys. 1/2/3 select DualPistol/Shotgun/Sniper;
+// B cycles fire modes on the current weapon. Both Digit1/Digit3 and
+// '1'/'3' accepted to cover numpad + top-row layouts.
+const KEY_WEAPON_1 = new Set(["1", "Digit1"]);
+const KEY_WEAPON_2 = new Set(["2", "Digit2"]);
+const KEY_WEAPON_3 = new Set(["3", "Digit3"]);
+const KEY_FIRE_MODE_CYCLE = new Set(["b", "B"]);
 
 export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElement): InputListener {
   const held: HeldState = {
@@ -109,6 +150,14 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
     wallrunPressed: false,
     cameraTogglePressed: false, fireHeld: false, meleePressed: false, bulletTimeHeld: false, reloadPressed: false,
     pointerLocked: false,
+    // PR #108 — initial weapon state (DualPistol + Semi). The
+    // server-side snapshot carries the authoritative state on
+    // connect-time; this is the optimistic local copy used by
+    // the B-key cycle handler. `gameSession.ts` updates both
+    // fields after every successful `sendWeaponSwitch` (and
+    // mirrors the server's snapshot value back on reconnect).
+    currentWeaponId: 0, // WeaponId.DualPistol
+    currentFireModeIndex: 0, // Semi
   };
 
   const isEditableTarget = (target: EventTarget | null): boolean => {
@@ -214,6 +263,53 @@ export function createInputListener(hooks: InputHooks, target?: HTMLCanvasElemen
         if (okToReload) {
           hooks.onReload?.();
           held.reloadPressed = true;
+        }
+      }
+      e.preventDefault();
+      return;
+    }
+    // PR #108 — weapon-switch keys (1/2/3) + fire-mode cycle (B).
+    // Same gate pattern as R: pointer-locked + !isEditableTarget
+    // (already handled at the top of onKeyDown) + !e.repeat +
+    // preventDefault. The local rate-limit gate at
+    // `WEAPON_SWITCH_RATE_LIMIT_MS` mirrors the server-side
+    // gate (5-gate #3) so we don't burn server cycles on a
+    // dropped-on-rate-limit packet.
+    //
+    // The host (`gameSession.ts`) is responsible for:
+    //   1. Calling `sendWeaponSwitch` to emit the wire packet.
+    //   2. Updating `held.currentWeaponId` /
+    //      `held.currentFireModeIndex` after a successful
+    //      switch (so the next B-press cycles correctly).
+    //   3. Mirroring the server snapshot's authoritative
+    //      values on reconnect.
+    if (KEY_WEAPON_1.has(key) || KEY_WEAPON_2.has(key) || KEY_WEAPON_3.has(key) || KEY_FIRE_MODE_CYCLE.has(key)) {
+      if (!e.repeat && held.pointerLocked === true) {
+        const nowMs = performance.now();
+        const elapsedMs = held.lastWeaponSwitchAtMs === undefined
+          ? Infinity
+          : nowMs - held.lastWeaponSwitchAtMs;
+        if (elapsedMs >= 1000 /* WEAPON_SWITCH_RATE_LIMIT_MS — mirrored constant */) {
+          let weaponId = held.currentWeaponId;
+          let fireModeIndex = held.currentFireModeIndex;
+          if (KEY_WEAPON_1.has(key)) { weaponId = 0; fireModeIndex = 0; }
+          else if (KEY_WEAPON_2.has(key)) { weaponId = 1; fireModeIndex = 0; }
+          else if (KEY_WEAPON_3.has(key)) { weaponId = 2; fireModeIndex = 0; }
+          else if (KEY_FIRE_MODE_CYCLE.has(key)) {
+            // Cycle fire modes on the CURRENT weapon. The number
+            // of modes varies per weapon (DualPistol = 2 modes;
+            // Shotgun / Sniper = 1 mode → B is a no-op for them).
+            // We don't pull `WEAPONS_TABLE` directly here — the
+            // host owns the data table. The listener is data-blind
+            // by design (parallels the existing reload handler
+            // shape). We emit a sentinel value `fireModeIndex: -1`
+            // meaning "cycle, you pick the next index"; the host
+            // resolves it to the next valid index.
+            weaponId = held.currentWeaponId;
+            fireModeIndex = -1;
+          }
+          hooks.onWeaponSwitch?.(weaponId, fireModeIndex);
+          held.lastWeaponSwitchAtMs = nowMs;
         }
       }
       e.preventDefault();

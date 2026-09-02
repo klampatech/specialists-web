@@ -516,6 +516,15 @@ export async function createScene(
     onReload: () => {
       gameSession?.tryStartReload?.();
     },
+    // PR #108 — weapon-switch keys (1/2/3) + fire-mode cycle (B).
+    // Delegates to `gameSession.tryStartWeaponSwitch()` which
+    // resolves the cycle sentinel (fireModeIndex === -1) to the
+    // next valid index in `WEAPONS_TABLE[weaponId].fire_modes[]`,
+    // then calls `sendWeaponSwitch` + updates the optimistic
+    // local state.
+    onWeaponSwitch: (weaponId, fireModeIndex) => {
+      gameSession?.tryStartWeaponSwitch?.(weaponId, fireModeIndex);
+    },
   }, canvas);  // PR 7.3: bind mouse handlers directly to the canvas so clicks
                // always reach the listener regardless of Babylon's attachControl
                // pointer-capture behavior.
@@ -1404,6 +1413,17 @@ export async function createScene(
                 }
               }
               prevHpByPlayerId.set(p.playerId, p.hp);
+            }
+            // PR #108 — pull the LOCAL player's authoritative
+            // weapon state from the snapshot. The snapshot's
+            // `weaponId` / `currentFireMode` are the source of
+            // truth; the optimistic local state set by
+            // `tryStartWeaponSwitch` is overwritten here so a
+            // dropped packet (server's rate-limit gate) doesn't
+            // leave the HUD desynced.
+            const localSnap = snap.players.find((p) => p.playerId === localPlayerId);
+            if (localSnap) {
+              gameSession?._setLocalWeaponStateFromSnapshot?.(localSnap.weaponId, localSnap.currentFireMode);
             }
             predictor.onSnapshot(snap, now);
             interpolator.onSnapshot(snap, now);
