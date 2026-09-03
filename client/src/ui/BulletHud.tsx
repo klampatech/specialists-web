@@ -133,16 +133,68 @@ function currentWeaponDef(weaponId: number): WeaponDef {
   return WEAPONS_TABLE[weaponId] ?? WEAPONS_TABLE[WeaponId.DualPistol];
 }
 
-/** PR #108 — ASCII-letter weapon icon (D/S/N). The carry-forward
- *  ships text labels first; real icon sprites are a follow-up PR.
- *  Single-letter codes: D=DualPistol (two pistols), S=Shotgun,
- *  N=Sniper (N for "sNiper"). */
-function weaponIconLetter(weaponId: number): string {
+/** PR #108 (carry-forward closed in PR #115 post-#114) — inline-SVG
+ *  weapon icons. Tiny 16x16 monoline icons drawn in the chip's
+ *  yellow accent (#ffce5a) — no external assets, no image
+ *  generation pipeline, no PNG sprite sheet. Two pistols (D),
+ *  shotgun (S), sniper rifle (N). All paths use `currentColor`
+ *  so the parent span's `color` style cascades into the strokes.
+ *
+ *  Why inline SVG over the previous ASCII letters: (1) at small
+ *  font sizes the letters D/S/N are ambiguous (S ↔ 5, D ↔ 0),
+ *  (2) the chip already has a font-size:10 weight:700 mono
+ *  context — visual contrast between letters + the rest of the
+ *  HUD was poor, (3) inline SVG scales crisply at any resolution
+ *  without bitmap interpolation. Trade-off: ~80 bytes of inline
+ *  SVG path data per icon × 3 icons = ~240 bytes, fits easily in
+ *  the existing bundle. The Crosshair's `data-weapon-id` probe
+ *  contract is unchanged — `weaponIconSvg(weaponId)` is purely
+ *  a render-layer swap from text glyph to SVG path. */
+export function weaponIconSvg(weaponId: number): string {
+  // PR #115 — 16x16 viewBox. Strokes are 1.5px so the icon
+  // reads cleanly at 12-16px display sizes (the chip renders
+  // the SVG at 14px). Paths are simplified to 4-6 commands
+  // each — readability matters more than pixel-perfect fidelity.
   switch (weaponId) {
-    case WeaponId.Shotgun: return "S";
-    case WeaponId.Sniper: return "N";
+    case WeaponId.Shotgun:
+      // Shotgun — long horizontal barrel with stock + grip.
+      return '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        // Barrel
+        '<line x1="2" y1="8" x2="12" y2="8"/>' +
+        // Stock
+        '<line x1="12" y1="8" x2="14" y2="11"/>' +
+        // Grip
+        '<line x1="9" y1="8" x2="10" y2="13"/>' +
+        // Trigger guard
+        '<path d="M 9.5 10 L 10.5 10"/>' +
+        '</svg>';
+    case WeaponId.Sniper:
+      // Sniper rifle — long thin barrel + scope on top.
+      return '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        // Barrel
+        '<line x1="2" y1="9" x2="13" y2="9"/>' +
+        // Scope (top-mounted)
+        '<line x1="6" y1="9" x2="6" y2="6"/>' +
+        '<line x1="9" y1="9" x2="9" y2="6"/>' +
+        '<line x1="6" y1="6" x2="9" y2="6"/>' +
+        // Stock
+        '<line x1="13" y1="9" x2="14.5" y2="11"/>' +
+        // Grip
+        '<line x1="10" y1="9" x2="11" y2="13"/>' +
+        '</svg>';
     case WeaponId.DualPistol:
-    default: return "D";
+    default:
+      // Dual pistols — two short barrels stacked.
+      return '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        // Upper pistol
+        '<line x1="3" y1="6" x2="10" y2="6"/>' +
+        '<line x1="10" y1="6" x2="11" y2="9"/>' +
+        '<line x1="7" y1="6" x2="8" y2="10"/>' +
+        // Lower pistol
+        '<line x1="3" y1="11" x2="10" y2="11"/>' +
+        '<line x1="10" y1="11" x2="11" y2="14"/>' +
+        '<line x1="7" y1="11" x2="8" y2="15"/>' +
+        '</svg>';
   }
 }
 
@@ -191,7 +243,7 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
   // player switches to Shotgun (8) or Sniper (5).
   const weapon = currentWeaponDef(weaponId);
   const magazineSize = weapon.magazineSize;
-  const iconLetter = weaponIconLetter(weaponId);
+  const iconSvg = weaponIconSvg(weaponId);
   const modeLabel = fireModeLabel(weaponId, fireModeIndex);
   // PR #115 (post-#114) Burst-active badge. Show "● FIRING" only
   // when the player is in Burst3 mode AND actively firing — the
@@ -256,7 +308,16 @@ export function BulletHud({ frame, repeatedFrames, connectionStatus, hasRemote, 
           ammo line so the player sees the weapon name first,
           then the ammo count underneath. */}
       <div data-testid="bullet-hud-weapon" style={{ opacity: 0.95 }}>
-        <span style={{ display: "inline-block", width: 12, textAlign: "center", marginRight: 4, color: "#ffce5a" }}>[{iconLetter}]</span>
+        <span
+          style={{
+            display: "inline-block",
+            width: 14,
+            textAlign: "center",
+            marginRight: 4,
+            color: "#ffce5a",
+          }}
+          dangerouslySetInnerHTML={{ __html: iconSvg }}
+        />
         <span style={{ opacity: 0.95 }}>{weapon.displayName}</span>
         <span style={{ marginLeft: 6, opacity: 0.7, fontSize: 10 }}>{modeLabel}</span>
         {isBurstActive && (

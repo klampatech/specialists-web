@@ -19,7 +19,7 @@
 // silently break the badge.
 
 import { describe, it, expect } from "vitest";
-import { isBurstActiveBadge } from "./BulletHud";
+import { isBurstActiveBadge, weaponIconSvg } from "./BulletHud";
 import { WEAPONS_TABLE, WeaponId, FireMode } from "../../../protocol/constants";
 
 describe("BulletHud isBurstActiveBadge (PR #115)", () => {
@@ -64,5 +64,49 @@ describe("BulletHud isBurstActiveBadge (PR #115)", () => {
     // array length, but the helper is exposed for unit testing).
     expect(isBurstActiveBadge(dualPistol, 99, 1)).toBe(false);
     expect(isBurstActiveBadge(dualPistol, -1, 1)).toBe(false);
+  });
+});
+
+describe("BulletHud weaponIconSvg (PR #115)", () => {
+  // PR #115 (post-#114) — close the "weapon icon sprites" carry-
+  // forward from PR #108. Replaces ASCII-letter D/S/N labels with
+  // inline SVG icons. The contract: each weapon gets a unique
+  // non-empty SVG string, unknown ids fall back to DualPistol's
+  // icon (defensive — the snapshot can't actually push an unknown
+  // weaponId, but the helper is exposed for unit testing).
+
+  it("returns a non-empty <svg> for each known weaponId", () => {
+    for (const weaponId of [WeaponId.DualPistol, WeaponId.Shotgun, WeaponId.Sniper]) {
+      const svg = weaponIconSvg(weaponId);
+      expect(svg).toContain("<svg");
+      expect(svg).toContain("</svg>");
+      expect(svg.length).toBeGreaterThan(50); // real SVG, not empty stub
+    }
+  });
+
+  it("returns different SVG per weapon (icons are visually distinct)", () => {
+    const dSvg = weaponIconSvg(WeaponId.DualPistol);
+    const sSvg = weaponIconSvg(WeaponId.Shotgun);
+    const nSvg = weaponIconSvg(WeaponId.Sniper);
+    expect(dSvg).not.toBe(sSvg);
+    expect(sSvg).not.toBe(nSvg);
+    expect(dSvg).not.toBe(nSvg);
+  });
+
+  it("falls back to DualPistol icon for unknown / negative ids", () => {
+    const dualPistolIcon = weaponIconSvg(WeaponId.DualPistol);
+    expect(weaponIconSvg(99)).toBe(dualPistolIcon);
+    expect(weaponIconSvg(-1)).toBe(dualPistolIcon);
+    expect(weaponIconSvg(0.5)).toBe(dualPistolIcon);
+  });
+
+  it("uses currentColor (cascades from the parent's color style)", () => {
+    // All three icons must use stroke="currentColor" so the chip's
+    // `color: "#ffce5a"` style cascades into the SVG strokes. If
+    // a future tweak hardcodes a color, the icon won't react to
+    // theme changes.
+    for (const weaponId of [WeaponId.DualPistol, WeaponId.Shotgun, WeaponId.Sniper]) {
+      expect(weaponIconSvg(weaponId)).toContain('stroke="currentColor"');
+    }
   });
 });
