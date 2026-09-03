@@ -74,9 +74,10 @@ use specialists_server::cert::DEFAULT_SANS;
 use specialists_server::constants::DEVBX_ROOM_ID;
 use specialists_server::position_history::Position;
 use specialists_server::protocol::{
-    decode_aim_event, decode_inputs_server, decode_ping, decode_position_update,
-    decode_reload_request, decode_weapon_switch, encode_pong, DISCRIMINATOR_AIM_EVENT,
-    DISCRIMINATOR_DAMAGE_BROADCAST, DISCRIMINATOR_DAMAGE_REQUEST, DISCRIMINATOR_INPUTS, DISCRIMINATOR_INPUTS_SERVER,
+    decode_aim_event, decode_inputs_server, decode_melee_event, decode_ping,
+    decode_position_update, decode_reload_request, decode_weapon_switch, encode_pong,
+    DISCRIMINATOR_AIM_EVENT, DISCRIMINATOR_DAMAGE_BROADCAST, DISCRIMINATOR_DAMAGE_REQUEST,
+    DISCRIMINATOR_INPUTS, DISCRIMINATOR_INPUTS_SERVER, DISCRIMINATOR_MELEE_EVENT,
     DISCRIMINATOR_PING, DISCRIMINATOR_PONG, DISCRIMINATOR_POSITION_UPDATE,
     DISCRIMINATOR_RELOAD_REQUEST, DISCRIMINATOR_SNAPSHOT,
     DISCRIMINATOR_WEAPON_SWITCH, Pong,
@@ -1573,6 +1574,139 @@ pub(super) async fn handle_binary(
                 "weaponSwitch processed"
             );
             vec![]
+        }
+        DISCRIMINATOR_MELEE_EVENT => {
+            // PR #114 — `0x0B MeleeEvent` wire. Body is 18 bytes
+            // (source_player_id u16 + yaw f32 + pitch f32 + frame
+            // u32 + event_id u32). The handler is server-side
+            // authoritative: validate 6 gates (source-in-room,
+            // anti-spoof, eventId-window, melee-cooldown, source-
+            // alive, yaw/pitch-finite), then iterate every OTHER
+            // player in the room and run `melee_cone_hit` against
+            // each. For every target in the cone, emit a
+            // `DamageBroadcast` (source=1=melee, amount=25=MELEE_DAMAGE).
+            //
+            // **Wire-break**: PR #114 stacks onto the existing
+            // `next-deploy-is-all-clients-new` from PR #107+#108+#110.
+            // Pre-#114 clients don't send MeleeEvents; the server's
+            // dispatcher arm for 0x0B doesn't exist pre-#114. The
+            // `other` fallback below would silently drop the packet
+            // pre-#114 — which is fine (the pre-#114 client didn't
+            // swing at anyone).
+            //
+            // **No lag-comp**: melee is proximity-based; at 1.5m
+            // range + 60° cone + 220ms cooldown, a single-tick
+            // target offset (~0.5m at typical player speed) doesn't
+            // matter. `validate_and_relay_melee` reads the LATEST
+            // position from `position_history` via
+            // `snapshot_at(u32::MAX)`.
+            let Some(req) = decode_melee_event(&payload[1..]) else {
+                warn!("meleeEvent: decoder rejected malformed payload");
+                return vec![];
+            };
+            // AimEvent / ReloadRequest / WeaponSwitch). Mirrors the
+            // AimEvent arm's claim-check pattern.
+            let claimed_player_id = {
+                let conn = connection_state.lock().unwrap();
+                match conn.check(req.source_player_id) {
+                    Ok(id) => id,
+                    Err((claimed, requested)) => {
+                        warn!(
+                            claimed_player_id = claimed,
+                            requested_player_id = requested,
+                            "meleeEvent: rejected -- connection identity mismatch",
+                        );
+                        return vec![];
+                    }
+                }
+            };
+            // PR-fix-0x06 — route to the connection's bound room
+            // (extracted from the transport request path during
+            // handshake).
+            let room_id = connection_state.lock().unwrap().room_id();
+            let room_arc = ensure_room(rooms, &room_id).await;
+            let now = Instant::now();
+            // The validator returns zero-or-more DamageBroadcasts
+            // (one per hit target). The 8-gate AimEvent validator's
+            // per-target lag-comp rewind is dropped here for melee
+            // (proximity-based; cone is wide enough that a
+            // single-tick offset doesn't matter). Pass 0 for
+            // `client_rtt_ms` (unused — the parameter exists for
+            // shape parity with `validate_and_relay_aim`).
+            let broadcasts = {
+                let mut room_guard = room_arc.write().await;
+                // Auto-register the source (mirrors the WeaponSwitch
+                // arm — a tab that hasn't sent any other packet yet
+                // should still be able to swing).
+                room_guard.add_player(claimed_player_id);
+                specialists_server::damage_relay::validate_and_relay_melee(
+                    &req,
+                    claimed_player_id,
+                    &mut *room_guard,
+                    0,
+                    now,
+                )
+            };
+            // Empty Vec: validator rejected (outer gate failure) OR
+            // no targets in range. Either way: nothing to fan out.
+            // (Unlike AimEvent, melee's "missed swing" doesn't cost
+            // the source anything — no ammo, no fire-rate, just a
+            // 220ms cooldown that's already been consumed.)
+            if broadcasts.is_empty() {
+                debug!(
+                    source = req.source_player_id,
+                    event_id = req.event_id,
+                    "meleeEvent: no broadcasts (gate rejected or no targets in range)",
+                );
+                return vec![];
+            }
+            // Promote the connection placeholder → real (mirrors
+            // the AimEvent arm's promotion block — same idempotency
+            // guard).
+            {
+                let mut room_guard = room_arc.write().await;
+                if let Some((_, sender)) =
+                    room_guard.connections.remove_entry(&placeholder_player_id)
+                {
+                    room_guard
+                        .connections
+                        .entry(claimed_player_id)
+                        .or_insert(sender);
+                }
+                connection_state.lock().unwrap().stamp_actual(claimed_player_id);
+            }
+            connection_state.lock().unwrap().stamp(claimed_player_id);
+            // Fan out each DamageBroadcast to every connection via
+            // the outbound mpsc's drop-oldest path (same as
+            // `broadcast_snapshot` and the AimEvent arm).
+            let first_wire_bytes =
+                specialists_server::damage_relay::relay_broadcast(&broadcasts[0]);
+            {
+                let room_guard = room_arc.read().await;
+                let n_conns = room_guard.connections.len();
+                for bc in &broadcasts {
+                    let wire_bytes = specialists_server::damage_relay::relay_broadcast(bc);
+                    for (player_id, outbound) in room_guard.connections.iter() {
+                        if let Err(()) = outbound.try_send(wire_bytes.clone()).await {
+                            warn!(
+                                target_player_id = *player_id,
+                                "meleeEvent->damageBroadcast fan-out: outbound closed (connection dying)",
+                            );
+                            continue;
+                        }
+                        debug!(
+                            target_player_id = *player_id,
+                            n_conns = n_conns,
+                            origin_event_id = bc.origin_event_id,
+                            "meleeEvent->damageBroadcast enqueued",
+                        );
+                    }
+                }
+            }
+            // Return the first broadcast's wire bytes as the direct
+            // reply (the inbound loop's "fallback direct send" path
+            // writes it back to the sender — belt-and-suspenders).
+            first_wire_bytes
         }
         other => {
             warn!(

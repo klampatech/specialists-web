@@ -786,3 +786,125 @@ export function decodeWeaponSwitch(buf: Uint8Array): WeaponSwitch | null {
     fireModeIndex: dv.getUint8(3),
   };
 }
+
+// =====================================================================
+// PR #114 — MeleeEvent wire type (Phase 2 melee).
+// =====================================================================
+//
+// Server-authoritative melee hit detection, mirrors the AimEvent
+// (0x0A) shape but without the `is_firing` byte (melee is a
+// single-tap, not a held state). Server runs a 60° proximity-cone
+// check at 1.5m range against snapshot-known positions for every
+// OTHER player in the room, emitting `DamageBroadcast`(s) for hits
+// (using `MELEE_DAMAGE = 25`).
+//
+// **Discriminator slot**: 0x0B was reserved for `StateResyncRequest`
+// per the brief's 0x07-0x0B reservation; the server-side
+// `validate_and_relay_aim` docstring explicitly anticipated
+// "Phase 2 melee work can add a `0x0B Melee` discriminator if
+// needed." Reclaim pattern matches PR #107's `DAMAGE_REJECT →
+// WeaponSwitch` (0x0C).
+//
+// **Wire-break**: PR #114 stacks onto the existing
+// `next-deploy-is-all-clients-new` from PR #107+#108+#110. Pre-#114
+// clients don't send MeleeEvents; the server's 0x0B dispatcher arm
+// doesn't exist pre-#114. The unknown-discriminator fallback in
+// `handle_binary` silently drops the packet pre-#114.
+
+/** PR #114 — body size for `MeleeEvent` BODY (without the
+ *  discriminator). Layout (big-endian):
+ *    byte 0..1   source_player_id (u16 BE) — who swung
+ *    byte 2..5   yaw_radians (f32 BE) — direction of swing
+ *    byte 6..9   pitch_radians (f32 BE) — vertical aim
+ *    byte 10..13 frame (u32 BE) — server frame for lag-comp
+ *    byte 14..17 event_id (u32 BE) — monotonic per-tab counter
+ *  Math: 2 + 4 + 4 + 4 + 4 = 18 bytes. */
+export const MELEE_EVENT_BODY_SIZE = 2 + 4 + 4 + 4 + 4;
+
+/** PR #114 — full on-the-wire packet (disc + body) = 19 bytes.
+ *  Same wire size as AimEvent (`AIM_EVENT_WIRE_SIZE = 19`). */
+export const MELEE_EVENT_WIRE_SIZE = MELEE_EVENT_BODY_SIZE + 1;
+
+/** PR #114 — discriminator 0x0B for MeleeEvent. */
+export const DISCRIMINATOR_MELEE_EVENT = 0x0B;
+
+/**
+ * Tab → Server. "I swung a melee at this yaw + pitch; tell me
+ * who I hit." Server runs `melee_cone_hit` (proximity-cone check
+ * against snapshot-known positions) for every OTHER player in
+ * the room and emits `DamageBroadcast`(s) for hits.
+ *
+ * Wire layout (19 bytes — `MELEE_EVENT_WIRE_SIZE`):
+ *   byte 0       discriminator 0x0B
+ *   byte 1..2    sourcePlayerId (u16 BE)
+ *   byte 3..6    yawRadians (f32 BE) — direction of swing
+ *   byte 7..10   pitchRadians (f32 BE) — vertical aim
+ *   byte 11..14  frame (u32 BE) — server frame for lag-comp
+ *   byte 15..18  eventId (u32 BE) — monotonic per-tab counter
+ *
+ * No `targetPlayerId` (server iterates all OTHER players; same
+ * pattern as AimEvent). No `is_firing` byte (melee is single-tap).
+ *
+ * **RMB keybind**: see `client/src/ui/App.tsx:499` —
+ * `<Key>RMB</Key> melee (1.5m cone)` — the RMB keypress path
+ * generates one MeleeEvent per RMB-down event.
+ */
+export interface MeleeEvent {
+  sourcePlayerId: number;
+  /** Yaw (radians, [-PI, PI]) at the moment of the swing. Server
+   *  trusts this claim (anti-cheat is Phase 4 / PR 11.10). */
+  yawRadians: number;
+  /** Pitch (radians, [-PI/2, PI/2]) at the moment of the swing. */
+  pitchRadians: number;
+  /** Server frame at the moment of the swing. */
+  frame: number;
+  /** Monotonic per-tab counter (resets on tab reload; the server
+   *  applies a bounded window of tolerance). */
+  eventId: number;
+}
+
+/** Encode a `MeleeEvent` to a 19-byte wire-format `Uint8Array`
+ *  (discriminator 0x0B + 18-byte body). Mirrors the Rust
+ *  `encode_melee_event` body layout byte-for-byte.
+ *
+ *  **Caller responsibility**: the client is responsible for
+ *  rate-limiting melee swings to `MELEE_COOLDOWN_MS` (220ms, the
+ *  client's `COMBAT.melee.swingDurationMs`) so it doesn't burn
+ *  the server-side rate-limit gate. The server gate is
+ *  authoritative; the local gate just avoids wasted packets. */
+export function encodeMeleeEvent(req: MeleeEvent): Uint8Array {
+  const bytes = concatBytes([
+    new Uint8Array([DISCRIMINATOR_MELEE_EVENT]), // disc 0x0B
+    u16BE(req.sourcePlayerId),                   // BE u16 source_player_id
+    f32BE(req.yawRadians),                      // BE f32 yaw_radians
+    f32BE(req.pitchRadians),                    // BE f32 pitch_radians
+    u32BE(req.frame),                           // BE u32 frame
+    u32BE(req.eventId),                         // BE u32 event_id
+  ]);
+  console.assert(
+    bytes.length === MELEE_EVENT_WIRE_SIZE,
+    `encodeMeleeEvent: expected ${MELEE_EVENT_WIRE_SIZE} bytes, got ${bytes.length}`,
+  );
+  return bytes;
+}
+
+/** Decode an 18-byte body buffer (discriminator already stripped)
+ *  to a `MeleeEvent`. Returns null on size mismatch. Mirrors the
+ *  Rust `decode_melee_event` exactly.
+ *
+ *  The client transport does NOT receive MeleeEvent inbound (only
+ *  the server decodes them) — this decoder exists for symmetry
+ *  with `decodeAimEvent` / `decodeWeaponSwitch` and for the
+ *  cross-language `cargo test` ↔ vitest round-trip guard (the
+ *  smoke's wire-byte assertions use it indirectly). */
+export function decodeMeleeEvent(buf: Uint8Array): MeleeEvent | null {
+  if (buf.length !== MELEE_EVENT_BODY_SIZE) return null;
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  return {
+    sourcePlayerId: dv.getUint16(0, false),
+    yawRadians: dv.getFloat32(2, false),
+    pitchRadians: dv.getFloat32(6, false),
+    frame: dv.getUint32(10, false),
+    eventId: dv.getUint32(14, false),
+  };
+}

@@ -32,6 +32,7 @@ import {
   encodeDamageBroadcast,
   encodeDamageRequest,
   encodeInputsServer,
+  encodeMeleeEvent,
   encodePing,
   encodePositionUpdate,
 } from "../../../protocol/damage";
@@ -41,6 +42,7 @@ import type {
   DamageReject,
   DamageRequest,
   InputsServer,
+  MeleeEvent,
   Ping,
   Pong,
   PositionUpdate,
@@ -295,6 +297,53 @@ export function sendWeaponSwitch(
   t.sendWeaponSwitch(req);
 }
 
+/**
+ * PR #114 — send a typed `MeleeEvent` over the transport. The
+ * server validates (`damage_relay::validate_and_relay_melee`, 6
+ * gates) and on success emits `DamageBroadcast`(s) for every
+ * player whose position falls inside the 60° proximity cone at
+ * 1.5m range from the source (source=1=melee, amount=25).
+ *
+ * **Caller responsibility**: the client is responsible for the
+ * local 220ms rate-limit (matches `COMBAT.melee.swingDurationMs`).
+ * The server-side `MELEE_COOLDOWN_MS` is the authoritative bound;
+ * the local gate just avoids wasted packets.
+ *
+ * The `eventId` is monotonically incremented via
+ * `nextMeleeEventId()` below; the server applies the same
+ * `EVENT_ID_WINDOW = 64` tolerance as AimEvent/ReloadRequest.
+ */
+export function sendMeleeEvent(
+  t: ServerTransport,
+  req: MeleeEvent,
+): number {
+  // PR 65 (debug) — log every MeleeEvent send at info level so smoke
+  // harnesses can grep for `meleeEvent->send` lines in browser-console
+  // and confirm whether the gameplay code path reached
+  // sendMeleeEvent at all (vs. being gated upstream by
+  // meleePressed / swingDurationMs / cooldown). Same pattern as
+  // sendAimEvent.
+  console.info(`[PR-114-DEBUG] meleeEvent->send source=${req.sourcePlayerId} yaw=${req.yawRadians} pitch=${req.pitchRadians} frame=${req.frame} eventId=${req.eventId}`);
+  t.sendMeleeEvent(req);
+  return req.eventId;
+}
+
+/**
+ * PR #114 — monotonic per-local-player counter for MeleeEvent
+ * eventIds. Mirrors `nextAimEventId` (PR 11.6.D) and
+ * `nextReloadEventId` (PR 11.7.E). Resets to 1 on tab reload; the
+ * server's bounded-window check (`EVENT_ID_WINDOW = 64`) allows
+ * tab reloads to recover.
+ */
+let _nextMeleeEventId = 1;
+export function nextMeleeEventId(): number {
+  return _nextMeleeEventId++;
+}
+/** Reset hook for tab reload (mirrors `resetAimEventId`). */
+export function resetMeleeEventId(next: number = 1): void {
+  _nextMeleeEventId = next;
+}
+
 // -- Broadcast handler ----------------------------------------------------
 
 export type BroadcastResult = "applied" | "ignored";
@@ -443,6 +492,14 @@ export interface DamageBusProbe {
    *  intent (yaw + pitch); the server runs the hitscan. Replaces
    *  `sendDamageRequest`. */
   sendAimEvent: (req: AimEvent) => number;
+  /** PR #114 — pure-send MeleeEvent. The client sends its intent
+   *  (yaw + pitch); the server runs the proximity-cone check. The
+   *  smoke drives this directly via `window.__damageBus.sendMeleeEvent`
+   *  (mirrors the AimEvent probe pattern) so the test doesn't
+   *  depend on the input listener + pointer-lock + RMB-mousedown
+   *  event chain — the smoke is verifying the wire round-trip,
+   *  not the keyboard binding. */
+  sendMeleeEvent: (req: MeleeEvent) => number;
   /** Send a typed `PositionUpdate` through the live transport. */
   sendPositionUpdate: (pu: PositionUpdate) => void;
   /** PR 11.6.D / §3.10: throttled PositionUpdate sender. */
@@ -484,6 +541,11 @@ export interface DamageBusProbe {
    *  inspect wire bytes without re-importing `protocol/damage`. */
   encodeDamageRequest: typeof encodeDamageRequest;
   encodeAimEvent: typeof encodeAimEvent;
+  /** PR #114 — encode MeleeEvent to wire bytes (used by smoke harnesses
+   *  that build the wire packet locally + assert against the canary
+   *  log's decoded bytes). Mirrors `encodeAimEvent` / `encodeDamageRequest`
+   *  in the probe surface. */
+  encodeMeleeEvent: typeof encodeMeleeEvent;
   encodePositionUpdate: typeof encodePositionUpdate;
   encodePing: typeof encodePing;
   encodeDamageBroadcast: typeof encodeDamageBroadcast;
@@ -492,6 +554,16 @@ export interface DamageBusProbe {
   decodePositionUpdate: typeof decodePositionUpdate;
   decodePing: typeof decodePing;
   decodePong: typeof decodePong;
+  /** PR #114 — monotonic per-tab counter for MeleeEvent eventIds.
+   *  Exposed on the probe so the smoke's `sendMeleeSwing` can
+   *  pull a fresh eventId instead of using a random u32 (which
+   *  the server's `validate_and_relay_melee` gate #3 rejects
+   *  via the EVENT_ID_WINDOW check). */
+  nextMeleeEventId: typeof nextMeleeEventId;
+  /** PR #107 / PR #59 — same shape, for AimEvent. */
+  nextAimEventId: typeof nextAimEventId;
+  /** PR 11.7.E — same shape, for ReloadRequest. */
+  nextReloadEventId: typeof nextReloadEventId;
 }
 
 export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
@@ -502,6 +574,7 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
       return sendDamageRequest(t, req);
     },
     sendAimEvent: (req: AimEvent) => sendAimEvent(t, req),
+    sendMeleeEvent: (req: MeleeEvent) => sendMeleeEvent(t, req),
     sendPositionUpdate: (pu) => sendPositionUpdate(t, pu),
     sendPositionUpdateThrottled: (frameCounter, playerId, positionX, positionY) =>
       sendPositionUpdateThrottled(t, frameCounter, playerId, positionX, positionY),
@@ -530,6 +603,7 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
     pendingApplyCount: () => 0, // PR 11.7.D: no pending map. Removed in B3.
     encodeDamageRequest,
     encodeAimEvent,
+    encodeMeleeEvent,
     encodePositionUpdate,
     encodePing,
     encodeDamageBroadcast,
@@ -538,5 +612,15 @@ export function createDamageBusProbe(t: ServerTransport): DamageBusProbe {
     decodePositionUpdate,
     decodePing,
     decodePong,
+    /** PR #114 — monotonic per-tab counter for MeleeEvent eventIds.
+     *  Exposed on the probe so the smoke's `sendMeleeSwing` can
+     *  pull a fresh eventId instead of using a random u32 (which
+     *  the server's `validate_and_relay_melee` gate #3 rejects
+     *  via the EVENT_ID_WINDOW check). */
+    nextMeleeEventId,
+    /** PR #107 / PR #59 — same shape, for AimEvent. */
+    nextAimEventId,
+    /** PR 11.7.E — same shape, for ReloadRequest. */
+    nextReloadEventId,
   };
 }

@@ -73,16 +73,18 @@ import {
   type DualPistolResult,
   type MeleeResult,
 } from "./combat";
-import { applyDamage, tickRespawn, type HealthSnapshot } from "./health";
+import { tickRespawn, type HealthSnapshot } from "./health";
 import {
   sendAimEvent as dbSendAimEvent,
   sendInputsServer as dbSendInputsServer,
+  sendMeleeEvent as dbSendMeleeEvent,
   sendPositionUpdateThrottled as dbSendPositionUpdateThrottled,
   sendReloadRequest as dbSendReloadRequest,
   sendWeaponSwitch as dbSendWeaponSwitch,
+  nextMeleeEventId as dbNextMeleeEventId,
   nextReloadEventId as dbNextReloadEventId,
 } from "../net/damageBus";
-import type { AimEvent } from "../../../protocol/damage";
+import type { AimEvent, MeleeEvent } from "../../../protocol/damage";
 import type { ServerTransport } from "../net/serverTransport";
 import { WEAPONS_TABLE, FireMode } from "../../../protocol/constants";
 
@@ -786,22 +788,58 @@ export function createGameSession(
         localController,
         remoteController,
       );
+      // PR #114 — server-authoritative melee. The local
+      // `meleeSwing` is still called for the HUD combat-event
+      // label (`melee_hit` vs `melee_miss` for the tracer ring)
+      // but the actual damage is now computed by the server's
+      // `validate_and_relay_melee` (proximity-cone check via
+      // `melee_cone_hit`) and lands on the remote HP via the
+      // 20Hz snapshot stream — NOT via local
+      // `applyDamage(remoteController, ...)`.
+      //
+      // The pre-#114 path used a `applyDamage` local-compute
+      // fallback (the comment at this site used to read "PR is
+      // FIRE-ONLY ... Phase 2 melee work adds a 0x0B
+      // MeleeEvent discriminator if needed"). PR #114 IS that
+      // phase-2 work — the discriminator (0x0B), the wire type,
+      // the validator, the cone check, all land here.
       if (result.hit) {
         frameCombatEvents.push({
           frame: advanced.frame,
           kind: "melee_hit",
           damage: result.damage,
         });
-        // PR #59 / §3.5: PR is FIRE-ONLY. The 0x01 DamageRequest
-        // wire type is REMOVED in PR #59; melee has no AimEvent
-        // equivalent yet (Phase 2 melee work adds a 0x0B
-        // MeleeEvent discriminator if needed). When the server-auth
-        // transport is wired, melee damage falls back to local-
-        // compute (applyDamage on the remote controller). The
-        // brief explicitly says melee is out of scope; this is
-        // the best-effort backward-compat path for the PR #59
-        // window.
-        applyDamage(remoteController, { source: "melee", amount: result.damage }, nowMs);
+      }
+      // PR #114 — emit a MeleeEvent wire packet on the rising
+      // edge of `meleePressed`. Mirrors the AimEvent send
+      // pattern (frame = `snapFrame + localDelta - 16` so the
+      // request lands within the server's lag-comp rewind
+      // window). The server validates 6 gates and applies
+      // damage to the remote HP via the 20Hz snapshot stream.
+      //
+      // **No client-side ammo / cooldown gate** — melee is
+      // free-to-swing per the original game. The server's
+      // `MELEE_COOLDOWN_MS = 220` (matching the client's
+      // `COMBAT.melee.swingDurationMs = 220`) is the
+      // authoritative rate-limit; the local rising-edge gate
+      // (`!wasMelee`) is the only client-side gate and it's
+      // already stricter than 220ms (the player can only press
+      // RMB faster than 220ms if they're mashing — and the
+      // server's gate catches the rest).
+      if (serverTransport) {
+        const snap = (window as Window & { __latestSnap?: () => unknown }).__latestSnap?.() as { serverFrame?: number } | null;
+        const snapFrame = snap?.serverFrame ?? 0;
+        const localDelta = advanced.frame - lastSnapshotFrameSeen;
+        const reqFrame = Math.max(snapFrame, snapFrame + localDelta - 16);
+        const req: MeleeEvent = {
+          sourcePlayerId: localPlayerId,
+          yawRadians: gameInput.yawRadians ?? 0,
+          pitchRadians: gameInput.pitchRadians ?? 0,
+          frame: reqFrame,
+          eventId: dbNextMeleeEventId(),
+        };
+        lastSnapshotFrameSeen = snapFrame;
+        dbSendMeleeEvent(serverTransport, req);
       }
     }
     wasFiring = gameInput.fireHeld;

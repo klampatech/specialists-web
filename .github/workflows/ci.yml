@@ -2597,6 +2597,74 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
+  client-melee-smoke:
+    name: client — melee smoke (MeleeEvent 0x0B wire, PR #114)
+    # PR #114: closes the "melee is client-side only" gap (the wire
+    # had no MeleeEvent discriminator pre-#114 — melee damage was
+    # server-silent). Boots canary on 14451/14452/18088 + vite on
+    # 5198 (next slot after cfn1-sustained per docs/PR-105-spec.md
+    # §2.4), 2-tab Playwright drives RMB swings from each tab,
+    # asserts:
+    #   - Tab B's HP drops by 25 (single hit at MELEE_DAMAGE = 25)
+    #   - 5 rapid swings → only 1 lands (rate-limit gate)
+    #   - Symmetric wire: Tab B's swing drops Tab A's HP by 25
+    # Catches the PR #114 contract:
+    #   - MeleeEvent wire round-trip (encoder → validator →
+    #     DamageBroadcast → snapshot → HP update)
+    #   - MELEE_COOLDOWN_MS = 220ms gate
+    #   - MELEE_DAMAGE = 25 (single fixed value, no per-weapon)
+    #   - Wire is symmetric (both tabs can melee each other)
+    # ~30-60s runtime.
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — melee smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Run melee smoke
+        working-directory: client
+        # PR #114 — 6min cap: locally the smoke runs in 30-60s, but
+        # the 4 pollRemoteHp cycles (up to 1.5s each) + 4 cooldown
+        # waits + teleportBothTabs + setup add up to ~15-20s. CI cold
+        # boot of canary (cargo run --quiet) takes another ~30s. 6min
+        # leaves wide margin (vs the previous 5min that timed out
+        # once on a CI flake).
+        run: node tools/melee-smoke.mjs
+        timeout-minutes: 6
+      - name: Tear down canary + vite
+        if: always()
+        run: |
+          if [[ -f /tmp/canary-server.pid ]]; then kill "$(cat /tmp/canary-server.pid)" || true; fi
+          pkill -f canary-server.sh || true
+          pkill -f vite || true
+          for port in 14451 14452 18088 5198; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   client-canary-orchestrator-smoke:
     name: client — canary orchestrator smoke (PR #89 follow-up)
     # Depends on server-build so the canary binary is the same one

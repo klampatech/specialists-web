@@ -57,25 +57,23 @@ import {
   encodeAimEvent,
   encodeDamageRequest,
   encodeInputsServer,
+  encodeMeleeEvent,
   encodePing,
   encodePositionUpdate,
   encodeWeaponSwitch,
 } from "../../../protocol/damage";
-// PR 11.7.E / §3.5 — ReloadRequest wire type. The client only
-// SENDS ReloadRequests (no inbound 0x09 dispatch — the server is
-// the sole source of post-reload state, carried by the next 20Hz
-// Snapshot fan-out). Encoder mirrors Rust `encode_reload_request`.
-import { encodeReloadRequest } from "../../../protocol/reload";
-import type { ReloadRequest } from "../../../protocol/reload";
-import { DISCRIMINATOR_SNAPSHOT } from "../../../protocol/snapshot";
 import type {
   AimEvent,
   DamageRequest,
   InputsServer,
+  MeleeEvent,
   Ping,
   PositionUpdate,
   WeaponSwitch,
 } from "../../../protocol/damage";
+import { encodeReloadRequest } from "../../../protocol/reload";
+import type { ReloadRequest } from "../../../protocol/reload";
+import { DISCRIMINATOR_SNAPSHOT } from "../../../protocol/snapshot";
 
 /** Underlying transport type reported by `getStats()`. */
 export type TransportKind = "webtransport" | "websocket";
@@ -457,6 +455,27 @@ export class ServerTransport {
    */
   sendWeaponSwitch(p: Uint8Array | WeaponSwitch): void {
     const bytes = p instanceof Uint8Array ? p : encodeWeaponSwitch(p);
+    this.sendRaw(bytes);
+  }
+
+  /**
+   * PR #114 — send a typed `MeleeEvent` over the transport. The
+   * server validates (`damage_relay::validate_and_relay_melee`, 6
+   * gates: source-in-room, anti-spoof, eventId-window, melee-
+   * cooldown, source-alive, yaw/pitch-finite). On success the
+   * server iterates every OTHER player in the room and runs
+   * `melee_cone_hit` against each — for every target in the cone,
+   * the server emits a `DamageBroadcast` (source=1=melee,
+   * amount=25=MELEE_DAMAGE). The next 20Hz Snapshot broadcast
+   * carries the new HP to every connected tab.
+   *
+   * **Caller responsibility**: local rate-limit gate at
+   * `MELEE_COOLDOWN_MS` (220ms — matches `COMBAT.melee.swingDurationMs`)
+   * so the server-side rate-limit isn't burned. RMB keypress path
+   * generates one MeleeEvent per RMB-down event.
+   */
+  sendMeleeEvent(p: Uint8Array | MeleeEvent): void {
+    const bytes = p instanceof Uint8Array ? p : encodeMeleeEvent(p);
     this.sendRaw(bytes);
   }
 

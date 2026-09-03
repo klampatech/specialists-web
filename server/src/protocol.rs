@@ -332,6 +332,111 @@ pub fn decode_aim_event(buf: &[u8]) -> Option<AimEvent> {
     })
 }
 
+// -- MeleeEvent (PR #114 — Phase 2 melee wire type) ----------------------
+
+/// PR #114 — `0x0B` discriminator for the MeleeEvent wire type. The
+/// brief reserves 0x07-0x0B for PR 11.7 types (Snapshot/StateAck/
+/// InputSeq/ReloadRequest/**StateResyncRequest**). 0x0B was
+/// originally planned for `StateResyncRequest` (per
+/// `client/src/engine/remoteInterpolator.ts` comment "StateResyncRequest
+/// would fix it but that's PR 11.7.D") but the reservation was never
+/// exercised — the server-side `validate_and_relay_aim` docstring
+/// (`server/src/damage_relay.rs:178-180`) explicitly anticipated
+/// "Phase 2 melee work can add a `0x0B Melee` discriminator if needed."
+///
+/// **Reclaim pattern**: same as PR #107's `DAMAGE_REJECT → WeaponSwitch`
+/// reclaim (the brief locked 0x0C for the same reason). The 0x0B
+/// slot becomes `MeleeEvent`, full stop. The next free slot after
+/// 0x0C is 0x0D — reserve 0x0D-0x0F for future PR 11.7.D types if
+/// any of them ever need to ship (e.g. Scoreboard, MMR request).
+///
+/// **Wire-break**: PR #114 is a `next-deploy-is-all-clients-new`
+/// wire-break (PR #107+#108+#110 were the prior one; PR #114 stacks
+/// into the same deploy cycle if Kyle chooses). Existing pre-#114
+/// clients don't send MeleeEvents; the server's `handle_binary`
+/// dispatcher arm for 0x0B doesn't exist pre-#114. Post-#114
+/// clients send MeleeEvents; the server validates + broadcasts.
+/// Any cached tab that doesn't refresh after deploy simply won't
+/// melee — no silent corruption (the server silently drops events
+/// for unknown discriminators per `handle_binary`'s fallback arm).
+pub const DISCRIMINATOR_MELEE_EVENT: u8 = 0x0B;
+
+/// PR #114 — body size of the MeleeEvent (the discriminator byte
+/// itself is NOT counted). Layout (18 bytes):
+///
+///   byte 0..1    sourcePlayerId (u16 BE) — who swung
+///   byte 2..5    yawRadians (f32 BE) — direction of swing
+///   byte 6..9    pitchRadians (f32 BE) — vertical aim
+///   byte 10..13  frame (u32 BE) — server frame for lag-comp
+///   byte 14..17  eventId (u32 BE) — monotonic per-tab counter
+///
+/// Mirrors the AimEvent structure but **drops the `is_firing` byte**:
+/// melee is a discrete single-tap (one event per RMB down), not a
+/// held-state. The post-#107 `is_firing` byte is fire-specific (drives
+/// the burst state machine in `validate_and_relay_aim`). Melee has no
+/// analogous held-state so the field would be dead bytes.
+pub const MELEE_EVENT_BODY_SIZE: usize = 2 + 4 + 4 + 4 + 4;
+/// PR #114 — full on-the-wire packet (disc + body) = 19 bytes.
+/// `MELEE_EVENT_BODY_SIZE + 1`. Same wire size as AimEvent
+/// (`AIM_EVENT_WIRE_SIZE = 19`).
+pub const MELEE_EVENT_WIRE_SIZE: usize = MELEE_EVENT_BODY_SIZE + 1;
+
+/// PR #114 — Tab → Server. "I swung a melee at this yaw + pitch;
+/// tell me who I hit." Server runs the proximity-cone check against
+/// snapshot-known positions for every OTHER player in the room and
+/// emits `DamageBroadcast`(s) for hits (using `MELEE_DAMAGE = 25`).
+///
+/// **No targetPlayerId** — same pattern as AimEvent. The server
+/// iterates all OTHER players in the room (and runs the cone check
+/// against each). This keeps the wire packet small (19 bytes; a 21-
+/// byte layout including target_player_id would be wasted bytes since
+/// the server still has to iterate everyone for the cone check).
+///
+/// **Single fixed damage** — `MELEE_DAMAGE = 25` (matches client-side
+/// `COMBAT.melee.damage = 25`). Per-weapon melee multipliers (e.g.
+/// katana 50, knife 15) are deferred to a future weapons arc PR; PR
+/// #114 keeps the surface tight with one fixed value, mirroring the
+/// single-`PLAYER_MAX_AMMO = 6` approach from PR #78.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeleeEvent {
+    pub source_player_id: u16,
+    pub yaw_radians: f32,
+    pub pitch_radians: f32,
+    pub frame: u32,
+    pub event_id: u32,
+}
+
+pub fn encode_melee_event(req: &MeleeEvent) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(MELEE_EVENT_BODY_SIZE);
+    buf.put_u16(req.source_player_id);
+    buf.put_f32(req.yaw_radians);
+    buf.put_f32(req.pitch_radians);
+    buf.put_u32(req.frame);
+    buf.put_u32(req.event_id);
+    debug_assert_eq!(
+        buf.len(),
+        MELEE_EVENT_BODY_SIZE,
+        "encode_melee_event: produced {} bytes, expected {}",
+        buf.len(),
+        MELEE_EVENT_BODY_SIZE,
+    );
+    buf
+}
+
+pub fn decode_melee_event(buf: &[u8]) -> Option<MeleeEvent> {
+    if buf.len() != MELEE_EVENT_BODY_SIZE {
+        return None;
+    }
+    let mut b = buf;
+    Some(MeleeEvent {
+        source_player_id: b.get_u16(),
+        yaw_radians: b.get_f32(),
+        pitch_radians: b.get_f32(),
+        frame: b.get_u32(),
+        event_id: b.get_u32(),
+    })
+}
+
 // -- DamageBroadcast ------------------------------------------------------
 
 /// Server → all tabs in the room. "This damage is canonical."
