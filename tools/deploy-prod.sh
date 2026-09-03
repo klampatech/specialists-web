@@ -144,6 +144,14 @@ log "configuring Tailscale Funnel on :$STATIC_PORT → http://127.0.0.1:$STATIC_
 ssh "$REMOTE_HOST" "sudo /home/kyle/go/bin/tailscale funnel --https=$STATIC_PORT off 2>/dev/null; sudo /home/kyle/go/bin/tailscale funnel --https=$STATIC_PORT --bg http://127.0.0.1:$STATIC_PORT_BACKEND" \
   || fail "tailscale funnel setup failed on $REMOTE_HOST"
 
+# NOTE: Tailscale Funnel is also enabled on :14433 (wire WebTransport) by
+# the pre-existing setup in docs/funnel-deploy.md. The wire's WS listeners
+# (:14434 plain, :14435 TLS) are NOT Funnel-forwarded because both the wire
+# server AND tailscaled try to bind the Tailscale IP for HTTPS termination,
+# causing EADDRINUSE. For cloud/internet clients (no Tailscale), WebTransport
+# on :14433 is the only currently-working path. For tailnet clients, plain
+# WS on :14434 just works via Tailscale mesh.
+
 # 7. Print the Funnel URLs
 cat <<EOF
 

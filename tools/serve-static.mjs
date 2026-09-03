@@ -153,17 +153,41 @@ async function proxyToMatchmaker(req, res, ts) {
       const proxyHost = (req.headers["x-forwarded-host"] ||
         req.headers.host ||
         "").split(":")[0];
-      if (proxyHost && parsed.ws_url) {
+      // For ws_url/wss_url, substitute the tailnet IP (100.95.111.112)
+      // instead of the Funnel hostname. The matchmaker's hardcoded
+      // peer.ip() is 127.0.0.1 (the proxy's local side) which doesn't
+      // work for any client. The Funnel hostname works for HTTPS but
+      // NOT for WebSocket (Funnel can't proxy WebSocket on :14434 due to
+      // EADDRINUSE — both tailscaled and the wire server try to bind
+      // the Tailscale IP for HTTPS termination).
+      //
+      // The tailnet IP (100.95.111.112) is reachable from any device
+      // with Tailscale installed and on the same tailnet. Plain WS on
+      // :14434 works via Tailscale mesh — no TLS, no cert hassle.
+      //
+      // Carry-forward: when the wire server is moved to a cloud host
+      // with a public WebSocket endpoint, the rewrite below should be
+      // updated to use the cloud hostname.
+      const TAILNET_IP = process.env.TAILNET_IP || "100.95.111.112";
+      if (parsed.ws_url) {
         parsed.ws_url = parsed.ws_url.replace(
           /^ws:\/\/[^:/]+/,
-          `ws://${proxyHost}`,
+          `ws://${TAILNET_IP}`,
         );
       }
-      if (proxyHost && parsed.wss_url) {
+      if (parsed.wss_url) {
         parsed.wss_url = parsed.wss_url.replace(
           /^wss:\/\/[^:/]+/,
-          `wss://${proxyHost}`,
+          `wss://${TAILNET_IP}`,
         );
+      }
+      // The matchmaker hardcodes the wire's plain-WS port (14434) in
+      // ws_url/wss_url. wss_url is wrong — it should use the WSS port
+      // (14435), not 14434 (which serves plain WS, no TLS). Rewrite
+      // wss_url's port from 14434 → 14435 so the browser's wss://
+      // upgrade reaches the TLS-wrapped listener.
+      if (parsed.wss_url) {
+        parsed.wss_url = parsed.wss_url.replace(/:14434\b/, ":14435");
       }
       body = Buffer.from(JSON.stringify(parsed), "utf8");
       if (headers["content-length"]) {
