@@ -194,6 +194,41 @@ async function teardown() {
   }
 }
 
+/**
+ * Wait for `window.__latestSnap()` to populate with both expected
+ * player IDs (the local tab's claimed ID + the remote tab's). The
+ * server promotes a connection's claimed ID from placeholder to
+ * real on the FIRST WeaponSwitch; the snapshot stream reflects
+ * this on the next 20Hz tick. Polls until both IDs appear or
+ * `timeoutMs` elapses. Fixes the pre-#112 CF-N1 flake where a
+ * single one-shot read at `sleep(1100)` caught a snapshot that
+ * hadn't yet included the freshly-claimed remote player (the
+ * server's broadcast of the promoted connection state landed
+ * ~50ms after the WeaponSwitch primer returned).
+ */
+async function pollForBothPlayersInSnapshot(page, expectedIds, timeoutMs) {
+  const start = Date.now();
+  const expected = JSON.stringify([...expectedIds].sort((a, b) => a - b));
+  while (Date.now() - start < timeoutMs) {
+    const ids = await page
+      .evaluate(() => {
+        const s = window.__latestSnap ? window.__latestSnap() : null;
+        return s ? (s.players ?? []).map((p) => p.playerId).sort((a, b) => a - b) : null;
+      })
+      .catch(() => null);
+    if (JSON.stringify(ids) === expected) return ids;
+    await sleep(50);
+  }
+  // Last attempt — return whatever's in the snapshot (may be null
+  // if it never populated; the caller asserts equality with [1,2]).
+  return await page
+    .evaluate(() => {
+      const s = window.__latestSnap ? window.__latestSnap() : null;
+      return s ? (s.players ?? []).map((p) => p.playerId).sort((a, b) => a - b) : null;
+    })
+    .catch(() => null);
+}
+
 async function waitForProbe(page, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -290,16 +325,16 @@ async function runSmoke() {
 
     // -----------------------------------------------------------------
     // Assertion 1: snapshot stream live (both players in both snapshots)
+    // Poll for both player IDs to appear in the snapshot — fixes the
+    // pre-#112 CF-N1 flake where a single one-shot read at
+    // `sleep(1100)` caught a snapshot that hadn't yet included the
+    // freshly-claimed remote player. 2s timeout covers the worst-case
+    // 20Hz tick latency (50ms interval × 2 ticks for both promotions
+    // to land in the broadcast stream).
     // -----------------------------------------------------------------
     log("Assert 1: snapshot stream live with both players...");
-    const initialSnapA = await pageA.evaluate(() => {
-      const s = window.__latestSnap ? window.__latestSnap() : null;
-      return s ? (s.players ?? []).map((p) => p.playerId).sort((a, b) => a - b) : null;
-    });
-    const initialSnapB = await pageB.evaluate(() => {
-      const s = window.__latestSnap ? window.__latestSnap() : null;
-      return s ? (s.players ?? []).map((p) => p.playerId).sort((a, b) => a - b) : null;
-    });
+    const initialSnapA = await pollForBothPlayersInSnapshot(pageA, [1, 2], 2000);
+    const initialSnapB = await pollForBothPlayersInSnapshot(pageB, [1, 2], 2000);
     assert(
       "Tab A snapshot contains both player IDs",
       JSON.stringify(initialSnapA) === JSON.stringify([1, 2]),
