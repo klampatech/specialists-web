@@ -90,6 +90,16 @@ interface HudState {
    *  `gameSession.getFireHeld()` which returns the most recent
    *  tick's `input.fireHeld`. */
   fireHeld: boolean;
+  /** PR #115 (post-#114) — snapshot-derived local `isFiring` (0 or 1
+   *  wire-bool). Drives the BulletHud Burst-active badge ("●
+   *  FIRING") when the local tab is in Burst3 mode AND firing.
+   *  Note: `fireHeld` (input) ≠ `isFiring` (snapshot-derived);
+   *  the snapshot's `isFiring` reflects the server's authoritative
+   *  view of which player is firing — it includes the per-weapon
+   *  fire-rate gate (Auto/Burst3 fireHeld=true may not yield
+   *  `isFiring=1` on every tick). The HUD badge uses `isFiring`
+   *  because that's what the wire carries. */
+  isFiring: number;
 }
 
 export function App() {
@@ -176,6 +186,9 @@ export function App() {
     // PR #110 — no local fire held at page load; first tick
     // overwrites via `session.getFireHeld()`.
     fireHeld: false,
+    // PR #115 (post-#114) — initial snapshot `isFiring`. The
+    // first 20Hz tick overwrites via the localSnapPlayer read.
+    isFiring: 0,
   });
 
   // PR 11.7.D2 / §3.10 — WebRTC peer / __peer / __smokeSignal /
@@ -280,7 +293,7 @@ export function App() {
           // Both default to 0 / null when the snapshot / session
           // hasn't initialized yet (first ~50ms of connection).
           const snap = typeof window !== "undefined"
-            ? (window as unknown as {__latestSnap?: () => { players: Array<{ playerId: number; ammo: number }> } | null}).__latestSnap?.() ?? null
+            ? (window as unknown as {__latestSnap?: () => { players: Array<{ playerId: number; ammo: number; isFiring?: number }> } | null}).__latestSnap?.() ?? null
             : null;
           const localSnapPlayer = snap
             ? snap.players.find((p) => p.playerId === session.localPlayerId)
@@ -298,6 +311,11 @@ export function App() {
             localRespawningMs: health.local.respawningMs,
             remoteRespawningMs: health.remote.respawningMs,
             localAmmo: localSnapPlayer ? localSnapPlayer.ammo : h.localAmmo,
+            // PR #115 (post-#114) — local snapshot's `isFiring`
+            // (server-authoritative). 0 or 1 wire-bool.
+            isFiring: localSnapPlayer
+              ? (localSnapPlayer.isFiring ?? 0)
+              : h.isFiring,
             reloadingUntilMs,
             isPointerLocked: chase.isPointerLocked,
             everLocked: chase.everLocked,
@@ -401,6 +419,7 @@ export function App() {
             reloadProgressMs={1500}
             weaponId={hud.weaponId}
             fireModeIndex={hud.fireModeIndex}
+            isFiring={hud.isFiring}
           />
           {/* PR #110 — center-screen weapon-aware crosshair.
               Reads weaponId/fireModeIndex/fireHeld from the same
