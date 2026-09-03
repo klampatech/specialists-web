@@ -590,13 +590,6 @@ async function main() {
     if (result.failCount > 0 || result.errors.length > 0) {
       process.exit(1);
     }
-    // Explicit exit on success — otherwise the playwright
-    // browser-context teardown hangs the node event loop past
-    // GH Actions' step timeout, even though all assertions
-    // passed. The orchestrator's `await contextA.close()` +
-    // `await browser.close()` already drained everything we
-    // care about; `process.exit(0)` here is a clean handoff.
-    process.exit(0);
     return;
   }
   log("Booting canary + vite...");
