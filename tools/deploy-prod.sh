@@ -77,10 +77,17 @@ sleep 1
 
 # 4. Boot the canary in background
 log "booting canary on ports $WT_PORT/$WS_PORT/$WSS_PORT"
+# --port-http 0: disable the matchmaker HTTP listener (default 8080).
+# Funnel play-testing routes clients via WebTransport on $WT_PORT; the
+# matchmaker HTTP endpoint is redundant in this topology (docs/funnel-deploy.md
+# §"Funnel deploy topology" documents this as the production pattern).
+# Disabling also avoids port-8080 collision with vaultwarden's docker-proxy
+# on m5 (which holds :8080 for the password-manager stack).
 nohup bash tools/canary-server.sh \
   --port-wt "$WT_PORT" \
   --port-ws "$WS_PORT" \
   --port-wss "$WSS_PORT" \
+  --port-http 0 \
   > /tmp/canary-deploy.log 2>&1 &
 echo $! > /tmp/canary-server.pid
 sleep 2
