@@ -106,21 +106,42 @@ if ! ss -tln 2>/dev/null | grep -q ":$WT_PORT"; then
   fail "canary did not bind :$WT_PORT within 20s — check /tmp/canary-deploy.log"
 fi
 
-# 6. Print the Funnel URL
+# 6. Build + boot the static client + Funnel/serve it on $STATIC_PORT.
+# The wire server doesn't serve the client JS bundle, so we need a separate
+# process for `client/dist/`. Tailscale Funnel/serve (we use Funnel for
+# internet-reachable play-testing) forwards :$STATIC_PORT → localhost:$STATIC_PORT.
+STATIC_PORT=14432
+log "building client (cd client && npm run build)"
+(cd client && npm run build 2>&1 | tail -3) || fail "client build failed"
+
+log "rsyncing client/dist/ to $REMOTE_HOST"
+rsync -az --delete client/dist/ "$REMOTE_HOST:~/Development/specialists-web/client/dist/" \
+  || fail "rsync of client/dist/ to $REMOTE_HOST failed"
+
+log "booting static server on 0.0.0.0:$STATIC_PORT on $REMOTE_HOST"
+ssh "$REMOTE_HOST" "cd ~/Development/specialists-web && HOST=0.0.0.0 PORT=$STATIC_PORT nohup node tools/serve-static.mjs > /tmp/serve-static.log 2>&1 & echo \$! > /tmp/serve-static.pid; sleep 2; tail -3 /tmp/serve-static.log" \
+  || fail "could not start static server on $REMOTE_HOST"
+
+log "configuring Tailscale Funnel on :$STATIC_PORT → http://localhost:$STATIC_PORT"
+ssh "$REMOTE_HOST" "sudo /home/kyle/go/bin/tailscale funnel --https=$STATIC_PORT off 2>/dev/null; sudo /home/kyle/go/bin/tailscale funnel --https=$STATIC_PORT --bg http://localhost:$STATIC_PORT" \
+  || fail "tailscale funnel setup failed on $REMOTE_HOST"
+
+# 7. Print the Funnel URLs
 cat <<EOF
 
 [deploy][OK] Production canary live.
 
-  Funnel URL : https://m5.tail1b3795.ts.net:$WT_PORT/
+  Static URL : https://m5.tail1b3795.ts.net:$STATIC_PORT/  (open this in your browser — serves the game client)
+  Wire URL   : https://m5.tail1b3795.ts.net:$WT_PORT/       (WebTransport; the client derives this from the static URL host)
   Local TCP  : $REMOTE_HOST:$WT_PORT (WebTransport/UDP)
   Local TCP  : $REMOTE_HOST:$WS_PORT (WebSocket)
   Local TCP  : $REMOTE_HOST:$WSS_PORT (WebSocket over TLS, Funnel fallback)
 
-  Logs       : /tmp/canary-deploy.log (tail -f to follow)
-  PID file   : /tmp/canary-server.pid
+  Logs       : /tmp/canary-deploy.log (canary) + /tmp/serve-static.log (static server)
+  PID files  : /tmp/canary-server.pid + /tmp/serve-static.pid
 
   Play-test checklist:
-    - Open https://m5.tail1b3795.ts.net:$WT_PORT/ in your browser
+    - Open https://m5.tail1b3795.ts.net:$STATIC_PORT/ in your browser
     - Open the same URL in 2-3 friends' browsers
     - All tabs should auto-connect to the same room
     - Verify AimEvent (LMB → HP drops on hit), WeaponSwitch (1/2 keys
@@ -128,6 +149,6 @@ cat <<EOF
       MeleeEvent (RMB within 1.5m + 60° cone → 25 HP drop)
 
   Tear-down:
-    kill \$(cat /tmp/canary-server.pid)
+    kill \$(cat /tmp/canary-server.pid) \$(cat /tmp/serve-static.pid)
     or: bash tools/deploy-prod.sh (re-runs will kill + restart)
 EOF
