@@ -294,12 +294,33 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
           : stats.connectedAt
           ? `${((Date.now() - stats.connectedAt) / 1000).toFixed(1)}s`
           : "—";
+        // PR #116 — reconnect observability (carry-forward from
+        // PR #58). Surface the new fields so operators can read
+        // "auto-reconnecting (attempt #N, next in Xs)" at a glance.
+        const reconnectAttempts = stats.reconnectAttempts ?? 0;
+        const lastDisconnectAt = stats.lastDisconnectAt ?? null;
+        const reconnectBackoffMs = stats.reconnectBackoffMs ?? 0;
+        const reconnectInfo = (() => {
+          if (connected) return "—";
+          if (reconnectAttempts === 0) {
+            // Disconnected but no auto-reconnect yet (or user closed).
+            if (closed) return "user-closed";
+            return "awaiting first retry";
+          }
+          // Show time-since-last-disconnect + time-until-next-retry.
+          const agoSec = lastDisconnectAt
+            ? Math.max(0, Math.round((Date.now() - lastDisconnectAt) / 1000))
+            : "?";
+          const nextSec = Math.round(reconnectBackoffMs / 1000);
+          return `attempt #${reconnectAttempts} · ${agoSec}s ago · next in ${nextSec}s`;
+        })();
         networkRef.current.innerHTML = `
           <div style="color:#888">transport kind:</div><div style="color:${kind === "webtransport" ? "#0f0" : kind === "websocket" ? "#ff0" : "#f55"}">${kind === "—" ? "none (no transport!)" : kind}</div>
           <div style="color:#888">connected:</div><div style="color:${connected ? "#0f0" : "#f55"}">${connected ? "✓" : "✗"}</div>
           <div style="color:#888">closed:</div><div style="color:${closed ? "#f55" : "#888"}">${closed ? "YES" : "no"}</div>
           <div style="color:#888">RTT:</div><div style="color:#fff">${rtt}ms</div>
           <div style="color:#888">uptime:</div><div style="color:#fff">${uptime}</div>
+          <div style="color:#888">reconnect:</div><div style="color:${connected ? "#888" : "#ff0"}">${reconnectInfo}</div>
         `;
       }
 

@@ -279,13 +279,30 @@ async function runSmoke() {
     // history (server rewind validation). Send a PositionUpdate for the
     // firer's playerId BEFORE the AimEvent so the server has at least one
     // snapshot frame to rewind to.
-    const baselineAmmo = await page.evaluate(() => {
-      const snap = (window).__latestSnap ? (window).__latestSnap() : null;
-      const e = snap ? snap.players.find((p) => p.playerId === 7) : null;
-      return e ? e.ammo : null;
-    });
+    //
+    // Poll (50ms × 2s budget) for the snapshot to populate with
+    // playerId=7. Pre-fix the smoke did a one-shot read after the
+    // ping/pong settled, which raced the server's first 20Hz snapshot
+    // tick — on CI the read often returned null and the smoke failed
+    // with "pre-fire snapshot missing playerId=7". Same A2 pattern
+    // fixed in cfn1-sustained-stress-smoke.mjs (commit 8da9b12) on
+    // 2026-09-02.
+    const SNAPSHOT_POLL_TIMEOUT_MS = 2000;
+    const snapPollStart = Date.now();
+    let baselineAmmo = null;
+    while (Date.now() - snapPollStart < SNAPSHOT_POLL_TIMEOUT_MS) {
+      baselineAmmo = await page.evaluate(() => {
+        const snap = (window).__latestSnap ? (window).__latestSnap() : null;
+        const e = snap ? snap.players.find((p) => p.playerId === 7) : null;
+        return e ? e.ammo : null;
+      });
+      if (baselineAmmo !== null) break;
+      await sleep(50);
+    }
     if (baselineAmmo === null) {
-      throw new Error("pre-fire snapshot missing playerId=7 (single-tab ammo baseline)");
+      throw new Error(
+        `pre-fire snapshot missing playerId=7 (single-tab ammo baseline) after ${SNAPSHOT_POLL_TIMEOUT_MS}ms poll`,
+      );
     }
     // Seed position history for player 7 (the firer).
     await page.evaluate(() => {

@@ -86,6 +86,23 @@ export interface ServerTransportStats {
   transport?: TransportKind;
   /** True once `connect()` has resolved. */
   connected: boolean;
+  /** PR #116 — reconnect observability (was a carry-forward from
+   *  PR #58, see §"Reconnect observability" in HANDOFF.md).
+   *  Number of times the auto-reconnect health-check has fired
+   *  for the CURRENT disconnect cycle. Resets to 0 on each
+   *  successful connect. Operators reading the DebugHud can see
+   *  at a glance whether a stalled tab is on attempt #1 vs #15. */
+  reconnectAttempts: number;
+  /** PR #116 — `performance.now()` at the LAST disconnect event
+   *  (server-initiated close). Null if never disconnected.
+   *  Lets DebugHud render "disconnected 47s ago" instead of just
+   *  "Disconnected". */
+  lastDisconnectAt: number | null;
+  /** PR #116 — current backoff window in ms (1s → 2s → 4s → ...
+   *  capped at 30s). Lets DebugHud render "next retry in 16s"
+   *  so the operator knows whether the next attempt is imminent
+   *  or queued for a long tail. */
+  reconnectBackoffMs: number;
 }
 
 /** Listener registry. Multiple listeners per channel. */
@@ -213,6 +230,12 @@ export class ServerTransport {
   // already rejects on re-entry, but a second microtask-scheduled
   // attempt before the first resolves would lose the race).
   private reconnecting = false;
+  /** PR #116 — reconnect observability (carry-forward from PR #58).
+   *  Number of auto-reconnect attempts for the CURRENT disconnect
+   *  cycle. Resets to 0 on each successful connect (see
+   *  `onReconnectSucceeded`). Increments every time the health-
+   *  check fires a new attempt (see `startAutoReconnect`). */
+  private reconnectAttempts = 0;
   // PR 11.7+ / AutoReconnect — the health-check uses a single
   // `setTimeout` whose period is `reconnectBackoffMs` (which doubles
   // after failed attempts). The function is reassigned in
@@ -546,6 +569,13 @@ export class ServerTransport {
       rttMs: this.medianRtt(),
       transport: this.activeKind ?? undefined,
       connected: this.connected,
+      // PR #116 — reconnect observability (carry-forward from
+      // PR #58). Three new fields so the DebugHud can render
+      // "auto-reconnecting… (attempt #N, next in Xs)" instead of
+      // just the boolean "Disconnected" state.
+      reconnectAttempts: this.reconnectAttempts,
+      lastDisconnectAt: this.lastDisconnectAt,
+      reconnectBackoffMs: this.reconnectBackoffMs,
     };
   }
 
@@ -1070,6 +1100,9 @@ export class ServerTransport {
   private onReconnectSucceeded(): void {
     this.reconnectBackoffMs = RECONNECT_BACKOFF_MS;
     this.lastDisconnectAt = null;
+    // PR #116 — successful connect ends the disconnect cycle; reset
+    // the attempt counter so the next disconnect starts at #1.
+    this.reconnectAttempts = 0;
     // Successful connect means the health-check no longer needs to
     // tick. `startAutoReconnect` re-arms it on the next disconnect.
     this.stopAutoReconnect();
@@ -1079,6 +1112,10 @@ export class ServerTransport {
    *  failed to connect. Doubles the backoff up to the cap. The
    *  health-check will fire again at the new (longer) interval. */
   private onReconnectFailed(): void {
+    // PR #116 — increment the attempt counter so the DebugHud can
+    // render "attempt #N" + the backoff window. Counter is reset
+    // by `onReconnectSucceeded` on a successful connect.
+    this.reconnectAttempts++;
     this.reconnectBackoffMs = Math.min(
       this.reconnectBackoffMs * 2,
       RECONNECT_BACKOFF_MAX_MS,
