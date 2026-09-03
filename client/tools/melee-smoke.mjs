@@ -627,6 +627,13 @@ async function main() {
   if (!success) {
     process.exit(1);
   }
+  // PR #114 fix: explicit process.exit(0) here — CI observed
+  // the smoke printing "9 PASS, 0 FAIL" then hanging 5+ minutes
+  // past `node` returning because Playwright's keep-alive handles
+  // (CDP, browser-context Vite HMR WebSocket) hold the event
+  // loop open. Matches the crosshair-smoke + 4 other smokes'
+  // pattern (PR #58 fix).
+  process.exit(0);
 }
 
 main().catch((err) => {
