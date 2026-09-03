@@ -36,6 +36,13 @@ MATCHMAKER_PORT=8084
 # so tailscaled can own $STATIC_PORT externally for Funnel.
 STATIC_PORT=14432
 STATIC_PORT_BACKEND=14032
+# Wire server cert source. PR 11.6.E's letsencrypt mode requires
+# server/certs/lets-encrypt.{pem,key} on disk (symlinks or copies of
+# `tailscale cert <host>` output). For dev without a real cert, set
+# CERT_SOURCE=self-signed. For Funnel play-testing, set to letsencrypt
+# so the WSS listener can serve a cert valid for the Funnel hostname.
+CERT_SOURCE="${CERT_SOURCE:-letsencrypt}"
+SANS="${SANS:-m5.tail1b3795.ts.net,localhost,127.0.0.1}"
 
 REBUILD=1
 LOCAL=0
@@ -101,6 +108,8 @@ nohup bash tools/canary-server.sh \
   --port-ws "$WS_PORT" \
   --port-wss "$WSS_PORT" \
   --port-http "$MATCHMAKER_PORT" \
+  --cert-source "$CERT_SOURCE" \
+  --sans "$SANS" \
   > /tmp/canary-deploy.log 2>&1 &
 echo $! > /tmp/canary-server.pid
 sleep 2
