@@ -43,9 +43,12 @@ import {
 } from "../net/matchmakerApi";
 
 const DEV_MATCHMAKER_ORIGIN = "http://127.0.0.1:18080";
-// Production (Tailscale Funnel) — will be wired in PR 11.11.
-// Matches `tools/specialists-server.service`'s Funnel-served URL.
-const PROD_MATCHMAKER_ORIGIN = "https://m5.tail1b3795.ts.net";
+// Production (Tailscale Funnel) — wired by the Funnel deploy script.
+// Matches the static client's URL so the lobby's same-origin POST /rooms
+// hits the static server (which proxies to the matchmaker). The static
+// URL is `https://m5.tail1b3795.ts.net:14432/` (Funnel + port; see
+// tools/deploy-prod.sh + docs/funnel-deploy.md §"Funnel deploy topology").
+const PROD_MATCHMAKER_ORIGIN = "https://m5.tail1b3795.ts.net:14432";
 
 /** After a successful getRoom(), the player-count indicator has
  *  one of three states: not-yet-checked (roomStatus is null), the

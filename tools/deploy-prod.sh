@@ -26,6 +26,16 @@ REMOTE_HOST="m5"
 WT_PORT=14433
 WS_PORT=14434
 WSS_PORT=14435
+# Matchmaker HTTP listener — PR 11.9. Default 8084 because m5's :8080
+# is held by docker-proxy for the vaultwarden password manager and
+# :8081 is held by llama-server (gbrain's local bge-reranker).
+# The static server proxies /rooms* from the page origin to localhost:8084.
+MATCHMAKER_PORT=8084
+# Static port on the wire: clients connect to https://m5.tail1b3795.ts.net:$STATIC_PORT/.
+# Static port on the host backend: serve-static.mjs binds here (loopback only)
+# so tailscaled can own $STATIC_PORT externally for Funnel.
+STATIC_PORT=14432
+STATIC_PORT_BACKEND=14032
 
 REBUILD=1
 LOCAL=0
@@ -76,18 +86,21 @@ fi
 sleep 1
 
 # 4. Boot the canary in background
-log "booting canary on ports $WT_PORT/$WS_PORT/$WSS_PORT"
-# --port-http 0: disable the matchmaker HTTP listener (default 8080).
-# Funnel play-testing routes clients via WebTransport on $WT_PORT; the
-# matchmaker HTTP endpoint is redundant in this topology (docs/funnel-deploy.md
-# §"Funnel deploy topology" documents this as the production pattern).
-# Disabling also avoids port-8080 collision with vaultwarden's docker-proxy
-# on m5 (which holds :8080 for the password-manager stack).
+log "booting canary on ports $WT_PORT/$WS_PORT/$WSS_PORT + matchmaker HTTP/$MATCHMAKER_PORT"
+# --port-http $MATCHMAKER_PORT (default 8081): the matchmaker HTTP listener
+# is required for the lobby flow (PR 11.9 — POST /rooms + GET /rooms/<id>).
+# We bind on 8081 because m5's :8080 is held by docker-proxy for the
+# vaultwarden password manager (verified via `sudo ss -tlnp`).
+#
+# The static server (booted in step 6 below) proxies /rooms* requests
+# from the page origin to localhost:$MATCHMAKER_PORT so the lobby client
+# (which derives matchmaker origin from window.location.origin) doesn't
+# need any cross-origin awareness.
 nohup bash tools/canary-server.sh \
   --port-wt "$WT_PORT" \
   --port-ws "$WS_PORT" \
   --port-wss "$WSS_PORT" \
-  --port-http 0 \
+  --port-http "$MATCHMAKER_PORT" \
   > /tmp/canary-deploy.log 2>&1 &
 echo $! > /tmp/canary-server.pid
 sleep 2
@@ -106,11 +119,11 @@ if ! ss -tln 2>/dev/null | grep -q ":$WT_PORT"; then
   fail "canary did not bind :$WT_PORT within 20s — check /tmp/canary-deploy.log"
 fi
 
-# 6. Build + boot the static client + Funnel/serve it on $STATIC_PORT.
+# 6. Build + boot the static client + Funnel it on $STATIC_PORT.
 # The wire server doesn't serve the client JS bundle, so we need a separate
-# process for `client/dist/`. Tailscale Funnel/serve (we use Funnel for
-# internet-reachable play-testing) forwards :$STATIC_PORT → localhost:$STATIC_PORT.
-STATIC_PORT=14432
+# process for `client/dist/`. Tailscale Funnel forwards :$STATIC_PORT →
+# localhost:$STATIC_PORT_BACKEND (loopback, so tailscaled can own
+# :$STATIC_PORT externally without EADDRINUSE).
 log "building client (cd client && npm run build)"
 (cd client && npm run build 2>&1 | tail -3) || fail "client build failed"
 
@@ -118,12 +131,17 @@ log "rsyncing client/dist/ to $REMOTE_HOST"
 rsync -az --delete client/dist/ "$REMOTE_HOST:~/Development/specialists-web/client/dist/" \
   || fail "rsync of client/dist/ to $REMOTE_HOST failed"
 
-log "booting static server on 0.0.0.0:$STATIC_PORT on $REMOTE_HOST"
-ssh "$REMOTE_HOST" "cd ~/Development/specialists-web && HOST=0.0.0.0 PORT=$STATIC_PORT nohup node tools/serve-static.mjs > /tmp/serve-static.log 2>&1 & echo \$! > /tmp/serve-static.pid; sleep 2; tail -3 /tmp/serve-static.log" \
+log "booting static server on 127.0.0.1:$STATIC_PORT_BACKEND (tailscaled owns :$STATIC_PORT externally)"
+# Bind the static server on a different port than $STATIC_PORT to avoid
+# colliding with tailscaled's own listener on the Tailscale IP for
+# :$STATIC_PORT (when Funnel is enabled, tailscaled needs to bind the
+# Tailscale IP; binding our app on the same port = EADDRINUSE on
+# tailscaled's bind). Funnel forwards :$STATIC_PORT → :$STATIC_PORT_BACKEND.
+ssh "$REMOTE_HOST" "cd ~/Development/specialists-web && HOST=127.0.0.1 PORT=$STATIC_PORT_BACKEND MATCHMAKER_URL=http://127.0.0.1:$MATCHMAKER_PORT nohup node tools/serve-static.mjs > /tmp/serve-static.log 2>&1 & echo \$! > /tmp/serve-static.pid; sleep 2; tail -3 /tmp/serve-static.log" \
   || fail "could not start static server on $REMOTE_HOST"
 
-log "configuring Tailscale Funnel on :$STATIC_PORT → http://localhost:$STATIC_PORT"
-ssh "$REMOTE_HOST" "sudo /home/kyle/go/bin/tailscale funnel --https=$STATIC_PORT off 2>/dev/null; sudo /home/kyle/go/bin/tailscale funnel --https=$STATIC_PORT --bg http://localhost:$STATIC_PORT" \
+log "configuring Tailscale Funnel on :$STATIC_PORT → http://127.0.0.1:$STATIC_PORT_BACKEND"
+ssh "$REMOTE_HOST" "sudo /home/kyle/go/bin/tailscale funnel --https=$STATIC_PORT off 2>/dev/null; sudo /home/kyle/go/bin/tailscale funnel --https=$STATIC_PORT --bg http://127.0.0.1:$STATIC_PORT_BACKEND" \
   || fail "tailscale funnel setup failed on $REMOTE_HOST"
 
 # 7. Print the Funnel URLs
