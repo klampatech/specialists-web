@@ -137,16 +137,35 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [engineLabel, setEngineLabel] = useState<"webgpu" | "webgl2" | null>(null);
   // PR 11.7.D3 — Debug HUD visibility toggle (key: backtick `).
-  // Persists across renders via React state; the keydown listener is
-  // attached once at mount.
-  const [debugHudVisible, setDebugHudVisible] = useState(false);
+  // Auto-shows in prod when `?debug=1` is in the URL or
+  // `localStorage.__debugHudOpen === "1"`. Toggle state syncs to
+  // localStorage so Kyle can pin it open across reloads.
+  const [debugHudVisible, setDebugHudVisible] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      if (localStorage.getItem("__debugHudOpen") === "1") return true;
+      const u = new URL(window.location.href);
+      if (u.searchParams.get("debug") === "1") return true;
+    } catch {
+      // localStorage / URL parse failed; default to off.
+    }
+    return false;
+  });
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Backtick (the key above Tab on US keyboards). Also accept ~ via
       // Shift+Backtick for convenience.
       if (e.key === "`" || (e.shiftKey && e.key === "~")) {
         e.preventDefault();
-        setDebugHudVisible((v) => !v);
+        setDebugHudVisible((v) => {
+          const next = !v;
+          try {
+            localStorage.setItem("__debugHudOpen", next ? "1" : "0");
+          } catch {
+            // ignore — toggle still works in-session even if storage is blocked
+          }
+          return next;
+        });
       }
     };
     window.addEventListener("keydown", onKey);
