@@ -1,54 +1,32 @@
 // wireServerTransport.ts
 //
 // (Hetzner staging, 2026-09-04) — extracted from scene.ts to escape
-// Vite/Rollup tree-shaking. The wire-up logic used to live inside
+// Vite/Rollup tree-shaking. The wire-up logic that lived inside
 // scene.ts's createScene() function as an `if (useServerTransportFromOpts ||
-// useServerTransportFromWindow) { ... }` block. Vite analyzed the
-// call graph and decided the whole branch was dead (probably because
-// the `MultiplayerOptions` parameter is always `undefined` at the
-// single call site in App.tsx, and Vite's static analysis didn't
-// fully account for the runtime `__forceServerTransport` flag).
+// useServerTransportFromWindow) { ... }` block was being tree-shaken
+// from production builds. Even with PR #119's DEV-gate removal, the
+// `MultiplayerOptions` parameter was always `undefined` at the single
+// call site in App.tsx, and Vite's static analysis didn't fully
+// account for the runtime `__forceServerTransport` flag.
 //
-// To force the wiring to ship, we put it in a separate module with
-// a side-effect-import at App.tsx's top level. The side-effect
-// import runs on every page load; the wire-up reads the runtime
-// `__forceServerTransport` flag and the `__damageServerUrl` /
-// `__damageServerRoomId` globals set by PeerOverlay when the URL
-// has `?server=`.
+// To force the wiring to ship reliably, we put it in a separate module
+// with a side-effect-import at App.tsx's top level. The side-effect
+// import runs on every page load.
 //
-// This module is intentionally minimal — it just calls
-// `wireServerTransport()` once at import time and writes the
-// resulting ServerTransport to `window.__serverTransport` (matching
-// the contract scene.ts used to honor in dev).
+// Module-load order note (Hetzner staging, 2026-09-04):
+// `wireServerTransport()` runs synchronously when this module is first
+// imported. `PeerOverlay`'s URL-parsing IIFE also runs at module
+// evaluation, and which one runs first depends on the bundler's
+// import graph + Vite's runtime. To avoid a race where we read
+// `__damageServerRoomId` before PeerOverlay has populated it, this
+// module parses the `?server=...` URL itself (the canonical prod
+// entrypoint encodes the room id in the `/rooms/<id>` path).
 
-import { ServerTransport } from "../net/serverTransport";
+import { ServerTransport, parseRoomFromUrl } from "../net/serverTransport";
 import { createDamageBusProbe } from "../net/damageBus";
-import { decodeSnapshot } from "../../../protocol/snapshot";
 
 export function wireServerTransport(): void {
-  // Set the runtime flag ourselves if `?server=` is in the URL.
-  // PeerOverlay also sets this, but it might run AFTER us in the
-  // module-load order — checking the URL directly is the safer
-  // single-source-of-truth for prod. (Hetzner staging, 2026-09-04.)
-  const url =
-    typeof window !== "undefined" && typeof window.location !== "undefined"
-      ? new URL(window.location.href)
-      : null;
-  const serverParam = url?.searchParams.get("server") ?? null;
-  if (serverParam && serverParam.length > 0) {
-    (window as unknown as { __forceServerTransport?: boolean }).__forceServerTransport = true;
-  }
-  // Guarded by the runtime flag — same condition as the old in-scene
-  // check. Bail silently if no multiplayer requested.
-  const flag =
-    typeof window !== "undefined" &&
-    (window as unknown as { __forceServerTransport?: boolean })
-      .__forceServerTransport === true;
-  console.info("[wireServerTransport] flag=", flag, "url=", window.location.href);
-  if (!flag) return;
-
-  // Don't double-wire. The IIFE race-guard that used to live in
-  // scene.ts is moved here, simplified.
+  // Window target — typed as `any`-shape for clarity.
   const win = window as unknown as {
     __serverTransport?: unknown;
     __damageBus?: unknown;
@@ -61,26 +39,69 @@ export function wireServerTransport(): void {
     __localPlayerId?: number;
     __peerPlayerId?: number;
     __remoteController?: unknown;
+    __forceServerTransport?: boolean;
   };
-  if (win.__serverTransport !== undefined) return;
-  win.__serverTransport = "INIT_INFLIGHT";
 
-  const urlBase =
-    win.__damageServerUrl ?? `${window.location.protocol}//${window.location.host}`;
-  const roomId = win.__damageServerRoomId;
-  if (!roomId) {
+  // Parse `?server=...` URL ourselves — see module-load order note
+  // at the top of this file.
+  const url =
+    typeof window !== "undefined" && typeof window.location !== "undefined"
+      ? new URL(window.location.href)
+      : null;
+  const serverParam = url?.searchParams.get("server") ?? null;
+  let urlBase: string | null = null;
+  let roomId: string | null = null;
+  if (serverParam && serverParam.length > 0) {
+    win.__forceServerTransport = true;
+    try {
+      const u = new URL(serverParam);
+      urlBase = u.origin;
+      // Match PeerOverlay's room-extraction: explicit `?room=` param
+      // first, else parse from the server URL's `/rooms/<id>` path.
+      const roomParam = url?.searchParams.get("room");
+      if (roomParam) {
+        roomId = roomParam;
+      } else {
+        try {
+          roomId = parseRoomFromUrl(u.toString());
+        } catch {
+          // malformed server URL — fall through, bail below
+        }
+      }
+    } catch {
+      // Malformed `?server=` URL — fall through, bail below.
+    }
+  }
+  // Override with whatever PeerOverlay already populated (smoke
+  // harnesses set these directly via page.addInitScript; legacy
+  // flows also go through PeerOverlay's setter).
+  if (urlBase === null) urlBase = win.__damageServerUrl ?? null;
+  if (roomId === null) roomId = win.__damageServerRoomId ?? null;
+
+  const flag = win.__forceServerTransport === true;
+  console.info(
+    "[wireServerTransport] flag=",
+    flag,
+    "urlBase=",
+    urlBase,
+    "roomId=",
+    roomId,
+  );
+  if (!flag || urlBase === null || roomId === null) {
     console.error(
-      "[wireServerTransport] __damageServerRoomId not set — ?server= URL malformed",
+      "[wireServerTransport] not wiring — flag/URL/roomId missing (likely no ?server= in URL)",
     );
-    win.__serverTransport = undefined;
     return;
   }
+  // Don't double-wire.
+  if (win.__serverTransport !== undefined) return;
+  win.__serverTransport = "INIT_INFLIGHT";
 
   const localPlayerId = win.__localPlayerId ?? 1;
 
   void (async () => {
     try {
-      const server = new ServerTransport(urlBase, roomId);
+      const server = new ServerTransport(urlBase as string, roomId as string);
       await server.connect();
       // Replace the sentinel with the real transport.
       win.__serverTransport = server;
@@ -89,8 +110,6 @@ export function wireServerTransport(): void {
       // dev-mode probe used to expose.
       const snapGetter = (): import("../../../protocol/snapshot").Snapshot | null => {
         try {
-          // ServerTransport exposes the latest snapshot via getStats
-          // in newer revisions; fall back to a placeholder if absent.
           const stats = server.getStats?.();
           if (stats && "latestSnap" in stats && stats.latestSnap) {
             return stats.latestSnap as import("../../../protocol/snapshot").Snapshot;
@@ -106,8 +125,9 @@ export function wireServerTransport(): void {
       // DebugHud's combat panel. scene.ts's createScene() also
       // publishes __gameSession, but it may not have run yet when
       // wireServerTransport completes; we re-publish here to be safe.
-      const gs = (window as unknown as { __gameSession?: { remoteController?: unknown; localController?: unknown } })
-        .__gameSession;
+      const gs = (window as unknown as {
+        __gameSession?: { remoteController?: unknown; localController?: unknown };
+      }).__gameSession;
       if (gs?.remoteController) {
         win.__remoteController = gs.remoteController;
       }
@@ -124,20 +144,10 @@ export function wireServerTransport(): void {
       win.__serverTransport = undefined;
     }
   })();
-
-  // Eagerly bind decodeSnapshot so Vite keeps it in the bundle
-  // (defensive — keep around for future wiring expansion).
-  void decodeSnapshot;
 }
 
 // Auto-wire on import. App.tsx imports this module for the side
 // effect; the function is also exported for tests / manual re-wiring.
-// Tagged with `/* @__SIDE_EFFECT__ */` comment so bundlers that
-// understand the hint keep the call even if the function appears
-// side-effect-free. (Rollup doesn't read this hint, but the explicit
-// assignment to a window property below gives it a real observable
-// effect that survives tree-shaking.)
-/* @__SIDE_EFFECT__ */
 const __wireResult = wireServerTransport();
 (window as unknown as { __wireServerTransportCalled?: boolean }).__wireServerTransportCalled = true;
 void __wireResult;
