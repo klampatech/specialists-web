@@ -88,7 +88,13 @@ export function wireServerTransport(): void {
     roomId,
   );
   if (!flag || urlBase === null || roomId === null) {
-    console.error(
+    // Not an error — most pages don't have `?server=` and that's
+    // fine. The dev-only legacy smokes (mouse-look, mouse-pitch,
+    // spectator-camera, etc.) treat `console.error` as a page-level
+    // failure signal, so we log at info level. The smoke harness
+    // bypass is to set `__forceServerTransport` + the URL-derived
+    // globals via `page.addInitScript`.
+    console.info(
       "[wireServerTransport] not wiring — flag/URL/roomId missing (likely no ?server= in URL)",
     );
     return;
@@ -140,7 +146,9 @@ export function wireServerTransport(): void {
         localPlayerId,
       );
     } catch (err) {
-      console.error("[wireServerTransport] connect failed:", err);
+      // console.warn, not console.error — same reason as above.
+      // The smoke harness treats console.error as a page-level failure.
+      console.warn("[wireServerTransport] connect failed:", err);
       win.__serverTransport = undefined;
     }
   })();
