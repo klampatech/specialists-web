@@ -307,7 +307,14 @@ export class ServerTransport {
     // works), but operators can override via
     // `window.__damageServerPorts.wss`. For HTTP pages we keep
     // `ws://` (no TLS) on the plain WS port.
-    const wssPort = ports?.wss ?? (wsPort + 1);
+    //
+    // PR 11.6.E / Hetzner staging (2026-09-04): when urlBase
+    // already carries a WSS port (the static-server proxy rewrites
+    // matchmaker responses to put the right port there), honor that
+    // port directly instead of computing `wsPort + 1`. Same logic as
+    // `wsPort` above. Otherwise the lobby ends up trying to connect
+    // to wss://host:14436 when the wire server is on 14435.
+    const wssPort = ports?.wss ?? urlPort ?? (wsPort + 1);
     if (typeof location !== "undefined" && location.protocol === "https:") {
       this.wsUrl = `wss://${host}:${wssPort}/rooms/${roomId}`;
       // Quiet the "mixed-content-blocked" warning that the

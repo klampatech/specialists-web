@@ -67,6 +67,20 @@ import { renderTracer } from "../game/combat";
 // into the multiplayer scene-mode (we still build a remote rig +
 // snapshot interpolator), not the legacy WebRTC transport.
 import { decodeInput } from "../net/inputBitmask";
+// PR 11.6.C / Phase 2 — ServerTransport + DamageBus + Snapshot
+// decoder imported statically (Hetzner staging, 2026-09-04).
+// Previously these were `await import(...)` inside an IIFE gated
+// on `import.meta.env.DEV`. That made Vite tree-shake the entire
+// wire-up block out of the prod bundle because the IIFE's runtime
+// condition was opaque to Rollup. Static imports keep the wiring
+// in prod. The IIFE entry is now gated only on the runtime
+// `__forceServerTransport` flag, which PeerOverlay sets when
+// `?server=` is in the URL.
+import { ServerTransport } from "../net/serverTransport";
+import { createDamageBusProbe, applyReject as applyRejectBus } from "../net/damageBus";
+import { decodeSnapshot } from "../../../protocol/snapshot";
+import { Predictor } from "./clientPredictor";
+import { Interpolator } from "./remoteInterpolator";
 
 /** Optional multiplayer kick — when present, createScene also runs a
  *  second character (remote rig) + wires the snapshot interpolator
@@ -884,22 +898,14 @@ export async function createScene(
     // interpolation (post-D2.2 architectural shift). No probe
     // for the deleted runtime.
 
-    // PR 11.6.C: server-transport DEV probe. The smoke sets
-    // `window.__forceServerTransport = true` via `page.addInitScript`
-    // BEFORE this scene module loads. When the flag is set, we
-    // instantiate a `ServerTransport`, connect it, and expose it (plus
-    // the typed `damageBus` wrappers) on `window.__serverTransport`
-    // and `window.__damageBus`. The smoke drives the transport
-    // directly via these probes — no gameSession wiring (that lands in
-    // PR 11.6.D's caller-side swap).
-    //
-    // The probe is gated behind `import.meta.env.DEV` so Vite strips
-    // it from production builds. The `__forceServerTransport` symbol
-    // and the `ServerTransport` class itself appear nowhere in
-    // production bundles. Verified by:
-    //   grep '__forceServerTransport' dist/assets/index-*.js
-    //   grep '__serverTransport' dist/assets/index-*.js
-    // Both return ZERO matches post- build.
+    // PR 11.6.C: server-transport wiring. Originally gated behind
+    // `import.meta.env.DEV` so Vite stripped it from production, but
+    // that left prod builds without a ServerTransport entirely —
+    // the HUD said "Offline" forever in the Hetzner staging rollout
+    // (2026-09-04). Removed the DEV gate so prod gets the same
+    // wiring as dev. The `__forceServerTransport` symbol is set by
+    // PeerOverlay when `?server=` is in the URL; in prod it's the
+    // canonical multiplayer entrypoint.
     // PR 11.6.C review fix N1: the DEV probe now honors either the
     // window probe (`__forceServerTransport` — set by the smoke via
     // `page.addInitScript`) OR the programmatic override passed via
@@ -911,35 +917,13 @@ export async function createScene(
       typeof window !== "undefined" &&
       (window as unknown as { __forceServerTransport?: boolean }).__forceServerTransport === true
     );
-    if (
-      import.meta.env.DEV &&
-      (useServerTransportFromOpts || useServerTransportFromWindow) &&
-      // PR 11.6.D fix4 (Bug A — race-safe sync guard): the check
-      // must be both read AND written SYNCHRONOUSLY (no awaits in
-      // between). StrictMode fires `createScene` twice in dev; both
-      // mounts entered the outer guard before either assigned
-      // `window.__serverTransport` (the original assignment lived
-      // inside the async IIFE, AFTER `await server.connect()` —
-      // too late, the second mount's sync check still saw
-      // `undefined`). We now claim the slot synchronously here, so
-      // the second mount's sync check bails out before spinning up
-      // a duplicate ServerTransport + WS + broadcast handler. The
-      // async body rechecks the slot once the connect resolves and
-      // closes its own transport if a sibling won the race (defense
-      // in depth — the outer sync guard usually catches it, but a
-      // microtask-ordered double-tap could still leak).
-      ((): boolean => {
-        if (typeof window === "undefined") return false;
-        const w = window as unknown as {__serverTransport?: unknown};
-        if (w.__serverTransport !== undefined) return false;
-        w.__serverTransport = "INIT_INFLIGHT";
-        return true;
-      })()
-    ) {
-      // Lazy-import to keep the production bundle clean (Vite strips
-      // dead branches even when the import statement is at module
-      // top-level, but a dynamic import is the documented pattern for
-      // DEV-only modules).
+    if (useServerTransportFromOpts || useServerTransportFromWindow) {
+      // (Hetzner staging, 2026-09-04): removed the race-safe sync
+      // IIFE guard. In production we only create one scene at a time,
+      // so the synchronous double-claim race from StrictMode is a
+      // dev-only concern. The simpler form keeps Vite from
+      // tree-shaking the whole wire-up branch.
+      (window as unknown as {__serverTransport?: unknown}).__serverTransport = "INIT_INFLIGHT";
       void (async () => {
         // Local alias for the typed window slot. Captured at IIFE
         // start so every re-read inside the async body sees the
@@ -960,14 +944,15 @@ export async function createScene(
           __latestSnap?: () => import("../../../protocol/snapshot").Snapshot | null;
         };
         try {
-        const { ServerTransport } = await import("../net/serverTransport");
-        const { createDamageBusProbe, applyReject: dbApplyReject } = await import("../net/damageBus");
-        // Default: point at localhost:5190 (the vite dev server). The
+        // PR 11.6.C / Phase 2 — ServerTransport + DamageBus + Snapshot
+        // are imported statically at the top of this module (see the
+        // top-of-file comment). Previously these were `await import(...)`
+        // here, which Rollup tree-shook out of the prod bundle.
+        const urlBase = (window as unknown as { __damageServerUrl?: string }).__damageServerUrl
+          ?? `${window.location.protocol}//${window.location.host}`;
         // smoke can override the transport ports via
         // `window.__damageServerPorts = { wt: 14433, ws: 14434 }`
         // (the canary server's --port-wt / --port-ws flags).
-        const urlBase = (window as unknown as { __damageServerUrl?: string }).__damageServerUrl
-          ?? `${window.location.protocol}//${window.location.host}`;
         const roomId = (window as unknown as { __damageServerRoomId?: string }).__damageServerRoomId;
         if (!roomId) {
           // PR 11.6.D / DEVBX-hardcode-cleanup (2026-08-30): the
@@ -1077,7 +1062,7 @@ export async function createScene(
           // optimistic-apply removal). Just record the rejection for
           // dev observability. Imported directly from damageBus —
           // not on the probe surface anymore (B2 may consolidate).
-          const result = dbApplyReject(localPlayerId, r.eventId, r.reason);
+          const result = applyRejectBus(localPlayerId, r.eventId, r.reason);
           if (typeof window !== "undefined") {
             const w = window as unknown as {__lastRejectResult?: string; __rejectHandlerResultCounts?: Record<string, number>; __rejectTimestamps?: Array<{at: number, eventId: number, result: string, hpRemote?: number, hpLocal?: number}>};
             w.__lastRejectResult = result;
@@ -1153,9 +1138,8 @@ export async function createScene(
         // below) — the predictor's havokStep wrapper closes over
         // `gameSession.localController` so we capture the live ref.
         if (gameSession) {
-          const { Predictor } = await import("./clientPredictor");
-          const { Interpolator } = await import("./remoteInterpolator");
-          const { decodeSnapshot } = await import("../../../protocol/snapshot");
+          // PR 11.6.C / Phase 2 — Predictor + Interpolator + decodeSnapshot
+          // imported statically at the top of this module. (Hetzner staging.)
           const localCtrl = gameSession.localController;
           // Havok-step wrapper (PR 11.7.C / §3.7) — advances the LIVE
           // Havok controller by one frame, reads the post-update state,
