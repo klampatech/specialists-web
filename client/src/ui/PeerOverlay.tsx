@@ -38,15 +38,16 @@ interface PeerOverlayProps {
  * Side-effect runs at module evaluation time (BEFORE React renders,
  * BEFORE scene.ts's `useEffect` runs), so scene.ts sees the flag.
  *
- * Gated behind `import.meta.env.DEV` so production bundles strip
- * this block entirely (verified by `grep '__forceServerTransport'
- * dist/assets/index-*.js` → ZERO matches in production builds).
+ * Fires in BOTH dev and prod builds. The `?server=` URL parameter
+ * is the canonical prod entrypoint — lobby clients hit
+ * `?server=wss://...` after Create room, and the prod scene wires
+ * ServerTransport off this flag. Previously gated behind
+ * `import.meta.env.DEV` (so prod bundles stripped this block) —
+ * that broke production: no ServerTransport in prod → HUD stuck
+ * "Offline". See PR #112+ for prod deploy testing. Removed DEV gate
+ * in Hetzner staging rollout 2026-09-04.
  */
-if (
-  import.meta.env.DEV &&
-  typeof window !== "undefined" &&
-  typeof window.location !== "undefined"
-) {
+if (typeof window !== "undefined" && typeof window.location !== "undefined") {
   const url = new URL(window.location.href);
   const serverParam = url.searchParams.get("server");
   // PR 11.7.D3 / loud diagnostic — always log the parsed state on

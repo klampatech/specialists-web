@@ -291,9 +291,30 @@ export class ServerTransport {
     // before this fix the transport IGNORED that port). If a smoke
     // harness has set `__damageServerPorts.ws` (the historical
     // PR 11.6.C override path), use that instead.
+    //
+    // PR 11.6.E / Hetzner staging (2026-09-04): only honor urlPort
+    // when urlBase carries a WebSocket-style scheme (ws: or wss:).
+    // A `https://` urlBase means the caller passed a WebTransport
+    // URL — the port there is the WT port (e.g. 14433), not the
+    // WS/WSS port. Honoring it as wsPort would silently break the
+    // ws:// + ws+1 = wss fallback on dev canary.
     const urlPort = u.port !== "" ? Number(u.port) : undefined;
-    const wtPort = ports?.wt ?? urlPort ?? 14433;
-    const wsPort = ports?.ws ?? urlPort ?? 14434;
+    const urlScheme = u.protocol;
+    const isWsScheme = urlScheme === "ws:" || urlScheme === "wss:";
+    // WebTransport: HTTPS port. Honor ports?.wt first, then the URL
+    // port (only if it's not a WS-style URL), then default 14433.
+    // The URL's port is the WT port for an `https://` urlBase, but
+    // for a `ws://` or `wss://` urlBase the URL port is the WS port
+    // — we should NOT use it as the WT port.
+    const wtPort = ports?.wt ?? (isWsScheme ? undefined : urlPort) ?? 14433;
+    const wsPort = ports?.ws ?? (isWsScheme ? urlPort : undefined) ?? 14434;
+    // PR 11.6.E / Hetzner staging (2026-09-04): wssPort only follows
+    // urlPort when the URL scheme is `wss:` (lobby proxy case). For
+    // `https:` URLs, fall back to `wsPort + 1` (dev canary convention).
+    // For `ws:` URLs, also use wsPort + 1 — a ws: URL doesn't carry the
+    // WSS port by definition.
+    const wssPort =
+      ports?.wss ?? (urlScheme === "wss:" ? urlPort : undefined) ?? (wsPort + 1);
     this.wtUrl = `https://${host}:${wtPort}/rooms/${roomId}`;
     // PR 11.6.E / Session 2 — WSS URL. When the page is loaded over
     // HTTPS and the browser falls back from WebTransport to
@@ -307,7 +328,6 @@ export class ServerTransport {
     // works), but operators can override via
     // `window.__damageServerPorts.wss`. For HTTP pages we keep
     // `ws://` (no TLS) on the plain WS port.
-    const wssPort = ports?.wss ?? (wsPort + 1);
     if (typeof location !== "undefined" && location.protocol === "https:") {
       this.wsUrl = `wss://${host}:${wssPort}/rooms/${roomId}`;
       // Quiet the "mixed-content-blocked" warning that the
