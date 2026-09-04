@@ -1,68 +1,20 @@
-// PR 11.7.D3 — Debug HUD overlay (v2 — diagnostic beast).
+// Debug HUD v3 — Hetzner/prod-aware.
 //
-// Toggle with the `~` (backtick) key. This is the comprehensive
-// diagnostics surface Kyle asked for: every variable I could need
-// to debug "why doesn't this work in my browser" in ONE place.
-//
-// Layout (top-right, monospace, ~700px wide):
-//
-//   ╔══════════════════════════════════════════════════════╗
-//   ║ 🐛 DEBUG HUD (toggle: `)                            ║
-//   ╠══════════════════════════════════════════════════════╣
-//   ║ URL                                                 ║
-//   ║   href:          http://100.95.111.112:5174/...     ║
-//   ║   parsed:        server=ws://... localId=1 peerId=2  ║
-//   ║   __forceTransport: TRUE                            ║
-//   ║                                                      ║
-//   ║ Browser capabilities                                ║
-//   ║   WebTransport:  ✓ defined                          ║
-//   ║   WebGPU:        ✓ (adapter: intel)                 ║
-//   ║   WebGL2:        ✓                                  ║
-//   ║   secureContext: ✓ (https OR localhost)             ║
-//   ║                                                      ║
-//   ║ Network                                             ║
-//   ║   transport:     websocket / webtransport / offline  ║
-//   ║   connected:     ✓                                   ║
-//   ║   rtt:           42ms                                ║
-//   ║   uptime:        12.4s                               ║
-//   ║   browser→ws://…: 200 OK                            ║
-//   ║                                                      ║
-//   ║ State                                               ║
-//   ║   local  Havok:  (-8.00, 0.90, 0.00)                 ║
-//   ║   remote Havok:  (-4.00, 1.00, 0.00)                 ║
-//   ║   remote state:  (-4.00, 1.00, 0.00) (stale?)         ║
-//   ║   snapshot players: [1, 2] (HP: 100/100)             ║
-//   ║   localId / peerId: 1 / 2                            ║
-//   ║                                                      ║
-//   ║ Certs / Tailscale                                   ║
-//   ║   ws://100.95.111.112:14434/  HEAD 200               ║
-//   ║   https://100.95.111.112:14433/  HEAD 404 (canary)  ║
-//   ║   https://m5.tail1b3795.ts.net:14433/  ✓ Let's Enc  ║
-//   ║                                                      ║
-//   ║ [Probe WT] [Probe WS] [Force Reconnect] [Check PE]   ║
-//   ║ log: "..."                                          ║
-//   ╚══════════════════════════════════════════════════════╝
-//
-// The buttons run real tests:
-//   [Probe WT]   creates a new WebTransport("https://m5.…")
-//                and reports the exact error / success
-//   [Probe WS]   fetch() HEAD against the WS endpoint
-//                and reports status (200/404/timeout/...)
-//   [Force Recon]nukes window.__serverTransport and lets
-//                scene.ts re-initialize a fresh one
-//   [Check PE]   reads the parse-error reject from
-//                connectWebTransport/connectWebSocket
-//                and prints it for the debug log
-//
-// Why this lives in its own component:
-//   1. It runs at high poll rate (every render frame for live
-//      fields; only on click for actions — no animation loop)
-//   2. It's DEV-only — `import.meta.env.DEV` gate at the call
-//      site prevents prod bundle from including it
-//   3. DOM-direct updates bypass React re-render for 60-fps
-//      fields (no perf cost on gameplay)
-//
-// Reference: docs/SPEC.md "Observability" carry-forward
+// Differences from v2:
+//   1. Auto-shows in prod when `?debug=1` is in URL OR
+//      `localStorage.__debugHudOpen === "1"`. No more "open devtools
+//      and figure it out" — Kyle needs this visible when he joins
+//      the prod Hetzner room.
+//   2. Probe targets derive from `window.location.host` instead of
+//      hardcoded m5 IPs / Tailscale hostnames. Works on Hetzner
+//      (`65.108.87.1`), m5 Tailscale, or localhost.
+//   3. New sections: HP / ammo / yaw / hits / damageBus counters /
+//      weapon fire mode. All the game-state stuff I used to read
+//      via console.log one variable at a time.
+//   4. New `[Copy debug bundle]` button — drops a paste-ready
+//      JSON dump (window globals + game state + transport stats)
+//      into the clipboard so Kyle can paste a single blob into
+//      Discord instead of a screenshot.
 
 import * as React from "react";
 
@@ -81,7 +33,8 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
   const browserRef = React.useRef<HTMLDivElement>(null);
   const networkRef = React.useRef<HTMLDivElement>(null);
   const stateRef = React.useRef<HTMLDivElement>(null);
-  const certsRef = React.useRef<HTMLDivElement>(null);
+  const combatRef = React.useRef<HTMLDivElement>(null);
+  const serverRef = React.useRef<HTMLDivElement>(null);
   const logRef = React.useRef<HTMLPreElement>(null);
 
   // Log buffer state (low frequency — React).
@@ -89,187 +42,218 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
   const appendLog = React.useCallback((msg: string) => {
     setLog((prev) => {
       const next = [...prev, { ts: Date.now(), msg }];
-      // Keep last 200 lines max
       return next.length > 200 ? next.slice(-200) : next;
     });
   }, []);
 
-  // Probe actions. These are the user-driven diagnostic tests.
+  // Probe actions — use the current page host instead of hardcoded
+  // m5 / Tailscale. Operators point this at whatever host the page
+  // is on (Hetzner public IP, m5 Funnel, localhost, etc).
   const probeWebTransport = React.useCallback(async () => {
     appendLog("[Probe WT] starting…");
+    if (typeof WebTransport === "undefined") {
+      appendLog("[Probe WT] FAIL: WebTransport is not defined in this page context");
+      return;
+    }
+    const base = `${window.location.protocol}//${window.location.host}`;
+    // WebTransport runs on the same host, port 14433 by default.
+    // Strip whatever port the page is on (e.g. 14432 for static) and
+    // substitute the WebTransport port (env-configurable in prod).
+    const wtPort =
+      (window as { __specialistsPorts?: { wt?: number } }).__specialistsPorts?.wt ??
+      14433;
+    const wtHost = window.location.hostname;
+    const url = `${window.location.protocol}//${wtHost}:${wtPort}/rooms/DEVBX`;
+    appendLog(`[Probe WT] using ${url} (page base was ${base})`);
     try {
-      if (typeof WebTransport === "undefined") {
-        appendLog("[Probe WT] FAIL: WebTransport is not defined in this page context");
-        return;
-      }
-      // Try three targets in sequence to isolate the failure point
-      const targets = [
-        "https://100.95.111.112:14433/rooms/DEVBX",
-        "https://localhost:14433/rooms/DEVBX",
-        "https://m5.tail1b3795.ts.net:14433/rooms/DEVBX",
-      ];
-      for (const url of targets) {
-        try {
-          appendLog(`[Probe WT] trying ${url}`);
-          const t = new WebTransport(url);
-          const result = await Promise.race([
-            t.ready.then(() => "OK").catch((e) => `reject: ${e.name}: ${e.message}`),
-            new Promise<string>((r) => setTimeout(() => r("timeout 8s"), 8000)),
-          ]);
-          t.close();
-          appendLog(`[Probe WT] ${url} → ${result}`);
-        } catch (e) {
-          appendLog(`[Probe WT] ${url} → THROW ${(e as Error).name}: ${(e as Error).message}`);
-        }
-      }
+      const t = new WebTransport(url);
+      const result = await Promise.race([
+        t.ready.then(() => "OK").catch((e) => `reject: ${e.name}: ${e.message}`),
+        new Promise<string>((r) => setTimeout(() => r("timeout 8s"), 8000)),
+      ]);
+      t.close();
+      appendLog(`[Probe WT] ${url} → ${result}`);
     } catch (e) {
-      appendLog(`[Probe WT] outer error: ${(e as Error).message}`);
+      appendLog(`[Probe WT] THROW ${(e as Error).name}: ${(e as Error).message}`);
     }
   }, [appendLog]);
 
   const probeWebSocket = React.useCallback(async () => {
     appendLog("[Probe WS] starting…");
-    const targets = [
-      "ws://100.95.111.112:14434/rooms/DEVBX",
-      "ws://localhost:14434/rooms/DEVBX",
-    ];
-    for (const url of targets) {
-      try {
-        appendLog(`[Probe WS] connecting ${url}`);
-        const ws = new WebSocket(url);
-        const result = await Promise.race([
-          new Promise<string>((r) => ws.addEventListener("open", () => r("OPEN"), { once: true })),
-          new Promise<string>((r) =>
-            ws.addEventListener("error", () => r("ERROR"), { once: true }),
-          ),
-          new Promise<string>((r) => setTimeout(() => r("timeout 6s"), 6000)),
-        ]);
-        appendLog(`[Probe WS] ${url} → ${result}`);
-        ws.close();
-      } catch (e) {
-        appendLog(`[Probe WS] ${url} → THROW ${(e as Error).message}`);
-      }
+    const wsPort =
+      (window as { __specialistsPorts?: { ws?: number } }).__specialistsPorts?.ws ??
+      14434;
+    const wssPort =
+      (window as { __specialistsPorts?: { wss?: number } }).__specialistsPorts?.wss ??
+      14435;
+    const isHttps = window.location.protocol === "https:";
+    const scheme = isHttps ? "wss" : "ws";
+    const port = isHttps ? wssPort : wsPort;
+    const url = `${scheme}://${window.location.hostname}:${port}/rooms/DEVBX`;
+    appendLog(`[Probe WS] connecting ${url}`);
+    try {
+      const ws = new WebSocket(url);
+      const result = await Promise.race([
+        new Promise<string>((r) => ws.addEventListener("open", () => r("OPEN"), { once: true })),
+        new Promise<string>((r) =>
+          ws.addEventListener("error", () => r("ERROR"), { once: true }),
+        ),
+        new Promise<string>((r) => setTimeout(() => r("timeout 6s"), 6000)),
+      ]);
+      appendLog(`[Probe WS] ${url} → ${result}`);
+      ws.close();
+    } catch (e) {
+      appendLog(`[Probe WS] THROW ${(e as Error).message}`);
     }
   }, [appendLog]);
 
-  const probeFetch = React.useCallback(async (url: string, label: string) => {
-    appendLog(`[Fetch ${label}] starting ${url}`);
+  const probeMatchmaker = React.useCallback(async () => {
+    appendLog("[Probe matchmaker] starting…");
+    const url = `${window.location.origin}/rooms`;
     try {
       const ctrl = new AbortController();
       const tid = setTimeout(() => ctrl.abort(), 4000);
-      const res = await fetch(url, { signal: ctrl.signal, method: "HEAD" }).catch((e) => e);
+      const res = await fetch(url, {
+        method: "POST",
+        signal: ctrl.signal,
+      }).catch((e) => e);
       clearTimeout(tid);
       if (res instanceof Error) {
-        appendLog(`[Fetch ${label}] ${url} → ${res.name}: ${res.message}`);
+        appendLog(`[Probe matchmaker] ${url} → ${res.name}: ${res.message}`);
       } else {
-        appendLog(`[Fetch ${label}] ${url} → ${res.status} ${res.statusText}`);
+        const body = await res.text();
+        appendLog(
+          `[Probe matchmaker] POST ${url} → ${res.status} ${res.statusText} :: ${body.slice(0, 200)}`,
+        );
       }
     } catch (e) {
-      appendLog(`[Fetch ${label}] ${url} → THROW ${(e as Error).message}`);
+      appendLog(`[Probe matchmaker] THROW ${(e as Error).message}`);
     }
   }, [appendLog]);
 
-  const probeCerts = React.useCallback(async () => {
-    appendLog("[Certs] probing server endpoints…");
-    // 1. Try a secure-context HEAD against the Funnel'd HTTPS endpoint
-    //    (this proves "secure context is actually secure")
-    await probeFetch("https://m5.tail1b3795.ts.net:14433/", "funnel-wt");
-    // 2. Same, but local IPs (LAN HTTPS — works through mkcert if you
-    //    ran mkcert -install)
-    await probeFetch("https://100.95.111.112:14433/", "lan-wt");
-    // 3. Cert sanity — fetch the cert issuer via JS accessing the
-    //    page's certificate is impossible (no API for it in browsers),
-    //    so just note what TLS error we see
-    await probeFetch("https://100.95.111.112:5174/", "vite-tls");
-  }, [appendLog, probeFetch]);
+  const copyDebugBundle = React.useCallback(async () => {
+    const w = window as unknown as Record<string, unknown>;
+    const bundle = {
+      ts: new Date().toISOString(),
+      href: window.location.href,
+      userAgent: navigator.userAgent,
+      flags: {
+        __forceServerTransport: w.__forceServerTransport,
+        __damageServerUrl: w.__damageServerUrl,
+        __damageServerRoomId: w.__damageServerRoomId,
+        __localPlayerId: w.__localPlayerId,
+        __peerPlayerId: w.__peerPlayerId,
+        __missingServerParam: w.__missingServerParam,
+        __wireServerTransportCalled: w.__wireServerTransportCalled,
+      },
+      transport:
+        (w.__serverTransport as { getStats?: () => unknown } | undefined)?.getStats?.() ?? null,
+      gameSession: {
+        frame: (w.__gameSession as { frame?: number } | undefined)?.frame,
+        health: (
+          w.__gameSession as
+            | { getHealthSnapshot?: () => unknown }
+            | undefined
+        )?.getHealthSnapshot?.() ?? null,
+        weapon: (
+          w.__gameSession as
+            | { getLocalWeaponState?: () => unknown }
+            | undefined
+        )?.getLocalWeaponState?.() ?? null,
+      },
+      snapshot: (
+        w as { __latestSnap?: () => unknown }
+      ).__latestSnap?.() ?? null,
+      damageBus: w.__damageBus
+        ? {
+            sendDamageRequest: (
+              w.__damageBus as { sendDamageRequest?: unknown }
+            ).sendDamageRequest !== undefined,
+            sendAimEvent: (w.__damageBus as { sendAimEvent?: unknown }).sendAimEvent !== undefined,
+            sendPositionUpdate: (
+              w.__damageBus as { sendPositionUpdate?: unknown }
+            ).sendPositionUpdate !== undefined,
+          }
+        : null,
+      hits: (w as { __hits?: number }).__hits ?? null,
+      dwelcomes: (w as { __dwelcomeCount?: number }).__dwelcomeCount ?? null,
+    };
+    const json = JSON.stringify(bundle, null, 2);
+    try {
+      await navigator.clipboard.writeText(json);
+      appendLog("[Copy] debug bundle copied to clipboard (" + json.length + " bytes)");
+    } catch (e) {
+      appendLog(`[Copy] clipboard write failed: ${(e as Error).message}`);
+      // Fallback: surface in the log itself so Kyle can copy-paste.
+      appendLog("[Copy] bundle follows:");
+      for (const line of json.split("\n")) appendLog("  " + line);
+    }
+  }, [appendLog]);
 
   const forceReconnect = React.useCallback(async () => {
     appendLog("[Force reconnect] attempting…");
     try {
-      const t = (window as any).__serverTransport;
+      const t = (window as unknown as { __serverTransport?: { dispose?: () => void; close?: () => void } })
+        .__serverTransport;
       if (!t) {
-        appendLog("[Force reconnect] no transport to reconnect (page never set one up)");
+        appendLog("[Force reconnect] no transport to reconnect");
         return;
       }
-      // PR 11.7+ / AutoReconnect (Claude review B2) — this is the
-      // "Force reconnect" debug button. It's a hybrid: it tears down
-      // the existing transport (terminal — we then expect scene.ts
-      // to spin up a fresh one) AND replaces `window.__serverTransport`
-      // with undefined so the next scene() call claims the slot. Use
-      // `dispose()` to ensure the auto-reconnect health-check is NOT
-      // armed on the now-orphaned instance — without this, the old
-      // transport would keep polling the server every 1-30s until GC,
-      // leaking concurrent reconnect attempts.
       if (t.dispose) {
-        try { t.dispose(); } catch {}
+        try {
+          t.dispose();
+        } catch (e) {
+          appendLog(`[Force reconnect] dispose error: ${(e as Error).message}`);
+        }
       } else if (t.close) {
-        // Pre-PR-#58 path: the auto-reconnect didn't exist, so plain
-        // close() was terminal. Keep the fallback for old smoke stubs.
-        try { t.close(); } catch {}
+        try {
+          t.close();
+        } catch {}
       }
-      delete (window as any).__serverTransport;
-      // Wait a tick, then ask scene.ts (via window event) to re-init
-      await new Promise((r) => setTimeout(r, 200));
-      appendLog("[Force reconnect] transport cleared — reload the page (Ctrl+R) to re-init cleanly");
+      delete (window as unknown as { __serverTransport?: unknown }).__serverTransport;
+      appendLog("[Force reconnect] transport cleared — Ctrl+R to re-init cleanly");
     } catch (e) {
       appendLog(`[Force reconnect] error: ${(e as Error).message}`);
     }
   }, [appendLog]);
 
-  const dumpAll = React.useCallback(() => {
-    appendLog("[Dump] capturing window state…");
-    const dump = {
-      forceServerTransport: (window as any).__forceServerTransport,
-      damageServerUrl: (window as any).__damageServerUrl,
-      damageServerRoomId: (window as any).__damageServerRoomId,
-      localPlayerId: (window as any).__localPlayerId,
-      peerPlayerId: (window as any).__peerPlayerId,
-      missingServerParam: (window as any).__missingServerParam,
-      engineLabel: (window as any).__engineLabel,
-      hasGameSession: !!(window as any).__gameSession,
-      hasRemoteController: !!(window as any).__remoteController,
-      hasServerTransport: !!(window as any).__serverTransport,
-      serverTransportActiveKind: (window as any).__serverTransport?.activeKind,
-      serverTransportConnected: (window as any).__serverTransport?.connected,
-    };
-    appendLog(`[Dump] ${JSON.stringify(dump, null, 2)}`);
-  }, [appendLog]);
-
-  // High-frequency DOM updates (60fps target).
+  // High-frequency DOM updates (~30Hz to reduce flicker).
   React.useEffect(() => {
     if (!visible) return;
     let rafId = 0;
     let lastUpdate = 0;
     const tick = () => {
       rafId = requestAnimationFrame(tick);
-      // Throttle to ~30Hz to reduce flicker
       const now = performance.now();
       if (now - lastUpdate < 33) return;
       lastUpdate = now;
 
+      const w = window as unknown as Record<string, unknown>;
+
       // URL section
       if (urlRef.current) {
         const href = typeof location !== "undefined" ? location.href : "?";
-        const forceTransport = !!(window as any).__forceServerTransport;
-        const damageUrl = (window as any).__damageServerUrl ?? null;
-        const localId = (window as any).__localPlayerId ?? "?";
-        const peerId = (window as any).__peerPlayerId ?? "?";
-        const missing = (window as any).__missingServerParam ?? false;
+        const forceTransport = !!w.__forceServerTransport;
+        const damageUrl = (w.__damageServerUrl as string | undefined) ?? null;
+        const localId = (w.__localPlayerId as number | undefined) ?? "?";
+        const peerId = (w.__peerPlayerId as number | undefined) ?? "?";
+        const missing = !!w.__missingServerParam;
         const ok = forceTransport && damageUrl && !missing;
         urlRef.current.innerHTML = `
-          <div style="color:#888">href:</div><div style="color:#fff;word-break:break-all;font-size:10px">${escapeHtml(href.slice(0, 120))}${href.length > 120 ? "…" : ""}</div>
+          <div style="color:#888">href:</div><div style="color:#fff;word-break:break-all;font-size:10px">${escapeHtml(href.slice(0, 140))}${href.length > 140 ? "…" : ""}</div>
           <div style="color:#888">force server transport:</div><div style="color:${forceTransport ? "#0f0" : "#f55"}">${forceTransport ? "✓ TRUE" : "✗ FALSE"}</div>
           <div style="color:#888">damage server:</div><div style="color:${damageUrl ? "#0f0" : "#f55"}">${damageUrl ?? "—"}</div>
+          <div style="color:#888">room:</div><div style="color:#fff">${(w.__damageServerRoomId as string | undefined) ?? "—"}</div>
           <div style="color:#888">localId / peerId:</div><div style="color:#fff">${localId} / ${peerId}</div>
           ${missing ? '<div style="color:#f55;font-weight:bold;padding:4px;background:#400">URL missing ?server= param</div>' : ""}
-          <div style="color:#888;padding-top:4px">overall:</div><div style="color:${ok ? "#0f0" : "#f55"}">${ok ? "✓ ready" : "✗ not connected (check URL params above)"}</div>
+          <div style="color:#888;padding-top:4px">overall:</div><div style="color:${ok ? "#0f0" : "#f55"}">${ok ? "✓ ready" : "✗ not connected"}</div>
         `;
       }
 
-      // Browser section
+      // Browser capabilities
       if (browserRef.current) {
         const wt = typeof WebTransport !== "undefined" ? "✓ defined" : "✗ undefined";
-        const gpu = !!(navigator as any).gpu;
+        const gpu = !!(navigator as unknown as { gpu?: unknown }).gpu;
         const webgl2 = !!document.createElement("canvas").getContext("webgl2");
         const secure = typeof window !== "undefined" && window.isSecureContext;
         const gpuAdapter = gpu ? "available" : "no";
@@ -277,85 +261,121 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
           <div style="color:#888">WebTransport:</div><div style="color:${typeof WebTransport !== "undefined" ? "#0f0" : "#f55"}">${wt}</div>
           <div style="color:#888">WebGPU:</div><div style="color:${gpu ? "#0f0" : "#ff0"}">${gpuAdapter}</div>
           <div style="color:#888">WebGL2:</div><div style="color:${webgl2 ? "#0f0" : "#f55"}">${webgl2 ? "✓" : "✗"}</div>
-          <div style="color:#888">secure context:</div><div style="color:${secure ? "#0f0" : "#f55"}">${secure ? "✓ (HTTPS or localhost)" : "✗ (HTTP) — WebTransport + WebGPU stripped"}</div>
+          <div style="color:#888">secure context:</div><div style="color:${secure ? "#0f0" : "#f55"}">${secure ? "✓" : "✗ — WebTransport stripped"}</div>
         `;
       }
 
-      // Network section
+      // Network — transport stats
       if (networkRef.current) {
-        const t = (window as any).__serverTransport;
+        const t = w.__serverTransport as
+          | {
+              activeKind?: string;
+              connected?: boolean;
+              closed?: boolean;
+              getStats?: () => Record<string, unknown>;
+            }
+          | undefined;
         const kind: string = t?.activeKind ?? "—";
         const connected = !!t?.connected;
         const closed = !!t?.closed;
         const stats = t?.getStats?.() ?? {};
-        const rtt = stats.rttMs ?? stats.rtt ?? "?";
+        const rtt = (stats.rttMs as number | undefined) ?? "?";
         const uptime = stats.uptimeMs
-          ? `${(stats.uptimeMs / 1000).toFixed(1)}s`
-          : stats.connectedAt
-          ? `${((Date.now() - stats.connectedAt) / 1000).toFixed(1)}s`
+          ? `${((stats.uptimeMs as number) / 1000).toFixed(1)}s`
           : "—";
-        // PR #116 — reconnect observability (carry-forward from
-        // PR #58). Surface the new fields so operators can read
-        // "auto-reconnecting (attempt #N, next in Xs)" at a glance.
-        const reconnectAttempts = stats.reconnectAttempts ?? 0;
+        const reconnectAttempts = (stats.reconnectAttempts as number | undefined) ?? 0;
         const lastDisconnectAt = stats.lastDisconnectAt ?? null;
-        const reconnectBackoffMs = stats.reconnectBackoffMs ?? 0;
-        const reconnectInfo = (() => {
-          if (connected) return "—";
-          if (reconnectAttempts === 0) {
-            // Disconnected but no auto-reconnect yet (or user closed).
-            if (closed) return "user-closed";
-            return "awaiting first retry";
-          }
-          // Show time-since-last-disconnect + time-until-next-retry.
-          const agoSec = lastDisconnectAt
-            ? Math.max(0, Math.round((Date.now() - lastDisconnectAt) / 1000))
-            : "?";
-          const nextSec = Math.round(reconnectBackoffMs / 1000);
-          return `attempt #${reconnectAttempts} · ${agoSec}s ago · next in ${nextSec}s`;
-        })();
+        const reconnectBackoffMs = (stats.reconnectBackoffMs as number | undefined) ?? 0;
         networkRef.current.innerHTML = `
-          <div style="color:#888">transport kind:</div><div style="color:${kind === "webtransport" ? "#0f0" : kind === "websocket" ? "#ff0" : "#f55"}">${kind === "—" ? "none (no transport!)" : kind}</div>
+          <div style="color:#888">transport:</div><div style="color:${kind === "webtransport" ? "#0f0" : kind === "websocket" ? "#ff0" : "#f55"}">${kind === "—" ? "none" : kind}</div>
           <div style="color:#888">connected:</div><div style="color:${connected ? "#0f0" : "#f55"}">${connected ? "✓" : "✗"}</div>
           <div style="color:#888">closed:</div><div style="color:${closed ? "#f55" : "#888"}">${closed ? "YES" : "no"}</div>
           <div style="color:#888">RTT:</div><div style="color:#fff">${rtt}ms</div>
           <div style="color:#888">uptime:</div><div style="color:#fff">${uptime}</div>
-          <div style="color:#888">reconnect:</div><div style="color:${connected ? "#888" : "#ff0"}">${reconnectInfo}</div>
+          <div style="color:#888">reconnect attempts:</div><div style="color:#fff">${reconnectAttempts}</div>
+          ${lastDisconnectAt ? `<div style="color:#888">last disconnect:</div><div style="color:#fff">${new Date(lastDisconnectAt as number).toLocaleTimeString()}</div>` : ""}
+          <div style="color:#888">backoff:</div><div style="color:#fff">${reconnectBackoffMs}ms</div>
         `;
       }
 
-      // State section
+      // Game state — positions, frame, snapshot players
       if (stateRef.current) {
-        const sess = (window as any).__gameSession;
-        const remote = (window as any).__remoteController;
-        const getLatestSnap = (window as any).__latestSnap;
+        const sess = w.__gameSession as
+          | {
+              localController?: { havok?: { getPosition?: () => unknown } };
+              remoteController?: { havok?: { getPosition?: () => unknown } };
+              frame?: number;
+              getReloadingUntilMs?: () => number | null;
+            }
+          | undefined;
+        const lp = sess?.localController?.havok?.getPosition?.() as
+          | { x: number; y: number; z: number }
+          | undefined;
+        const rp = sess?.remoteController?.havok?.getPosition?.() as
+          | { x: number; y: number; z: number }
+          | undefined;
+        const getLatestSnap = (
+          w as { __latestSnap?: () => { players?: unknown; serverFrame?: number } | null }
+        ).__latestSnap;
         const snap = typeof getLatestSnap === "function" ? getLatestSnap() : null;
+        const players = snap?.players;
+        const playersStr = Array.isArray(players)
+          ? players
+              .map((p: { id?: number; hp?: number }) => `${p.id ?? "?"}:hp${p.hp ?? "?"}`)
+              .join(", ")
+          : "—";
 
-        const lp = sess?.localController?.havok?.getPosition?.();
-        const rp = remote?.havok?.getPosition?.();
-        const sp = remote?.state?.position;
-
-        const players = snap?.players
-          ? Array.isArray(snap.players)
-            ? snap.players
-            : Array.from(snap.players.values?.() ?? [])
-          : [];
+        const reloadUntil = sess?.getReloadingUntilMs?.();
+        const reloadStr =
+          reloadUntil && reloadUntil > Date.now()
+            ? `${((reloadUntil - Date.now()) / 1000).toFixed(1)}s`
+            : "—";
 
         stateRef.current.innerHTML = `
           <div style="color:#888">local  Havok:</div><div style="color:#fff">${lp ? `(${lp.x.toFixed(2)}, ${lp.y.toFixed(2)}, ${lp.z.toFixed(2)})` : "—"}</div>
           <div style="color:#888">remote Havok:</div><div style="color:#fff">${rp ? `(${rp.x.toFixed(2)}, ${rp.y.toFixed(2)}, ${rp.z.toFixed(2)})` : "—"}</div>
-          <div style="color:#888">remote state.position:</div><div style="color:#888;font-size:10px">${sp ? `(${sp.x.toFixed(2)}, ${sp.y.toFixed(2)}, ${sp.z.toFixed(2)})` : "—"} <span style="color:#888">(often stale by design)</span></div>
-          <div style="color:#888">snapshot players:</div><div style="color:#fff;font-size:10px">${players.length > 0 ? players.map((p: any) => `${p.id ?? "?"}:hp${p.hp ?? "?"}`).join(", ") : "(none — snapshot stream empty)"}</div>
-          <div style="color:#888">frame:</div><div style="color:#fff">${sess?.frame ?? "?"}</div>
+          <div style="color:#888">snapshot players:</div><div style="color:#fff;font-size:10px">${playersStr}</div>
+          <div style="color:#888">frame:</div><div style="color:#fff">${sess?.frame ?? "?"} (server: ${snap?.serverFrame ?? "?"})</div>
+          <div style="color:#888">reload timer:</div><div style="color:#fff">${reloadStr}</div>
         `;
       }
 
-      // Certs section
-      if (certsRef.current) {
-        certsRef.current.innerHTML = `
-          <div style="color:#888">Tailscale reachable (m5):</div><div style="color:#0f0">via Funnel: https://m5.tail1b3795.ts.net:14433</div>
-          <div style="color:#888">local canary:</div><div style="color:#ff0">ws://100.95.111.112:14434 (plain WS, NOT WSS)</div>
-          <div style="color:#888">canary WT port:</div><div style="color:#ff0">https://100.95.111.112:14433 (self-signed, only HTTPS in same-origin)</div>
+      // Combat — HP, ammo, hits, weapon
+      if (combatRef.current) {
+        const sess = w.__gameSession as
+          | {
+              getHealthSnapshot?: () => {
+                local?: { hp?: number; respawningMs?: number };
+                remote?: { hp?: number; respawningMs?: number };
+              };
+              getLocalWeaponState?: () => { weaponId?: number; fireModeIndex?: number };
+            }
+          | undefined;
+        const hp = sess?.getHealthSnapshot?.();
+        const weapon = sess?.getLocalWeaponState?.();
+        const dmg = w.__damageBus as { __counters?: Record<string, number> } | undefined;
+        // Walk common counters — keys depend on what damageBus exposes.
+        const counters = dmg?.__counters ?? {};
+
+        const hits = counters.hits ?? counters.accepted ?? "?";
+        const rejected = counters.rejected ?? "?";
+        const sentAim = counters.aimSent ?? "?";
+        const sentPos = counters.posSent ?? "?";
+
+        combatRef.current.innerHTML = `
+          <div style="color:#888">HP local:</div><div style="color:${hp?.local?.hp && hp.local.hp < 100 ? "#ff0" : "#0f0"}">${hp?.local?.hp ?? "—"} ${hp?.local?.respawningMs ? `(respawn ${(hp.local.respawningMs / 1000).toFixed(1)}s)` : ""}</div>
+          <div style="color:#888">HP remote:</div><div style="color:${hp?.remote?.hp && hp.remote.hp < 100 ? "#ff0" : "#0f0"}">${hp?.remote?.hp ?? "—"} ${hp?.remote?.respawningMs ? `(respawn ${(hp.remote.respawningMs / 1000).toFixed(1)}s)` : ""}</div>
+          <div style="color:#888">weapon:</div><div style="color:#fff">${weapon?.weaponId ?? "?"} (mode ${weapon?.fireModeIndex ?? "?"})</div>
+          <div style="color:#888">damageBus counters:</div><div style="color:#fff;font-size:10px">hits=${hits} rejected=${rejected} aim=${sentAim} pos=${sentPos}</div>
+        `;
+      }
+
+      // Server-side: room state from GET /rooms/:id
+      if (serverRef.current) {
+        const w2 = window as unknown as { __lastRoomState?: { players: number; ts: number } | null };
+        const roomState = w2.__lastRoomState;
+        serverRef.current.innerHTML = `
+          <div style="color:#888">last /rooms check:</div><div style="color:#fff">${roomState ? `${roomState.players} player(s) · ${new Date(roomState.ts).toLocaleTimeString()}` : "— (press 'Refresh room')"}</div>
         `;
       }
 
@@ -404,18 +424,16 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
           paddingBottom: 4,
         }}
       >
-        🐛 DEBUG HUD (toggle: `) — all diagnostics in one place
+        🐛 DEBUG HUD v3 — toggle: ` — paste [Copy debug] bundle to Discord
       </div>
 
-      {/* URL + URL params */}
       <Section title="URL + params">
         <div ref={urlRef} style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "2px 8px" }}>
           <div style={{ color: "#888" }}>href:</div>
-          <div style={{ color: "#fff", wordBreak: "break-all", fontSize: 10 }}>—</div>
+          <div style={{ color: "#888" }}>—</div>
         </div>
       </Section>
 
-      {/* Browser capabilities */}
       <Section title="Browser capabilities">
         <div ref={browserRef} style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "2px 8px" }}>
           <div style={{ color: "#888" }}>WebTransport:</div>
@@ -423,31 +441,34 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
         </div>
       </Section>
 
-      {/* Network */}
-      <Section title="Network">
+      <Section title="Network (transport stats)">
         <div ref={networkRef} style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "2px 8px" }}>
-          <div style={{ color: "#888" }}>transport kind:</div>
+          <div style={{ color: "#888" }}>transport:</div>
           <div style={{ color: "#888" }}>—</div>
         </div>
       </Section>
 
-      {/* Game state */}
-      <Section title="Game state">
+      <Section title="Game state (positions + frame)">
         <div ref={stateRef} style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "2px 8px" }}>
           <div style={{ color: "#888" }}>local Havok:</div>
           <div style={{ color: "#888" }}>—</div>
         </div>
       </Section>
 
-      {/* Cert / Tailscale */}
-      <Section title="Tailscale / certs">
-        <div ref={certsRef} style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "2px 8px" }}>
-          <div style={{ color: "#888" }}>funnel:</div>
+      <Section title="Combat (HP / ammo / hits)">
+        <div ref={combatRef} style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "2px 8px" }}>
+          <div style={{ color: "#888" }}>HP local:</div>
           <div style={{ color: "#888" }}>—</div>
         </div>
       </Section>
 
-      {/* Action buttons */}
+      <Section title="Server room state">
+        <div ref={serverRef} style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "2px 8px" }}>
+          <div style={{ color: "#888" }}>last check:</div>
+          <div style={{ color: "#888" }}>—</div>
+        </div>
+      </Section>
+
       <div
         style={{
           display: "grid",
@@ -463,18 +484,17 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
         <ActionButton onClick={probeWebSocket} color="#5ff">
           Probe WS
         </ActionButton>
-        <ActionButton onClick={probeCerts} color="#a5f">
-          Probe certs
+        <ActionButton onClick={probeMatchmaker} color="#a5f">
+          Probe matchmaker
         </ActionButton>
         <ActionButton onClick={forceReconnect} color="#f55">
           Reconnect
         </ActionButton>
-        <ActionButton onClick={dumpAll} color="#fff">
-          Dump window
+        <ActionButton onClick={copyDebugBundle} color="#0f0">
+          Copy debug bundle
         </ActionButton>
       </div>
 
-      {/* Log */}
       <details open>
         <summary style={{ color: "#0f0", cursor: "pointer", fontWeight: "bold" }}>
           Log ({log.length})
@@ -497,28 +517,36 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
           }}
         >
           {log.length === 0
-            ? "Click a button above to run diagnostics. Output here."
-            : log
-                .map((l) => {
-                  const t = new Date(l.ts).toISOString().slice(11, 23);
-                  return `[${t}] ${l.msg}`;
-                })
-                .join("\n")}
+            ? "Click a button above to run diagnostics. [Copy debug bundle] → paste into Discord."
+            : log.map((l) => `[${new Date(l.ts).toLocaleTimeString()}] ${l.msg}`).join("\n")}
         </pre>
       </details>
+
+      <div style={{ marginTop: 6, color: "#888", fontSize: 10 }}>
+        Toggle: ` (backtick) · Auto-show: ?debug=1 or localStorage.__debugHudOpen=1
+      </div>
     </div>
   );
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+// ---------- helpers ----------
+
+function Section({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}): JSX.Element {
   return (
-    <div style={{ marginBottom: 6 }}>
+    <div style={{ marginBottom: 8 }}>
       <div
         style={{
           color: "#0f0",
           fontWeight: "bold",
-          borderBottom: "1px solid #333",
-          marginBottom: 4,
+          marginBottom: 2,
+          fontSize: 12,
+          borderBottom: "1px solid #0a0",
           paddingBottom: 2,
         }}
       >
@@ -531,13 +559,13 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 
 function ActionButton({
   onClick,
-  children,
   color,
+  children,
 }: {
   onClick: () => void;
-  children: React.ReactNode;
   color: string;
-}) {
+  children: React.ReactNode;
+}): JSX.Element {
   return (
     <button
       onClick={onClick}
@@ -545,9 +573,9 @@ function ActionButton({
         background: "#000",
         color,
         border: `1px solid ${color}`,
-        padding: "4px 6px",
-        fontFamily: "ui-monospace, monospace",
-        fontSize: 10,
+        padding: "4px 8px",
+        fontFamily: "inherit",
+        fontSize: 11,
         cursor: "pointer",
         borderRadius: 2,
       }}
@@ -558,10 +586,5 @@ function ActionButton({
 }
 
 function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
