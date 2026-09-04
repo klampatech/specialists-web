@@ -31,12 +31,25 @@
 // Content-Type map: only the MIME types we actually ship in
 // client/dist/. Add more if the build starts emitting new extensions.
 
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, readFileSync, statSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { extname, join, normalize, resolve } from "node:path";
 
 const PORT = parseInt(process.env.PORT || "14432", 10);
 const ROOT = resolve(process.env.ROOT || "client/dist");
 const HOST = process.env.HOST || "0.0.0.0";
+
+// Optional TLS — set TLS_CERT + TLS_KEY env vars to enable HTTPS.
+// The handler is identical for http and https; only the server
+// instance differs. Used by Hetzner / cloud deployments where
+// there's no Tailscale Funnel terminating TLS in front of the
+// static port — the static port must be HTTPS so the lobby page
+// can use WSS / WebTransport without mixed-content blocks. In dev
+// (vite on 5174 + m5 Funnel) leave these unset for plain HTTP.
+const TLS_CERT = process.env.TLS_CERT; // absolute path to PEM cert
+const TLS_KEY = process.env.TLS_KEY; // absolute path to PEM key
+const TLS_ENABLED = !!(TLS_CERT && TLS_KEY);
 
 // Where the wire server's matchmaker HTTP listener is reachable.
 // Default matches the deploy-prod.sh convention: matchmaker on 8084
@@ -191,10 +204,13 @@ function serverError(res, err) {
   res.end(`server error: ${err.message}\n`);
 }
 
-const server = await import("node:http").then((m) =>
-  m.createServer((req, res) => {
-    const ts = new Date().toISOString();
-    try {
+// PR-4 Hetzner staging — build the request handler on an HTTP server
+// (noListen so we don't double-bind), then pass it to either http
+// or https. The TLS_CERT/TLS_KEY env vars pick which listener we
+// expose; without them, behavior is identical to before this PR.
+const handler = (req, res) => {
+  const ts = new Date().toISOString();
+  try {
       // Proxy routes accept GET/HEAD (for /rooms/<id>) AND POST
       // (for /rooms creation). Other methods on /rooms* are 405.
       if (
@@ -323,12 +339,19 @@ const server = await import("node:http").then((m) =>
       serverError(res, err);
       console.error(`[${ts}] 500 ${req.method} ${req.url}: ${err.message}`);
     }
-  }),
-);
+};
+
+const server = TLS_ENABLED
+  ? createHttpsServer(
+      { cert: readFileSync(TLS_CERT), key: readFileSync(TLS_KEY) },
+      handler,
+    )
+  : createHttpServer(handler);
 
 server.listen(PORT, HOST, () => {
+  const scheme = TLS_ENABLED ? "https" : "http";
   console.log(
-    `[serve-static] listening on http://${HOST}:${PORT} root=${ROOT} (serving ${ROOT})`,
+    `[serve-static] listening on ${scheme}://${HOST}:${PORT} root=${ROOT} (serving ${ROOT})${TLS_ENABLED ? ` cert=${TLS_CERT}` : ""}`,
   );
 });
 
