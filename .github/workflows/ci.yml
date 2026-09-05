@@ -2500,6 +2500,7 @@ jobs:
         with:
           node-version: '24'
           cache: 'npm'
+          cache-dependency-path: client/package-lock.json
       - run: npm ci --prefix client
       - name: Run matchmaker-public-host-smoke (boots canary with --public-host)
         working-directory: client
