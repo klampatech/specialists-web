@@ -9,6 +9,7 @@
 // bug.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Instant;
 
 use crate::constants::POSITION_HISTORY_RETENTION_FRAMES;
@@ -255,6 +256,19 @@ pub struct Room {
     /// 64 entries deep; we collapse to one per tick). The physics
     /// tick reads from this map to drive `PhysicsWorld::step`.
     pub drained_inputs_this_tick: HashMap<PlayerId, EncodedInput>,
+    /// PR #134 — per-room monotonic counter for assigning PlayerIds
+    /// to fresh connections. Starts at 1; the first connection in
+    /// the room gets id=1, the second gets id=2, etc. Replaces the
+    /// pre-#134 global `PLACEHOLDER_COUNTER` (server/src/transport.rs)
+    /// so different rooms get independent id sequences. The
+    /// lobby-driven flow (client/src/ui/Lobby.tsx) uses this counter
+    /// via `Room::allocate_next_player_id` to claim a unique
+    /// per-room id for each tab joining the room.
+    ///
+    /// `AtomicU16` matches the wire format's PlayerId type. The brief
+    /// accepts wraparound at u16::MAX (~65k connections per room)
+    /// — far above the matchmaker's `MAX_PLAYERS_PER_ROOM` cap (24).
+    pub next_player_id: AtomicU16,
 }
 
 impl Room {
@@ -272,7 +286,32 @@ impl Room {
             next_server_frame: 0,
             physics: crate::physics::PhysicsWorld::new(),
             drained_inputs_this_tick: HashMap::new(),
+            // PR #134 — per-room counter starts at 1 so the first
+            // connection in a fresh room gets id=1 (matches the
+            // lobby-driven `&localId=1` claim from the creator tab).
+            // The old global counter started at 1000 to avoid
+            // collision with the smoke's claimed ids; the per-room
+            // approach makes the id sequence predictable from the
+            // matchmaker's player count alone.
+            next_player_id: AtomicU16::new(1),
         }
+    }
+
+    /// PR #134 — allocate the next monotonic PlayerId for a fresh
+    /// connection in this room. Replaces the pre-#134 global
+    /// `PLACEHOLDER_COUNTER` + `next_placeholder_player_id()` (server/
+    /// src/transport.rs). Returns 1 for the first connection, 2 for
+    /// the second, etc.
+    ///
+    /// **Caller contract**: hold the room write lock while calling
+    /// this. The atomic fetch_add is itself safe under any lock, but
+    /// the subsequent `register_connection` call needs &mut Room, so
+    /// both ops share the same write-lock scope. Same pattern as the
+    /// pre-#134 listener code (`room_guard.register_connection(...)`
+    /// after `next_placeholder_player_id()` was hoisted out of the
+    /// lock).
+    pub fn allocate_next_player_id(&self) -> PlayerId {
+        self.next_player_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Add a player to the room with default HP=100. Idempotent on
@@ -486,6 +525,37 @@ mod tests_pr11_6d {
         // Idempotent.
         room.unregister_connection(7);
         assert!(!room.connections.contains_key(&7));
+    }
+
+    #[test]
+    fn allocate_next_player_id_starts_at_one_and_is_monotonic() {
+        // PR #134 — per-room PlayerId allocation starts at 1
+        // (the lobby's `?localId=1` claim for the creator tab)
+        // and increments monotonically per room. Different rooms
+        // must have independent sequences — the matchmaker's
+        // `GET /rooms/<id>` player count directly maps to the
+        // next available id under this contract.
+        let room_a = Room::new("ROOM_A");
+        let room_b = Room::new("ROOM_B");
+        assert_eq!(room_a.allocate_next_player_id(), 1);
+        assert_eq!(room_a.allocate_next_player_id(), 2);
+        assert_eq!(room_a.allocate_next_player_id(), 3);
+        // Independent sequence — Room B's counter did not
+        // advance when Room A's allocations happened.
+        assert_eq!(room_b.allocate_next_player_id(), 1);
+        assert_eq!(room_b.allocate_next_player_id(), 2);
+        // Room A continues where it left off.
+        assert_eq!(room_a.allocate_next_player_id(), 4);
+    }
+
+    #[test]
+    fn new_room_next_player_id_is_one() {
+        // PR #134 — fresh Room::new has next_player_id = 1 so
+        // the first connection in the room gets id=1 (matches
+        // the lobby-driven creator flow's `?localId=1`).
+        let room = Room::new("FRESH");
+        assert_eq!(room.next_player_id.load(Ordering::Relaxed), 1);
+        assert_eq!(room.allocate_next_player_id(), 1);
     }
 
     #[test]

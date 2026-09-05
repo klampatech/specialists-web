@@ -788,8 +788,8 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         snap.players.len(),
     );
     buf.put_u8(snap.players.len() as u8);
-    for p in &snap.players {
-        buf.put_u16(p.player_id);
+   for p in &snap.players {
+       buf.put_u16(p.player_id);
         buf.put_f32(p.position_x);
         buf.put_f32(p.position_y);
         buf.put_f32(p.velocity_x);

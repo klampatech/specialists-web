@@ -98,8 +98,8 @@ impl SnapshotGenerator {
         // authoritative fan-out target). The brief says
         // "player_count is the number of currently-connected
         // players (not MAX_PLAYERS_PER_ROOM)".
-        let mut player_states: Vec<PlayerState> = Vec::new();
-        for (player_id, _) in &room.connections {
+       let mut player_states: Vec<PlayerState> = Vec::new();
+       for (player_id, _) in &room.connections {
             // Look up HP/ammo. If the player isn't in `room.players`
             // (e.g., the connection arrived but no DamageRequest has
             // been processed yet), default to 100/0.

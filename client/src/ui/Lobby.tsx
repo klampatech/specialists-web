@@ -160,6 +160,20 @@ export function Lobby() {
       // navigates away on the next tick.)
       const target = new URL(window.location.href);
       target.searchParams.set("server", serverUrl);
+      // PR #134 — append `&localId=<id>` so the lobby is the
+      // single source of truth for player identity. The creator
+      // is always id=1 (the first connection into a fresh room
+      // — the server's per-room `Room::next_player_id` starts at
+      // 1, server/src/session.rs). PeerOverlay reads this URL
+      // param into `window.__localPlayerId` (see
+      // client/src/ui/PeerOverlay.tsx), which wireServerTransport
+      // consumes as `claimed_player_id` on the wire. Without
+      // this, both tabs defaulted to localId=1, both spawned at
+      // the same world position, and the snapshot's playerId
+      // lookup mis-routed DamageBroadcasts (the pre-#134 lobby
+      // bug). The real-player perspective: a player clicking
+      // "Create" expects to be player 1.
+      target.searchParams.set("localId", "1");
       // Popup-blocker / sandboxed-frame / etc. recovery (NB #3). The
       // browser can throw on `window.location.href = ...` if it
       // refuses the navigation. Without this try/catch, a blocked
@@ -306,6 +320,22 @@ export function Lobby() {
           : r.ws_url;
       const target = new URL(window.location.href);
       target.searchParams.set("server", serverUrl);
+      // PR #134 — append `&localId=<players+1>` so the lobby
+      // is the single source of truth for player identity. The
+      // matchmaker's `GET /rooms/<id>` returns `players` (the
+      // current connection count from `room.connections.len()`),
+      // so `players + 1` is the next available per-room id (the
+      // server's `Room::next_player_id` allocates 1, 2, 3, ...
+      // per connection, server/src/session.rs). This must be set
+      // BEFORE the navigation — `window.location.href = ...`
+      // tears the page down on the next tick. PeerOverlay reads
+      // this URL param into `window.__localPlayerId` (see
+      // client/src/ui/PeerOverlay.tsx) which flows through
+      // `claimed_player_id` on the wire to the server's
+      // collision-safe promotion block (server/src/transport.rs).
+      // The real-player perspective: a player joining a
+      // friend's room expects to be the next available player.
+      target.searchParams.set("localId", String(r.players + 1));
       // Same popup-blocker recovery shape as onCreate above:
       // a throw here means the browser refused the navigation
       // (popup blocker, sandboxed iframe, etc.) and we need to

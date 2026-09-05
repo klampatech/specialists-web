@@ -85,10 +85,16 @@ async function main() {
   const ctxB = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1024, height: 768 } });
 
   // Tab A: open the lobby
-  log("Navigating Tab A to lobby…");
-  const pageA = await ctxA.newPage();
-  pageA.on("pageerror", (err) => log(`[A:pageerror] ${err.message.substring(0, 200)}`));
-  await pageA.goto(STATIC_URL, { waitUntil: "commit", timeout: NAV_TIMEOUT });
+ log("Navigating Tab A to lobby…");
+ const pageA = await ctxA.newPage();
+ pageA.on("pageerror", (err) => log(`[A:pageerror] ${err.message.substring(0, 200)}`));
+  pageA.on("console", (msg) => {
+    const text = msg.text();
+    if (text.includes("SRV-TRANSPORT") || text.includes("DamageBroadcast") || text.includes("aimEvent") || text.includes("[PR-65")) {
+      log(`[A:console:${msg.type()}] ${text.substring(0, 200)}`);
+    }
+  });
+ await pageA.goto(STATIC_URL, { waitUntil: "commit", timeout: NAV_TIMEOUT });
 
   // Wait for lobby-create button to appear
   try {
@@ -173,8 +179,14 @@ async function main() {
   // Tab B: open the lobby
   log("Navigating Tab B to lobby…");
   const pageB = await ctxB.newPage();
-  pageB.on("pageerror", (err) => log(`[B:pageerror] ${err.message.substring(0, 200)}`));
-  await pageB.goto(STATIC_URL, { waitUntil: "commit", timeout: NAV_TIMEOUT });
+ pageB.on("pageerror", (err) => log(`[B:pageerror] ${err.message.substring(0, 200)}`));
+  pageB.on("console", (msg) => {
+    const text = msg.text();
+    if (text.includes("SRV-TRANSPORT") || text.includes("DamageBroadcast") || text.includes("aimEvent") || text.includes("[PR-65")) {
+      log(`[B:console:${msg.type()}] ${text.substring(0, 200)}`);
+    }
+  });
+ await pageB.goto(STATIC_URL, { waitUntil: "commit", timeout: NAV_TIMEOUT });
 
   try {
     await pageB.waitForSelector('[data-testid="lobby-create"]', { timeout: LOBBY_TIMEOUT });
@@ -312,6 +324,16 @@ async function main() {
   await pageA.evaluate(() => {
     const t = window.__serverTransport;
     if (!t || !window.__damageBus) return;
+    // PR #134 — per-room PlayerIds + lobby-derived localIds mean
+    // the tabs now spawn at different x positions (Tab A at
+    // x=-8 for localId=1, Tab B at x=-4 for localId=2 via
+    // PLAYER_SPAWN_X_OFFSET in client/src/game/gameSession.ts).
+    // To hit Tab B, Tab A must face +X — yaw=π/2 in the
+    // combat.ts forward formula (`forwardX = sin(yaw) * cos(pitch)`,
+    // `forwardZ = cos(yaw) * cos(pitch)`; yaw=π/2 → forward
+    // = (1, 0, 0)). Pre-#134 both tabs defaulted to localId=1
+    // and overlapped at x=-8, so yaw=0 was a no-op workaround
+    // for the bug — with proper ids we need the real aim.
     const yaw = Math.PI / 2;
     const pitch = 0;
     const eventId = 1;
@@ -350,18 +372,75 @@ async function main() {
   });
   log(`Tab A final snap: ${JSON.stringify(aFinalSnap)}`);
   log(`Tab B final snap: ${JSON.stringify(bFinalSnap)}`);
-  // Pass if at least one tab has a different state than baseline
-  // (some HP < 100 OR the snapshot grew a weapon-change event).
-  const someDamage = (aFinalSnap ?? []).some((p) => p.hp < 100) ||
+
+  // Also read the actual HUD-rendered health (from the controllers directly,
+  // not from the snapshot's playerId lookup).
+  const aControllerHealth = await pageA.evaluate(() => {
+    const gs = window.__gameSession;
+    if (!gs) return null;
+    return {
+      local: gs.localController?.state?.hp,
+      remote: gs.remoteController?.state?.hp,
+    };
+  });
+  const bControllerHealth = await pageB.evaluate(() => {
+    const gs = window.__gameSession;
+    if (!gs) return null;
+    return {
+      local: gs.localController?.state?.hp,
+      remote: gs.remoteController?.state?.hp,
+    };
+  });
+ // PR #134 — diagnostic: also pull broadcast-handler stats.
+ const aBroadcastStats = await pageA.evaluate(() => ({
+   count: window.__broadcastHandlerCount ?? -1,
+   counts: window.__broadcastResultCounts ?? null,
+   latest: window.__lastBroadcastResult ?? null,
+    registered: window.__broadcastHandlerRegistered ?? false,
+    registeredAt: window.__broadcastHandlerRegisteredAt ?? null,
+    localId: window.__localPlayerId ?? null,
+    transportType: typeof window.__serverTransport,
+    transportConnected: window.__serverTransport?.connected ?? null,
+   lastHpRemote: window.__gameSession?.remoteController?.state?.hp ?? null,
+   lastHpLocal: window.__gameSession?.localController?.state?.hp ?? null,
+ }));
+ const bBroadcastStats = await pageB.evaluate(() => ({
+   count: window.__broadcastHandlerCount ?? -1,
+   counts: window.__broadcastResultCounts ?? null,
+   latest: window.__lastBroadcastResult ?? null,
+    registered: window.__broadcastHandlerRegistered ?? false,
+    registeredAt: window.__broadcastHandlerRegisteredAt ?? null,
+    localId: window.__localPlayerId ?? null,
+    transportType: typeof window.__serverTransport,
+    transportConnected: window.__serverTransport?.connected ?? null,
+   lastHpRemote: window.__gameSession?.remoteController?.state?.hp ?? null,
+   lastHpLocal: window.__gameSession?.localController?.state?.hp ?? null,
+  }));
+  log(`Tab A broadcast stats: ${JSON.stringify(aBroadcastStats)}`);
+  log(`Tab B broadcast stats: ${JSON.stringify(bBroadcastStats)}`);
+  log(`Tab A controller health: ${JSON.stringify(aControllerHealth)}`);
+  log(`Tab B controller health: ${JSON.stringify(bControllerHealth)}`);
+
+  // Pass if either:
+  //   - snapshot HP drops (proves wire damage path works)
+  //   - controller HP changes (proves broadcast resolver applied damage)
+  // The "real player" test: Tab B's localController.hp should drop if
+  // the broadcast resolved to its local controller.
+  const snapDamage = (aFinalSnap ?? []).some((p) => p.hp < 100) ||
                      (bFinalSnap ?? []).some((p) => p.hp < 100);
-  const snapshotAdvanced = JSON.stringify(aFinalSnap) !== JSON.stringify(bFinalSnap) ||
-                           (aFinalSnap && aFinalSnap.length > 0);
-  if (someDamage) {
-    recordPass("L9", "damage-round-trip", `A=${JSON.stringify(aFinalSnap)} B=${JSON.stringify(bFinalSnap)}`);
-  } else if (snapshotAdvanced) {
-    recordPass("L9", "damage-round-trip", `snapshots advanced; HP stays 100 (likely hit-detection missed at default yaw; load-bearing connection works)`);
+  const controllerDamage = (aControllerHealth?.remote ?? 100) < 100 ||
+                           (bControllerHealth?.remote ?? 100) < 100 ||
+                           (aControllerHealth?.local ?? 100) < 100 ||
+                           (bControllerHealth?.local ?? 100) < 100;
+  if (snapDamage) {
+    recordPass("L9", "damage-round-trip-snapshot", `A=${JSON.stringify(aFinalSnap)} B=${JSON.stringify(bFinalSnap)}`);
   } else {
-    recordFail("L9", "damage-round-trip", `no snapshot movement in 3s after fire; A=${JSON.stringify(aFinalSnap)} B=${JSON.stringify(bFinalSnap)}`);
+    recordFail("L9", "damage-round-trip-snapshot", `snapshot HP unchanged: A=${JSON.stringify(aFinalSnap)} B=${JSON.stringify(bFinalSnap)}`);
+  }
+  if (controllerDamage) {
+    recordPass("L10", "damage-round-trip-controller", `A=${JSON.stringify(aControllerHealth)} B=${JSON.stringify(bControllerHealth)}`);
+  } else {
+    recordFail("L10", "damage-round-trip-controller", `controller HP unchanged: A=${JSON.stringify(aControllerHealth)} B=${JSON.stringify(bControllerHealth)}`);
   }
 
   // Screenshots

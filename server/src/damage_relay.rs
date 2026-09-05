@@ -203,7 +203,6 @@ pub fn validate_and_relay_aim(
     client_rtt_ms: u32,
     now: Instant,
 ) -> Vec<DamageBroadcast> {
-    // --- Gate 1: source in room -----------------------------------------
     let req_source = req.source_player_id;
     if !room.players.contains_key(&req_source) {
         warn!(
@@ -461,11 +460,11 @@ pub fn validate_and_relay_aim(
         // DamageBroadcast -- a single shot can hit at most one
         // target in the dual-pistol cone, but the Vec allows
         // multi-hit if the cone is widened later).
-        let target_player = room
-            .players
-            .get_mut(&target_id)
-            .expect("target_id from keys() invariant violated");
-        target_player.hp = target_player.hp.saturating_sub(amount);
+       let target_player = room
+           .players
+           .get_mut(&target_id)
+           .expect("target_id from keys() invariant violated");
+       target_player.hp = target_player.hp.saturating_sub(amount);
     }
     // Side effects on every accepted event (gate 4 passes):
     // decrement source ammo + stamp last_fire_at + saturating
@@ -556,8 +555,8 @@ pub fn validate_and_relay_aim(
         req.event_id
     };
     room.last_event_id_for_source
-        .insert(req_source, new_event_id);
-    broadcasts
+       .insert(req_source, new_event_id);
+   broadcasts
 }
 /// PR 11.7.E / §3.5 — `validate_and_relay_reload`.
 ///

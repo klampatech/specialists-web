@@ -945,8 +945,8 @@ export class ServerTransport {
         console.warn("[ServerTransport] inbound damageRequest — discarding");
         return;
       case DISCRIMINATOR_DAMAGE_BROADCAST:
-        for (const f of this.listeners.damageBroadcast) f(body);
-        return;
+       for (const f of this.listeners.damageBroadcast) f(body);
+       return;
       case DISCRIMINATOR_DAMAGE_REJECT:
         // PR 11.6.D FIX 4: dispatch private server-to-source-tab
         // reject signals. Wire-format stable since PR 11.6.D —

@@ -57,7 +57,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+// PR #134 — removed unused AtomicU16 + Ordering imports (the global
+// `PLACEHOLDER_COUNTER` was removed in favor of per-room
+// `Room::next_player_id`).
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -82,6 +84,7 @@ use specialists_server::protocol::{
     DISCRIMINATOR_RELOAD_REQUEST, DISCRIMINATOR_SNAPSHOT,
     DISCRIMINATOR_WEAPON_SWITCH, Pong,
 };
+use specialists_server::protocol::{encode_aim_event, AimEvent};
 use specialists_server::session::{EncodedInput, PlayerId, Room, ServerFrame};
 
 /// Shared state — the single-source-of-truth for all in-flight rooms.
@@ -94,15 +97,18 @@ pub type RoomRegistry = Arc<RwLock<HashMap<String, Arc<RwLock<Room>>>>>;
 /// `DamageRequest`. Starts at 1000 so it never collides with a
 /// legitimate wire-format PlayerId (the smoke uses 1 and 2; the
 /// counter wraps at u16::MAX which we accept — 60k+ connections).
-static PLACEHOLDER_COUNTER: AtomicU16 = AtomicU16::new(1000);
 
-/// PR 11.6.D: allocate the next unique placeholder PlayerId for a
-/// fresh connection. The dispatcher re-registers the connection
-/// under its real PlayerId (from the first `DamageRequest`) once
-/// validation succeeds.
-fn next_placeholder_player_id() -> PlayerId {
-    PLACEHOLDER_COUNTER.fetch_add(1, Ordering::Relaxed)
-}
+/// PR #134 — REMOVED. The global `PLACEHOLDER_COUNTER` and
+/// `next_placeholder_player_id()` are replaced by per-room
+/// `Room::next_player_id` + `Room::allocate_next_player_id()` (see
+/// server/src/session.rs). The global counter was single-source
+/// across every room on the server; with per-room counters, each
+/// room gets an independent 1..=u16::MAX sequence and the
+/// matchmaker's `GET /rooms/<id>` player count directly maps to
+/// the next available id (creator claims localId=1, first joiner
+/// claims localId=2, etc.). See also `Room::allocate_next_player_id`
+/// and the lobby's `?localId=<n>` URL derivation in
+/// `client/src/ui/Lobby.tsx`.
 
 /// PR 11.6.D — per-connection state shared between the listener
 /// loop and `handle_binary`. Used `Cell` for interior mutability
@@ -674,15 +680,25 @@ where
     // side means saturation no longer translates to broadcast drops
     // visible to the smoke.
     let outbound = specialists_server::connection_outbound::ConnectionOutbound::new();
-    let placeholder_id = next_placeholder_player_id();
+    // PR #134 — allocate the placeholder id from the room's per-room
+    // counter (see `Room::allocate_next_player_id`) instead of the
+    // pre-#134 global `PLACEHOLDER_COUNTER`. Per-room ids start at 1
+    // and increment monotonically; the matchmaker's `players` count
+    // therefore directly maps to the next available id, and the
+    // lobby's `?localId=<players+1>` derivation stays consistent
+    // with what the server allocates. Allocation happens inside the
+    // write-lock scope because `register_connection` needs `&mut
+    // Room` next.
+    let placeholder_id;
+    {
+        let mut room_guard = room_arc.write().await;
+        placeholder_id = room_guard.allocate_next_player_id();
+        room_guard.register_connection(placeholder_id, outbound.clone());
+    }
     let conn_state = ConnectionState::new(placeholder_id);
     // PR-fix-0x06 — stamp the room id (captured from the request
     // path above) so `handle_binary` can route to the correct room.
     conn_state.lock().unwrap().stamp_room(room_id.clone());
-    {
-        let mut room_guard = room_arc.write().await;
-        room_guard.register_connection(placeholder_id, outbound.clone());
-    }
 
     let (mut sink, mut stream) = ws.split();
 
@@ -873,17 +889,21 @@ async fn handle_webtransport_session(
     // rationale. Capacity matches the WS listener's capacity (512)
     // — the brief locks this as identical across both listeners.
     let outbound = specialists_server::connection_outbound::ConnectionOutbound::new();
-    let placeholder_id = next_placeholder_player_id();
+    // PR #134 — per-room counter (see WS listener comment above).
+    // Allocates 1, 2, 3, ... per room so the lobby-derived
+    // `?localId=<players+1>` matches the server's allocation.
+    let placeholder_id;
+    {
+        let mut room_guard = room_arc.write().await;
+        placeholder_id = room_guard.allocate_next_player_id();
+        room_guard.register_connection(placeholder_id, outbound.clone());
+    }
     let conn_state = ConnectionState::new(placeholder_id);
     // PR-fix-0x06 — stamp the room id (captured from the request
     // path above) so `handle_binary` can route InputServer yaw/pitch
     // updates to the correct room instead of the pre-fix hardcoded
     // DEVBX. First-call-wins via stamp_room's idempotent guard.
     conn_state.lock().unwrap().stamp_room(room_id.clone());
-    {
-        let mut room_guard = room_arc.write().await;
-        room_guard.register_connection(placeholder_id, outbound.clone());
-    }
 
     loop {
         tokio::select! {
@@ -1121,14 +1141,43 @@ pub(super) async fn handle_binary(
             // re-registering. The source_player_id entry stays.
             {
                 let mut room_guard = room_arc.write().await;
+                // PR #134 — collision-safe promotion. If the
+                // claimed id is already taken (e.g., two tabs
+                // raced to claim id=1 because the matchmaker
+                // hadn't yet observed one of them), assign the
+                // next available per-room id and use that
+                // instead. Logged as a warning so the operator
+                // can spot misconfigurations; under normal
+                // lobby-driven flow, the lobby pre-allocates
+                // unique ids via `?localId=<players+1>` so this
+                // branch is only hit by a malformed client or a
+                // rare matchmaker-observation race.
+                let promotion_id = if placeholder_player_id != claimed_player_id
+                    && room_guard.connections.contains_key(&claimed_player_id)
+                {
+                    let fallback = room_guard.allocate_next_player_id();
+                    warn!(
+                        claimed_player_id = claimed_player_id,
+                        assigned_player_id = fallback,
+                        "id collision: claimed id already taken; assigned next available id",
+                    );
+                    fallback
+                } else {
+                    claimed_player_id
+                };
                 if let Some((_, sender)) = room_guard.connections.remove_entry(&placeholder_player_id) {
-                    // Only insert if `source_player_id` doesn't
-                    // already have a sender (defensive -- prevents
-                    // clobbering an existing connection under the
-                    // same PlayerId).
-                    room_guard.connections.entry(claimed_player_id).or_insert(sender);
+                    // PR #134 — use the (possibly-fallback)
+                    // `promotion_id` so the connection lands in
+                    // a free slot. Pre-#134 the
+                    // `.entry(claimed).or_insert(sender)` pattern
+                    // silently dropped the second connection when
+                    // the claimed id collided (the `or_insert`
+                    // is a no-op if the slot is full — the
+                    // sender was extracted from `remove_entry`
+                    // and then thrown away).
+                    room_guard.connections.insert(promotion_id, sender);
                 }
-                connection_state.lock().unwrap().stamp_actual(claimed_player_id);
+                connection_state.lock().unwrap().stamp_actual(promotion_id);
             }
             // Stamp the connection's claimed identity so subsequent
             // inbound arms can be checked against it. Idempotent.
@@ -1249,6 +1298,41 @@ pub(super) async fn handle_binary(
                     if let Some((_, sender)) = room_guard.connections.remove_entry(&placeholder_player_id) {
                         room_guard.connections.insert(pu.player_id, sender);
                         connection_state.lock().unwrap().stamp_actual(pu.player_id);
+                    }
+                }
+                // PR #134 — collision-safe promotion. Mirrors the
+                // AimEvent/MeleeEvent promotion block above. If
+                // the claimed slot is already taken (two tabs
+                // racing to claim the same id, e.g., a
+                // matchmaker-observation race), allocate the next
+                // per-room id and use that instead. Without this
+                // branch, the pre-#134
+                // `!room_guard.connections.contains_key(&pu.player_id)`
+                // guard silently no-ops and the connection stays
+                // under its placeholder id forever — the snapshot
+                // would never include the player under the
+                // claimed id, and the broadcast resolver can't
+                // route damage to/from it. Pre-existing seed
+                // pattern behavior (PositionUpdate doesn't
+                // clobber an existing connection under the same
+                // id) is preserved by the `not_taken_branch`
+                // guard above; this is the new
+                // collision-fallback branch.
+                else if placeholder_player_id != pu.player_id
+                    && room_guard.connections.contains_key(&placeholder_player_id)
+                    && room_guard.connections.contains_key(&pu.player_id)
+                {
+                    let fallback = room_guard.allocate_next_player_id();
+                    warn!(
+                        claimed_player_id = pu.player_id,
+                        assigned_player_id = fallback,
+                        "id collision (PositionUpdate): claimed id already taken; assigned next available id",
+                    );
+                    if let Some((_, sender)) =
+                        room_guard.connections.remove_entry(&placeholder_player_id)
+                    {
+                        room_guard.connections.insert(fallback, sender);
+                        connection_state.lock().unwrap().stamp_actual(fallback);
                     }
                 }
                 // PR 11.6.D: a PositionUpdate also auto-registers the
@@ -1681,15 +1765,39 @@ pub(super) async fn handle_binary(
             // guard).
             {
                 let mut room_guard = room_arc.write().await;
+                // PR #134 — collision-safe promotion (same as the
+                // AimEvent arm). If `claimed_player_id` is
+                // already taken, allocate the next per-room id and
+                // use that. Without this, the pre-#134
+                // `.entry(claimed).or_insert(sender)` pattern
+                // silently drops the second connection when the
+                // claimed id collides — the sender is extracted
+                // from `remove_entry(&placeholder_player_id)`
+                // and then thrown away because the `or_insert`
+                // short-circuits on a full slot. The connection
+                // disappears from `room.connections`, the
+                // close-handler's `unregister_connection` no-ops,
+                // and the orphan outbound leaks until process
+                // exit.
+                let promotion_id = if placeholder_player_id != claimed_player_id
+                    && room_guard.connections.contains_key(&claimed_player_id)
+                {
+                    let fallback = room_guard.allocate_next_player_id();
+                    warn!(
+                        claimed_player_id = claimed_player_id,
+                        assigned_player_id = fallback,
+                        "id collision (meleeEvent): claimed id already taken; assigned next available id",
+                    );
+                    fallback
+                } else {
+                    claimed_player_id
+                };
                 if let Some((_, sender)) =
                     room_guard.connections.remove_entry(&placeholder_player_id)
                 {
-                    room_guard
-                        .connections
-                        .entry(claimed_player_id)
-                        .or_insert(sender);
+                    room_guard.connections.insert(promotion_id, sender);
                 }
-                connection_state.lock().unwrap().stamp_actual(claimed_player_id);
+                connection_state.lock().unwrap().stamp_actual(promotion_id);
             }
             connection_state.lock().unwrap().stamp(claimed_player_id);
             // Fan out each DamageBroadcast to every connection via
@@ -2079,6 +2187,85 @@ mod tests {
         assert!(
             room_guard.players.contains_key(&2),
             "room.players should include player_id=2 after the first PositionUpdate"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_position_update_promotion_uses_next_id_on_collision() {
+        // PR #134 — collision-safe promotion regression test.
+        // If two connections claim the same PlayerId (a
+        // matchmaker-observation race or a misbehaving client),
+        // the second promotion must allocate the next per-room
+        // id and use that instead. Pre-#134 the
+        // `.entry(claimed).or_insert(sender)` pattern silently
+        // dropped the second connection — the sender was
+        // extracted from `remove_entry` and then thrown away.
+        let rooms = fresh_rooms();
+        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
+        // Simulate the creator-then-joiner flow: Tab A
+        // allocates id=1 from the per-room counter, then Tab B
+        // allocates id=2 from the same counter. Both tabs
+        // connect via the PositionUpdate arm (simplest path —
+        // no AimEvent validator to satisfy, just room setup).
+        // Tab A claims id=1 (no collision — placeholder == claimed),
+        // Tab B claims id=1 too (collision — the test's whole
+        // point). The fallback path should land Tab B on id=3
+        // (next available per-room id).
+        {
+            let mut room_guard = room_arc.write().await;
+            let tab_a_id = room_guard.allocate_next_player_id();
+            assert_eq!(tab_a_id, 1);
+            room_guard.register_connection(tab_a_id, ConnectionOutbound::new());
+            // Tab A doesn't need a player entry — the
+            // PositionUpdate handler auto-registers on first
+            // inbound packet.
+        }
+        {
+            let mut room_guard = room_arc.write().await;
+            // Tab B — placeholder id=2.
+            let tab_b_placeholder = room_guard.allocate_next_player_id();
+            assert_eq!(tab_b_placeholder, 2);
+            room_guard.register_connection(tab_b_placeholder, ConnectionOutbound::new());
+        }
+        // Tab B sends a PositionUpdate claiming player_id=1
+        // (collision with Tab A's id=1).
+        let pu = PositionUpdate {
+            server_frame: 100,
+            player_id: 1, // COLLISION with Tab A.
+            position_x: 0.0,
+            position_y: 0.0,
+        };
+        let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+        payload.extend(encode_position_update(&pu));
+        // Call handle_binary with Tab B's placeholder=2.
+        let _ = handle_binary(
+            &payload,
+            &rooms,
+            2,
+            ConnectionState::new(2),
+        )
+        .await;
+        // After the collision: Tab A stays at id=1, Tab B's
+        // placeholder slot is freed, and Tab B is registered
+        // under id=3 (next available per-room id from the
+        // counter — the counter was at 2 after Tab B's
+        // placeholder allocation, so the fallback allocates
+        // 3 and bumps to 4).
+        let room_guard = room_arc.read().await;
+        assert!(
+            room_guard.connections.contains_key(&1),
+            "Tab A's connection (player 1) must NOT be clobbered by the collision fallback",
+        );
+        let actual_ids: Vec<u16> = {
+            let mut ids: Vec<u16> = room_guard.connections.keys().copied().collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            actual_ids,
+            vec![1, 3],
+            "Tab A stays at id=1, Tab B lands at id=3 (next available per-room id after the collision); actual={:?}",
+            actual_ids,
         );
     }
 
