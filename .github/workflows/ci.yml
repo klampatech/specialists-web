@@ -2468,6 +2468,58 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
+  client-matchmaker-public-host-smoke:
+    name: client — matchmaker public-host smoke (PR #128, Hetzner staging 2026-09-05)
+    # PR #128 (closes #127) regression coverage. PR #128 added the
+    # `--public-host` flag so the matchmaker embeds the server's
+    # public host (not the requester's IP) in `ws_url` / `wss_url`
+    # responses. Before the fix, cloud deploys returned URLs that
+    # pointed at the client's egress IP — the browser then tried
+    # to WSS-connect to a machine with no wire listener and got
+    # ERR_CONNECTION_REFUSED on every connection.
+    #
+    # This smoke pins the fix in place. It boots a canary with
+    # `--public-host 127.0.0.1` (loopback-equivalent of a public
+    # host) and asserts POST /rooms + GET /rooms/<id> both return
+    # URLs whose host matches that flag — not peer.ip() (which
+    # equals 127.0.0.1 here anyway, but the test verifies the
+    # *plumbing*; cloud deploys pass the same flag with the
+    # server's actual public IP). The host assertion catches a
+    # regression where someone removes the public_host arg from
+    # the format!() and falls back to peer.ip() silently.
+    #
+    # Mirrors the prod-bundle-smoke CI shape (boots canary itself,
+    # no SMOKE_NO_BOOT). Faster than prod-bundle-smoke (no bundle
+    # build, no Playwright) — ~30-60s.
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci --prefix client
+      - name: Run matchmaker-public-host-smoke (boots canary with --public-host)
+        working-directory: client
+        env:
+          PUBLIC_HOST: '127.0.0.1'
+          HTTP_PORT: '18080'
+          WT_PORT: '14433'
+          WS_PORT: '14434'
+          WSS_PORT: '14435'
+          CERT_DIR: '.certs'
+        run: node tools/matchmaker-public-host-smoke.mjs
+      - name: Tear down canary
+        if: always()
+        run: |
+          pkill -f canary-server.sh || true
+          for port in 14433 14434 18080; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   client-rig-visual-smoke:
     name: client — rig-visual smoke (visual rig position propagation, PR #99)
     # PR #99: closes the "visual rig position propagation (pending
