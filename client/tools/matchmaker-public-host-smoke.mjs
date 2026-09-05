@@ -197,10 +197,19 @@ async function main() {
   // `exists: false` until a client connects. To make the GET test
   // deterministic, we have to first open a WS connection to create the
   // room. We do that with a minimal WebSocket handshake via curl.
-  log(`Opening WS to ${postResult.ws_url} to lazily create the room...`);
+  //
+  // Curl takes an http:// or https:// URL, not ws:// — convert.
+  const wsUrl = postResult.ws_url.replace(/^ws/, "http");
+  log(`Opening WS to ${wsUrl} (via WebSocket upgrade) to lazily create the room...`);
   try {
     execSync(
-      `timeout 5 curl -sN -i ${JSON.stringify(postResult.ws_url)} </dev/null`,
+      `timeout 5 curl -sN -i ` +
+      `-H "Connection: Upgrade" ` +
+      `-H "Upgrade: websocket" ` +
+      `-H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" ` +
+      `-H "Sec-WebSocket-Version: 13" ` +
+      JSON.stringify(wsUrl) +
+      ` </dev/null`,
       { encoding: "utf8", stdio: "pipe" },
     );
   } catch {
