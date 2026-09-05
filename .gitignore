@@ -82,3 +82,4 @@ server/certs/*.key
 .certs/*.key
 client/.certs/*.pem
 client/.certs/*.key
+client/tools/fe-sync-matrix.json
