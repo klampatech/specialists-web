@@ -2468,7 +2468,7 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
-  client-matchmaker-public-host-smoke:
+  client-matchmaker-public-host-smoke:  # busted GH cache 2026-09-05
     name: client — matchmaker public-host smoke (PR #128, Hetzner staging 2026-09-05)
     # PR #128 (closes #127) regression coverage. PR #128 added the
     # `--public-host` flag so the matchmaker embeds the server's
