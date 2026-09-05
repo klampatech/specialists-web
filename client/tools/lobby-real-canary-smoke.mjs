@@ -315,6 +315,14 @@ async function assert6_lobbyJoinNavigatesToRealCanaryWsUrl() {
       recordFail("lobby-join-real-ws-url", `matchmaker didn't return ws_url (got: ${JSON.stringify(room)}) — PR 95 fix missing?`);
       return;
     }
+    // PR 11.9 follow-up (Hetzner staging, 2026-09-04): matchmaker
+    // should also return `wss_url` so HTTPS lobby pages can pick
+    // the TLS variant. Without this, the browser's mixed-content
+    // blocker drops the WSS handshake on HTTPS lobby URLs.
+    if (!room.wss_url || !room.wss_url.startsWith("wss")) {
+      recordFail("lobby-join-real-ws-url", `matchmaker didn't return wss_url (got: ${JSON.stringify(room)}) — PR 11.9 follow-up missing?`);
+      return;
+    }
     // 4. Now navigate a fresh tab to the lobby and click Join
     const lobbyTab = await ctx.newPage();
     const lobbyUrl = new URL(URL_BASE);
@@ -335,6 +343,20 @@ async function assert6_lobbyJoinNavigatesToRealCanaryWsUrl() {
     }
     if (serverParam !== room.ws_url) {
       recordFail("lobby-join-real-ws-url", `Join navigated to wrong URL — expected matchmaker's ws_url "${room.ws_url}", got "${serverParam}"`);
+      return;
+    }
+    // PR 11.9 follow-up (Hetzner staging, 2026-09-04): when the
+    // lobby page itself is HTTPS, it should pick `wss_url` (not
+    // `ws_url`) so the browser's mixed-content blocker doesn't drop
+    // the WSS handshake. Verify the URL_Base's scheme against the
+    // navigated serverParam's scheme.
+    const lobbyScheme = new URL(URL_BASE).protocol;
+    const expectedScheme = lobbyScheme === "https:" ? "wss:" : "ws:";
+    if (!serverParam.startsWith(expectedScheme)) {
+      recordFail(
+        "lobby-join-real-ws-url",
+        `lobby scheme "${lobbyScheme}" → expected serverParam scheme "${expectedScheme}", got "${serverParam}"`,
+      );
       return;
     }
     recordPass("lobby-join-real-ws-url");

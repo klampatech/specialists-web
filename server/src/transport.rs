@@ -360,6 +360,15 @@ pub async fn run_server(
     // `0` disables (no spawn → permanent-pending in the select!).
     // Default 8080 in dev canary; production passes `--port-http 0`
     // to disable if a separate matchmaker service is running.
+    // PR 11.9 follow-up (Hetzner staging, 2026-09-04 / smoke fix):
+    // pass both `port_ws` and `port_wss` so the matchmaker can return
+    // a `wss_url` that points at the actual TLS listener port. Previously
+    // it used `port_ws` for both ws_url and wss_url, which on Hetzner
+    // (where WS=14434 plain and WSS=14435 TLS) meant the browser tried
+    // to WSS-connect to port 14434 — and failed because port 14434 is
+    // the plain (no-TLS) WS listener. Symptom: prod-bundle smoke
+    // showed `wss://127.0.0.1:14434/rooms/<id>` in the browser and
+    // got ERR_CONNECTION_CLOSED on every connection.
     let http_handle = if port_http == 0 {
         info!("HTTP matchmaker listener skipped: --port-http 0");
         None
@@ -367,7 +376,7 @@ pub async fn run_server(
         Some(tokio::spawn({
             let rooms = rooms.clone();
             async move {
-                if let Err(e) = specialists_server::matchmaker::run_matchmaker_http(port_http, port_ws, rooms).await {
+                if let Err(e) = specialists_server::matchmaker::run_matchmaker_http(port_http, port_ws, port_wss, rooms).await {
                     warn!("run_matchmaker_http exited: {e:?}");
                     Err(e)
                 } else {
