@@ -7,15 +7,72 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |>## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#115 (2026-09-03). **`main` @ `43e4c04` (PR #115 squash — MERGED 2026-09-03 16:13 UTC).** **`You are here` summary**: PR #107 (server weapons wire) + PR #108 (client mirror) + PR #109 (docs) + PR #110 (Crosshair) + PR #111 (docs) + PR #112 (CF-N1 sustained-stress smoke + opt-in CI gate) + **PR #114 (MeleeEvent wire — server-authoritative melee + 5 validation gates + melee smoke + CI gate)** + **PR #115 (overnight rollup — pre-deploy-prod.sh + HUD icon-SVG swap + Burst-active chip + reconnect observability + A2 smoke fix)** are all **MERGED** to `main`. **PR #114 closed the `0x0B MeleeEvent` carry-forward** — the combat completeness gap is now closed (weapons + melee + reload all server-authoritative). **PR #115 is deploy-enabling infrastructure** — all additive/observational, no wire changes, no schema changes, no gameplay logic changes. It unblocks `tools/deploy-prod.sh` for the **coordinated wire-break deploy of PR #107+#108+#110+#114** to m5 via Tailscale Funnel (`https://m5.tail1b3795.ts.net:14433/`). **`main` @ `43e4c04` carries 5 commits ahead of `origin/main` at the time of the overnight session start** — those 5 commits (deploy-prod.sh, CF-N1 A2 poll pattern, Burst-active chip, inline-SVG weapon icons, reconnect observability) plus the A2 smoke fix to `damage-server-smoke.mjs` (which surfaced on PR #115's first CI run as a deterministic regression, not a flake) all rolled into one PR per Kyle's "do it right over do it fast" preference. **Verification**: cargo test --lib 119/119 PASS, vitest **118/118 PASS** (was 110 pre-#115; +8 from `serverTransport.test.ts` 9 tests + `BulletHud.test.ts` 8 tests — actually +9 net, but pre-existing renames absorbed some; net delta +8), typecheck+build clean, `tools/damage-server-smoke.mjs` deterministic regression fixed (A2 pattern), all **36/36 CI checks GREEN** on the PR #115 merge commit. **Carry-forwards beyond PR #115**: (a) **`tools/deploy-prod.sh` → actual wire-break deploy** (~30 min, operational) — first coordinated ship of PR #107+#108+#110+#114 to m5 Funnel. After this ships, play-testing with 2-3 friends can begin. (b) Pre-existing CF-N1 flake root-cause fix (if the opt-in `client-cfn1-sustained-stress-smoke` fails on nightly, the next step is bumping the per-connection mpsc capacity from 1024 — still deferred per the PR #112 rationale; preemptive bump risks introducing different regressions). (c) Maintenance sweep — the few remaining deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test. (d) New feature arc — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat. (e) Outbound mpsc review — defensive, pre-cloud verification pass + capacity bump if needed before sustained cloud load.
+**`You are here`**: post-PR-#129-followup (2026-09-05). **`main` @ `be57dd0` (PR #128 + #129-followup squash — MERGED 2026-09-05).** Multiplayer is end-to-end functional on Hetzner prod at `https://65.108.87.1:14432/?server=wss%3A%2F%2F65.108.87.1%3A14435%2Frooms%2F<id>&localId=1&peerId=2`. 2-tab damage convergence verified headless: 100 → 88 HP on hit, broadcastHandlerCount=1, both rigs visible in the peer viewport.
+
+**The session shipped two PRs**:
+- **PR #128 (`fix(matchmaker): --public-host flag`)** — matchmaker was returning `wss://<client-egress-IP>/...` from direct matchmaker consumers. Cloud deploys got URLs pointing back to themselves. Fix: `--public-host` flag threaded through `matchmaker.rs` / `transport.rs` / `canary-server.sh` with `peer.ip()` fallback for dev. Hetzner's `serve-static.mjs` URL-rewrite workaround is now a defensive no-op.
+- **PR #129 (`fix: ungate scene.ts gameSession + two-tab prod-bundle damage smoke`)** — closed the dev-vs-prod gameSession tree-shaking gap (separate from PR #128's `await import()` variant). The first attempt (33ad83a, side-effect module) created a structural double-GameSession bug that **Claude Code's cross-vendor review caught** while my Stage 2 verification missed it (typecheck + vitest 118/118 + build + bundle-gate + prod-bundle-smoke 7/7 ALL green while multiplayer was broken). The actual fix (`be57dd0`): ungate `scene.ts`'s `__gameSession = gameSession` publication, delete `createGameSessionEntry.ts`, add **`client/tools/two-tab-prod-bundle-damage-smoke.mjs`** — the load-bearing gate for any future gameSession / wire-up integration change.
+
+**Verification**: typecheck clean, vitest 118/118 PASS, cargo 119/119, `npm run build` clean, bundle gate: `__gameSession = x 1` (single instance), `ensureGameSession x 0`, `createGameSessionEntry x 0`. prod-bundle-smoke **7/7 PASS**. **NEW: two-tab-prod-bundle-damage-smoke 3/3 PASS** (`wire-up-connected-both-tabs`, `gameSession-single-instance-correct-ids`, `damage-converges-pre=100-post=88-drop=12-bcastCount=1`). Hetzner live: bundle `index-Bm8ArOAY.js` (md5 `3e6074df36f02ac81fba7dbcdc595080`) deployed via `scp + systemctl restart specialists-static`.
+
+**Cross-vendor check-and-balance load-bearing (memory anchor §evo-verification-discipline-2026-09-05 + skill reference `pr-129-gameSession-tree-shake-and-cross-vendor-catch.md`)**: first-attempt verifier-clean ≠ correct. The smoke's `wire-up-connected === true` check passed 7/7 while multiplayer was non-functional. Counter-measure: re-run gates with "would the broken version pass this gate?" lens. For structural invariants (single-instance, shared state), structural verification (2-tab Playwright + assert HP convergence) beats signal-checking.
 
 **Recommended next direction (your call)**:
-- **(a) Weapons Phase 2.2 — HUD polish + crosshair + icon sprites** (~1 session). D/S/N text labels work but a real crosshair with weapon-aware spread (Burst shows slight spread, Sniper a dot) + per-weapon icon sprites would close the UX gap. Use `image_generate` once fal.ai balance resets.
-- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator (PR #83) + producer-side rate-limiter (PR #81) already cover the worst case. Pre-cloud verification pass + small capacity bump if needed before sustained cloud load.
-- **(c) New feature arc** — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat, `0x0B MeleeEvent` wire type. Phase 2 candidates that were deferred pre-#98.
-- **(d) Maintenance sweep** — the few remaining deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test (needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session; the 2026-09-01 attempt was blocked by the existing Vivaldi absorbing the flag).
+- **(a) Predictor/interpolator migration to wireServerTransport.ts** (~1-2 hours). Still tree-shaken — same `if (effectiveMultiplayer)` IIFE trap, but for the predictor/interpolator hooks at `scene.ts:1123-1609`. Mirrors the PR #128/129 pattern (extract to top-level module / side-effect import). Not blocked. Closes the remaining item from the PR #123 follow-up list.
+- **(b) Smoke resilience pass — tolerate ghost placeholder IDs (CF-N1 family)** (~30 min). The 11-smoke flake-storm family is well-documented and tolerable in CI but real. Cheapest mitigation: filter by smoke-level marker rather than retry. Acceptable to defer until CI becomes load-bearing.
+- **(c) Real multiplayer playtest from Mac against Hetzner** — open `https://65.108.87.1:14432/?server=wss%3A%2F%2F65.108.87.1%3A14435%2Frooms%2Ftest&localId=1&peerId=2` in two tabs. Verify hit registration + rig visibility + matchmaker URL pickup on a real browser. Headless 2-tab smoke already proved the chain works; this is the user-facing confirmation.
+- **(d) Domain + Let's Encrypt** (~1-2 hours). Swap the Hetzner self-signed cert for a real domain + cert. Currently `65.108.87.1:14432` throws `ERR_CERT_AUTHORITY_INVALID` in non-trusting browsers. Blocks broader shareability.
+- **(e) CI auto-deploy from main** (~2-3 hours). GitHub Action + secrets management to replace the manual `scp + systemctl restart` deploy. Lower-priority until we want others to deploy.
+- **(f) New feature arc** — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat. Phase 2 candidates that were deferred pre-#98.
 
-**Deploy coordination reminder**: PR #107 + PR #108 are a `next-deploy-is-all-clients-new` pair. The deploy message must call out that **ALL clients must refresh** — existing tabs (cached JS from pre-#107) will be broken until they reload because PlayerState grew 30 → 31 bytes and AimEvent grew 19 → 20 bytes. Flag `#operations` for the deploy.
+**Deploy coordination reminder**: Hetzner has the latest bundle. Future deploys are `cd client && VITE_MATCHMAKER_ORIGIN=https://65.108.87.1:14432 npm run build && scp dist/assets/index-*.js root@65.108.87.1:/root/specialists-web/client/dist/assets/ && scp dist/index.html root@65.108.87.1:/root/specialists-web/client/dist/ && ssh root@65.108.87.1 'cd /root/specialists-web/client/dist/assets && rm -f index-*.js && systemctl restart specialists-static && sleep 2 && curl -sk https://65.108.87.1:14432/ | grep index-`.
+
+---
+
+## 2026-09-05 — PR #128 + #129-followup (matchmaker public-host + gameSession tree-shake)
+
+**Scope**: Hetzner prod bring-up completion. The 2026-09-04 deploy session had two latent bugs in the production bundle: (1) the matchmaker returned URLs containing the requester's egress IP rather than the server's, breaking direct matchmaker consumers and forcing a `serve-static.mjs` URL-rewrite workaround; (2) the new gameSession creation path (`window.__gameSession = gameSession`) was tree-shaken from the prod bundle because it sat inside scene.ts's `if (import.meta.env.DEV)` block. Kyle's playtest (msg `1545827883321135125`, room `1mm4mqI1`) exposed bug #2: wire-up connected but `snapshot: null` and no rig — HUD was reading hardcoded fallback values. Two PRs shipped in this session.
+
+**PR #128 — matchmaker public-host** (`27ee718`, MERGED):
+- **`server/src/main.rs` (+3)** — `--public-host` CLI arg.
+- **`server/src/transport.rs` (+5)** — thread public_host into `run_matchmaker_http`.
+- **`server/src/matchmaker.rs` (+12)** — accept `public_host: Option<String>`, format strings use `public_host.as_deref().unwrap_or(&peer.ip().to_string())` for dev back-compat.
+- **`tools/canary-server.sh` (+8)** — forward `--public-host` to specialists-server, default empty.
+- **`client/tools/matchmaker-public-host-smoke.mjs` (+238, NEW)** — boots canary with `--public-host`, hits matchmaker via curl, asserts `wss_url` host matches. Uses WebSocket-upgrade curl trick for `ensure_room` lazy-creation.
+- **`.github/workflows/ci.yml` (+15)** — new `client-matchmaker-public-host-smoke` job (the GH Actions workflow-file-cache pitfall bit us: had to add a comment trigger to bust cache).
+
+**PR #129-followup — gameSession tree-shake + cross-vendor bug catch** (`be57dd0`, MERGED):
+- **`client/src/engine/createGameSessionEntry.ts` (-83, DELETED)** — the wrong abstraction; scene.ts owns gameSession creation.
+- **`client/src/engine/scene.ts` (+30)** — ungate `createGameSession(...)` + `window.__gameSession = gameSession` publication. gameSession is now unconditionally created + published. Single instance, no phantom.
+- **`client/src/ui/App.tsx` (-18)** — remove `ensureGameSession` import + call.
+- **`client/tools/two-tab-prod-bundle-damage-smoke.mjs` (+667, NEW)** — the load-bearing gate. Boots canary + serve-static (HTTPS), opens TWO headless browser contexts, fires an AimEvent from Tab A, asserts Tab B's `__gameSession.localController.state.hp` drops. 3/3 PASS: `wire-up-connected-both-tabs`, `gameSession-single-instance-correct-ids`, `damage-converges-pre=100-post=88-drop=12-bcastCount=1`.
+- **`.gitignore` (+11)** — exclude runtime-generated cert dirs from smoke runs.
+
+**Cross-vendor review (load-bearing)**:
+- Codex dispatched first attempt (`33ad83a`) which created a DOUBLE GameSession bug. My Stage 2 verification (typecheck + vitest + build + bundle-gate + prod-bundle-smoke 7/7) ALL reported green.
+- Claude Code review caught it: `createGameSession(...)` is preserved in prod (Vite keeps it — it's OUTSIDE the DEV block). Combined with ensureGameSession's unconditional call, the prod bundle had two GameSession instances — wireServerTransport's broadcast handler + setServerTransport landed on a phantom instance whose controllers no HUD reads from.
+- Codex dispatched second attempt (`be57dd0`) which fixed the structural bug. Verified independently on Hetzner: bundle `__gameSession = x 1` (single instance), 2-tab damage smoke 3/3 PASS, prod-bundle-smoke 7/7 PASS, visual confirmation via screenshot — 2 models visible in Tab B's viewport (red Tab A rig, teal Tab B rig), HP 100 → 88 after Tab A fired.
+
+**Verification**:
+| Surface | Result |
+|---|---|
+| `npm run typecheck` | exit 0 |
+| `npx vitest run` | 118/118 PASS |
+| `cargo test --lib` | 119/119 PASS (no server changes in #129-followup) |
+| `npm run build` | exit 0 |
+| Bundle gate | `__gameSession = x 1`, `ensureGameSession x 0`, `createGameSessionEntry x 0`, `yct() x 2` (1 def + 1 call site) |
+| prod-bundle-smoke | 7/7 PASS, no `[warn] no __gameSession on window` |
+| **two-tab-prod-bundle-damage-smoke** | **3/3 PASS** |
+| Visual (Playwright screenshot) | 2 models visible in Tab B, HP 100 → 88 on hit |
+
+**Workflow patterns captured for future PRs**:
+1. **Verifier-clean ≠ correct for structural invariants** — the prod-bundle-smoke's `wire-up-connected === true` check passed 7/7 while multiplayer was broken. The new `two-tab-prod-bundle-damage-smoke.mjs` is the load-bearing gate. Any future multiplayer-related change must keep this smoke green. See skill reference `pr-129-gameSession-tree-shake-and-cross-vendor-catch.md`.
+2. **First-attempt verification is biased toward "fix worked"** — re-run gates with "would the broken version pass this gate?" lens. For the multi-instance case: bundle-gate counted `createGameSession x 1` (the minified name) which appeared once for both the function definition AND the call site, masking the duplicate. Build gates that catch the bug, then verify the fix.
+3. **GH Actions workflow-file cache pitfall** — new CI jobs don't appear in PR runs until the workflow file is on main's tip. To bust the cache, add a comment trigger to the job declaration (`client-matchmaker-public-host-smoke:  # busted GH cache YYYY-MM-DD`).
+
+**Memory anchors**: §specialists-web-hetzner-prod-wireup-2026-09-04 (updated), §evo-verification-discipline-2026-09-05 (added).
+
+**Next session task**: predictor/interpolator migration to wireServerTransport.ts (same tree-shake pattern, separate scope). Or real 2-tab Mac playtest for user-facing confirmation.
 
 ---
 
