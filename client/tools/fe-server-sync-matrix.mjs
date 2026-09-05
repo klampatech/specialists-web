@@ -186,6 +186,8 @@ async function bootServeStatic() {
       env: {
         ...process.env,
         PORT: String(PROD_BUNDLE_PORT),
+        TLS_CERT: resolve(CERT_DIR, "dev.pem"),
+        TLS_KEY: resolve(CERT_DIR, "dev.key"),
         CERT_PATH: resolve(CERT_DIR, "dev.pem"),
         KEY_PATH: resolve(CERT_DIR, "dev.key"),
       },
