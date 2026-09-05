@@ -71,3 +71,14 @@ client/lockstep-rollback.png
 server/certs/*.pem
 server/certs/*.key
 !server/certs/.gitkeep
+
+# PR #129 follow-up — local smoke certificates. Generated at runtime by
+# prod-bundle-smoke.mjs + two-tab-prod-bundle-damage-smoke.mjs when the
+# canary boots in self-signed mode. Two locations:
+#   - $REPO_ROOT/.certs/ (smoke scripts' default CERT_DIR)
+#   - client/.certs/  (canary-server.sh's `--cert-dir` default when invoked
+#     from client/tools/*)
+.certs/*.pem
+.certs/*.key
+client/.certs/*.pem
+client/.certs/*.key

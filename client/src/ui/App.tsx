@@ -32,10 +32,6 @@ import { createScene, type SceneHandle } from "../engine/scene";
 // module with an explicit side-effect import forces Vite to keep
 // it (the side-effect import is itself the live reference).
 import "../engine/wireServerTransport";
-// PR #129 — keep gameSession creation + window publication in a
-// side-effect-imported entry module so Vite cannot tree-shake it out
-// with scene.ts's runtime multiplayer branch.
-import { ensureGameSession } from "../engine/createGameSessionEntry";
 import { PLAYER_MAX_AMMO } from "../engine/characterConfig";
 import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
@@ -256,20 +252,6 @@ export function App() {
         sceneRef.current = handle;
         setEngineLabel(handle.isWebGPU() ? "webgpu" : "webgl2");
         setPhase("ready");
-
-        // PR #129 — unconditional prod-bundle safety net. In the dev
-        // canary scene.ts may already have published the live session;
-        // ensureGameSession is idempotent and returns that same instance.
-        // In production it creates + publishes the session that the
-        // side-effect-imported wireServerTransport module waits for.
-        const initLocalPlayerId =
-          (window as unknown as { __localPlayerId?: number }).__localPlayerId ?? 1;
-        const initPeerPlayerId =
-          (window as unknown as { __peerPlayerId?: number }).__peerPlayerId ?? 2;
-        ensureGameSession(handle.scene, {
-          localPlayerId: initLocalPlayerId,
-          peerPlayerId: initPeerPlayerId,
-        });
 
         // Poll the runtime at ~10Hz for HUD display (avoids per-render React
         // re-renders from per-frame state updates).

@@ -418,12 +418,23 @@ export async function createScene(
       (window as unknown as { __forceServerTransport?: boolean }).__forceServerTransport === true)
       ? { useServerTransport: true }
       : undefined);
-  const gameSession = effectiveMultiplayer
-    ? createGameSession(scene, {
-        localPlayerId: initLocalPlayerId,
-        peerPlayerId: initPeerPlayerId,
-      })
-    : null;
+  // PR #129 follow-up — gameSession is created unconditionally now.
+  // The pre-#129 form gated this on `effectiveMultiplayer`, but that
+  // gate was opaque to Vite/Rollup's static analysis AND left the
+  // single-player path without a GameSession at all (HUD reads
+  // returned undefined). Creating the session unconditionally keeps
+  // the prod bundle's tree-shaker honest AND unifies single-player +
+  // multiplayer around a single rig-owning instance. The wire-up
+  // IIFE below still bails when `__forceServerTransport` is unset,
+  // so single-player has no ServerTransport — but it does have the
+  // local controller that the chase camera follows.
+  const gameSession = createGameSession(scene, {
+    localPlayerId: initLocalPlayerId,
+    peerPlayerId: initPeerPlayerId,
+  });
+  if (typeof window !== "undefined") {
+    (window as unknown as { __gameSession?: GameSession }).__gameSession = gameSession;
+  }
 
   let character: CharacterController;
   let applyPose: () => void = () => {};
@@ -725,13 +736,6 @@ export async function createScene(
     // lock-then-unlock debounce window.
     (window as unknown as { __pointerLockToggle?: (locked: boolean) => void }).__pointerLockToggle =
       (locked: boolean) => chase.setPointerLockImmediate(locked);
-    // PR 11.6.D: smoke-only gameSession probe. Exposes the live
-    // GameSession (and via it the local/remote controllers) so the
-    // damage-server-hp-convergence smoke can drive fire events and
-    // read HP values directly. DEV-only — stripped in production.
-    if (gameSession) {
-      (window as unknown as {__gameSession?: GameSession}).__gameSession = gameSession;
-    }
     // PR 11.1.1: chase-camera toggle probe. Calls chase.toggle() so the
     // smoke can advance the viewMode state machine without dispatching
     // a synthetic V key event. Same DEV-only gate.
