@@ -19,7 +19,7 @@
 # the orchestrator can read its stdout / stderr.
 #
 # Usage:
-#   tools/canary-server.sh [--port-wt <u16>] [--port-ws <u16>] [--port-wss <u16>] [--port-http <u16>] [--cert-dir <dir>] [--sans <csv>] [--cert-source <mode>]
+#   tools/canary-server.sh [--port-wt <u16>] [--port-ws <u16>] [--port-wss <u16>] [--port-http <u16>] [--cert-dir <dir>] [--sans <csv>] [--cert-source <mode>] [--public-host <host>]
 #
 # Env-var equivalents (consumed by the script as defaults):
 #   PORT_WT      (default 4433)
@@ -28,6 +28,7 @@
 #   PORT_HTTP    (default 8080) — PR 11.9 matchmaker
 #   CERT_DIR     (default <repo>/server/certs)
 #   CERT_SOURCE  (default "self-signed")
+#   PUBLIC_HOST  (default "")   — PR #127: forward to specialists-server --public-host
 #
 # The CI workflow (`.github/workflows/ci.yml` → `server-build`) runs
 # `cargo test` directly with `SKIP_WEBTRANSPORT_TEST=1`, so this
@@ -54,6 +55,12 @@ PORT_HTTP="${PORT_HTTP:-8080}"
 CERT_DIR="${CERT_DIR:-$REPO_ROOT/server/certs}"
 SANS="${SANS:-localhost,127.0.0.1,::1}"
 CERT_SOURCE="${CERT_SOURCE:-self-signed}"
+# PR #127 (2026-09-05): empty by default. When set, the matchmaker
+# uses this host in `ws_url` / `wss_url` responses instead of the
+# requester's IP. Required for cloud deployments where the requester
+# is on a different host than the matchmaker (e.g. Hetzner — peer.ip()
+# from Hetzner's POV is the client's egress IP, not Hetzner's).
+PUBLIC_HOST="${PUBLIC_HOST:-}"
 CARGO_PROFILE="${CARGO_PROFILE:-release}"
 # Build the cargo profile flag. "debug" is the default and doesn't
 # take a flag, so we omit --$CARGO_PROFILE when CARGO_PROFILE=debug
@@ -89,6 +96,12 @@ while [[ $# -gt 0 ]]; do
       SANS="$2"; shift 2 ;;
     --cert-source)
       CERT_SOURCE="$2"; shift 2 ;;
+    --public-host)
+      # PR #127 (2026-09-05): forwarded to specialists-server so
+      # the matchmaker uses this host (not the requester's IP) when
+      # constructing `ws_url` / `wss_url` in POST /rooms and GET
+      # /rooms/<id> responses. Required for cloud deployments.
+      PUBLIC_HOST="$2"; shift 2 ;;
     --debug)
       CARGO_PROFILE="debug"; shift ;;
     -h|--help)
@@ -173,6 +186,7 @@ echo "[canary] cert source: $CERT_SOURCE"
 echo "[canary] cert: $CERT_PATH"
 echo "[canary] key:  $KEY_PATH"
 [[ "$CERT_SOURCE" == "self-signed" ]] && echo "[canary] sans: $SANS"
+[[ -n "$PUBLIC_HOST" ]] && echo "[canary] public_host: $PUBLIC_HOST"
 
 # Hand off to the server. exec so signals (SIGINT) reach it directly.
 exec cargo run --manifest-path server/Cargo.toml --quiet $CARGO_PROFILE_FLAG -- \
@@ -183,4 +197,5 @@ exec cargo run --manifest-path server/Cargo.toml --quiet $CARGO_PROFILE_FLAG -- 
   --cert-source "$CERT_SOURCE" \
   --cert "$CERT_PATH" \
   --key "$KEY_PATH" \
-  --sans "$SANS"
+  --sans "$SANS" \
+  ${PUBLIC_HOST:+--public-host "$PUBLIC_HOST"}
