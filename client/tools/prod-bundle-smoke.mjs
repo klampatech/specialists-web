@@ -74,8 +74,15 @@ const CERT_DIR = process.env.CERT_DIR ?? resolve(REPO_ROOT, ".certs");
 const SMOKE_PNG = process.env.SMOKE_PNG ?? resolve(REPO_ROOT, "client/tools/prod-bundle-smoke.png");
 const SMOKE_NO_BOOT = process.env.SMOKE_NO_BOOT === "1";
 
-const STATIC_URL = `https://127.0.0.1:${PROD_BUNDLE_PORT}/`;
-const CANARY_HTTP = `http://127.0.0.1:${HTTP_PORT}`;
+const PROD_BUNDLE_HOST = process.env.PROD_BUNDLE_HOST ?? "127.0.0.1";
+const PROD_BUNDLE_SCHEME = process.env.PROD_BUNDLE_SCHEME ?? "https";
+const STATIC_URL = `${PROD_BUNDLE_SCHEME}://${PROD_BUNDLE_HOST}:${PROD_BUNDLE_PORT}/`;
+// The matchmaker HTTP listener port. May differ from the static port when
+// the static port proxies to the matchmaker (Hetzner serves both on the
+// same port). Override CANARY_HOST / CANARY_SCHEME when proxying.
+const CANARY_HOST = process.env.CANARY_HOST ?? PROD_BUNDLE_HOST;
+const CANARY_SCHEME = process.env.CANARY_SCHEME ?? "http";
+const CANARY_HTTP = `${CANARY_SCHEME}://${CANARY_HOST}:${HTTP_PORT}`;
 
 const CERT_PATH = resolve(CERT_DIR, "dev.pem");
 const KEY_PATH = resolve(CERT_DIR, "dev.key");
@@ -278,7 +285,7 @@ async function bootServeStatic() {
     const reachable = await new Promise((resolve) => {
       const req = httpsRequest(
         {
-          host: "127.0.0.1",
+          host: PROD_BUNDLE_HOST,
           port: PROD_BUNDLE_PORT,
           path: "/health",
           method: "GET",
@@ -320,10 +327,26 @@ async function assertProdBundleWiresUp() {
     process.stderr.write(`[pageerror] ${err.message}\n`);
   });
 
-  // Hit the matchmaker first to get a real ws_url + wss_url
-  const createRes = await fetch(`${CANARY_HTTP}/rooms`, { method: "POST" });
-  if (!createRes.ok) {
-    recordFail("matchmaker-create", `POST /rooms returned ${createRes.status}`);
+  // Hit the matchmaker first to get a real ws_url + wss_url.
+  // We use curl (not globalThis.fetch) because Node 22's fetch
+  // silently rejects self-signed certs without honoring the
+  // tls.rejectUnauthorized option. curl's --insecure flag is the
+  // universal escape hatch.
+  let createRes;
+  try {
+    const curlOutput = execSync(
+      `curl -sk -m 10 -X POST ${JSON.stringify(`${CANARY_HTTP}/rooms`)}`,
+      { encoding: "utf8" },
+    );
+    const statusMatch = curlOutput.match(/"id"\s*:/);
+    if (!statusMatch) {
+      recordFail("matchmaker-create", `POST /rooms returned non-JSON: ${curlOutput.slice(0, 200)}`);
+      await browser.close();
+      return;
+    }
+    createRes = { ok: true, json: () => JSON.parse(curlOutput) };
+  } catch (e) {
+    recordFail("matchmaker-create", `POST /rooms fetch failed: ${e.message}`);
     await browser.close();
     return;
   }
