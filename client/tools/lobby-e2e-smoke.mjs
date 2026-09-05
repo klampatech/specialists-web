@@ -32,12 +32,24 @@
 // Usage: SMOKE_NO_BOOT=1 SMOKE_NO_BUILD=1 node tools/lobby-e2e-smoke.mjs
 
 import { chromium } from "playwright";
-import { execSync } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
+import { mkdirSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const REPO_ROOT = resolve(__dirname, "..", "..");
 
 const PROD_BUNDLE_HOST = process.env.PROD_BUNDLE_HOST ?? "65.108.87.1";
 const PROD_BUNDLE_SCHEME = process.env.PROD_BUNDLE_SCHEME ?? "https";
 const PROD_BUNDLE_PORT = Number(process.env.PROD_BUNDLE_PORT ?? 14432);
+const WT_PORT = Number(process.env.WT_PORT ?? 14433);
+const WS_PORT = Number(process.env.WS_PORT ?? 14434);
+const WSS_PORT = Number(process.env.WSS_PORT ?? 14435);
+const HTTP_PORT = Number(process.env.HTTP_PORT ?? 18080);
 const STATIC_URL = `${PROD_BUNDLE_SCHEME}://${PROD_BUNDLE_HOST}:${PROD_BUNDLE_PORT}/`;
+const CANARY_HTTP = `http://${PROD_BUNDLE_HOST}:${HTTP_PORT}`;
 
 const SMOKE_NO_BOOT = process.env.SMOKE_NO_BOOT === "1";
 const SMOKE_NO_BUILD = process.env.SMOKE_NO_BUILD === "1";
@@ -46,8 +58,41 @@ const LOBBY_TIMEOUT = Number(process.env.LOBBY_TIMEOUT ?? 10000);
 const WIRE_UP_TIMEOUT_MS = Number(process.env.WIRE_UP_TIMEOUT_MS ?? 25000);
 const SNAPSHOT_DECODED_TIMEOUT_MS = Number(process.env.SNAPSHOT_DECODED_TIMEOUT_MS ?? 10000);
 
+// PR #135 — CI self-boot support. When SMOKE_NO_BOOT is unset (or 0), the
+// smoke spawns its own canary (tools/canary-server.sh) + serve-static.mjs
+// on the configured ports. This lets the smoke run as a CI job without an
+// external server harness — the same shape as prod-bundle-smoke.mjs.
+const START_TIMEOUT_MS = Number(process.env.START_TIMEOUT_MS ?? 15000);
+const CERT_DIR = process.env.CERT_DIR ?? resolve(REPO_ROOT, "server", "certs");
+const CERT_PATH = process.env.CERT_PATH ?? resolve(CERT_DIR, "dev.pem");
+const KEY_PATH = process.env.KEY_PATH ?? resolve(CERT_DIR, "dev.key");
+
 const log = (...args) => console.error("[lobby-e2e]", ...args);
 const fail = (...args) => console.error("[lobby-e2e][FAIL]", ...args);
+
+let canaryProc = null;
+let serveStaticProc = null;
+let viteProc = null;
+
+function killProc(proc) {
+  if (!proc || proc.exitCode !== null) return;
+  try { process.kill(-proc.pid, "SIGTERM"); } catch { /* already gone */ }
+  try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+}
+
+async function cleanup() {
+  killProc(canaryProc);
+  killProc(serveStaticProc);
+  killProc(viteProc);
+  for (const port of [PROD_BUNDLE_PORT, WT_PORT, WS_PORT, WSS_PORT, HTTP_PORT, 5197]) {
+    try {
+      execSync(`lsof -ti:${port} | xargs -r kill -9`, { stdio: "ignore" });
+    } catch { /* nothing to kill */ }
+  }
+}
+
+process.on("SIGINT", () => { cleanup().then(() => process.exit(130)); });
+process.on("SIGTERM", () => { cleanup().then(() => process.exit(143)); });
 
 const results = [];
 const recordPass = (section, name, info = "") => {
@@ -77,8 +122,89 @@ function extractRoomId(url) {
 }
 
 async function main() {
+  try {
+    return await mainImpl();
+  } finally {
+    await cleanup();
+  }
+}
+
+async function mainImpl() {
   log(`Going against ${STATIC_URL}`);
   log(`SMOKE_NO_BOOT=${SMOKE_NO_BOOT}, SMOKE_NO_BUILD=${SMOKE_NO_BUILD}`);
+
+  // PR #135 — self-boot canary + serve-static when not in SMOKE_NO_BOOT mode.
+  // Same shape as prod-bundle-smoke.mjs so the lobby-e2e smoke can run as a
+  // CI job without an external server harness.
+  if (!SMOKE_NO_BOOT) {
+    mkdirSync(CERT_DIR, { recursive: true });
+    log(`Booting canary (WT=${WT_PORT}, WS=${WS_PORT}, WSS=${WSS_PORT}, HTTP=${HTTP_PORT})...`);
+    canaryProc = spawn(
+      "bash",
+      [
+        resolve(REPO_ROOT, "tools", "canary-server.sh"),
+        "--port-wt", String(WT_PORT),
+        "--port-ws", String(WS_PORT),
+        "--port-wss", String(WSS_PORT),
+        "--port-http", String(HTTP_PORT),
+        "--cert-source", "self-signed",
+        "--cert-dir", CERT_DIR,
+      ],
+      {
+        cwd: REPO_ROOT,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, CARGO_PROFILE: "debug" },
+        detached: true,
+      },
+    );
+    canaryProc.stdout.on("data", (d) => process.stderr.write(`[canary] ${d}`));
+    canaryProc.stderr.on("data", (d) => process.stderr.write(`[canary-err] ${d}`));
+
+    // Wait for /health (max 90s for cold cargo build)
+    const HEALTH_TIMEOUT_MS = 90000;
+    const canaryStart = Date.now();
+    while (Date.now() - canaryStart < HEALTH_TIMEOUT_MS) {
+      try {
+        const r = await fetch(`${CANARY_HTTP}/health`);
+        if (r.ok) {
+          log(`Canary healthy after ${((Date.now() - canaryStart) / 1000).toFixed(1)}s`);
+          break;
+        }
+      } catch { /* not up yet */ }
+      await sleep(500);
+    }
+
+    log(`Booting serve-static (PORT=${PROD_BUNDLE_PORT}, TLS_CERT=${CERT_PATH})...`);
+    serveStaticProc = spawn(
+      "node",
+      [resolve(REPO_ROOT, "tools", "serve-static.mjs")],
+      {
+        cwd: REPO_ROOT,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          PORT: String(PROD_BUNDLE_PORT),
+          TLS_CERT: CERT_PATH,
+          TLS_KEY: KEY_PATH,
+        },
+        detached: true,
+      },
+    );
+    serveStaticProc.stdout.on("data", (d) => process.stderr.write(`[static] ${d}`));
+    serveStaticProc.stderr.on("data", (d) => process.stderr.write(`[static-err] ${d}`));
+
+    const staticStart = Date.now();
+    while (Date.now() - staticStart < START_TIMEOUT_MS) {
+      try {
+        const r = await fetch(STATIC_URL);
+        if (r.ok || r.status < 500) {
+          log(`serve-static HTTPS up after ${((Date.now() - staticStart) / 1000).toFixed(1)}s`);
+          break;
+        }
+      } catch { /* not up yet */ }
+      await sleep(300);
+    }
+  }
 
   const browser = await chromium.launch({ headless: true });
   const ctxA = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1024, height: 768 } });
@@ -474,8 +600,9 @@ function summarize() {
   process.exit(failed === 0 ? 0 : 1);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   log(`FATAL: ${err.message}`);
   log(err.stack);
+  await cleanup();
   process.exit(2);
 });

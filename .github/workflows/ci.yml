@@ -2393,6 +2393,179 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
+  # PR #135 — lobby E2E smoke (the real-player flow gate).
+  #
+  # This is the gate Kyle demanded: "Fix it as cleanly and permanently as
+  # possible. We need to start trending toward stability." The previous
+  # smokes tested the wire (matrix smoke) and the dev-canary lobby (lobby
+  # smoke), but neither tested the real user flow end-to-end through the
+  # lobby UI. This smoke drives the actual UI:
+  #
+  #   Tab A: opens lobby, clicks Create room, gets a wss URL.
+  #   Tab B: opens lobby, types the room code, clicks Join.
+  #   Both: wire up, see each other in the snapshot stream, take damage
+  #   and see HP drop on the right controller.
+  #
+  # 10 assertions across §L1-§L10. All passed live on Hetzner on
+  # 2026-09-05 (commit a6bdf6f). This job makes the regression class
+  # that bit us (per-room PlayerId collision, lobby URL not appending
+  # &localId=N) a CI-blocker for any future change.
+  #
+  # Boots its own canary + serve-static.mjs (no SMOKE_NO_BOOT needed).
+  # ~30-90s runtime. Required gate (no continue-on-error).
+  client-lobby-e2e-smoke:
+    name: client — lobby E2E smoke (real-player flow, PR #135)
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — lobby-e2e smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Run lobby E2E smoke (boots canary + serve-static internally)
+        working-directory: client
+        run: node tools/lobby-e2e-smoke.mjs
+        env:
+          PROD_BUNDLE_HOST: "127.0.0.1"
+          PROD_BUNDLE_SCHEME: "https"
+          PROD_BUNDLE_PORT: "24732"
+          WT_PORT: "24733"
+          WS_PORT: "24734"
+          WSS_PORT: "24735"
+          HTTP_PORT: "24780"
+          CERT_DIR: "${{ runner.temp }}/lobby-e2e-certs"
+          SMOKE_PNG: client/tools/lobby-e2e-A.png
+        timeout-minutes: 3
+      - name: Upload screenshot (Tab A)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lobby-e2e-smoke-screenshot-A
+          path: client/tools/lobby-e2e-A.png
+          if-no-files-found: warn
+      - name: Upload screenshot (Tab B)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lobby-e2e-smoke-screenshot-B
+          path: client/tools/lobby-e2e-B.png
+          if-no-files-found: warn
+      - name: Tear down canary + serve-static
+        if: always()
+        run: |
+          pkill -f canary-server.sh || true
+          pkill -f serve-static.mjs || true
+          pkill -f specialists-server || true
+          for port in 24732 24733 24734 24735 24780; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
+  # PR #135 — FE-server sync matrix smoke.
+  #
+  # 24 assertions across 7 sections covering every wire surface: wire-up
+  # + identity, position sync, HP convergence, weapon state sync, snapshot
+  # timing, RTT, field sanity. All passed live on Hetzner on 2026-09-05
+  # (commit 1cd36d4). The matrix smoke found 3 LIVE regressions that the
+  # existing two-tab smoke missed (snapshot decoder race + broadcast
+  # controller closure-capture + serve-static wasm MIME). This job
+  # makes those regressions CI-blockers.
+  #
+  # Boots its own canary + serve-static.mjs (no SMOKE_NO_BOOT needed).
+  # ~30-90s runtime. Required gate (no continue-on-error).
+  client-fe-sync-matrix-smoke:
+    name: client — FE-server sync matrix smoke (PR #135)
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — fe-sync-matrix smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Run FE-server sync matrix smoke (boots canary + serve-static internally)
+        working-directory: client
+        run: node tools/fe-server-sync-matrix.mjs
+        env:
+          PROD_BUNDLE_HOST: "127.0.0.1"
+          PROD_BUNDLE_SCHEME: "https"
+          PROD_BUNDLE_PORT: "24832"
+          CANARY_HOST: "127.0.0.1"
+          WT_PORT: "24833"
+          WS_PORT: "24834"
+          WSS_PORT: "24835"
+          HTTP_PORT: "24880"
+          CERT_DIR: "${{ runner.temp }}/fe-sync-matrix-certs"
+          SMOKE_PNG: client/tools/fe-sync-A.png
+        timeout-minutes: 3
+      - name: Upload screenshot (Tab A)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fe-sync-matrix-smoke-screenshot-A
+          path: client/tools/fe-sync-A.png
+          if-no-files-found: warn
+      - name: Upload screenshot (Tab B)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fe-sync-matrix-smoke-screenshot-B
+          path: client/tools/fe-sync-B.png
+          if-no-files-found: warn
+      - name: Tear down canary + serve-static
+        if: always()
+        run: |
+          pkill -f canary-server.sh || true
+          pkill -f serve-static.mjs || true
+          pkill -f specialists-server || true
+          for port in 24832 24833 24834 24835 24880; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   client-prod-bundle-smoke:
     name: client — prod-bundle smoke (PR #125+ follow-up, Hetzner staging 2026-09-04)
     # PR 11.7.D3+ follow-up: catches the class of bug that bit us on
