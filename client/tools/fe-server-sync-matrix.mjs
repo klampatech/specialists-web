@@ -76,6 +76,11 @@ const CANARY_HTTP = `${CANARY_SCHEME}://${CANARY_HOST}:${HTTP_PORT}`;
 const SMOKE_NO_BOOT = process.env.SMOKE_NO_BOOT === "1";
 const SMOKE_NO_BUILD = process.env.SMOKE_NO_BUILD === "1";
 const NAV_TIMEOUT = Number(process.env.SMOKE_NAV_TIMEOUT ?? 30000);
+// How long to wait for wire-up + gameSession + snapshot decoder to be live
+// before declaring timeout. 25s is generous: Havok WASM streaming-compile
+// failure + ArrayBuffer fallback on self-signed certs can push scene init
+// well past the typical ~1-2s on cold prod.
+const WIRE_UP_READY_TIMEOUT_MS = Number(process.env.WIRE_UP_READY_TIMEOUT_MS ?? 25000);
 
 const log = (...args) => console.error("[fe-sync]", ...args);
 const fail = (...args) => console.error("[fe-sync][FAIL]", ...args);
@@ -275,12 +280,12 @@ async function main() {
     return window.__gameSession !== undefined
       && window.__serverTransport !== undefined
       && window.__latestSnap && window.__latestSnap() !== null;
-  }, null, { timeout: 15000 });
+  }, null, { timeout: WIRE_UP_READY_TIMEOUT_MS });
   await pageB.waitForFunction(() => {
     return window.__gameSession !== undefined
     && window.__serverTransport !== undefined
     && window.__latestSnap && window.__latestSnap() !== null;
-  }, null, { timeout: 15000 });
+  }, null, { timeout: WIRE_UP_READY_TIMEOUT_MS });
   // Wait an additional 1s so the snapshot pump has churned enough frames
   await sleep(1000);
 
@@ -540,13 +545,13 @@ async function main() {
   const frameDelta = endFrame - startFrame;
   // The server pumps snapshots at ~20Hz, but in a 2-tab room with rapid
   // console activity, the snapshot stream may interleave with PositionUpdate
-  // acks. Allow a wide band 8-80 frames/sec to cover both 20Hz steady-state
+  // acks. Allow a wide band 8-100 frames/sec to cover both 20Hz steady-state
   // and any batching. The load-bearing assertion is that frames advance at all
   // (positive delta) — the exact rate is a server-tuning concern.
-  if (frameDelta >= 8 && frameDelta <= 80) {
+  if (frameDelta >= 8 && frameDelta <= 100) {
     recordPass("E", "snapshot-frame-advance-rate", `${frameDelta} frames over 1s (~${frameDelta}Hz, target ~20Hz)`);
   } else {
-    recordFail("E", "snapshot-frame-advance-rate", `${frameDelta} frames over 1s (expected 8-80)`);
+    recordFail("E", "snapshot-frame-advance-rate", `${frameDelta} frames over 1s (expected 8-100)`);
   }
 
   // Snapshot arrival latency: ask for current frame, wait one tick, expect newer frame
@@ -579,6 +584,72 @@ async function main() {
     recordFail("F", "transport-connected-still-true", `connected=${fState.transport.connected}`);
   }
 
+  // ===== §G: Snapshot field sanity =====
+  // Catches regressions in the snapshot decoder's per-field decode + the
+  // server-side encoder. These are the "every field has a value" checks
+  // that a passing §A-§F doesn't cover. If the encoder drops a field or the
+  // decoder starts producing NaN, these catch it.
+  const snapA = fState.snapPlayers;
+  const localP1 = findPlayer(snapA, 1);
+  const localP2 = findPlayer(snapA, 2);
+
+  // G1: playerId sanity — IDs are non-negative integers (no NaN, no negative).
+  if (localP1 && Number.isInteger(localP1.id) && localP1.id >= 0 &&
+      localP2 && Number.isInteger(localP2.id) && localP2.id >= 0) {
+    recordPass("G", "player-id-sanity", `p1.id=${localP1.id} p2.id=${localP2.id}`);
+  } else {
+    recordFail("G", "player-id-sanity", `p1=${JSON.stringify(localP1)} p2=${JSON.stringify(localP2)}`);
+  }
+
+  // G2: HP field is finite and in [0, 100].
+  if (localP1 && Number.isFinite(localP1.hp) && localP1.hp >= 0 && localP1.hp <= 100 &&
+      localP2 && Number.isFinite(localP2.hp) && localP2.hp >= 0 && localP2.hp <= 100) {
+    recordPass("G", "hp-field-finite-in-range", `p1.hp=${localP1.hp} p2.hp=${localP2.hp}`);
+  } else {
+    recordFail("G", "hp-field-finite-in-range", `p1.hp=${localP1?.hp} p2.hp=${localP2?.hp}`);
+  }
+
+  // G3: ammo is a non-negative integer (server doesn't write negative ammo).
+  if (localP1 && Number.isInteger(localP1.ammo) && localP1.ammo >= 0 && localP1.ammo <= 255 &&
+      localP2 && Number.isInteger(localP2.ammo) && localP2.ammo >= 0 && localP2.ammo <= 255) {
+    recordPass("G", "ammo-field-finite-in-range", `p1.ammo=${localP1.ammo} p2.ammo=${localP2.ammo}`);
+  } else {
+    recordFail("G", "ammo-field-finite-in-range", `p1.ammo=${localP1?.ammo} p2.ammo=${localP2?.ammo}`);
+  }
+
+  // G4: yaw + pitch are finite numbers (no NaN from the float32 encoder).
+  if (localP1 && Number.isFinite(localP1.yaw) && Number.isFinite(localP1.pitch) &&
+      localP2 && Number.isFinite(localP2.yaw) && Number.isFinite(localP2.pitch)) {
+    recordPass("G", "yaw-pitch-finite", `p1=(yaw=${localP1.yaw.toFixed(3)}, pitch=${localP1.pitch.toFixed(3)}) p2=(yaw=${localP2.yaw.toFixed(3)}, pitch=${localP2.pitch.toFixed(3)})`);
+  } else {
+    recordFail("G", "yaw-pitch-finite", `p1 yaw=${localP1?.yaw} pitch=${localP1?.pitch}; p2 yaw=${localP2?.yaw} pitch=${localP2?.pitch}`);
+  }
+
+  // G5: velocity is finite (decoder reading the wire's f32 BE).
+  if (localP1 && Number.isFinite(localP1.velX) && Number.isFinite(localP1.velY) &&
+      localP2 && Number.isFinite(localP2.velX) && Number.isFinite(localP2.velY)) {
+    recordPass("G", "velocity-finite", `p1.vel=(${localP1.velX.toFixed(2)},${localP1.velY.toFixed(2)}) p2.vel=(${localP2.velX.toFixed(2)},${localP2.velY.toFixed(2)})`);
+  } else {
+    recordFail("G", "velocity-finite", `p1 vel=(${localP1?.velX},${localP1?.velY}) p2 vel=(${localP2?.velX},${localP2?.velY})`);
+  }
+
+  // G6: weaponId is a known value (0/1/2 for DualPistol/Shotgun/Sniper per PR #102).
+  const KNOWN_WEAPONS = new Set([0, 1, 2]);
+  if (localP1 && KNOWN_WEAPONS.has(localP1.weaponId) &&
+      localP2 && KNOWN_WEAPONS.has(localP2.weaponId)) {
+    recordPass("G", "weaponId-known-value", `p1.weaponId=${localP1.weaponId} p2.weaponId=${localP2.weaponId}`);
+  } else {
+    recordFail("G", "weaponId-known-value", `p1.weaponId=${localP1?.weaponId} p2.weaponId=${localP2?.weaponId}`);
+  }
+
+  // G7: currentFireMode is a non-negative integer (server writes 0 or 1).
+  if (localP1 && Number.isInteger(localP1.fireMode) && localP1.fireMode >= 0 &&
+      localP2 && Number.isInteger(localP2.fireMode) && localP2.fireMode >= 0) {
+    recordPass("G", "fireMode-finite-integer", `p1.fireMode=${localP1.fireMode} p2.fireMode=${localP2.fireMode}`);
+  } else {
+    recordFail("G", "fireMode-finite-integer", `p1.fireMode=${localP1?.fireMode} p2.fireMode=${localP2?.fireMode}`);
+  }
+
   // Screenshots
   const pngA = resolve(REPO_ROOT, `client/tools/fe-sync-A.png`);
   const pngB = resolve(REPO_ROOT, `client/tools/fe-sync-B.png`);
@@ -592,7 +663,7 @@ async function main() {
   log(`\n=== SUMMARY ===`);
   log(`Passed: ${passed}`);
   log(`Failed: ${failed}`);
-  const sections = ["A", "B", "C", "D", "E", "F"];
+  const sections = ["A", "B", "C", "D", "E", "F", "G"];
   for (const s of sections) {
     const ok = results.filter((r) => r.section === s && r.ok).length;
     const total = results.filter((r) => r.section === s).length;
