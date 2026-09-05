@@ -2393,6 +2393,81 @@ jobs:
             if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
           done
 
+  client-prod-bundle-smoke:
+    name: client — prod-bundle smoke (PR #125+ follow-up, Hetzner staging 2026-09-04)
+    # PR 11.7.D3+ follow-up: catches the class of bug that bit us on
+    # 2026-09-04 — a feature works in `vite dev` (no tree-shaking) but
+    # is dead-code-eliminated from the prod bundle that real users run.
+    # All existing smokes run against `vite dev`; they're useless for
+    # catching tree-shake regressions. This smoke:
+    #   1. Builds the prod bundle (`npm run build` with VITE_MATCHMAKER_ORIGIN).
+    #   2. Asserts the bundle JS contains wire-up symbols
+    #      (`wireServerTransport`, `__serverTransport`, `__damageBus`).
+    #      Tree-shaking ate these on 2026-09-04 — gate them here.
+    #   3. Boots canary + serve-static.mjs (TLS mode).
+    #   4. Playwright headless Chrome navigates to the HTTPS lobby URL
+    #      with `?server=<wss_url>` and asserts the wire-up actually
+    #      connects (window.__serverTransport.connected === true).
+    #   5. Drives the lobby "Create room" flow and asserts the URL pick
+    #      matches the page scheme (HTTPS → wss://, PR #125).
+    # Mirrors lobby-real-canary-smoke's CI shape (boots canary itself,
+    # no SMOKE_NO_BOOT). ~45-90s runtime.
+    needs: server-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cleanup-ports
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - name: Build server (debug — prod-bundle smoke uses debug profile)
+        run: cargo build --manifest-path server/Cargo.toml
+      - name: Install npm deps
+        working-directory: client
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-${{ hashFiles('client/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-chromium-
+      - name: Install Playwright browser (chromium only — no --with-deps)
+        run: npx playwright install chromium
+        timeout-minutes: 3
+      - name: Run prod-bundle smoke
+        working-directory: client
+        run: node tools/prod-bundle-smoke.mjs
+        env:
+          PROD_BUNDLE_PORT: "14432"
+          WT_PORT: "14433"
+          WS_PORT: "14434"
+          WSS_PORT: "14435"
+          HTTP_PORT: "18080"
+          SMOKE_PNG: client/tools/prod-bundle-smoke.png
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-bundle-smoke-screenshot
+          path: client/tools/prod-bundle-smoke.png
+          if-no-files-found: warn
+      - name: Tear down canary + serve-static
+        if: always()
+        run: |
+          pkill -f canary-server.sh || true
+          pkill -f serve-static.mjs || true
+          for port in 14432 14433 14434 14435 18080; do
+            pids=$(lsof -ti:${port} 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then kill -9 $pids || true; fi
+          done
+
   client-rig-visual-smoke:
     name: client — rig-visual smoke (visual rig position propagation, PR #99)
     # PR #99: closes the "visual rig position propagation (pending
