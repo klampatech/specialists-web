@@ -311,8 +311,13 @@ async fn handle_get_room(
     // constructing it from `window.location.host` (which is the lobby
     // page's host:port — Vite in dev, not the WS listener's port).
     // Same shape as POST /rooms' `ws_url` field — `ws://<peer_ip>:<ws_port>/rooms/<id>`.
+    //
+    // PR 11.9 follow-up (Hetzner staging, 2026-09-04): also include
+    // `wss_url` so HTTPS lobby pages can pick the TLS variant without
+    // the browser's mixed-content blocker dropping the WSS handshake.
+    // Mirrors POST /rooms' shape.
     let body = format!(
-        r#"{{"exists":true,"players":{players},"max":{max},"ws_url":"ws://{peer_addr}:{ws_port}/rooms/{id}"}}"#,
+        r#"{{"exists":true,"players":{players},"max":{max},"ws_url":"ws://{peer_addr}:{ws_port}/rooms/{id}","wss_url":"wss://{peer_addr}:{ws_port}/rooms/{id}"}}"#,
         players = players,
         max = MAX_PLAYERS_PER_ROOM,
         peer_addr = peer.ip(),

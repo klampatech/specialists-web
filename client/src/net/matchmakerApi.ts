@@ -30,7 +30,17 @@ export type GetRoomResponse =
   // server without constructing it from `window.location.host`
   // (which is the lobby page's host:port — Vite in dev, not the WS
   // listener's port). Same shape as POST /rooms' `ws_url` field.
-  | { exists: true; players: number; max: number; ws_url: string };
+  //
+  // PR 11.9 follow-up (Hetzner staging, 2026-09-04): also include
+  // `wss_url` so HTTPS lobby pages can pick the TLS variant without
+  // the browser's mixed-content blocker dropping the WSS handshake.
+  | {
+      exists: true;
+      players: number;
+      max: number;
+      ws_url: string;
+      wss_url: string;
+    };
 
 /** Error categories the matchmaker API can throw. Mirrored on
  *  the `cause` field of the thrown Error instance so the

@@ -145,13 +145,21 @@ export function Lobby() {
       setCreating(true);
     });
     try {
-      const { ws_url } = await roomApi.createRoom(origin);
-      // Navigate to the same page with `?server=<ws_url>`. PeerOverlay
+      // PR 11.9 follow-up (Hetzner staging, 2026-09-04): the matchmaker
+      // returns BOTH `ws_url` (plain) AND `wss_url` (TLS). Pick the
+      // secure variant when the lobby page itself is HTTPS, otherwise
+      // the browser's mixed-content blocker silently drops the WSS
+      // handshake. (Workaround was `VITE_MATCHMAKER_ORIGIN=https://...`
+      // build-time env var on Hetzner; this fix removes it.)
+      const { ws_url, wss_url } = await roomApi.createRoom(origin);
+      const serverUrl =
+        window.location.protocol === "https:" ? wss_url ?? ws_url : ws_url;
+      // Navigate to the same page with `?server=<serverUrl>`. PeerOverlay
       // picks up the flag on module re-evaluation and wires the
       // ServerTransport. (No need to reset `creating` — the page
       // navigates away on the next tick.)
       const target = new URL(window.location.href);
-      target.searchParams.set("server", ws_url);
+      target.searchParams.set("server", serverUrl);
       // Popup-blocker / sandboxed-frame / etc. recovery (NB #3). The
       // browser can throw on `window.location.href = ...` if it
       // refuses the navigation. Without this try/catch, a blocked
@@ -287,9 +295,17 @@ export function Lobby() {
       // matchmaker's ws_url (PR 95 fix to GET /rooms/<id>) is the
       // authoritative answer. Caught by the real-canary smoke on
       // 2026-09-01 (PR #94 follow-up).
-      const ws_url = r.ws_url;
+      // PR 11.9 follow-up (Hetzner staging, 2026-09-04): same HTTPS-aware
+      // URL pick as onCreate above. The matchmaker already returns
+      // both `ws_url` and `wss_url`; use the secure variant when the
+      // lobby page is on HTTPS so the WSS handshake isn't blocked by
+      // the browser's mixed-content rules.
+      const serverUrl =
+        window.location.protocol === "https:"
+          ? r.wss_url ?? r.ws_url
+          : r.ws_url;
       const target = new URL(window.location.href);
-      target.searchParams.set("server", ws_url);
+      target.searchParams.set("server", serverUrl);
       // Same popup-blocker recovery shape as onCreate above:
       // a throw here means the browser refused the navigation
       // (popup blocker, sandboxed iframe, etc.) and we need to
