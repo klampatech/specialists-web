@@ -56,9 +56,9 @@
 
 import { chromium } from "playwright";
 import { spawn, execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve, dirname } from "node:path";
+import { readFileSync, existsSync } from "node:fs";
+import { request as httpsRequest } from "node:https";
+import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -268,22 +268,35 @@ async function bootServeStatic() {
   serveStaticProc.stdout.on("data", (d) => process.stderr.write(`[static] ${d}`));
   serveStaticProc.stderr.on("data", (d) => process.stderr.write(`[static-err] ${d}`));
 
-  // Wait for HTTPS to be reachable
+  // Wait for HTTPS to be reachable. We use node:https directly (not
+  // globalThis.fetch) because fetch in Node 22 doesn't honor the
+  // `tls.rejectUnauthorized` option — silently rejects self-signed
+  // certs. node:https.request accepts rejectUnauthorized in options.
   const START_TIMEOUT_MS = 30000;
   const start = Date.now();
   while (Date.now() - start < START_TIMEOUT_MS) {
-    try {
-      // ignore TLS errors at the curl level — Playwright will handle
-      // the cert trust on its end
-      const r = await fetch(STATIC_URL, {
-        // @ts-ignore — node 22 supports this for fetch
-        tls: { rejectUnauthorized: false },
-      }).catch(() => null);
-      if (r && r.ok) {
-        log(`serve-static HTTPS up after ${((Date.now() - start) / 1000).toFixed(1)}s`);
-        return;
-      }
-    } catch {}
+    const reachable = await new Promise((resolve) => {
+      const req = httpsRequest(
+        {
+          host: "127.0.0.1",
+          port: PROD_BUNDLE_PORT,
+          path: "/health",
+          method: "GET",
+          rejectUnauthorized: false,
+        },
+        (res) => {
+          // Drain the response stream so the socket can close cleanly.
+          res.resume();
+          resolve(res.statusCode === 200);
+        }
+      );
+      req.on("error", () => resolve(false));
+      req.end();
+    });
+    if (reachable) {
+      log(`serve-static HTTPS up after ${((Date.now() - start) / 1000).toFixed(1)}s`);
+      return;
+    }
     await sleep(500);
   }
   throw new Error(`serve-static didn't come up within ${START_TIMEOUT_MS}ms`);
