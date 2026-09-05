@@ -923,6 +923,18 @@ export async function createScene(
       // so the synchronous double-claim race from StrictMode is a
       // dev-only concern. The simpler form keeps Vite from
       // tree-shaking the whole wire-up branch.
+      //
+      // (Hetzner staging, 2026-09-05) — this IIFE bails out when
+      // wireServerTransport has already populated
+      // `window.__serverTransport` with a real ServerTransport (this
+      // is the prod race: wireServerTransport runs as a side-effect
+      // import in App.tsx and finishes its connect() before scene.ts
+      // even constructs createScene()). The actual integration logic
+      // (server.onDamageBroadcast, gameSession.setServerTransport,
+      // server.onSnapshot, broadcast handler) now lives in
+      // wireServerTransport.ts — see that module's top-level
+      // post-connect block. It looks up `window.__gameSession` and
+      // late-binds everything onto the live gameSession.
       (window as unknown as {__serverTransport?: unknown}).__serverTransport = "INIT_INFLIGHT";
       void (async () => {
         // Local alias for the typed window slot. Captured at IIFE
@@ -948,8 +960,6 @@ export async function createScene(
         // are imported statically at the top of this module (see the
         // top-of-file comment). Previously these were `await import(...)`
         // here, which Rollup tree-shook out of the prod bundle.
-        const urlBase = (window as unknown as { __damageServerUrl?: string }).__damageServerUrl
-          ?? `${window.location.protocol}//${window.location.host}`;
         // smoke can override the transport ports via
         // `window.__damageServerPorts = { wt: 14433, ws: 14434 }`
         // (the canary server's --port-wt / --port-ws flags).
@@ -977,25 +987,68 @@ export async function createScene(
         // script (smoke sets this via `window.__localPlayerId`). Defaults
         // to 1 (matches the smoke's first tab; the smoke uses 2 for tab B).
         const localPlayerId = (window as unknown as { __localPlayerId?: number }).__localPlayerId ?? 1;
-        const server = new ServerTransport(urlBase, roomId);
-        await server.connect();
-        // PR 11.6.D fix4 (Bug A — race resolution): after the
-        // connect resolves, check whether a sibling mount already
-        // wrote a real (non-sentinel) ServerTransport into the slot.
-        // If so, this mount lost the race — discard the freshly-
-        // connected transport (close to release the WS) and bail.
-        // The outer sync guard normally prevents this branch from
-        // firing, but GC / microtask reordering can still race two
-        // in-flight `connect()` calls; close() prevents a leaked
-        // socket + a duplicate broadcast handler.
-        if (winSlot.__serverTransport !== "INIT_INFLIGHT" &&
-            winSlot.__serverTransport !== undefined) {
-          try {
-            server.close();
-          } catch {
-            // ignore — best-effort cleanup
+        // PR #128 follow-up (Hetzner staging, 2026-09-05) —
+        // the wire-up is now driven by wireServerTransport.ts (side-effect
+        // import in App.tsx) to escape Vite's tree-shaking. wireServerTransport
+        // may have already created a ServerTransport and placed it in
+        // `window.__serverTransport` BEFORE this IIFE runs — the sync
+        // "INIT_INFLIGHT" guard above no longer holds (line 926 wrote it,
+        // wireServerTransport then replaced it with the server object).
+        // Reuse the existing transport instead of bailing — the bail
+        // was for StrictMode double-mount races, not the wire-up race.
+        // (StrictMode still gets caught by the SECOND check at line ~1088
+        // which guards against duplicate broadcast handlers.)
+        let server: ServerTransport;
+        const existingTransport = winSlot.__serverTransport;
+        if (existingTransport && existingTransport !== "INIT_INFLIGHT" &&
+            typeof existingTransport === "object") {
+          // wireServerTransport already wired up the transport. Reuse
+          // it; the broadcast/reject/setServerTransport wiring below
+          // runs against this object.
+          server = existingTransport as ServerTransport;
+        } else {
+          const urlBase = (window as unknown as { __damageServerUrl?: string }).__damageServerUrl
+            ?? `${window.location.protocol}//${window.location.host}`;
+          const roomId = (window as unknown as { __damageServerRoomId?: string }).__damageServerRoomId;
+          if (!roomId) {
+            // PR 11.6.D / DEVBX-hardcode-cleanup (2026-08-30): the
+            // silent `?? "DEVBX"` fallback masked URL-vs-client
+            // mismatches in smoke harnesses (any smoke that didn't
+            // inject __damageServerRoomId silently joined DEVBX,
+            // masking whether the server-side parse_room_id() was
+            // actually returning the right room). Throwing surfaces
+            // the missing-injection at smoke-fail time, where the bug
+            // matters. Server-side parse_room_id() already does the
+            // correct thing (URL → room with DEVBX_ROOM_ID only as
+            // back-compat for malformed paths); this is the matching
+            // client-side guard.
+            throw new Error(
+              "[scene] __damageServerRoomId not set — smoke harness must inject window.__damageServerRoomId before scene boots. " +
+              "The room id should be derived from the URL path /rooms/<id> via parseRoomFromUrl(). " +
+              "Server-side parse_room_id() already handles malformed URLs by falling back to DEVBX_ROOM_ID, " +
+              "but the client should never silently substitute a default."
+            );
           }
-          return;
+          server = new ServerTransport(urlBase, roomId);
+          await server.connect();
+          // PR 11.6.D fix4 (Bug A — race resolution): after the
+          // connect resolves, check whether a sibling mount already
+          // wrote a real (non-sentinel) ServerTransport into the slot.
+          // If so, this mount lost the race — discard the freshly-
+          // connected transport (close to release the WS) and bail.
+          // The outer sync guard normally prevents this branch from
+          // firing, but GC / microtask reordering can still race two
+          // in-flight `connect()` calls; close() prevents a leaked
+          // socket + a duplicate broadcast handler.
+          if (winSlot.__serverTransport !== "INIT_INFLIGHT" &&
+              winSlot.__serverTransport !== undefined) {
+            try {
+              server.close();
+            } catch {
+              // ignore — best-effort cleanup
+            }
+            return;
+          }
         }
         // PR 11.6.D / §3.9 — register the broadcast handler. The
         // controller getter is late-binding: gameSession is created

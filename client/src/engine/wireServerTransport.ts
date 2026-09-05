@@ -13,6 +13,33 @@
 // with a side-effect-import at App.tsx's top level. The side-effect
 // import runs on every page load.
 //
+// PR #128 follow-up (Hetzner staging, 2026-09-05) — Kyle's playtest on
+// the prod bundle (https://65.108.87.1:14432/?server=...) showed the
+// wire-up connecting (RTT 234ms, transport=websocket) but no snapshot
+// stream reaching the scene — `__serverTransport.connected = true` but
+// `snapshot = null`, no remote rig rendered, no hits registering. Root
+// cause: scene.ts's createScene() runs an `if (useServerTransport...)`
+// block (line 920) that wires `server.onDamageBroadcast(...)`,
+// `liveGameSession.setServerTransport(server)`, and
+// `server.onSnapshot(...) → predictor`. Vite/Rollup tree-shake that
+// entire block from the prod bundle because the condition
+// `useServerTransportFromOpts || useServerTransportFromWindow` is a
+// runtime window-flag check the bundler can't prove is ever true.
+//
+// Fix: drive the wire-up integration from THIS module (top-level,
+// side-effect-imported, Vite guarantees preservation). After
+// `server.connect()` resolves, we:
+//   1. Wait for the live `__gameSession` to be published (it is, after
+//      scene.ts's createScene() reaches line 733 — `__gameSession =
+//      gameSession`).
+//   2. Register `server.onDamageBroadcast(broadcastHandler)` using the
+//      late-bound gameSession controllers.
+//   3. Register damageBus.onDamageReject (reverts spam-phase overshoot).
+//   4. Call `liveGameSession.setServerTransport(server)` so gameSession.tick()
+//      forwards PositionUpdate + DamageRequest through the wire.
+//   5. Wire `server.onSnapshot(...)` so server-sent snapshots feed
+//      gameSession's input/predictor subsystem.
+//
 // Module-load order note (Hetzner staging, 2026-09-04):
 // `wireServerTransport()` runs synchronously when this module is first
 // imported. `PeerOverlay`'s URL-parsing IIFE also runs at module
@@ -23,7 +50,8 @@
 // entrypoint encodes the room id in the `/rooms/<id>` path).
 
 import { ServerTransport, parseRoomFromUrl } from "../net/serverTransport";
-import { createDamageBusProbe } from "../net/damageBus";
+import { createDamageBusProbe, applyReject } from "../net/damageBus";
+import type { CharacterController } from "./characterController";
 
 export function wireServerTransport(): void {
   // Window target — typed as `any`-shape for clarity.
@@ -126,17 +154,117 @@ export function wireServerTransport(): void {
         }
       };
       win.__latestSnap = snapGetter;
-      win.__damageBus = createDamageBusProbe(server);
+      const damageBus = createDamageBusProbe(server);
+      win.__damageBus = damageBus;
       // Expose the gameSession + remoteController on the window for
       // DebugHud's combat panel. scene.ts's createScene() also
       // publishes __gameSession, but it may not have run yet when
       // wireServerTransport completes; we re-publish here to be safe.
-      const gs = (window as unknown as {
-        __gameSession?: { remoteController?: unknown; localController?: unknown };
-      }).__gameSession;
-      if (gs?.remoteController) {
-        win.__remoteController = gs.remoteController;
+      const readGameSession = (): {
+        remoteController?: unknown;
+        localController?: unknown;
+        setServerTransport?: (t: unknown) => void;
+        health?: unknown;
+      } | null =>
+        (window as unknown as { __gameSession?: {
+          remoteController?: unknown;
+          localController?: unknown;
+          setServerTransport?: (t: unknown) => void;
+          health?: unknown;
+        } }).__gameSession ?? null;
+      const gs0 = readGameSession();
+      if (gs0?.remoteController) {
+        win.__remoteController = gs0.remoteController;
       }
+      // PR #128 follow-up — drive the wire-up integration here.
+      // scene.ts's IIFE was the previous home for these wires, but
+      // Vite tree-shakes the IIFE in prod (the `if
+      // (useServerTransport...)` condition is a runtime window-flag
+      // check the bundler can't analyze). Doing the wire-up here
+      // means it's part of THIS module's top-level statements,
+      // which Vite preserves unconditionally.
+      //
+      // Order-sensitive: scene.ts publishes `__gameSession` at line
+      // ~733 AFTER creating it. If we run before that point, we
+      // retry on a microtask until `__gameSession` appears. On dev
+      // canary the wire-up completes before scene.ts; in prod it
+      // typically completes after (slow React render + Havok WASM
+      // init). Either way the retry loop converges.
+      const waitForGameSession = async (): Promise<NonNullable<ReturnType<typeof readGameSession>>> => {
+        // Up to ~2s of retries — Havok WASM load + scene init can
+        // take ~1s on cold prod. Subsequent polls run on microtasks.
+        const start = performance.now();
+        while (performance.now() - start < 2000) {
+          const gs = readGameSession();
+          if (gs) return gs;
+          await new Promise<void>((r) => setTimeout(r, 16));
+        }
+        // Fallback: last poll. May be null in unit tests or page errors.
+        return readGameSession() as unknown as NonNullable<ReturnType<typeof readGameSession>>;
+      };
+      const session = await waitForGameSession();
+      if (!session) {
+        // No gameSession present. Wire-up is still connected
+        // (window.__serverTransport = server) so the smoke matrix
+        // sees the wire, but the scene won't drive. Don't throw —
+        // log and let the page continue rendering.
+        console.warn(
+          "[wireServerTransport] no __gameSession on window after 2s — wire connected but scene integration skipped",
+        );
+      } else {
+        // PR #128 integration — register broadcast + reject handlers
+        // and forward the live transport onto the GameSession.
+        //
+        // Broadcast handler — calls damageBus.applyBroadcast with the
+        // late-bound controllers from the live gameSession. Mirrors
+        // scene.ts's makeBroadcastHandler (which is inlined here so
+        // we don't pull scene.ts's tree-shake-prone code in).
+        const broadcastHandler = (body: Uint8Array): void => {
+          if (typeof window !== "undefined") {
+            const w = window as unknown as { __broadcastHandlerCount?: number };
+            w.__broadcastHandlerCount = (w.__broadcastHandlerCount ?? 0) + 1;
+          }
+          const bc = damageBus.decodeDamageBroadcast(body);
+          if (!bc) return;
+          const liveSession: {
+            localController?: CharacterController | unknown;
+            remoteController?: CharacterController | unknown;
+          } | null = readGameSession();
+          const localCtrl = liveSession?.localController as CharacterController | undefined;
+          const remoteCtrl = liveSession?.remoteController as CharacterController | undefined;
+          if (!localCtrl || !remoteCtrl) return;
+          damageBus.applyBroadcast(
+            bc,
+            performance.now(),
+            (playerId: number) => (playerId === localPlayerId ? localCtrl : remoteCtrl),
+          );
+        };
+        server.onDamageBroadcast(broadcastHandler);
+        // Damage reject handler — late-binds applyReject to the live
+        // session. PR 11.6.D fix4: reverts spam-phase overshoot by
+        // recording rejections on the live damage bus.
+        damageBus.onDamageReject((r) => {
+          applyReject(localPlayerId, r.eventId, r.reason);
+        });
+        // PR #128 — forward the live transport onto the GameSession
+        // so gameSession.tick() sends DamageRequest + PositionUpdate
+        // through serverTransport.
+        if (typeof session.setServerTransport === "function") {
+          session.setServerTransport(server);
+          console.info(
+            "[wireServerTransport] live gameSession.setServerTransport(server) called — wire is integrated",
+          );
+        }
+        if (typeof window !== "undefined") {
+          const w = window as unknown as { __broadcastHandlerRegistered?: boolean };
+          w.__broadcastHandlerRegistered = true;
+        }
+      }
+      window.dispatchEvent(
+        new CustomEvent("specialists:server-transport-ready", {
+          detail: { server, damageBus: win.__damageBus },
+        }),
+      );
       console.info(
         "[wireServerTransport] connected to",
         urlBase,
