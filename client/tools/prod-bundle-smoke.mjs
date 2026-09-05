@@ -58,7 +58,7 @@ import { chromium } from "playwright";
 import { spawn, execSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { request as httpsRequest } from "node:https";
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
