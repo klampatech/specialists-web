@@ -180,10 +180,31 @@ async function assertBundledSymbols() {
   // Check for the wire-up markers. After PR #123's extraction, these
   // should be in the bundle (the side-effect import is the live reference
   // Vite can't tree-shake).
+  //
+  // PR #130 — add the snapshot decoder / Predictor / Interpolator
+  // markers. The decoder + predictor + interpolator block that lived
+  // in scene.ts's tree-shaken IIFE was migrated to wireServerTransport.ts
+  // in PR #130; if any of these markers are gone, the prod bug from
+  // 2026-09-05 has regressed (snapshots arrive on the wire but never
+  // decode → remote rig tracks stale position → position sync broken).
+  //
+  // Note on `decodeSnapshot`: Vite minifies internal function names, so
+  // the literal string `decodeSnapshot` may not appear in the bundle.
+  // We instead grep for two structural markers that survive minification:
+  //   - `getUint16(c+0` — the per-player playerId read in the decoder body
+  //   - `snapshot decoder wired` — the console.info log line
+  // The Predictor + Interpolator class names ARE preserved because they're
+  // top-level exports of their modules (Vite preserves exported symbol
+  // names for the public API surface).
   const requiredMarkers = [
     "wireServerTransport",
     "__serverTransport",
     "__damageBus",
+    "Predictor",
+    "Interpolator",
+    "__liveInterpolatorTickHook",
+    "__predictor",
+    "__interpolator",
   ];
   const missing = requiredMarkers.filter(m => !bundleText.includes(m));
   if (missing.length) {
@@ -196,6 +217,29 @@ async function assertBundledSymbols() {
     throw new Error("tree-shake");
   }
   recordPass("bundle-wire-up-symbols");
+
+  // PR #130 — assert the snapshot decoder body (or its minified form)
+  // is in the bundle. `decodeSnapshot` is exported from protocol/snapshot
+  // so its body MUST be reachable from wireServerTransport.ts's side-
+  // effect import. Without this check, a regression where the decoder
+  // body got tree-shaken would still pass `requiredMarkers` (which only
+  // checks that the wire-up is wired, not that the snapshot data flows).
+  const decoderMarkers = [
+    "snapshot decoder wired",         // console.info log line
+    "getUint16(c+0",                  // per-player playerId read (decoder body)
+  ];
+  const missingDecoder = decoderMarkers.filter(m => !bundleText.includes(m));
+  if (missingDecoder.length) {
+    recordFail(
+      "bundle-snapshot-decoder",
+      `snapshot decoder markers missing: ${missingDecoder.join(", ")}. ` +
+      `Vite tree-shook the snapshot decoder body out of the prod bundle. ` +
+      `Fix: verify wireServerTransport.ts imports decodeSnapshot at the ` +
+      `top level (side-effect module) — see PR #130.`,
+    );
+  } else {
+    recordPass("bundle-snapshot-decoder");
+  }
 
   log(`Bundle size: ${(bundleBytes.length / 1024 / 1024).toFixed(2)} MB`);
 }

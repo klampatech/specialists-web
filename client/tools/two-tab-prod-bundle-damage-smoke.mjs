@@ -613,6 +613,64 @@ async function runSmoke() {
       `damage-converges-pre=${tabBpre.hpBefore}-post=${hpAfter}-drop=${tabBpre.hpBefore - hpAfter}-bcastCount=${broadcastHandlerCountAfter}`,
     );
 
+    // PR #130 / Hetzner staging 2026-09-05 — assertSnapshotsDecoded.
+    // The damage-converges check above proves broadcast reaches Tab B's
+    // live gameSession; this check proves the snapshot-driven remote
+    // rig is actually tracking Tab A's position via the snapshot
+    // decoder pipeline (Predictor + Interpolator + LIVE tick hook —
+    // all migrated to wireServerTransport.ts in PR #130). Pre-PR-#130,
+    // Vite tree-shook scene.ts's onSnapshot listener from the prod
+    // bundle, so the snapshot arrived on the wire but was NEVER
+    // decoded → __latestSnap() returned null → the remote rig stayed
+    // at its spawn position regardless of what the server broadcast.
+    //
+    // Wait a bit more to make sure at least one snapshot has been
+    // decoded (the smoke flow above takes a couple seconds, but the
+    // first snapshot may arrive within ~1s of connect).
+    let snapshotsDecoded = false;
+    let decodedSnapshot = null;
+    const SNAP_DECODE_TIMEOUT_MS = 5000;
+    const snapDecodeStart = Date.now();
+    while (Date.now() - snapDecodeStart < SNAP_DECODE_TIMEOUT_MS) {
+      const probe = await pageB.evaluate(() => {
+        const snap = window.__latestSnap?.() ?? null;
+        const interp = window.__interpolator;
+        return {
+          snap,
+          snapPlayersCount: snap?.players?.length ?? 0,
+          hasInterpolator: !!interp,
+          // Live observer's last setPosition — proves the snapshot
+          // decoder is actually moving the remote rig's Havok body.
+          lastSetPos: window.__lastInterpolatorSetPosition ?? null,
+        };
+      });
+      if (probe.snap !== null && probe.snapPlayersCount >= 2 && probe.hasInterpolator) {
+        snapshotsDecoded = true;
+        decodedSnapshot = probe;
+        break;
+      }
+      await sleep(100);
+    }
+    log(`Post-fire Tab B snapshot probe: ${JSON.stringify({
+      snapPlayersCount: decodedSnapshot?.snapPlayersCount ?? 0,
+      hasInterpolator: decodedSnapshot?.hasInterpolator ?? false,
+      lastSetPos: decodedSnapshot?.lastSetPos ?? null,
+    })}`);
+    if (!snapshotsDecoded) {
+      throw new Error(
+        `Tab B __latestSnap() returned null (or with too few players) after ` +
+        `${SNAP_DECODE_TIMEOUT_MS}ms post-fire. The snapshot decoder pipeline ` +
+        `(Predictor + Interpolator + LIVE tick hook) is NOT wired in the prod ` +
+        `bundle. This is the regression PR #130 targets. ` +
+        `Snapshot probe: ${JSON.stringify(decodedSnapshot)}. ` +
+        `Fix: verify wireServerTransport.ts imports decodeSnapshot + Predictor + ` +
+        `Interpolator at the top level and the snapshot block IIFE runs.`,
+      );
+    }
+    recordPass(
+      `snapshots-decoded-players=${decodedSnapshot.snapPlayersCount}-hasInterpolator=${decodedSnapshot.hasInterpolator}-lastSetPos=${JSON.stringify(decodedSnapshot.lastSetPos)}`,
+    );
+
     // Screenshots
     try {
       await pageA.screenshot({ path: SMOKE_PNG_A, fullPage: true });

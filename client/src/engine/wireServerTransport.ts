@@ -52,6 +52,16 @@
 import { ServerTransport, parseRoomFromUrl } from "../net/serverTransport";
 import { createDamageBusProbe, applyReject } from "../net/damageBus";
 import type { CharacterController } from "./characterController";
+// PR #130 / Hetzner staging 2026-09-05 — predictor/interpolator/snapshot-decoder
+// migration out of scene.ts (see the new IIFE block at the bottom of this module).
+// Top-level imports keep the symbols alive in Vite's tree-shake output
+// (mirrors the wireServerTransport extraction pattern from PR #128).
+import { decodeSnapshot } from "../../../protocol/snapshot";
+import { Predictor } from "./clientPredictor";
+import { Interpolator } from "./remoteInterpolator";
+import { decodeInput } from "../net/inputBitmask";
+import { HEALTH } from "./characterConfig";
+import type { GameSession } from "../game/gameSession";
 
 export function wireServerTransport(): void {
   // Window target — typed as `any`-shape for clarity.
@@ -281,6 +291,299 @@ export function wireServerTransport(): void {
     }
   })();
 }
+
+// === PR #130 / Hetzner staging 2026-09-05 — Snapshot decoder block ===
+//
+// The snapshot decoder + Predictor + Interpolator + LIVE
+// `__liveInterpolatorTickHook` publish that lived inside scene.ts's
+// `if (useServerTransportFromOpts || useServerTransportFromWindow)` IIFE
+// (lines 1197-1513 pre-#129-followup) was being tree-shaken from prod
+// builds. The snapshot stream arrived on the wire but was NEVER decoded
+// — `__latestSnap()` returned null in prod. Mirror the PR #128 / PR #129
+// pattern: do it here in this side-effect-imported module so Vite
+// preserves it.
+//
+// Order note: the wire-up IIFE above polls for `__gameSession` for up to
+// 2s; this block ALSO polls for `__gameSession` (same window). They are
+// independent — both run on page load in parallel, both see the same
+// live gameSession instance. No race; no double-wire (the
+// `__predictor` / `__interpolator` guards bail on a second invocation).
+//
+// Local aliases for window reads — keep the IIFE self-contained (the
+// `win` + `readGameSession` closure-captures inside wireServerTransport()
+// aren't visible at module top-level).
+const __wstWindow = window as unknown as {
+  __serverTransport?: {
+    onSnapshot?: (cb: (body: Uint8Array) => void) => void;
+  };
+  __gameSession?: GameSession;
+  __predictor?: unknown;
+  __interpolator?: unknown;
+  __latestSnap?: () => import("../../../protocol/snapshot").Snapshot | null;
+  __localPlayerId?: number;
+  __remoteController?: unknown;
+};
+const __wstReadGameSession = (): GameSession | null => {
+  return __wstWindow.__gameSession ?? null;
+};
+void (async () => {
+  try {
+    // Don't double-wire — React StrictMode (App.tsx) imports this
+    // module twice on mount; bail if the second invocation finds the
+    // first's Interpolator already published.
+    if (__wstWindow.__interpolator !== undefined || __wstWindow.__predictor !== undefined) {
+      return;
+    }
+    // Poll for __gameSession (up to 2s — Havok WASM load + scene init
+    // can take ~1s on cold prod). Mirrors the existing
+    // waitForGameSession helper used in the wire-up block above.
+    const __wstStart = performance.now();
+    let liveSession: GameSession | null = null;
+    while (performance.now() - __wstStart < 2000) {
+      liveSession = __wstReadGameSession();
+      if (liveSession) break;
+      await new Promise<void>((r) => setTimeout(r, 16));
+    }
+    if (!liveSession) {
+      console.warn(
+        "[wireServerTransport] snapshot decoder skipped — no __gameSession on window after 2s",
+      );
+      return;
+    }
+    const liveServer = __wstWindow.__serverTransport;
+    if (!liveServer || typeof liveServer.onSnapshot !== "function") {
+      console.warn(
+        "[wireServerTransport] snapshot decoder skipped — __serverTransport not yet connected (or no onSnapshot)",
+      );
+      return;
+    }
+    const liveLocalCtrl = liveSession.localController as
+      | CharacterController
+      | undefined;
+    const liveRemoteCtrl = liveSession.remoteController as
+      | CharacterController
+      | undefined;
+    const liveLocalPlayerId = __wstWindow.__localPlayerId ?? 1;
+    if (!liveLocalCtrl) {
+      console.warn(
+        "[wireServerTransport] snapshot decoder skipped — __gameSession.localController missing",
+      );
+      return;
+    }
+
+    // Havok-step wrapper (PR 11.7.C / §3.7) — advances the LIVE Havok
+    // controller by one frame, reads the post-update state, then
+    // RESTORES the controller to its prior position+velocity (a
+    // "phantom" simulation: temporarily step physics, capture the
+    // result, then revert). The live controller is unchanged after the
+    // wrapper returns, but the wrapper reports the state Havok WOULD
+    // have reached if the input had been applied. This is the
+    // predictor's source of forward-predicted positions for the
+    // snapshot-driven drift check.
+    //
+    // **Why save/restore, not just step**: `gameSession.tick()` (called
+    // from the render observer at scene.ts:484) already advances the
+    // live controller per-frame. A naive step would double-advance.
+    // Save/restore is O(1) per call.
+    const havokStep = (
+      _state: import("../../../protocol/snapshot").PlayerState,
+      encoded: Uint8Array,
+    ): import("../../../protocol/snapshot").PlayerState => {
+      const decoded = decodeInput(encoded);
+      const savedPos = liveLocalCtrl.havok.getPosition().clone();
+      const savedVel = liveLocalCtrl.havok.getVelocity().clone();
+      liveLocalCtrl.update(decoded, 1 / 60, performance.now());
+      const postPos = liveLocalCtrl.havok.getPosition();
+      const postVel = liveLocalCtrl.havok.getVelocity();
+      const result: import("../../../protocol/snapshot").PlayerState = {
+        playerId: liveLocalPlayerId,
+        positionX: postPos.x,
+        positionY: postPos.z,
+        velocityX: postVel.x,
+        velocityY: postVel.z,
+        yaw: 0, // PR 11.7.B wire doesn't carry yaw/pitch
+        pitch: 0,
+        hp: liveLocalCtrl.state.hp,
+        ammo: 0,
+        isFiring: decoded.fireHeld ? 1 : 0,
+        weaponId: 0,
+        currentFireMode: 0,
+      };
+      liveLocalCtrl.havok.setPosition(savedPos);
+      liveLocalCtrl.havok.setVelocity(savedVel);
+      return result;
+    };
+    const predictor = new Predictor(
+      liveLocalPlayerId,
+      havokStep,
+      () => liveSession.frame,
+    );
+    const interpolator = new Interpolator(liveLocalPlayerId);
+
+    // PR 11.7.D3.1 — respawn-snap HP edge detector. Snapshot's
+    // `players[i].hp` going `0 → 100` on the 20Hz server-authoritative
+    // stream is the canonical respawn signal post-#50. Fire
+    // `remoteController.respawn()` so Havok + visualRoot teleport to
+    // `respawnPosition` (already canonical per PR 10.2). The 3s grace
+    // window inside respawn() suppresses the observer's setPosition
+    // clobbering the teleport with the snapshot's pre-respawn value.
+    const prevHpByPlayerId = new Map<number, number>();
+
+    let latestSnap: import("../../../protocol/snapshot").Snapshot | null = null;
+    liveServer.onSnapshot((body: Uint8Array) => {
+      const snap = decodeSnapshot(body);
+      if (!snap) return;
+      const now = performance.now();
+      latestSnap = snap;
+      // HP edge detection — must run BEFORE the interpolator so the
+      // respawn teleport takes effect this frame.
+      for (const p of snap.players) {
+        // Skip placeholder ids (1000+) — un-promoted connections
+        // waiting for their first DamageRequest.
+        if (p.playerId >= 1000) continue;
+        const prevHp = prevHpByPlayerId.get(p.playerId) ?? HEALTH.maxHp;
+        if (prevHp <= 0 && p.hp === HEALTH.maxHp) {
+          if (liveRemoteCtrl) {
+            liveRemoteCtrl.respawn(now);
+            // Refresh the interpolator's per-frame buffer so the visual
+            // tracking starts clean at the respawn position.
+            if (typeof window !== "undefined") {
+              const w = window as unknown as {
+                __lastInterpolatorSetPosition?: {
+                  x: number;
+                  z: number;
+                  ts: number;
+                  playerId: number;
+                };
+              };
+              w.__lastInterpolatorSetPosition = {
+                x: liveRemoteCtrl.respawnPosition.x,
+                z: liveRemoteCtrl.respawnPosition.z,
+                ts: now,
+                playerId: p.playerId,
+              };
+            }
+          }
+        }
+        prevHpByPlayerId.set(p.playerId, p.hp);
+      }
+      // PR #108 — pull the LOCAL player's authoritative weapon state
+      // from the snapshot. The snapshot's weaponId / currentFireMode
+      // are the source of truth; the optimistic local state set by
+      // `tryStartWeaponSwitch` is overwritten here so a dropped packet
+      // (server's rate-limit gate) doesn't leave the HUD desynced.
+      const localSnap = snap.players.find(
+        (p) => p.playerId === liveLocalPlayerId,
+      );
+      if (localSnap) {
+        const sessWithSet = liveSession as {
+          _setLocalWeaponStateFromSnapshot?: (
+            weaponId: number,
+            fireMode: number,
+          ) => void;
+        };
+        sessWithSet._setLocalWeaponStateFromSnapshot?.(
+          localSnap.weaponId,
+          localSnap.currentFireMode,
+        );
+      }
+      predictor.onSnapshot(snap, now);
+      interpolator.onSnapshot(snap, now);
+    });
+
+    // PR 11.7.D2.1 — publish the LIVE remote-controller + the
+    // interpolation tick body to the window slot. This decouples the
+    // render observer from the createScene() closure that originally
+    // set the hook. Under React StrictMode the first createScene wins
+    // the sync-claim guard, then gets disposed; the second
+    // createScene's observer must then drive the hook against the
+    // LIVE (window-resolved) remote controller. Without this, the
+    // observer calls a closure-bound hook whose remoteCtrl is disposed
+    // (scene.dispose → gameSession.dispose → remoteController.havok
+    // disposed) and setPosition silently no-ops.
+    if (typeof window !== "undefined") {
+      const liveHook = (nowMs: number) => {
+        const liveRemote = (window as unknown as {
+          __gameSession?: GameSession;
+        }).__gameSession?.remoteController as CharacterController | undefined;
+        if (!liveRemote) return;
+        const liveInterpolator = (window as unknown as {
+          __interpolator?: InstanceType<typeof Interpolator>;
+        }).__interpolator;
+        if (!liveInterpolator) return;
+        const liveStates = liveInterpolator.tick(nowMs);
+        if (liveStates.length === 0) return;
+        const liveState = liveStates[0];
+        // PR 11.7.D3.2 / post-merge hardening — skip position writes
+        // during the respawn grace period (3s after `respawn()` fires).
+        if (liveRemote.isInRespawnGrace(nowMs)) {
+          return;
+        }
+        liveRemote.havok.setPosition(liveState.position);
+        // PR 11.7.D3 / walk-mirror visual fix — mirror the snapshot
+        // position onto the visualRoot TransformNode AND state.position
+        // so the rig visually tracks the snapshot, not just the Havok
+        // body.
+        liveRemote.setVisualPosition(liveState.position);
+        liveRemote.state.position.copyFrom(liveState.position);
+        // Debug hooks so the smoke's __lastInterpolatorTick +
+        // __lastInterpolatorSetPosition stay populated when the
+        // render observer is in a different scope from the original
+        // closure.
+        const w = window as unknown as {
+          __lastInterpolatorTick?: { ts: number; statesCount: number };
+          __lastInterpolatorSetPosition?: {
+            x: number;
+            z: number;
+            ts: number;
+            playerId: number;
+          };
+        };
+        w.__lastInterpolatorTick = {
+          ts: performance.now(),
+          statesCount: liveStates.length,
+        };
+        w.__lastInterpolatorSetPosition = {
+          x: liveState.position.x,
+          z: liveState.position.z,
+          ts: performance.now(),
+          playerId: liveState.playerId,
+        };
+      };
+      (window as unknown as {
+        __liveInterpolatorTickHook?: ((nowMs: number) => void) | null;
+      }).__liveInterpolatorTickHook = liveHook;
+    }
+
+    // DEV probes — forward-looking instrumentation for the snapshot
+    // smoke. The `__latestSnap` getter OVERWRITES the null-returning
+    // snapGetter installed by the wire-up block above so smoke
+    // consumers get the real decoded snapshot.
+    (window as unknown as { __predictor?: Predictor }).__predictor = predictor;
+    (window as unknown as { __interpolator?: Interpolator }).__interpolator =
+      interpolator;
+    (window as unknown as {
+      __latestSnap?: () => import("../../../protocol/snapshot").Snapshot | null;
+    }).__latestSnap = () => latestSnap;
+
+    // Late-bind the predictor onto the GameSession so tick() can call
+    // predictor.recordLocalInput alongside the existing
+    // runtime.submitLocalInput.
+    const sessWithSetPred = liveSession as {
+      setPredictor?: (p: Predictor) => void;
+    };
+    sessWithSetPred.setPredictor?.(predictor);
+
+    console.info(
+      "[wireServerTransport] snapshot decoder wired, Interpolator + LIVE tick hook published",
+    );
+  } catch (e) {
+    // console.warn, not console.error — same reason as the wire-up
+    // block above. The smoke harness treats console.error as a
+    // page-level failure.
+    console.warn("[wireServerTransport] snapshot decoder init failed:", e);
+  }
+})();
 
 // Auto-wire on import. App.tsx imports this module for the side
 // effect; the function is also exported for tests / manual re-wiring.
