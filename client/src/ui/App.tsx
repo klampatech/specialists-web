@@ -19,6 +19,19 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createScene, type SceneHandle } from "../engine/scene";
+// PR 11.7.D3 — wireServerTransport side-effect import. The wire-up
+// logic that used to live inside scene.ts (DEV-gated, tree-shaken
+// from prod builds) is being migrated to its own module. App.tsx
+// imports it for the side effect; the function runs on every page
+// load and reads the runtime `__forceServerTransport` flag set by
+// PeerOverlay when `?server=` is in the URL.
+//
+// This is the actual prod-bundle fix. PR #119's DEV-gate removal
+// alone didn't survive Vite's tree-shaking (the wire-up IIFE in
+// scene.ts is dead-code-eliminated). Moving it to a separate
+// module with an explicit side-effect import forces Vite to keep
+// it (the side-effect import is itself the live reference).
+import "../engine/wireServerTransport";
 import { PLAYER_MAX_AMMO } from "../engine/characterConfig";
 import { PeerOverlay } from "./PeerOverlay";
 import { BulletHud } from "./BulletHud";
