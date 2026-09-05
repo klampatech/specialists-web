@@ -7,19 +7,62 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |>## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#115 (2026-09-03). **`main` @ `43e4c04` (PR #115 squash — MERGED 2026-09-03 16:13 UTC).** **`You are here` summary**: PR #107 (server weapons wire) + PR #108 (client mirror) + PR #109 (docs) + PR #110 (Crosshair) + PR #111 (docs) + PR #112 (CF-N1 sustained-stress smoke + opt-in CI gate) + **PR #114 (MeleeEvent wire — server-authoritative melee + 5 validation gates + melee smoke + CI gate)** + **PR #115 (overnight rollup — pre-deploy-prod.sh + HUD icon-SVG swap + Burst-active chip + reconnect observability + A2 smoke fix)** are all **MERGED** to `main`. **PR #114 closed the `0x0B MeleeEvent` carry-forward** — the combat completeness gap is now closed (weapons + melee + reload all server-authoritative). **PR #115 is deploy-enabling infrastructure** — all additive/observational, no wire changes, no schema changes, no gameplay logic changes. It unblocks `tools/deploy-prod.sh` for the **coordinated wire-break deploy of PR #107+#108+#110+#114** to m5 via Tailscale Funnel (`https://m5.tail1b3795.ts.net:14433/`). **`main` @ `43e4c04` carries 5 commits ahead of `origin/main` at the time of the overnight session start** — those 5 commits (deploy-prod.sh, CF-N1 A2 poll pattern, Burst-active chip, inline-SVG weapon icons, reconnect observability) plus the A2 smoke fix to `damage-server-smoke.mjs` (which surfaced on PR #115's first CI run as a deterministic regression, not a flake) all rolled into one PR per Kyle's "do it right over do it fast" preference. **Verification**: cargo test --lib 119/119 PASS, vitest **118/118 PASS** (was 110 pre-#115; +8 from `serverTransport.test.ts` 9 tests + `BulletHud.test.ts` 8 tests — actually +9 net, but pre-existing renames absorbed some; net delta +8), typecheck+build clean, `tools/damage-server-smoke.mjs` deterministic regression fixed (A2 pattern), all **36/36 CI checks GREEN** on the PR #115 merge commit. **Carry-forwards beyond PR #115**: (a) **`tools/deploy-prod.sh` → actual wire-break deploy** (~30 min, operational) — first coordinated ship of PR #107+#108+#110+#114 to m5 Funnel. After this ships, play-testing with 2-3 friends can begin. (b) Pre-existing CF-N1 flake root-cause fix (if the opt-in `client-cfn1-sustained-stress-smoke` fails on nightly, the next step is bumping the per-connection mpsc capacity from 1024 — still deferred per the PR #112 rationale; preemptive bump risks introducing different regressions). (c) Maintenance sweep — the few remaining deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test. (d) New feature arc — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat. (e) Outbound mpsc review — defensive, pre-cloud verification pass + capacity bump if needed before sustained cloud load.
+**`You are here`**: post-PR-#130 (2026-09-05). **`main` @ `b0b51ff` (PR #128 + #129-followup + #130 squashes — MERGED 2026-09-05).** The full wire-up chain is now alive in prod on Hetzner: wire connects → snapshots decoded → Predictor + Interpolator drive the remote rig's visual position. 2-tab damage smoke (4/4) + visual screenshot (two capsules at distinct snapshot-known positions) both confirm end-to-end.
+
+**The session shipped three PRs**:
+- **PR #128 (`fix(matchmaker): --public-host flag`)** — matchmaker was returning `wss://<client-egress-IP>/...` from direct consumers. Fix: `--public-host` CLI flag with `peer.ip()` fallback for dev. Hetzner's `serve-static.mjs` URL-rewrite workaround now a defensive no-op.
+- **PR #129-followup (`fix: ungate scene.ts gameSession + two-tab prod-bundle damage smoke`)** — closed the dev-vs-prod gameSession tree-shaking gap. Claude Code's cross-vendor review caught a structural double-instance bug (first attempt `33ad83a`); `be57dd0` ungates `scene.ts`'s `__gameSession` publication, deletes the wrong side-effect module.
+- **PR #130 (`fix: migrate snapshot decoder + Predictor + Interpolator to wireServerTransport`)** — closed the **third** tree-shake variant. The snapshot decoder pipeline lived inside scene.ts's `if (effectiveMultiplayer)` IIFE; in prod, `decodeSnapshot`/`Predictor`/`Interpolator` were tree-shaken. `__latestSnap()` returned `null`. The fix: a new top-level async IIFE in `wireServerTransport.ts` that polls `__gameSession` (up to 2s), then wires snapshot decoder + Predictor + Interpolator + LIVE tick hook. Same pattern as PR #128/129 (top-level statements survive Vite tree-shaking). New `bundle-snapshot-decoder` assertion in prod-bundle-smoke + new `assertSnapshotsDecoded` in two-tab-prod-bundle-damage-smoke (the load-bearing gate).
+
+**Verification (live Hetzner)**: bundle `index-Bxr3vwIa.js` (md5 `6150db3ceaf900afae981035553486c5`) deployed. typecheck clean, vitest 118/118 PASS, cargo 119/119. prod-bundle-smoke 7/8 PASS (1 lobby-create-join URL-nav failure is the lobby flow, not wire-up). **two-tab-prod-bundle-damage-smoke 4/4 PASS** — `snapshots-decoded-players=2-hasInterpolator=true-lastSetPos={"x":-8,"z":0,...}`. **Visual confirmation**: two-tab smoke screenshot shows teal + red capsules at distinct positions (snapshot-driven remote tracking working). Pre-#130 screenshot showed both capsules at fixed positions.
+
+**Cross-vendor check-and-balance load-bearing (memory anchor §specialists-web-hetzner-prod-wireup-2026-09-04 + §evo-verification-discipline-2026-09-05)**: First-attempt verifier-clean ≠ correct. The smoke's `wire-up-connected === true` check passed 7/7 while multiplayer was broken (PR #129 double-instance). Counter-measure: re-run gates with "would the broken version pass this gate?" lens. For structural invariants (single-instance, shared state, decoder-alive), 2-tab damage convergence + visual confirmation beats signal-checking.
 
 **Recommended next direction (your call)**:
-- **(a) Weapons Phase 2.2 — HUD polish + crosshair + icon sprites** (~1 session). D/S/N text labels work but a real crosshair with weapon-aware spread (Burst shows slight spread, Sniper a dot) + per-weapon icon sprites would close the UX gap. Use `image_generate` once fal.ai balance resets.
-- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator (PR #83) + producer-side rate-limiter (PR #81) already cover the worst case. Pre-cloud verification pass + small capacity bump if needed before sustained cloud load.
-- **(c) New feature arc** — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat, `0x0B MeleeEvent` wire type. Phase 2 candidates that were deferred pre-#98.
-- **(d) Maintenance sweep** — the few remaining deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test (needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session; the 2026-09-01 attempt was blocked by the existing Vivaldi absorbing the flag).
+- **(a) Smoke resilience pass — tolerate ghost placeholder IDs (CF-N1 family)** (~30 min). 11-smoke flake-storm family is well-documented; cheapest mitigation is filter-by-smoke-level marker. Acceptable to defer until CI becomes load-bearing.
+- **(b) Domain + Let's Encrypt** (~1-2 hours). Hetzner self-signed cert currently throws `ERR_CERT_AUTHORITY_INVALID` in non-trusting browsers; blocks broader shareability. The canary-server.sh already has a `letsencrypt` cert-source option.
+- **(c) CI auto-deploy from main** (~2-3 hours). Replaces manual `scp + systemctl restart`. Lower-priority until others deploy.
+- **(d) Real multiplayer playtest from Mac against Hetzner** — open `https://65.108.87.1:14432/?server=wss%3A%2F%2F65.108.87.1%3A14435%2Frooms%2Ftest&localId=1&peerId=2` in two tabs. The snapshot-driven visual sync is now live; this is the user-facing confirmation. Note: the self-signed cert will throw `ERR_CERT_AUTHORITY_INVALID` in Chrome unless you've accepted it once.
+- **(e) Maintenance sweep** — deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test.
+- **(f) New feature arc** — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat.
 
-**Deploy coordination reminder**: PR #107 + PR #108 are a `next-deploy-is-all-clients-new` pair. The deploy message must call out that **ALL clients must refresh** — existing tabs (cached JS from pre-#107) will be broken until they reload because PlayerState grew 30 → 31 bytes and AimEvent grew 19 → 20 bytes. Flag `#operations` for the deploy.
+**Deploy coordination reminder**: Hetzner has the latest bundle. Future deploys are `cd client && VITE_MATCHMAKER_ORIGIN=https://65.108.87.1:14432 npm run build && scp dist/assets/index-*.js root@65.108.87.1:/root/specialists-web/client/dist/assets/ && scp dist/index.html root@65.108.87.1:/root/specialists-web/client/dist/ && ssh root@65.108.87.1 'cd /root/specialists-web/client/dist/assets && rm -f index-*.js && systemctl restart specialists-static && sleep 2 && curl -sk https://65.108.87.1:14432/ | grep index-`. **The scp-silent-failure pitfall bit us again on PR #130 deploy**: confirm the bundle is actually on Hetzner after every scp (`ssh 'ls -la dist/assets/index-*.js'`) before trusting the smoke.
 
 ---
 
-## 2026-09-02 — PR #112 CF-N1 sustained-stress smoke MERGED (observation gap closed; play-testing arc begins)
+## 2026-09-05 — PR #130 (snapshot decoder + Predictor + Interpolator migration)
+
+**Scope**: Close the third tree-shake variant — snapshot decoder pipeline was tree-shaken from prod. Wire received snapshots but `__latestSnap()` returned `null`. Pre-fix bundle `index-Bm8ArOAY.js` had `Predictor x 0, Interpolator x 0, decodeSnapshot x 0` (all minified out).
+
+**PR #130 — snapshot decoder migration** (`b0b51ff`, MERGED):
+- **`client/src/engine/wireServerTransport.ts` (+303)** — new top-level async IIFE that polls `__gameSession` (up to 2s), then wires the snapshot decoder + Predictor + Interpolator + LIVE tick hook. Mirrors the PR #128/129 pattern. Includes Havok-step wrapper (save/restore pattern from PR 11.7.C), the respawn-snap HP-edge detector (from PR 11.7.D3.1), the local weapon state sync (from PR #108), and the LIVE observer publish. The scene.ts predictor/interpolator block at lines 1197-1513 stays INTACT for dev canary.
+- **`client/tools/prod-bundle-smoke.mjs` (+44)** — new `bundle-snapshot-decoder` assertion + extended `requiredMarkers`.
+- **`client/tools/two-tab-prod-bundle-damage-smoke.mjs` (+58)** — new `assertSnapshotsDecoded` (assertion 4): probes `__latestSnap()`, `window.__interpolator`, `__lastInterpolatorSetPosition`.
+- **`client/tools/pr130-visual-confirm.mjs` (+253, NEW)** — opens two tabs, waits 5s, asserts remote rig tracks Tab A's position.
+
+**Verification**:
+| Surface | Result |
+|---|---|
+| `npm run typecheck` | exit 0 |
+| `npx vitest run` | 118/118 PASS |
+| `npm run build` | exit 0 (bundle `index-Bxr3vwIa.js`) |
+| Bundle gate | `Predictor x 2`, `Interpolator x 6`, `__liveInterpolatorTickHook x 2`, `__predictor x 2`, `__interpolator x 3`, `snapshot decoder wired x 1` |
+| prod-bundle-smoke (Hetzner) | 7/8 PASS (1 lobby-create-join URL-nav failure is lobby flow) |
+| **two-tab-prod-bundle-damage-smoke (Hetzner)** | **4/4 PASS** |
+| **Visual (Hetzner, 2-tab screenshot)** | **2 capsules at distinct positions — snapshot-driven remote tracking working** |
+
+**Workflow patterns captured**:
+1. **Third tree-shake variant now in the canon**: DEV-gated code is the obvious one; `await import()` inside unawaited IIFEs is the second; full code blocks inside `if (effectiveMultiplayer) { ... }` IIFEs that Vite can't prove reachable is the third. Fix pattern is the same for all three.
+2. **The 2-tab damage smoke is now a 4-assertion gate**: wire-up + single-instance + damage-converges + snapshots-decoded.
+3. **scp-silent-failure pitfall (recurring)**: every Hetzner deploy needs `ls -la dist/assets/index-*.js` after the scp.
+
+**Memory anchors**: §specialists-web-hetzner-prod-wireup-2026-09-04 (updated).
+
+**Next session task**: real Mac 2-tab playtest for user-facing confirmation (option (d) above). Or smoke resilience (option (a)).
+
+---
+
+## 2026-09-05 — PR #128 + #129-followup (matchmaker public-host + gameSession tree-shake)
 
 **Scope**: First sub-deliverable of the **cloud infrastructure + basic play testing** arc (user + 2-3 friends connecting to a hosted dev server). PR #112 is **observation-only** — no server or client behavioral change. Closes the observation gap on the pre-existing CF-N1 flake (outbound-mpsc saturation under sustained spam-fire on `damage-server-hp-convergence`). **MERGED** at `886856d` (squash `886856d` — combined with the in-flight `b2ffa1a` fix to CI YAML path, MERGED 2026-09-02 17:50 UTC). One PR, one squash.
 
