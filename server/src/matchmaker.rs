@@ -70,6 +70,7 @@ const ROOM_ID_LEN: usize = 8;
 pub async fn run_matchmaker_http(
     port: u16,
     ws_port: u16,
+    wss_port: u16,
     rooms: RoomRegistry,
 ) -> Result<()> {
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -89,7 +90,7 @@ pub async fn run_matchmaker_http(
                 // are one-shot endpoints, and a keep-alive state
                 // machine would inflate the surface by ~3x.
                 tokio::spawn(async move {
-                    if let Err(e) = handle_http_connection(stream, peer, rooms, ws_port).await {
+                    if let Err(e) = handle_http_connection(stream, peer, rooms, ws_port, wss_port).await {
                         debug!(%peer, "matchmaker HTTP connection ended: {e:?}");
                     }
                 });
@@ -110,6 +111,7 @@ async fn handle_http_connection(
     peer: SocketAddr,
     rooms: RoomRegistry,
     ws_port: u16,
+    wss_port: u16,
 ) -> Result<()> {
     debug!(%peer, "handle_http_connection entered");
     // Read up to MAX_REQUEST_LINE_BYTES + MAX_HEADERS_BYTES, or until
@@ -205,10 +207,10 @@ async fn handle_http_connection(
         ("GET", "/health") => {
             write_response(&mut stream, 200, "OK", "text/plain", b"ok").await
         }
-        ("POST", "/rooms") => handle_create_room(&mut stream, peer, ws_port).await,
+        ("POST", "/rooms") => handle_create_room(&mut stream, peer, ws_port, wss_port).await,
         ("GET", p) if p.starts_with("/rooms/") => {
             let id = &p[7..]; // strip "/rooms/"
-            handle_get_room(&mut stream, peer, id, rooms, ws_port).await
+            handle_get_room(&mut stream, peer, id, rooms, ws_port, wss_port).await
         }
         _ => {
             write_response(
@@ -239,13 +241,14 @@ async fn handle_http_connection(
 /// without the port, the lobby's Create flow produced a URL like
 /// `ws://127.0.0.1/rooms/<id>` which the browser tried to resolve
 /// on port 80 (default WS) and got ERR_CONNECTION_REFUSED.
-async fn handle_create_room(stream: &mut TcpStream, peer: SocketAddr, listen_port: u16) -> Result<()> {
+async fn handle_create_room(stream: &mut TcpStream, peer: SocketAddr, ws_port: u16, wss_port: u16) -> Result<()> {
     let id = mint_room_id();
     let body = format!(
-        r#"{{"id":"{id}","ws_url":"ws://{peer_addr}:{port}/rooms/{id}","wss_url":"wss://{peer_addr}:{port}/rooms/{id}","max_players":{max}}}"#,
+        r#"{{"id":"{id}","ws_url":"ws://{peer_addr}:{ws_port}/rooms/{id}","wss_url":"wss://{peer_addr}:{wss_port}/rooms/{id}","max_players":{max}}}"#,
         id = id,
         peer_addr = peer.ip(),
-        port = listen_port,
+        ws_port = ws_port,
+        wss_port = wss_port,
         max = MAX_PLAYERS_PER_ROOM,
     );
     info!(%peer, room_id = %id, "POST /rooms → minted");
@@ -266,6 +269,7 @@ async fn handle_get_room(
     id: &str,
     rooms: RoomRegistry,
     ws_port: u16,
+    wss_port: u16,
 ) -> Result<()> {
     // Validate the ID against the same regex `parse_room_id` uses.
     // Anything else is a 400, not a 404 — it means the client is
@@ -311,17 +315,13 @@ async fn handle_get_room(
     // constructing it from `window.location.host` (which is the lobby
     // page's host:port — Vite in dev, not the WS listener's port).
     // Same shape as POST /rooms' `ws_url` field — `ws://<peer_ip>:<ws_port>/rooms/<id>`.
-    //
-    // PR 11.9 follow-up (Hetzner staging, 2026-09-04): also include
-    // `wss_url` so HTTPS lobby pages can pick the TLS variant without
-    // the browser's mixed-content blocker dropping the WSS handshake.
-    // Mirrors POST /rooms' shape.
     let body = format!(
-        r#"{{"exists":true,"players":{players},"max":{max},"ws_url":"ws://{peer_addr}:{ws_port}/rooms/{id}","wss_url":"wss://{peer_addr}:{ws_port}/rooms/{id}"}}"#,
+        r#"{{"exists":true,"players":{players},"max":{max},"ws_url":"ws://{peer_addr}:{ws_port}/rooms/{id}","wss_url":"wss://{peer_addr}:{wss_port}/rooms/{id}"}}"#,
         players = players,
         max = MAX_PLAYERS_PER_ROOM,
         peer_addr = peer.ip(),
         ws_port = ws_port,
+        wss_port = wss_port,
         id = id,
     );
     debug!(%peer, room_id = %id, players, "GET /rooms/<id> → 200");
