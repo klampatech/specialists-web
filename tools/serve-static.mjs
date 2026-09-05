@@ -76,6 +76,7 @@ const MIME = {
   ".otf": "font/otf",
   ".map": "application/json; charset=utf-8",
   ".txt": "text/plain; charset=utf-8",
+  ".wasm": "application/wasm",
 };
 
 function safeJoin(rootDir, requestedPath) {

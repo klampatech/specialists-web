@@ -225,28 +225,29 @@ export function wireServerTransport(): void {
         // PR #128 integration — register broadcast + reject handlers
         // and forward the live transport onto the GameSession.
         //
-        // Broadcast handler — calls damageBus.applyBroadcast with the
-        // late-bound controllers from the live gameSession. Mirrors
-        // scene.ts's makeBroadcastHandler (which is inlined here so
-        // we don't pull scene.ts's tree-shake-prone code in).
-        const broadcastHandler = (body: Uint8Array): void => {
-          if (typeof window !== "undefined") {
-            const w = window as unknown as { __broadcastHandlerCount?: number };
-            w.__broadcastHandlerCount = (w.__broadcastHandlerCount ?? 0) + 1;
-          }
+        // Broadcast handler — calls damageBus.applyBroadcast with
+        // a LATE-BOUND controller resolver (reads `__gameSession`
+        // on every broadcast, not the closure-captured controller).
+        // Pre-fix: closure capture pinned localCtrl/remoteCtrl to the
+        // first createScene()'s instance. Under React StrictMode
+        // the SECOND createScene's instance is the live one, so the
+        // broadcast handler would apply damage to a disposed
+        // controller (no observable HP change in the HUD). Late-binding
+        // mirrors the PR #128 setServerTransport fix.
+        const broadcastHandler = (body: Uint8Array) => {
           const bc = damageBus.decodeDamageBroadcast(body);
           if (!bc) return;
-          const liveSession: {
+          const liveSess: {
             localController?: CharacterController | unknown;
             remoteController?: CharacterController | unknown;
           } | null = readGameSession();
-          const localCtrl = liveSession?.localController as CharacterController | undefined;
-          const remoteCtrl = liveSession?.remoteController as CharacterController | undefined;
-          if (!localCtrl || !remoteCtrl) return;
+          const liveLocalCtrl = liveSess?.localController as CharacterController | undefined;
+          const liveRemoteCtrl = liveSess?.remoteController as CharacterController | undefined;
+          if (!liveLocalCtrl || !liveRemoteCtrl) return;
           damageBus.applyBroadcast(
             bc,
             performance.now(),
-            (playerId: number) => (playerId === localPlayerId ? localCtrl : remoteCtrl),
+            (playerId: number) => (playerId === localPlayerId ? liveLocalCtrl : liveRemoteCtrl),
           );
         };
         server.onDamageBroadcast(broadcastHandler);
@@ -334,15 +335,16 @@ void (async () => {
     if (__wstWindow.__interpolator !== undefined || __wstWindow.__predictor !== undefined) {
       return;
     }
-    // Poll for __gameSession (up to 2s — Havok WASM load + scene init
-    // can take ~1s on cold prod). Mirrors the existing
+    // Poll for __gameSession (up to 10s — Havok WASM streaming-compile
+    // failure + ArrayBuffer fallback path on self-signed certs can push
+    // scene init well past 2s on cold prod. Mirrors the existing
     // waitForGameSession helper used in the wire-up block above.
     const __wstStart = performance.now();
     let liveSession: GameSession | null = null;
-    while (performance.now() - __wstStart < 2000) {
+    while (performance.now() - __wstStart < 10000) {
       liveSession = __wstReadGameSession();
       if (liveSession) break;
-      await new Promise<void>((r) => setTimeout(r, 16));
+      await new Promise<void>((r) => setTimeout(r, 32));
     }
     if (!liveSession) {
       console.warn(
@@ -350,10 +352,25 @@ void (async () => {
       );
       return;
     }
-    const liveServer = __wstWindow.__serverTransport;
-    if (!liveServer || typeof liveServer.onSnapshot !== "function") {
+    // PR #131 — also poll for a REAL __serverTransport (ServerTransport
+    // instance), not the "INIT_INFLIGHT" sentinel. The broadcast wire-up
+    // IIFE races us; if we find gameSession first (scene.ts publishes it
+    // before IIFE 1's `await server.connect()` resolves), __serverTransport
+    // may still be the sentinel. Without this poll, snapshot decoder
+    // bails while the wire is still connecting.
+    const __wstServerStart = performance.now();
+    let liveServer: ServerTransport | null = null;
+    while (performance.now() - __wstServerStart < 5000) {
+      const candidate = __wstWindow.__serverTransport;
+      if (candidate && typeof candidate === "object" && typeof candidate.onSnapshot === "function") {
+        liveServer = candidate as ServerTransport;
+        break;
+      }
+      await new Promise<void>((r) => setTimeout(r, 16));
+    }
+    if (!liveServer) {
       console.warn(
-        "[wireServerTransport] snapshot decoder skipped — __serverTransport not yet connected (or no onSnapshot)",
+        "[wireServerTransport] snapshot decoder skipped — __serverTransport not yet connected (or no onSnapshot) after 5s",
       );
       return;
     }
