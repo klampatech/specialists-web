@@ -41,6 +41,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, "..", "..");
 
+// PR #135 — self-signed cert for local canary means fetch() rejects by default.
+// Disable cert verification for the boot probes only. Production deploys use
+// real certs so this is safe in scope.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "0";
+
 const PROD_BUNDLE_HOST = process.env.PROD_BUNDLE_HOST ?? "65.108.87.1";
 const PROD_BUNDLE_SCHEME = process.env.PROD_BUNDLE_SCHEME ?? "https";
 const PROD_BUNDLE_PORT = Number(process.env.PROD_BUNDLE_PORT ?? 14432);
@@ -132,6 +137,34 @@ async function main() {
 async function mainImpl() {
   log(`Going against ${STATIC_URL}`);
   log(`SMOKE_NO_BOOT=${SMOKE_NO_BOOT}, SMOKE_NO_BUILD=${SMOKE_NO_BUILD}`);
+
+  // PR #135 — build the prod bundle if not skipping. Same shape as
+  // prod-bundle-smoke.mjs: VITE_MATCHMAKER_ORIGIN must point at the
+  // matchmaker HTTP endpoint so the lobby's POST /rooms hits the right
+  // origin (and the lobby's wss_url derivation picks the TLS variant
+  // for HTTPS pages).
+  if (!SMOKE_NO_BUILD) {
+    log(`Building prod bundle (npm run build with VITE_MATCHMAKER_ORIGIN=${CANARY_HTTP})...`);
+    try {
+      execSync(
+        `npm run build`,
+        {
+          cwd: resolve(REPO_ROOT, "client"),
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            ...process.env,
+            VITE_MATCHMAKER_ORIGIN: CANARY_HTTP,
+          },
+        },
+      );
+      log(`Build succeeded`);
+    } catch (e) {
+      log(`Build failed: ${e.message}`);
+      throw new Error("build failed; aborting");
+    }
+  } else {
+    log("SMOKE_NO_BUILD=1 — skipping build (using existing client/dist)");
+  }
 
   // PR #135 — self-boot canary + serve-static when not in SMOKE_NO_BOOT mode.
   // Same shape as prod-bundle-smoke.mjs so the lobby-e2e smoke can run as a

@@ -52,6 +52,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
 
+// PR #135 — self-signed cert for local canary means fetch() rejects by default.
+// Disable cert verification for the boot probes only. Production deploys use
+// real certs so this is safe in scope.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "0";
+
 const PROD_BUNDLE_PORT = Number(process.env.PROD_BUNDLE_PORT ?? 24032);
 const WT_PORT = Number(process.env.WT_PORT ?? 24033);
 const WS_PORT = Number(process.env.WS_PORT ?? 24034);
@@ -221,9 +226,9 @@ async function fetchRoomId() {
 }
 
 async function main() {
+  if (!SMOKE_NO_BUILD) buildProdBundle();
   await bootCanary();
   await bootServeStatic();
-  if (!SMOKE_NO_BUILD) buildProdBundle();
 
   // Discover the actual bundle hash from the served HTML (use curl to bypass self-signed cert)
   const idxHtml = execSync(
