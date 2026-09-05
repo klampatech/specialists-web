@@ -1046,6 +1046,64 @@ Vitest 25/25 PASS (no new tests added; the smoke covers the integration).
 
 **Carry-forward.** For future `console.error` additions: if the error is meant for end-user debugging, prefer the HUD-overlay path (already proven). Reserve `console.error` for cases where the dev-tools console is the primary surface (e.g., wire-format mismatches). Smokes capture console.error as `PAGE_ERRORS:`; non-blocking dev-mode diagnostics should go through `console.info` or `console.warn` to avoid the same trap.
 
+### 2026-09-04 — Hetzner staging rollout (PRs #119 / #120 / #121 / #122 / #123)
+
+**The Hetzner prod deploy went live today** (`65.108.87.1`, Ubuntu 26.04, 4GB RAM, Rust stable, self-signed TLS cert with IP SAN). All 5 PRs landed:
+
+| # | Title | What it shipped |
+|---|-------|-----------------|
+| **#119** | `fix(prod): ServerTransport wiring broken in production builds` | Removed DEV-gate from PeerOverlay's `__forceServerTransport` setter + scene.ts's wire-up IIFE. Converted dynamic `await import(...)` inside the IIFE to static imports at module top (PR 11.7.D2 follow-up). Fixed `wssPort` computation to honor `urlBase`'s port directly (Hetzner was getting `:14436` instead of `:14435`). Follow-up commit `e2c8a8b` fixed the vitest boundary-test breakage caused by PR 1's `wssPort` change: only honor `urlPort` for `ws:`/`wss:` schemes — for `https:` URLs (WebTransport), `urlPort` is the WT port, not the WS port, so fall through to `wsPort + 1`. |
+| **#120** | `feat(hud): DebugHud v3 — prod-aware, host-derived probes, copy bundle` | Rewrote `DebugHud.tsx` (607 lines): host-aware probes derived from `window.location.host` (no more hardcoded m5 URLs), auto-show on `?debug=1` or `localStorage.__debugHudOpen === "1"`, backtick ` toggle, Copy-bundle button, sections for Combat / Network / Server room state / Browser capabilities / Game state. App.tsx wired the auto-init + backtick listener + state persistence. |
+| **#121** | `feat(serve-static): optional HTTPS via TLS_CERT/TLS_KEY env vars` | `tools/serve-static.mjs` reads optional `TLS_CERT` / `TLS_KEY` env vars; if both present, swaps http→https. Default-off, byte-identical to before in dev. Hetzner static server now serves HTTPS. |
+| **#122** | `docs: DEPLOY.md — Hetzner + m5 rollout process` | New `DEPLOY.md` documenting m5 dev canary vs Hetzner prod topology, manual SSH+`git pull`+systemd deploy, the prod bundle deploy sequence (`scp dist/assets/*` + `scp dist/index.html`), known gaps (no auto-deploy, no CI smoke matrix, self-signed cert), and a checklist for next time. |
+| **#123** | `feat(engine): wireServerTransport side-effect + fix prod wire-up` | The actual prod wire-up fix. PR #119 alone wasn't enough — Vite STILL tree-shook the wire-up IIFE in scene.ts because of the runtime-opaque `if (useServerTransportFromOpts \|\| useServerTransportFromWindow)` condition. New module `client/src/engine/wireServerTransport.ts` exports `wireServerTransport()` which is called at module-load (App.tsx side-effect import). Vite can't tree-shake an explicit side-effect import. Two commits: `eefb713` (initial wire-up + URL parser) + `e332dfc` (downgrade `console.error` → `console.warn`/`info` to keep single-player smokes happy — the smokes capture console.error as `PAGE_ERRORS:`). |
+
+**Hetzner prod endpoints (LIVE 2026-09-04):**
+- Static HTTPS: `https://65.108.87.1:14432/`
+- WebTransport: `:14433`
+- WebSocket (plain): `:14434`
+- WebSocket (TLS): `:14435`
+- Matchmaker: HTTP `:8084` (URL rewrite via static server)
+
+**End-to-end smoke verified**: headless Chrome on m5 + Kyle's Mac joined the same room, server log shows both peers, transport kind = `websocket` (WebTransport falls back to WSS on this network — no QUIC), RTT ~233-271ms. Bundle `index-fv_-IXbX.js` deployed.
+
+**Vite tree-shaking trap (architecture decision, recorded here so the next session doesn't rediscover it):**
+
+The pattern `if (runtime-opaque-condition) { /* 600-line IIFE with side effects */ }` is dead-code-eliminated by Vite/Rollup even when the side effects include `window.X = ...`, `await server.connect()`, network IO. Rollup's `/* @__SIDE_EFFECT__ */` comment hint is **not respected**. The only reliable way to keep such code in a prod bundle is to put it in a separate module with a side-effect import from a top-level entry point. The bundler treats the import as the live reference and preserves the entire module. Inline guards inside `createScene` do NOT survive tree-shaking.
+
+The same trap bit PR #119 once (DEV gate) and then PR #123 (runtime-opaque condition). The fix in PR #123 (extracted module + side-effect import) is the canonical pattern for any future "wire some runtime-only code" work.
+
+**Why scene.ts's wire-up IIFE is still in source but not in bundles:**
+
+Even after PR #119's DEV-gate removal, scene.ts's `if (useServerTransportFromOpts || useServerTransportFromWindow) { ... }` IIFE is dead-code-eliminated by Rollup. The condition is opaque (`typeof window !== "undefined" && __forceServerTransport === true`) so Rollup should keep both branches — but it also has enough static analysis to determine that the IIFE body produces no used values (the window writes go to window, which Rollup can't see being read by anything it knows about). The result is Vite ships a bundle where `__serverTransport === undefined` even with `__forceServerTransport === true`. PR #123's `wireServerTransport.ts` is the actual fix. The old IIFE in scene.ts will be removed in a follow-up PR once `wireServerTransport.ts` has absorbed all of its responsibilities (predictor/interpolator/broadcast handler setup, currently still missing).
+
+**Known gaps left as follow-ups (Hetzner prod is not "done done" yet):**
+- **No predictor/interpolator pipeline.** `wireServerTransport.ts` populates `__serverTransport`, `__damageBus`, `__latestSnap`, `__remoteController`. The predictor/interpolator setup that used to live in scene.ts's IIFE has not migrated. The HUD gets HP via `__gameSession.getHealthSnapshot()` (scene.ts still wires it), but snapshot-driven remote position interpolation isn't running. The "blue model half stuck in the floor" symptom Kyle observed is a manifestation of this — interpolator hasn't lerped the remote to its controller position yet.
+- **Three pre-existing smoke flakes** (CF-N1 sustained-stress, 24-player stress, two-tab manual-flow): all fail on main too (verified by stashing my changes and re-running locally). Ghost player IDs from failed WebTransport handshakes accumulate in the snapshot. Listed in DEPLOY.md "Known gaps." Not blocking.
+- **No CI on PRs that runs a prod-bundle smoke.** All existing smokes run against `vite dev`, which is exactly why the prod bug survived. A prod-bundle smoke is needed to gate this class of regression going forward. Listed as PR #124.
+- **No auto-deploy from main.** Manual SSH + `git pull` + systemd restart. Listed in DEPLOY.md.
+- **Self-signed cert.** Hetzner has a self-signed cert with IP SAN `65.108.87.1` + `localhost` + `127.0.0.1`. Works in Safari after one cert-trust prompt; mTLS / mkcert / keychain detour explicitly avoided per Kyle's preference. Listed in DEPLOY.md.
+- **No domain.** Hetzner is `https://65.108.87.1:14432/` directly. Domain + Let's Encrypt is a future deploy improvement.
+- **No Lobby prod-flow fix.** `client/src/ui/Lobby.tsx:287` uses `r.ws_url` should be `r.wss_url` for HTTPS pages. Currently worked around via `VITE_MATCHMAKER_ORIGIN=https://65.108.87.1:14432` build-time env var. This will be a problem when the lobby flow is wired into the production bundle (currently the lobby code path is only used by `tools/lobby-smoke.mjs` against `vite dev`).
+
+**Smoke matrix status (post-merge):**
+- 31/34 pass on PR #123's CI run.
+- 3 pre-existing flakes (CF-N1, 24p, manual-flow) — same 3 that flake on main.
+- `two-tab smoke (ServerTransport, PR 11.7.D2)` PASS — canonical connectivity smoke.
+- `vitest boundary tests` PASS — 118/118 unit tests.
+- All single-player smokes (mouse-look, mouse-pitch, pointer-lock, jump, wallrun, pause-menu, spectator-camera, crosshair, weapon-switch, melee, health, scene, yaw, pitch) PASS.
+
+**Recommended next priorities (for regroup, ordered by user impact):**
+1. **Lobby prod-flow fix** (`Lobby.tsx:287` ws_url → wss_url) — unblocks running the lobby against the prod bundle without the build-time env var workaround. ~30 min fix + a new smoke.
+2. **Predictor/interpolator migration to wireServerTransport.ts** — restores snapshot-driven remote position interpolation. Closes the "stuck model" symptom and brings the prod wire-up to feature parity with dev. ~2-3 hours.
+3. **Smoke resilience: tolerate ghost placeholder IDs** — relaxes the assertion to "expect [1, 2] subset of any snapshot containing them" for the 3 flaky smokes. ~30 min. Stops CI noise.
+4. **Prod-bundle smoke** — runs against a built bundle (not vite dev), covers the wireServerTransport.ts code path end-to-end. Catches the tree-shake class of bugs going forward. ~2 hours. Would have caught the original prod bug.
+5. **Domain + Let's Encrypt** — swaps self-signed cert for a real cert. ~1-2 hours including DNS config.
+6. **CI auto-deploy from main** — wires a GitHub Action that runs `bash tools/deploy-prod.sh` after a green merge to main. ~2-3 hours including secrets management for the Hetzner SSH key.
+7. **Hetzner predictive damage timing + cross-machine browser validation** — verify the predictor's effective ping budget (current 1-step predict). Run a real Kyle-Mac vs m5-headless two-tab match through the prod bundle to characterize end-to-end HP convergence latency.
+
+**Carry-forward lesson (architectural, recorded for future sessions):** When a feature is gated behind a runtime-opaque condition (`if (window.__someFlag) { ... }`), never put the gated body in the same module as the call site. Extract to a separate module with a top-level side-effect import. Bundler tree-shaking will eat the inline body; the side-effect import is the only reliable keep-alive.
+
 ---
 
 ## Open questions
