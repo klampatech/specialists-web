@@ -274,6 +274,12 @@ pub async fn run_server(
     // actual room is created lazily on first connection via
     // `ensure_room`.
     port_http: u16,
+    // PR #127 (2026-09-05): public host for the matchmaker to embed
+    // in `ws_url` / `wss_url` responses. When `None`, falls back to
+    // `peer.ip()` (correct only when the client is on the same host).
+    // Cloud deployments should pass the server's public IP or
+    // hostname here.
+    public_host: Option<String>,
     cert_source: specialists_server::cert::CertSource,
     cert_path: PathBuf,
     key_path: PathBuf,
@@ -375,8 +381,9 @@ pub async fn run_server(
     } else {
         Some(tokio::spawn({
             let rooms = rooms.clone();
+            let public_host = public_host.clone();
             async move {
-                if let Err(e) = specialists_server::matchmaker::run_matchmaker_http(port_http, port_ws, port_wss, rooms).await {
+                if let Err(e) = specialists_server::matchmaker::run_matchmaker_http(port_http, port_ws, port_wss, public_host, rooms).await {
                     warn!("run_matchmaker_http exited: {e:?}");
                     Err(e)
                 } else {

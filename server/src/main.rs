@@ -51,6 +51,14 @@ struct Args {
     /// the systemd unit binds a separate matchmaker; `8080` for
     /// dev canary).
     port_http: Option<u16>,
+    /// PR #127 (2026-09-05) — public host for the matchmaker to embed
+    /// in `ws_url` / `wss_url` responses. When `None`, the matchmaker
+    /// falls back to `peer.ip()` (the connected client's IP), which
+    /// is correct only when the client is on the same host (loopback
+    /// or dev canary). For cloud deployments where the matchmaker is
+    /// bound to a public IP and the client is remote, set this to the
+    /// server's public hostname or IP. Example: `--public-host 65.108.87.1`.
+    public_host: Option<String>,
     print_help: bool,
 }
 
@@ -90,6 +98,16 @@ fn parse_args() -> Result<Args> {
                         .parse()
                         .context("--port-http must be u16")?,
                 );
+            }
+            "--public-host" => {
+                let raw = iter
+                    .next()
+                    .context("--public-host requires a value")?;
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--public-host must be non-empty");
+                }
+                args.public_host = Some(trimmed.to_string());
             }
             "--cert" | "--cert-out" => {
                 args.cert_out = Some(PathBuf::from(
@@ -255,6 +273,11 @@ async fn main() -> ExitCode {
     // canary). Production passes `--port-http 0` to disable if the
     // operator wants the matchmaker as a separate service.
     let port_http = args.port_http.unwrap_or(8080);
+    // PR #127 (2026-09-05): plumb `--public-host` through to the
+    // matchmaker so cloud deployments don't have to rely on
+    // `peer.ip()` (which returns the client's IP, not the server's).
+    // Default `None` preserves dev-canary behavior.
+    let public_host = args.public_host.clone();
 
     let rooms: RoomRegistry = Arc::new(RwLock::new(HashMap::new()));
 
@@ -262,6 +285,7 @@ async fn main() -> ExitCode {
         port_wt,
         port_ws,
         port_http,
+        public_host = public_host.as_deref().unwrap_or("(unset, peer.ip())"),
         cert_source = ?cert_source,
         cert = %cert_path.display(),
         key = %key_path.display(),
@@ -277,6 +301,7 @@ async fn main() -> ExitCode {
         port_ws,
         port_wss,
         port_http,
+        public_host,
         cert_source,
         cert_path,
         key_path,

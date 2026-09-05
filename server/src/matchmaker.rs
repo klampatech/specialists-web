@@ -71,6 +71,13 @@ pub async fn run_matchmaker_http(
     port: u16,
     ws_port: u16,
     wss_port: u16,
+    // PR #127 (2026-09-05): public host to embed in `ws_url` /
+    // `wss_url` responses. When `None`, falls back to `peer.ip()`
+    // (the requester's IP) — correct only for loopback / dev canary
+    // where the requester is on the same host as the listeners.
+    // For cloud deployments, pass the server's public IP or
+    // hostname. Example: `Some("65.108.87.1".to_string())`.
+    public_host: Option<String>,
     rooms: RoomRegistry,
 ) -> Result<()> {
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -80,17 +87,24 @@ pub async fn run_matchmaker_http(
     let local = listener
         .local_addr()
         .with_context(|| format!("local_addr on TCP/{port} (matchmaker HTTP)"))?;
-    info!(%local, "Matchmaker HTTP listener bound (§3.5)");
+    // PR #127 (2026-09-05): log whether public_host is set, so
+    // operators can confirm the deployment is configured correctly.
+    info!(
+        %local,
+        public_host = public_host.as_deref().unwrap_or("(unset, using peer.ip())"),
+        "Matchmaker HTTP listener bound (§3.5)"
+    );
 
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let rooms = rooms.clone();
+                let public_host = public_host.clone();
                 // One accept = one connection. No keep-alive — these
                 // are one-shot endpoints, and a keep-alive state
                 // machine would inflate the surface by ~3x.
                 tokio::spawn(async move {
-                    if let Err(e) = handle_http_connection(stream, peer, rooms, ws_port, wss_port).await {
+                    if let Err(e) = handle_http_connection(stream, peer, rooms, ws_port, wss_port, public_host).await {
                         debug!(%peer, "matchmaker HTTP connection ended: {e:?}");
                     }
                 });
@@ -112,6 +126,8 @@ async fn handle_http_connection(
     rooms: RoomRegistry,
     ws_port: u16,
     wss_port: u16,
+    // PR #127 (2026-09-05): see `run_matchmaker_http` doc.
+    public_host: Option<String>,
 ) -> Result<()> {
     debug!(%peer, "handle_http_connection entered");
     // Read up to MAX_REQUEST_LINE_BYTES + MAX_HEADERS_BYTES, or until
@@ -207,10 +223,10 @@ async fn handle_http_connection(
         ("GET", "/health") => {
             write_response(&mut stream, 200, "OK", "text/plain", b"ok").await
         }
-        ("POST", "/rooms") => handle_create_room(&mut stream, peer, ws_port, wss_port).await,
+        ("POST", "/rooms") => handle_create_room(&mut stream, peer, ws_port, wss_port, public_host.as_deref()).await,
         ("GET", p) if p.starts_with("/rooms/") => {
             let id = &p[7..]; // strip "/rooms/"
-            handle_get_room(&mut stream, peer, id, rooms, ws_port, wss_port).await
+            handle_get_room(&mut stream, peer, id, rooms, ws_port, wss_port, public_host.as_deref()).await
         }
         _ => {
             write_response(
@@ -241,17 +257,32 @@ async fn handle_http_connection(
 /// without the port, the lobby's Create flow produced a URL like
 /// `ws://127.0.0.1/rooms/<id>` which the browser tried to resolve
 /// on port 80 (default WS) and got ERR_CONNECTION_REFUSED.
-async fn handle_create_room(stream: &mut TcpStream, peer: SocketAddr, ws_port: u16, wss_port: u16) -> Result<()> {
+async fn handle_create_room(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    ws_port: u16,
+    wss_port: u16,
+    // PR #127 (2026-09-05): `Some(host)` to use as the host in
+    // the response URLs; `None` to fall back to `peer.ip()` for
+    // loopback / dev canary setups.
+    public_host: Option<&str>,
+) -> Result<()> {
     let id = mint_room_id();
+    // PR #127 (2026-09-05): prefer the configured `public_host`
+    // when set, fall back to the connected client's IP for
+    // backwards compat with the dev canary.
+    let host = public_host
+        .map(str::to_string)
+        .unwrap_or_else(|| peer.ip().to_string());
     let body = format!(
-        r#"{{"id":"{id}","ws_url":"ws://{peer_addr}:{ws_port}/rooms/{id}","wss_url":"wss://{peer_addr}:{wss_port}/rooms/{id}","max_players":{max}}}"#,
+        r#"{{"id":"{id}","ws_url":"ws://{host}:{ws_port}/rooms/{id}","wss_url":"wss://{host}:{wss_port}/rooms/{id}","max_players":{max}}}"#,
         id = id,
-        peer_addr = peer.ip(),
+        host = host,
         ws_port = ws_port,
         wss_port = wss_port,
         max = MAX_PLAYERS_PER_ROOM,
     );
-    info!(%peer, room_id = %id, "POST /rooms → minted");
+    info!(%peer, room_id = %id, %host, "POST /rooms → minted");
     write_response(stream, 200, "OK", "application/json", body.as_bytes()).await
 }
 
@@ -270,6 +301,8 @@ async fn handle_get_room(
     rooms: RoomRegistry,
     ws_port: u16,
     wss_port: u16,
+    // PR #127 (2026-09-05): see `handle_create_room` doc.
+    public_host: Option<&str>,
 ) -> Result<()> {
     // Validate the ID against the same regex `parse_room_id` uses.
     // Anything else is a 400, not a 404 — it means the client is
@@ -315,11 +348,22 @@ async fn handle_get_room(
     // constructing it from `window.location.host` (which is the lobby
     // page's host:port — Vite in dev, not the WS listener's port).
     // Same shape as POST /rooms' `ws_url` field — `ws://<peer_ip>:<ws_port>/rooms/<id>`.
+    //
+    // PR 11.9 follow-up (Hetzner staging, 2026-09-04): also include
+    // `wss_url` so HTTPS lobby pages can pick the TLS variant without
+    // the browser's mixed-content blocker dropping the WSS handshake.
+    // Mirrors POST /rooms' shape.
+    //
+    // PR #127 (2026-09-05): use the configured `public_host` when
+    // set, falling back to the connected client's IP otherwise.
+    let host = public_host
+        .map(str::to_string)
+        .unwrap_or_else(|| peer.ip().to_string());
     let body = format!(
-        r#"{{"exists":true,"players":{players},"max":{max},"ws_url":"ws://{peer_addr}:{ws_port}/rooms/{id}","wss_url":"wss://{peer_addr}:{wss_port}/rooms/{id}"}}"#,
+        r#"{{"exists":true,"players":{players},"max":{max},"ws_url":"ws://{host}:{ws_port}/rooms/{id}","wss_url":"wss://{host}:{wss_port}/rooms/{id}"}}"#,
         players = players,
         max = MAX_PLAYERS_PER_ROOM,
-        peer_addr = peer.ip(),
+        host = host,
         ws_port = ws_port,
         wss_port = wss_port,
         id = id,
