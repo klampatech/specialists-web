@@ -7,15 +7,82 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 |>## ⚡ TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#115 (2026-09-03). **`main` @ `43e4c04` (PR #115 squash — MERGED 2026-09-03 16:13 UTC).** **`You are here` summary**: PR #107 (server weapons wire) + PR #108 (client mirror) + PR #109 (docs) + PR #110 (Crosshair) + PR #111 (docs) + PR #112 (CF-N1 sustained-stress smoke + opt-in CI gate) + **PR #114 (MeleeEvent wire — server-authoritative melee + 5 validation gates + melee smoke + CI gate)** + **PR #115 (overnight rollup — pre-deploy-prod.sh + HUD icon-SVG swap + Burst-active chip + reconnect observability + A2 smoke fix)** are all **MERGED** to `main`. **PR #114 closed the `0x0B MeleeEvent` carry-forward** — the combat completeness gap is now closed (weapons + melee + reload all server-authoritative). **PR #115 is deploy-enabling infrastructure** — all additive/observational, no wire changes, no schema changes, no gameplay logic changes. It unblocks `tools/deploy-prod.sh` for the **coordinated wire-break deploy of PR #107+#108+#110+#114** to m5 via Tailscale Funnel (`https://m5.tail1b3795.ts.net:14433/`). **`main` @ `43e4c04` carries 5 commits ahead of `origin/main` at the time of the overnight session start** — those 5 commits (deploy-prod.sh, CF-N1 A2 poll pattern, Burst-active chip, inline-SVG weapon icons, reconnect observability) plus the A2 smoke fix to `damage-server-smoke.mjs` (which surfaced on PR #115's first CI run as a deterministic regression, not a flake) all rolled into one PR per Kyle's "do it right over do it fast" preference. **Verification**: cargo test --lib 119/119 PASS, vitest **118/118 PASS** (was 110 pre-#115; +8 from `serverTransport.test.ts` 9 tests + `BulletHud.test.ts` 8 tests — actually +9 net, but pre-existing renames absorbed some; net delta +8), typecheck+build clean, `tools/damage-server-smoke.mjs` deterministic regression fixed (A2 pattern), all **36/36 CI checks GREEN** on the PR #115 merge commit. **Carry-forwards beyond PR #115**: (a) **`tools/deploy-prod.sh` → actual wire-break deploy** (~30 min, operational) — first coordinated ship of PR #107+#108+#110+#114 to m5 Funnel. After this ships, play-testing with 2-3 friends can begin. (b) Pre-existing CF-N1 flake root-cause fix (if the opt-in `client-cfn1-sustained-stress-smoke` fails on nightly, the next step is bumping the per-connection mpsc capacity from 1024 — still deferred per the PR #112 rationale; preemptive bump risks introducing different regressions). (c) Maintenance sweep — the few remaining deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test. (d) New feature arc — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat. (e) Outbound mpsc review — defensive, pre-cloud verification pass + capacity bump if needed before sustained cloud load.
+**`You are here`**: post-PR-#131 (2026-09-05). **`main` @ `1cd36d4` (PR #128 + #129-followup + #130 + #131 squashes — MERGED 2026-09-05 19:00 UTC).** The complete FE-server sync chain is now alive in prod on Hetzner and **24/24 of the matrix smoke passes live**. Wire connects → snapshots decoded → damage converges → weapon state syncs → remote rig tracks snapshot position. The 2-tab screenshot shows full multiplayer rendering.
+
+**This session shipped 4 PRs**:
+- **PR #128 (`fix(matchmaker): --public-host flag`)** — matchmaker returning client egress IP. Fix: `--public-host` CLI arg.
+- **PR #129-followup (`fix: ungate scene.ts gameSession + two-tab prod-bundle damage smoke`)** — closed gameSession tree-shake gap. Claude Code review caught the double-instance bug in the first attempt.
+- **PR #130 (`fix: migrate snapshot decoder + Predictor + Interpolator to wireServerTransport`)** — closed the THIRD tree-shake variant. Top-level async IIFE in wireServerTransport.ts polls __gameSession + wires decoder.
+- **PR #131 (`fix: late-bound snapshot poll + WASM MIME + fe-sync matrix smoke + §G field sanity`)** — the matrix smoke against live Hetzner found **3 LIVE regressions** that the two-tab smoke missed:
+  1. **Snapshot decoder race**: it polled `__gameSession` for 2s then immediately checked `__serverTransport` — but the broadcast IIFE races us and `__serverTransport` may still be the `"INIT_INFLIGHT"` sentinel. Fix: poll both for 5s.
+  2. **Broadcast handler closure-capture under React StrictMode**: the broadcast applied damage to the FIRST (disposed) createScene instance's controllers; the live (SECOND) instance's HP never dropped in the HUD. Fix: late-bind `liveLocalCtrl`/`liveRemoteCtrl` on every broadcast call.
+  3. **`serve-static.mjs` missing `application/wasm` MIME**: Havok WASM triggered fallback (~1s extra latency per cold load). Fix: 1-line MIME map addition.
+
+**Verification (live Hetzner)**:
+- Bundle: `index-CbRUFl9j.js` (md5 `0e7bc01e811c25c820236025ead47f16`)
+- typecheck clean, vitest 118/118 PASS, cargo 119/119
+- prod-bundle-smoke: 7/8 PASS (1 lobby flow nit, not wire-up)
+- two-tab-prod-bundle-damage-smoke: 4/4 PASS
+- **fe-server-sync-matrix: 24/24 PASS** (7 sections: §A wire-up + identity 4, §B position sync 2, §C HP convergence 3, §D weapon state 4, §E snapshot timing 2, §F RTT 2, §G field sanity 7)
+- 6-tab stress test: PASSES (all 6 tabs see all 6 players within 5s)
+
+**Cross-vendor check-and-balance**: matrix smoke was reviewed by Codex (caught timing nit + recommended §G). My Stage 2 verification missed the 3 regressions. The matrix smoke is now the canonical gate.
+
+**Live 2-tab screenshot at `client/tools/fe-sync-B.png`**: full multiplayer scene rendered — red capsule (Tab A's local rig) at Tab A's actual Havok position (-8, 0), teal capsule (Tab B's local rig) at Tab B's position (-4, 0), HUD shows `HP me: 88, HP them: 100, Dual Pistol SEMI, Ammo: ▮▮▮▮▮▮▮▮▮▮ /10`, `Server: connected (websocket)`.
 
 **Recommended next direction (your call)**:
-- **(a) Weapons Phase 2.2 — HUD polish + crosshair + icon sprites** (~1 session). D/S/N text labels work but a real crosshair with weapon-aware spread (Burst shows slight spread, Sniper a dot) + per-weapon icon sprites would close the UX gap. Use `image_generate` once fal.ai balance resets.
-- **(b) `server/src/main.rs` outbound mpsc + back-pressure review** (~1 session, defensive). Drop-oldest + per-room SnapshotGenerator (PR #83) + producer-side rate-limiter (PR #81) already cover the worst case. Pre-cloud verification pass + small capacity bump if needed before sustained cloud load.
-- **(c) New feature arc** — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat, `0x0B MeleeEvent` wire type. Phase 2 candidates that were deferred pre-#98.
-- **(d) Maintenance sweep** — the few remaining deferred items from PR #94 + #92 reviews (focus-trap "soft" doc, popup-blocker flushSync parity, StrictMode rAF race — all cosmetic) plus tier-3 Vivaldi keyboard test (needs Kyle to launch Vivaldi with `--remote-debugging-port` from his own session; the 2026-09-01 attempt was blocked by the existing Vivaldi absorbing the flag).
+- **(a) Smoke resilience pass** — tolerate ghost placeholder IDs (CF-N1 family) (~30 min). 11-smoke flake-storm; cheapest mitigation is filter-by-smoke-level marker. Acceptable to defer until CI becomes load-bearing.
+- **(b) Domain + Let's Encrypt** (~1-2 hours). Self-signed cert throws `ERR_CERT_AUTHORITY_INVALID` in non-trusting browsers. canary-server.sh has a `letsencrypt` cert-source option.
+- **(c) CI auto-deploy from main** (~2-3 hours). Replaces manual `scp + systemctl restart`.
+- **(d) Real multiplayer playtest from Mac** — open `https://65.108.87.1:14432/?server=wss%3A%2F%2F65.108.87.1%3A14435%2Frooms%2Ftest&localId=1&peerId=2` in two tabs.
+- **(e) Maintenance sweep** — deferred cosmetic items from PR #94 + #92 reviews + tier-3 Vivaldi keyboard test.
+- **(f) New feature arc** — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat.
 
-**Deploy coordination reminder**: PR #107 + PR #108 are a `next-deploy-is-all-clients-new` pair. The deploy message must call out that **ALL clients must refresh** — existing tabs (cached JS from pre-#107) will be broken until they reload because PlayerState grew 30 → 31 bytes and AimEvent grew 19 → 20 bytes. Flag `#operations` for the deploy.
+**Deploy coordination reminder**: Hetzner has the latest bundle. Future deploys are `cd client && VITE_MATCHMAKER_ORIGIN=https://65.108.87.1:14432 npm run build && ssh root@65.108.87.1 'rm -rf /root/specialists-web/client/dist/assets' && scp -r dist/assets root@65.108.87.1:/root/specialists-web/client/dist/ && scp dist/index.html root@65.108.87.1:/root/specialists-web/client/dist/ && ssh root@65.108.87.1 'systemctl restart specialists-static'`. **scp-silent-failure pitfall** (PR #130, #131): confirm the bundle is actually on Hetzner after every scp (`ssh 'ls -la dist/assets/index-*.js'`). The full asset dir needs replacement — Babylon's dynamic chunks change hashes per build, so just `scp dist/assets/index-*.js` will miss chunks and the new bundle will 404 on the missing imports.
+
+---
+
+## 2026-09-05 — PR #131 (matrix smoke + late-binding fixes)
+
+**Scope**: Build a comprehensive FE-server sync matrix that covers every wire surface, run it against live Hetzner, fix every regression it finds.
+
+**The 3 regressions the matrix smoke caught** (and the existing two-tab smoke missed):
+
+1. **Snapshot decoder race with broadcast IIFE.** The snapshot decoder at `client/src/engine/wireServerTransport.ts` polled `__gameSession` for 2s then immediately read `__serverTransport`. If scene.ts published `__gameSession` before the broadcast IIFE's `await server.connect()` resolved, `__serverTransport` was still the `"INIT_INFLIGHT"` sentinel string. `typeof "INIT_INFLIGHT".onSnapshot === 'undefined'` → snapshot decoder bailed. Fix: also poll for a real `__serverTransport` instance (up to 5s). Mirrors the existing gameSession-poll pattern.
+
+2. **Broadcast handler captured stale controllers under React StrictMode.** The broadcast handler had a closure-captured read of `__gameSession` that returned `localCtrl`/`remoteCtrl` ONCE during wire-up. Under React StrictMode, createScene runs TWICE — the second instance is the live one. The broadcast handler applied damage to the FIRST (disposed) instance's controllers; the HUD reads from the SECOND, so the HP drop never showed. Fix: late-bind `liveLocalCtrl`/`liveRemoteCtrl` on every broadcast call. Same late-binding pattern as the existing `setServerTransport` fix.
+
+3. **`serve-static.mjs` missing `application/wasm` MIME.** The Hetzner bundle serves Havok Physics `.wasm` without the correct MIME, triggering `wasm streaming compile failed: Expected 'application/wasm'`. Browser falls back to ArrayBuffer instantiation, ~1s slower on cold load. Fix: 1-line addition to the MIME map in `tools/serve-static.mjs`.
+
+**The matrix smoke (client/tools/fe-server-sync-matrix.mjs)** — 24 assertions across 7 sections:
+
+| Section | Coverage |
+|---|---|
+| §A Wire-up + identity | both tabs connect, both have correct localPlayerId, snapshots present on both tabs |
+| §B Position sync | Tab A's Havok position matches the snapshot's player-1 entry on Tab A; Tab B's snapshot of player 1 matches Tab A's Havok |
+| §C HP convergence | initial HP=100 both tabs; AimEvent → 12-damage hit lands on Tab B's localController.state.hp; controller.hp equals snapshot.hp (proves late-binding works) |
+| §D Weapon state | initial DualPistol/Semi; Tab A sends WeaponSwitch → both snapshots reflect fireMode=1; Tab A's getLocalWeaponState converges to 1 |
+| §E Snapshot timing | frames advance at 8-100 Hz; newer frame arrives in <250ms |
+| §F RTT + transport | RTT finite + <500ms; connected=true |
+| §G Field sanity (NEW per Codex review) | playerId/HP/ammo/yaw/pitch/velocity/weaponId/fireMode all finite + in-range |
+
+All 24/24 PASS on Hetzner with bundle `index-CbRUFl9j.js`. The smoke is now the canonical regression gate for any change that touches wire-up, gameSession, snapshot decoder, or remote visual tracking.
+
+**Codex cross-vendor review** flagged two timing nits (15s→25s waitForFunction, 80Hz→100Hz frame-rate upper bound) and one major coverage gap (§G field sanity). All three addressed in `1cd36d4`.
+
+**6-tab stress test** (separate inline script): all 6 tabs see all 6 player IDs in the snapshot stream within 5s.
+
+**Commits on `main`**:
+- `9a72e6c fix(wire-up): late-bound snapshot poll + WASM MIME + fe-sync matrix smoke`
+- `1cd36d4 test(fe-sync): add §G field-sanity block + relax timing tolerances (Codex review)`
+
+**Memory anchors**: §specialists-web-hetzner-prod-wireup-2026-09-04 (updated with PR #131 lessons).
+
+**Next session task**: real Mac 2-tab playtest for user-facing confirmation, or pick one of the recommended next directions.
+
+---
+
+## 2026-09-05 — PR #130 (snapshot decoder migration)
 
 ---
 
