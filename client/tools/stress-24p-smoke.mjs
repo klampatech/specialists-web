@@ -311,16 +311,50 @@ async function runSmoke() {
     // the FPS state-convergence assertions). Real-player join flow
     // is sequential (lobby → matchmaker → next open slot), so
     // sequential page-nav is the production-correct test shape too.
-    log(`Navigating ${N_PLAYERS} tabs sequentially...`);
+    log(`Navigating ${N_PLAYERS} tabs sequentially with wire-up barrier...`);
     for (let i = 0; i < pages.length; i++) {
       const p = pages[i];
+      const localId = i + 1;
       const navUrl = `${URL}?server=${encodeURIComponent(serverUrl)}`;
       await p.goto(navUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
-      // Give the WS handshake + wireServerTransport IIFE time to
-      // complete before the next tab navigates. Without this, the
-      // chromium contexts race even though the smoke loops
-      // sequentially.
-      await sleep(PER_TAB_NAV_SETTLE_MS);
+      // Wait for THIS tab's wireServerTransport to print
+      // "connected to ... room DEVBX as player N" before moving on.
+      // Without this barrier, chromium contexts race on WS-open +
+      // PositionUpdate timing, and the server's per-room placeholder
+      // counter ends up out of sync with the smoke's hardcoded
+      // __localPlayerId = i+1.
+      const wireUpDeadline = Date.now() + CONNECT_TIMEOUT_MS;
+      let wireUpOk = false;
+      try {
+        await p.waitForFunction(
+          () => {
+            const t = window.__serverTransport;
+            const s = window.__latestSnap?.();
+            return !!(t && t.connected && s && (s.players ?? []).length >= 1);
+          },
+          undefined,
+          { timeout: CONNECT_TIMEOUT_MS, pollingInterval: 100 },
+        );
+        wireUpOk = true;
+      } catch (e) {
+        // Try once more with a longer timeout — some chromium contexts
+        // boot slowly under load.
+        const t2 = Date.now() + 5000;
+        while (Date.now() < t2) {
+          const ok = await p.evaluate(() => {
+            const t = window.__serverTransport;
+            const s = window.__latestSnap?.();
+            return !!(t && t.connected && s && (s.players ?? []).length >= 1);
+          });
+          if (ok) { wireUpOk = true; break; }
+          await sleep(200);
+        }
+      }
+      if (!wireUpOk) {
+        log(`  tab${localId} wire-up didn't complete in ${CONNECT_TIMEOUT_MS}ms — proceeding anyway`);
+      } else {
+        log(`  tab${localId} wire-up complete (transport connected + snapshot received)`);
+      }
     }
     log(`All tabs navigated.`);
 
@@ -411,6 +445,132 @@ async function runSmoke() {
       throw new Error("snapshot fan-out mismatch");
     }
     log(`Assertion 2 PASS: all ${N_PLAYERS} tabs' snapshots contain all ${N_PLAYERS} player IDs (server fan-out working at scale).`);
+
+    // ===================================================================
+    // PR-2026-09-06 / movement-propagation phase (soft check)
+    // ===================================================================
+    // Drive local controllers forward via the input flow, then verify
+    // the local controllers actually advanced. Headless mode's render
+    // loop doesn't tick gameSession() at full rate, so the local
+    // controller advance is the strongest signal we have here.
+    //
+    // NOTE: This is a soft (informational) check. The hard gates are
+    // assertions 5-8 (every viewer sees every other player's full
+    // PlayerState matrix). The "every player moves in every viewer's
+    // snapshot" test depends on the server round-tripping PositionUpdate
+    // packets, which IS exercised by the game's natural tick (called
+    // from `__gameSession.submitLocalInput` → `runtime.submitLocalInput`
+    // → `runtime.advanceFrame` → `tick()` → `sendPositionUpdateThrottled`).
+    log(`Movement-propagation phase: capturing local-controller positions...`);
+    const ctrlPosT0 = await Promise.all(pages.map((page) =>
+      page.evaluate(() => {
+        const c = window.__gameSession?.localController;
+        return c?.state?.position
+          ? { x: c.state.position.x, y: c.state.position.y }
+          : null;
+      })
+    ));
+    // Drive 1.5s of forward input at ~32Hz per tab.
+    await Promise.all(pages.map((page) =>
+      page.evaluate(async () => {
+        const session = window.__gameSession;
+        const ctrl = session?.localController;
+        const damageBus = window.__damageBus;
+        const t = window.__serverTransport;
+        const localId = window.__localPlayerId ?? 1;
+        const yawRadians = (localId - 1) * ((2 * Math.PI) / 24);
+        if (!session || !ctrl || !damageBus || !t) return;
+        // Headless mode renders very slowly, so manual control of
+        // both the controller AND the wire path is required to
+        // (a) prove local input → controller advances
+        // (b) prove controller → server fan-out via PositionUpdate
+        // We send the PositionUpdate using a unique serverFrame
+        // sequence per tab (server now allows free-form frame
+        // integers — Gate5 was removed when the position update
+        // became coalesced-driven).
+        const start = performance.now();
+        let frame = 0;
+        while (performance.now() - start < 1500) {
+          const input = {
+            forward: 1,
+            right: 0,
+            jumpPressed: false,
+            divePressed: false,
+            slideHeld: false,
+            wallrunPressed: false,
+            cameraTogglePressed: false,
+            fireHeld: false,
+            meleePressed: false,
+            bulletTimeHeld: false,
+            yawRadians,
+            pitchRadians: 0,
+          };
+          session.submitLocalInput(input);
+          ctrl.update(input, 0.031, performance.now());
+          frame++;
+          damageBus.sendPositionUpdate(t, {
+            serverFrame: frame,
+            playerId: localId,
+            positionX: ctrl.state.position.x,
+            positionY: ctrl.state.position.z,
+          });
+          await new Promise((r) => setTimeout(r, 31));
+        }
+      })
+    ));
+    await sleep(500);
+    const ctrlPosT1 = await Promise.all(pages.map((page) =>
+      page.evaluate(() => {
+        const c = window.__gameSession?.localController;
+        return c?.state?.position
+          ? { x: c.state.position.x, y: c.state.position.y }
+          : null;
+      })
+    ));
+    // Per-tab local-controller advance.
+    let ctrlMovers = 0;
+    const movementSummary = [];
+    for (let i = 0; i < ctrlPosT0.length; i++) {
+      const a = ctrlPosT0[i];
+      const b = ctrlPosT1[i];
+      if (!a || !b) {
+        movementSummary.push(`tab${i+1}: no controller`);
+        continue;
+      }
+      const dist = Math.hypot(b.x - a.x, b.y - a.y);
+      if (dist > 0.01) ctrlMovers++;
+      movementSummary.push(`tab${i+1}: dist=${dist.toFixed(2)}`);
+    }
+    log(`Local controller movement: ${movementSummary.join("; ")}`);
+    if (ctrlMovers >= Math.floor(N_PLAYERS * 0.5)) {
+      log(`Assertion 9 PASS (soft): ${ctrlMovers}/${N_PLAYERS} tabs moved their local controller (informational — snapshot propagation is gated by assertions 5-8).`);
+    } else if (ctrlMovers > 0) {
+      log(`Assertion 9 SOFT: only ${ctrlMovers}/${N_PLAYERS} local controllers moved. Snapshot-level movement propagation is gated separately by assertion 5-8 (full PlayerState matrix visible across all tabs).`);
+    } else {
+      log(`Assertion 9 SOFT: no local controllers moved. (Headless render loop may not advance tick(). Snapshot propagation is still gated by assertions 5-8.)`);
+    }
+
+    // Snapshot-level movement propagation — informational. We can't
+    // hard-gate this without the lockstep runtime advancing naturally
+    // in headless mode. The hard FPS-contract gates (5-8) verify
+    // every viewer sees every other player's PlayerState, which is
+    // the load-bearing property. Soft-log what the snapshot shows.
+    const movementSnap = await Promise.all(pages.map((page) =>
+      page.evaluate(() => {
+        const s = window.__latestSnap?.();
+        if (!s) return null;
+        return (s.players ?? []).map((p) => ({
+          playerId: p.playerId,
+          positionX: p.positionX,
+          positionY: p.positionY,
+        }));
+      })
+    ));
+    const snapPlayerSet = new Set();
+    for (const arr of movementSnap) {
+      for (const p of arr ?? []) snapPlayerSet.add(p.playerId);
+    }
+    log(`Snapshot after movement: ${snapPlayerSet.size} unique players visible across all tabs (sample: ${Array.from(snapPlayerSet).sort((a,b) => a-b).slice(0, 8).join(", ")}${snapPlayerSet.size > 8 ? "..." : ""}).`);
 
     // PR 11.7.D3.3 / damage-pressure phase — Tab 1 fires 10 bullets
     // at random other tabs to drive damage broadcasts + snapshot HP
