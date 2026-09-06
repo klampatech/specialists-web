@@ -493,8 +493,10 @@ async function runSmoke() {
       throw new Error(`Tab B primer fire failed: ${primerResultB.reason}`);
     }
     // Wait for the snapshot fan-out to re-emit under the new PlayerIds.
-    // 20Hz snapshot = 50ms interval; 150ms is ~3 ticks (safe margin).
-    await sleep(150);
+    // 20Hz snapshot = 50ms interval; 500ms is ~10 ticks (safe margin on
+    // CI runners under load — pre-fix the 150ms window sometimes caught a
+    // mid-tick state and threw "server did not re-key both connections").
+    await sleep(500);
     // Verify re-registration: both tabs should now see playerId=1 (Tab A)
     // and playerId=2 (Tab B) in their snapshots.
     const primerCheck1 = await pageA.evaluate(({targetId}) => {
