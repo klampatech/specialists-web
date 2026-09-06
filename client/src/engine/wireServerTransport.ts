@@ -236,6 +236,17 @@ export function wireServerTransport(): void {
         // mirrors the PR #128 setServerTransport fix.
         const broadcastHandler = (body: Uint8Array) => {
           const bc = damageBus.decodeDamageBroadcast(body);
+          // PR #135 — instrument the broadcast handler so the lobby-e2e
+          // smoke can distinguish "no broadcast arrived" from
+          // "broadcast arrived but applyBroadcast was a no-op". The
+          // scene.ts counter (__broadcastHandlerCount) was tree-shaken
+          // in PR #128; this is the surviving wireServerTransport path's
+          // equivalent. Read by client/tools/lobby-e2e-smoke.mjs §L.9/§L.10.
+          if (typeof window !== "undefined") {
+            const w = window as unknown as { __wireBroadcastHandlerCount?: number };
+            w.__wireBroadcastHandlerCount = (w.__wireBroadcastHandlerCount ?? 0) + 1;
+            (window as unknown as { __lastWireBroadcastAt?: number }).__lastWireBroadcastAt = performance.now();
+          }
           if (!bc) return;
           const liveSess: {
             localController?: CharacterController | unknown;

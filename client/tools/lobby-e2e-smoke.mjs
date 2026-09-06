@@ -550,31 +550,33 @@ async function mainImpl() {
       remote: gs.remoteController?.state?.hp,
     };
   });
- // PR #134 — diagnostic: also pull broadcast-handler stats.
+ // PR #135 — diagnostic: also pull broadcast-handler stats. Use the
+ // wireServerTransport counter (scene.ts's __broadcastHandlerCount was
+ // tree-shaken in PR #128; the surviving path is in wireServerTransport).
  const aBroadcastStats = await pageA.evaluate(() => ({
-   count: window.__broadcastHandlerCount ?? -1,
-   counts: window.__broadcastResultCounts ?? null,
-   latest: window.__lastBroadcastResult ?? null,
-    registered: window.__broadcastHandlerRegistered ?? false,
-    registeredAt: window.__broadcastHandlerRegisteredAt ?? null,
-    localId: window.__localPlayerId ?? null,
-    transportType: typeof window.__serverTransport,
-    transportConnected: window.__serverTransport?.connected ?? null,
+   count: window.__wireBroadcastHandlerCount ?? -1,
+   counts: window.__wireBroadcastResultCounts ?? null,
+   latest: window.__lastWireBroadcastAt ?? null,
+   registered: window.__broadcastHandlerRegistered ?? false,
+   registeredAt: window.__broadcastHandlerRegisteredAt ?? null,
+   localId: window.__localPlayerId ?? null,
+   transportType: typeof window.__serverTransport,
+   transportConnected: window.__serverTransport?.connected ?? null,
    lastHpRemote: window.__gameSession?.remoteController?.state?.hp ?? null,
    lastHpLocal: window.__gameSession?.localController?.state?.hp ?? null,
  }));
  const bBroadcastStats = await pageB.evaluate(() => ({
-   count: window.__broadcastHandlerCount ?? -1,
-   counts: window.__broadcastResultCounts ?? null,
-   latest: window.__lastBroadcastResult ?? null,
-    registered: window.__broadcastHandlerRegistered ?? false,
-    registeredAt: window.__broadcastHandlerRegisteredAt ?? null,
-    localId: window.__localPlayerId ?? null,
-    transportType: typeof window.__serverTransport,
-    transportConnected: window.__serverTransport?.connected ?? null,
+   count: window.__wireBroadcastHandlerCount ?? -1,
+   counts: window.__wireBroadcastResultCounts ?? null,
+   latest: window.__lastWireBroadcastAt ?? null,
+   registered: window.__broadcastHandlerRegistered ?? false,
+   registeredAt: window.__broadcastHandlerRegisteredAt ?? null,
+   localId: window.__localPlayerId ?? null,
+   transportType: typeof window.__serverTransport,
+   transportConnected: window.__serverTransport?.connected ?? null,
    lastHpRemote: window.__gameSession?.remoteController?.state?.hp ?? null,
    lastHpLocal: window.__gameSession?.localController?.state?.hp ?? null,
-  }));
+ }));
   log(`Tab A broadcast stats: ${JSON.stringify(aBroadcastStats)}`);
   log(`Tab B broadcast stats: ${JSON.stringify(bBroadcastStats)}`);
   log(`Tab A controller health: ${JSON.stringify(aControllerHealth)}`);
