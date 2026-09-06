@@ -267,7 +267,13 @@ async function runSmoke() {
   // filters out playerId === localPlayerId, so we don't need to
   // simulate 23 unique peer-pairings; the snapshot stream's
   // server-side fan-out includes all 24 players regardless.
-  const serverUrl = `ws://localhost:${WS_PORT}/rooms/DEVBX`;
+  //
+  // WS_URL_TARGET (optional): override the WS server URL (e.g. a remote
+  // Hetzner URL). Default: ws://localhost:${WS_PORT}/rooms/DEVBX.
+  // When set, WS_PORT is ignored for connection but still used for the
+  // canary-boot health check (no-op when SMOKE_NO_BOOT=1).
+  const serverUrl = process.env.WS_URL_TARGET
+    ?? `ws://localhost:${WS_PORT}/rooms/DEVBX`;
   for (let i = 0; i < pages.length; i++) {
     const page = pages[i];
     const localId = i + 1;
@@ -461,29 +467,39 @@ async function runSmoke() {
 
     // Verify the server-side drop-oldest counter stayed at zero.
     // We grep the canary log for the [stress-stats] lines.
-    log(`Grepping canary log for [stress-stats] drop-oldest counter...`);
-    const logContents = existsSync(CANARY_LOG) ? readFileSync(CANARY_LOG, "utf8") : "";
-    const statLines = logContents
-      .split("\n")
-      .filter((l) => l.includes("[stress-stats]"));
-    log(`Found ${statLines.length} [stress-stats] lines.`);
-    if (statLines.length === 0) {
-      fail(`no [stress-stats] lines found in canary log — CANARY_STATS_INTERVAL_MS may be set too high`);
-      throw new Error("no stress-stats lines");
-    }
-    let maxDrops = 0;
-    for (const line of statLines) {
-      const m = line.match(/drops_total=(\d+)/);
-      if (m) {
-        const v = parseInt(m[1], 10);
-        if (v > maxDrops) maxDrops = v;
+    //
+    // Skip when running against a remote canary (WS_URL_TARGET set):
+    // we don't have access to the remote's canary log file, so the
+    // [stress-stats] lines aren't available locally. The 3 prior
+    // assertions cover the load-bearing surface (connect, fan-out,
+    // stream stability) which is what the fix actually gates on.
+    if (process.env.WS_URL_TARGET) {
+      log(`Assertion 4 SKIP: WS_URL_TARGET set (running against remote canary) — no local log access`);
+    } else {
+      log(`Grepping canary log for [stress-stats] drop-oldest counter...`);
+      const logContents = existsSync(CANARY_LOG) ? readFileSync(CANARY_LOG, "utf8") : "";
+      const statLines = logContents
+        .split("\n")
+        .filter((l) => l.includes("[stress-stats]"));
+      log(`Found ${statLines.length} [stress-stats] lines.`);
+      if (statLines.length === 0) {
+        fail(`no [stress-stats] lines found in canary log — CANARY_STATS_INTERVAL_MS may be set too high`);
+        throw new Error("no stress-stats lines");
       }
+      let maxDrops = 0;
+      for (const line of statLines) {
+        const m = line.match(/drops_total=(\d+)/);
+        if (m) {
+          const v = parseInt(m[1], 10);
+          if (v > maxDrops) maxDrops = v;
+        }
+      }
+      log(`Max drop-oldest counter observed: ${maxDrops}`);
+      if (maxDrops > 0) {
+        throw new Error(`drop-oldest counter is ${maxDrops} (expected 0). Snapshot fan-out is saturating the per-connection outbound queue.`);
+      }
+      log(`Assertion 4 PASS: drop-oldest counter stayed at 0 across ${statLines.length} stats intervals (no saturation under ${N_PLAYERS}-player load).`);
     }
-    log(`Max drop-oldest counter observed: ${maxDrops}`);
-    if (maxDrops > 0) {
-      throw new Error(`drop-oldest counter is ${maxDrops} (expected 0). Snapshot fan-out is saturating the per-connection outbound queue.`);
-    }
-    log(`Assertion 4 PASS: drop-oldest counter stayed at 0 across ${statLines.length} stats intervals (no saturation under ${N_PLAYERS}-player load).`);
 
     if (errors.length > 0) {
       fail(`pageerror events during smoke: ${errors.join("; ")}`);
