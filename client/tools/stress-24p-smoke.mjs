@@ -572,6 +572,59 @@ async function runSmoke() {
     }
     log(`Snapshot after movement: ${snapPlayerSet.size} unique players visible across all tabs (sample: ${Array.from(snapPlayerSet).sort((a,b) => a-b).slice(0, 8).join(", ")}${snapPlayerSet.size > 8 ? "..." : ""}).`);
 
+    // PositionSync barrier — the damage phase's hit-test raycasts
+    // against server-authoritative positions. If tab1's PositionUpdate
+    // hasn't propagated yet, the server has tab1 at the placeholder
+    // default (0, 0) and the forward-aimed raycast misses every
+    // other tab, so 0 damage broadcasts land. We explicitly wait for
+    // every tab's PositionUpdate to be reflected in tab1's view
+    // BEFORE firing damage. This is the same kind of barrier as the
+    // per-tab wire-up wait earlier, but at the position-state layer.
+    log(`PositionSync barrier: waiting for all tabs' positions to converge in tab1's snapshot (max 15s)...`);
+    const positionSyncDeadline = Date.now() + 15000;
+    let positionSyncOk = false;
+    let positionSyncConvergenceCount = 0;
+    while (Date.now() < positionSyncDeadline) {
+      const positionsSeenByTab1 = await pages[0].evaluate(() => {
+        const s = window.__latestSnap?.();
+        if (!s) return null;
+        return (s.players ?? []).map((p) => ({
+          playerId: p.playerId,
+          positionX: p.positionX,
+          positionY: p.positionY,
+        }));
+      });
+      if (!positionsSeenByTab1 || positionsSeenByTab1.length < N_PLAYERS) {
+        await sleep(200);
+        continue;
+      }
+      // Diagnostic — first iteration, log every player's position.
+      if (positionSyncConvergenceCount === 0) {
+        log(`  tab1 snapshot positions (first iter): ${positionsSeenByTab1.map((p) => `p${p.playerId}=(${p.positionX.toFixed(2)},${p.positionY.toFixed(2)})`).join("; ")}`);
+      }
+      const movedCount = positionsSeenByTab1.filter(
+        (p) => Math.abs(p.positionX) > 0.01 || Math.abs(p.positionY) > 0.01,
+      ).length;
+      positionSyncConvergenceCount = Math.max(positionSyncConvergenceCount, movedCount);
+      if (movedCount >= N_PLAYERS - 1) {
+        positionSyncOk = true;
+        break;
+      }
+      await sleep(200);
+    }
+    if (positionSyncOk) {
+      log(`PositionSync barrier PASS: ${positionSyncConvergenceCount}/${N_PLAYERS} positions converged in tab1's snapshot.`);
+    } else {
+      // Soft — diagnostic only. The PositionSync barrier exists to give
+      // the smoke a fighting chance at the damage-phase hit-test, but
+      // chromium-context races + 144ms RTT can leave some players'
+      // positions at the placeholder (0,0) default. We log the result
+      // and proceed regardless; assertion 6 (every viewer saw damage)
+      // may then fail with "0 broadcasts" — that's the hit-test
+      // missing the (0,0) cluster, not a wire-protocol bug.
+      log(`PositionSync barrier SOFT: only ${positionSyncConvergenceCount}/${N_PLAYERS} positions converged after 15s. Damage phase may miss hit-tests.`);
+    }
+
     // PR 11.7.D3.3 / damage-pressure phase — Tab 1 fires 10 bullets
     // at random other tabs to drive damage broadcasts + snapshot HP
     // updates across the full 24-player graph. Validates that:
