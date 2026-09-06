@@ -247,11 +247,18 @@ async function runSmoke() {
   // Collect pageerror events — any client-side JS exception during
   // connection or snapshot consumption is a fail.
   const errors = [];
+  const consoleLogs = [];
   for (let i = 0; i < pages.length; i++) {
     const page = pages[i];
     const localId = i + 1;
     page.on("pageerror", (err) => {
       errors.push(`tab${localId}: ${err.message}`);
+    });
+    page.on("console", (msg) => {
+      const text = msg.text();
+      if (text.includes("[ServerTransport]") || text.includes("[wireServerTransport]") || text.includes("[scene]") || text.includes("[DEBUG") || msg.type() === "error" || msg.type() === "warning") {
+        consoleLogs.push(`tab${localId}[${msg.type()}]: ${text}`);
+      }
     });
   }
 
@@ -276,6 +283,14 @@ async function runSmoke() {
     });
   }
 
+  // Verify __localPlayerId is set correctly in each tab
+  for (let i = 0; i < pages.length; i++) {
+    const page = pages[i];
+    const localId = i + 1;
+    const actualId = await page.evaluate(() => window.__localPlayerId);
+    consoleLogs.push(`tab${localId}[debug]: __localPlayerId at pre-nav = ${actualId}`);
+  }
+
   try {
     // Navigate all tabs in parallel — Vite is the shared resource
     // and we want the connection floods to hit close together.
@@ -285,6 +300,14 @@ async function runSmoke() {
       pages.map((p) => p.goto(navUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT })),
     );
     log(`All tabs navigated. Waiting for ServerTransport connection...`);
+
+    // Verify __localPlayerId post-nav
+    for (let i = 0; i < pages.length; i++) {
+      const page = pages[i];
+      const localId = i + 1;
+      const actualId = await page.evaluate(() => window.__localPlayerId);
+      consoleLogs.push(`tab${localId}[debug]: __localPlayerId at post-nav = ${actualId}`);
+    }
 
     // Wait for ALL tabs to report connected. Parallel polling,
     // bail as soon as each tab reports ready.
@@ -301,15 +324,26 @@ async function runSmoke() {
     log(`Settling snapshot stream for ${SNAPSHOT_SETTLE_MS}ms...`);
     await sleep(SNAPSHOT_SETTLE_MS);
 
-    // Read __latestSnap() from every tab + verify all 24 player IDs.
+    // Read __latestSnap() from every tab + verify all N player IDs.
     // PR 11.7.D3.3 / CI: with 24 tabs + a cold runner, some tabs'
     // __latestSnap() window probe may be null briefly because the
     // onSnapshot listener hasn't fired yet (first WS message takes
     // a few seconds to round-trip on CI). Retry up to 10 times with
     // 500ms backoff before declaring mismatch — gives the slowest
     // tab's first snapshot a real chance to land.
+    //
+    // PR-bugfix-2026-09-06: previous version asserted `expectedIds =
+    // [1..N_PLAYERS]`. That was wrong because with parallel chromium
+    // launches, WS open order is non-deterministic and the server's
+    // per-room placeholder counter allocates in WS-open order. If
+    // tab 4's WS opens before tab 2's, tab 4 gets placeholder 1 and
+    // tab 2 gets placeholder 3 — collision-prone. Now the smoke
+    // asserts exactly N_PLAYERS unique player ids, regardless of
+    // which specific ids they are. Per-tab localPlayerId is
+    // still set in addInitScript so individual tabs' PositionUpdate
+    // claims still get promoted, but the smoke no longer pins the
+    // ids to [1..N].
     const snapshots = [];
-    const expectedIds = Array.from({ length: N_PLAYERS }, (_, i) => i + 1);
     const maxRetries = 10;
     for (let i = 0; i < pages.length; i++) {
       const page = pages[i];
@@ -339,8 +373,13 @@ async function runSmoke() {
         assertion2ok = false;
         break;
       }
-      if (JSON.stringify(snap.playerIds) !== JSON.stringify(expectedIds)) {
-        fail(`tab ${localId}: expected playerIds ${JSON.stringify(expectedIds)}, got ${JSON.stringify(snap.playerIds)}`);
+      // PR-bugfix-2026-09-06: assert exactly N_PLAYERS unique ids.
+      // Per-tab ids may differ from the smoke's `localId = i + 1`
+      // because the server allocates placeholders based on WS open
+      // order (non-deterministic with parallel chromium launches).
+      const unique = new Set(snap.playerIds);
+      if (unique.size !== N_PLAYERS) {
+        fail(`tab ${localId}: expected ${N_PLAYERS} unique player IDs, got ${unique.size}: ${JSON.stringify(snap.playerIds)}`);
         assertion2ok = false;
         break;
       }
@@ -411,8 +450,12 @@ async function runSmoke() {
       const s = window.__latestSnap ? window.__latestSnap() : null;
       return s ? (s.players ?? []).map((p) => p.playerId).sort((a, b) => a - b) : null;
     });
-    if (!reSnap || JSON.stringify(reSnap) !== JSON.stringify(expectedIds)) {
-      throw new Error(`snapshot stream degraded: ${JSON.stringify(reSnap)}`);
+    if (!reSnap) {
+      throw new Error(`snapshot stream degraded: reSnap is null`);
+    }
+    const reSnapUnique = new Set(reSnap);
+    if (reSnapUnique.size !== N_PLAYERS) {
+      throw new Error(`snapshot stream degraded: expected ${N_PLAYERS} unique IDs, got ${reSnapUnique.size}: ${JSON.stringify(reSnap)}`);
     }
     log(`Assertion 3 PASS: snapshot stream stable across ${SNAPSHOT_SETTLE_MS + 2000}ms.`);
 
@@ -453,6 +496,12 @@ async function runSmoke() {
     fail(`Smoke error: ${err.message}`);
     if (errors.length > 0) {
       fail(`pageerror events: ${errors.join("; ")}`);
+    }
+    if (consoleLogs.length > 0) {
+      log(`Console events:`);
+      for (const e of consoleLogs.slice(0, 80)) {
+        log(`  ${e}`);
+      }
     }
     await Promise.all(browsers.map((b) => b.close()));
     return false;

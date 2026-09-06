@@ -939,7 +939,22 @@ export async function createScene(
       // wireServerTransport.ts — see that module's top-level
       // post-connect block. It looks up `window.__gameSession` and
       // late-binds everything onto the live gameSession.
-      (window as unknown as {__serverTransport?: unknown}).__serverTransport = "INIT_INFLIGHT";
+      //
+      // PR 11.6.D / bug-fix-2026-09-06 — DO NOT unconditionally write
+      // "INIT_INFLIGHT" into __serverTransport here. wireServerTransport
+      // (side-effect import in App.tsx) is the canonical owner of the
+      // slot; if it has already populated the slot with a real
+      // ServerTransport (or even just its own sentinel), overwriting
+      // it from here rips the live transport out of the slot mid-flight.
+      // The snapshot decoder IIFE polls __serverTransport and bails if
+      // it sees the sentinel for 5s straight.
+      //
+      // Only write the sentinel if the slot is currently undefined
+      // (i.e., wireServerTransport's IIFE hasn't even started yet — a
+      // rare-but-real race on slow cold-starts).
+      if ((window as unknown as {__serverTransport?: unknown}).__serverTransport === undefined) {
+        (window as unknown as {__serverTransport?: unknown}).__serverTransport = "INIT_INFLIGHT";
+      }
       void (async () => {
         // Local alias for the typed window slot. Captured at IIFE
         // start so every re-read inside the async body sees the
@@ -1001,7 +1016,8 @@ export async function createScene(
         // Reuse the existing transport instead of bailing — the bail
         // was for StrictMode double-mount races, not the wire-up race.
         // (StrictMode still gets caught by the SECOND check at line ~1088
-        // which guards against duplicate broadcast handlers.)
+        // which guards against duplicate broadcast handlers. The
+        // bug-fix-2026-09-06 changes disabled that second close.)
         let server: ServerTransport;
         const existingTransport = winSlot.__serverTransport;
         if (existingTransport && existingTransport !== "INIT_INFLIGHT" &&
@@ -1010,6 +1026,47 @@ export async function createScene(
           // it; the broadcast/reject/setServerTransport wiring below
           // runs against this object.
           server = existingTransport as ServerTransport;
+        } else if (existingTransport === "INIT_INFLIGHT") {
+          // PR 11.6.D / bug-fix-2026-09-06 — wireServerTransport has
+          // claimed ownership of __serverTransport but its IIFE hasn't
+          // finished `await server.connect()` yet. Without this branch
+          // we fall into the else below and create a duplicate
+          // ServerTransport — that allocates an extra placeholder id
+          // on the server, confuses the snapshot fan-out check, and
+          // (when its race-loser close fires) tears down the live wire.
+          // Poll briefly for wireServerTransport's real transport to
+          // land; if it doesn't, we still create our own as a fallback
+          // so the scene isn't stuck forever (the prior race-loser
+          // close is now removed, so a duplicate transport doesn't
+          // cause a disconnect — it just leaks the duplicate's WS).
+          let waited = 0;
+          while (winSlot.__serverTransport === "INIT_INFLIGHT" && waited < 5000) {
+            await new Promise<void>((r) => setTimeout(r, 50));
+            waited += 50;
+          }
+          const resolved = winSlot.__serverTransport;
+          if (resolved && resolved !== "INIT_INFLIGHT" && typeof resolved === "object") {
+            server = resolved as ServerTransport;
+          } else {
+            // Fallback path — wireServerTransport's IIFE never landed a
+            // real transport within 5s. This is a broken-wire scenario;
+            // surface it via the URL/room guards below and create our
+            // own (the post-connect close that used to fire here is
+            // now removed, see the bug-fix-2026-09-06 changes).
+            const urlBase = (window as unknown as { __damageServerUrl?: string }).__damageServerUrl
+              ?? `${window.location.protocol}//${window.location.host}`;
+            const roomId = (window as unknown as { __damageServerRoomId?: string }).__damageServerRoomId;
+            if (!roomId) {
+              throw new Error(
+                "[scene] __damageServerRoomId not set — smoke harness must inject window.__damageServerRoomId before scene boots. " +
+                "The room id should be derived from the URL path /rooms/<id> via parseRoomFromUrl(). " +
+                "Server-side parse_room_id() already handles malformed URLs by falling back to DEVBX_ROOM_ID, " +
+                "but the client should never silently substitute a default."
+              );
+            }
+            server = new ServerTransport(urlBase, roomId);
+            await server.connect();
+          }
         } else {
           const urlBase = (window as unknown as { __damageServerUrl?: string }).__damageServerUrl
             ?? `${window.location.protocol}//${window.location.host}`;
@@ -1035,24 +1092,22 @@ export async function createScene(
           }
           server = new ServerTransport(urlBase, roomId);
           await server.connect();
-          // PR 11.6.D fix4 (Bug A — race resolution): after the
-          // connect resolves, check whether a sibling mount already
-          // wrote a real (non-sentinel) ServerTransport into the slot.
-          // If so, this mount lost the race — discard the freshly-
-          // connected transport (close to release the WS) and bail.
-          // The outer sync guard normally prevents this branch from
-          // firing, but GC / microtask reordering can still race two
-          // in-flight `connect()` calls; close() prevents a leaked
-          // socket + a duplicate broadcast handler.
-          if (winSlot.__serverTransport !== "INIT_INFLIGHT" &&
-              winSlot.__serverTransport !== undefined) {
-            try {
-              server.close();
-            } catch {
-              // ignore — best-effort cleanup
-            }
-            return;
-          }
+          // PR 11.6.D fix4 (Bug A — race resolution) [bug-fix-2026-09-06]:
+          // pre-fix this branch closed `server` if the slot had a
+          // sibling's transport. With the new "adopt the slot's transport
+          // if it's already an object" logic upstream in this IIFE,
+          // `server` IS the canonical shared transport — closing it here
+          // tears down the live wire and arms auto-reconnect, allocating
+          // a fresh placeholder id that diverges the tab from its claimed
+          // id (visible in the 24p stress smoke as the tab seeing
+          // playerIds [2] instead of [1] for a 1-tab run).
+          //
+          // The pre-fix branch only made sense when this IIFE created a
+          // brand-new ServerTransport AND a sibling had raced ahead to
+          // populate the slot. With the adopt-first fix, the
+          // "I created my own" path can no longer reach this point with
+          // a sibling's transport in the slot — we would have adopted.
+          // Old race-loser close removed.
         }
         // PR 11.6.D / §3.9 — register the broadcast handler. The
         // controller getter is late-binding: gameSession is created
@@ -1135,21 +1190,17 @@ export async function createScene(
         if (typeof window !== "undefined") {
           (window as unknown as {__rejectHandlerRegistered?: boolean}).__rejectHandlerRegistered = true;
         }
-        // PR 11.6.D fix4 (Bug A — handler-publish race): before
-        // replacing the sentinel with the real ServerTransport,
-        // re-check the slot. If a sibling mount somehow sneaked a
-        // real ServerTransport into the slot between connect()
-        // resolving and here, that sibling is the authority — drop
-        // ours (close + return) to avoid duplicate broadcast
-        // handlers / probe maps.
-        if (winSlot.__serverTransport !== "INIT_INFLIGHT") {
-          try {
-            server.close();
-          } catch {
-            // ignore — best-effort cleanup
-          }
-          return;
-        }
+        // PR 11.6.D fix4 (Bug A — handler-publish race) [bug-fix-2026-09-06]:
+        // pre-fix this branch closed `server` and returned before writing
+        // the server into the slot. With the upstream "adopt the slot's
+        // transport" change, `server` IS the canonical shared transport
+        // — closing it here tears down the live wire and arms
+        // auto-reconnect, allocating a fresh placeholder id that
+        // diverges the tab from its claimed id. Old race-loser close
+        // removed; instead, simply write `server` to the slot (it'll be
+        // the same object reference as the sibling's, which is fine —
+        // the subsequent `setServerTransport(server)` call on
+        // gameSession is idempotent).
         winSlot.__serverTransport = server;
         winSlot.__damageBus = probe;
         // PR 11.7.D2.1 / FIX — late-bind the server transport onto the
