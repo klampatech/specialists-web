@@ -463,6 +463,19 @@ void (async () => {
       if (!snap) return;
       const now = performance.now();
       latestSnap = snap;
+      // PR #139 — peerPlayerId auto-fill from snapshot stream.
+      // If the lobby didn't emit `&peerId=` (which it doesn't,
+      // post-#134), peerPlayerId stays undefined until we see
+      // another player in the snapshot. Auto-fill from the first
+      // non-self player id. Closes the symmetric self-peer bug
+      // where both tabs defaulted peerPlayerId=2 and Tab B's
+      // "remote" was Tab B itself.
+      if (liveSession && liveSession.peerPlayerId === undefined) {
+        const remotePlayer = snap.players.find((p) => p.playerId !== liveSession.localPlayerId);
+        if (remotePlayer) {
+          liveSession.setPeerPlayerId(remotePlayer.playerId);
+        }
+      }
       // HP edge detection — must run BEFORE the interpolator so the
       // respawn teleport takes effect this frame.
       for (const p of snap.players) {
