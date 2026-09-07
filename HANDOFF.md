@@ -81,6 +81,44 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ---
 
+## 2026-09-07 — PR #158 (HUD HP from snapshot + diagnostic logs)
+
+**Kyle's "HP them doesn't drop" was a HUD-side bug, NOT server-side.**
+The HUD read `remoteController.state.hp` (initialized to 100, never
+updated by anyone). Fixed: `getHealthSnapshot()` now reads the peer HP
+from `__latestSnap().players[peerId].hp`.
+
+**Server-side diagnostic logging added** (always-on at info-level for
+snapshot_summary; gated for damage_relay/transport at debug):
+
+- `RUST_LOG=info,damage_relay=debug,specialists_server::transport=debug`
+  wired in `/etc/systemd/system/specialists-server.service`.
+- Snapshot per-player summary every 20Hz: `SNAPSHOT p1:hp100:ammo10:yaw3.94:z0.80 p2:hp100:ammo10:yaw6.02:z0.80`
+- AIM_ACCEPTED log after Gate 8 (cooldown/ammo/hp/frame all pass).
+- HIT log per server-validated hit.
+
+**Server-side UNRESOLVED** — Kyle's "HP doesn't drop when I shoot
+them": the 5/15/21-byte WebSocket packets are reaching the server
+(snapshot_summary shows the live state). 20-byte AimEvent packets are
+sent by the client (confirmed via WebSocket.prototype.send wrap: 10
+20-byte frames sent) but do NOT appear in the server's `WS dispatch`
+log. tungstenite's read loop appears to drop or coalesce 20-byte
+frames. Documented as open issue for next session.
+
+**Kyle's test observations after PR #158**:
+- HP them DID drop when the snapshot carried reduced hp — confirmed by
+  the `HP them: 88` reading on the other tab's HUD after a successful
+  server-side hit (server confirmed via HIT log).
+- Ammo DOES track (PR #142+#143 align PLAYER_MAX_AMMO=10).
+- Models rotate + jump + look around (PRs #155 + #156).
+- Frame desync — server has been running for 5+ hours with rooms
+  accumulating server_frame in the millions while fresh client tabs
+  start from frame 0; this gap doesn't break the wire (snapshots
+  carry server's frame correctly) but the frame field in the Debug
+  HUD shows the gap visually.
+
+## 2026-09-07 — PR #155 (Remote rig rotation tracks peer yaw) + #156 (vertical Y in snapshot)
+
 ## 2026-09-07 — PR #150 (HUD hits counter shows only confirmed peer hits)
 
 **Scope**: Fix Kyle's "shooting anything still counts as a hit" symptom.
