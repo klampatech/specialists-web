@@ -92,7 +92,46 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Memory anchors**: §specialists-web-hetzner-prod-wireup-2026-09-04 (updated), §evo-verification-discipline-2026-09-05 (added).
 
-**Next session task**: predictor/interpolator migration to wireServerTransport.ts (same tree-shake pattern, separate scope). Or real 2-tab Mac playtest for user-facing confirmation.
+**Next session task**: predictor/interpolator migration to wireServerTransport.ts (same tree-shake pattern, separate scope). Or real 2-tab Mac playtest for user-facing confirmation.---
+
+## 2026-09-05 — PR #131 (matrix smoke + late-binding fixes)
+
+**Scope**: Build a comprehensive FE-server sync matrix that covers every wire surface, run it against live Hetzner, fix every regression it finds.
+
+**The 3 regressions the matrix smoke caught** (and the existing two-tab smoke missed):
+
+1. **Snapshot decoder race with broadcast IIFE.** The snapshot decoder at `client/src/engine/wireServerTransport.ts` polled `__gameSession` for 2s then immediately read `__serverTransport`. If scene.ts published `__gameSession` before the broadcast IIFE's `await server.connect()` resolved, `__serverTransport` was still the `"INIT_INFLIGHT"` sentinel string. `typeof "INIT_INFLIGHT".onSnapshot === 'undefined'` → snapshot decoder bailed. Fix: also poll for a real `__serverTransport` instance (up to 5s). Mirrors the existing gameSession-poll pattern.
+
+2. **Broadcast handler captured stale controllers under React StrictMode.** The broadcast handler had a closure-captured read of `__gameSession` that returned `localCtrl`/`remoteCtrl` ONCE during wire-up. Under React StrictMode, createScene runs TWICE — the second instance is the live one. The broadcast handler applied damage to the FIRST (disposed) instance's controllers; the HUD reads from the SECOND, so the HP drop never showed. Fix: late-bind `liveLocalCtrl`/`liveRemoteCtrl` on every broadcast call. Same late-binding pattern as the existing `setServerTransport` fix.
+
+3. **`serve-static.mjs` missing `application/wasm` MIME.** The Hetzner bundle serves Havok Physics `.wasm` without the correct MIME, triggering `wasm streaming compile failed: Expected 'application/wasm'`. Browser falls back to ArrayBuffer instantiation, ~1s slower on cold load. Fix: 1-line addition to the MIME map in `tools/serve-static.mjs`.
+
+**The matrix smoke (client/tools/fe-server-sync-matrix.mjs)** — 24 assertions across 7 sections:
+
+| Section | Coverage |
+|---|---|
+| §A Wire-up + identity | both tabs connect, both have correct localPlayerId, snapshots present on both tabs |
+| §B Position sync | Tab A's Havok position matches the snapshot's player-1 entry on Tab A; Tab B's snapshot of player 1 matches Tab A's Havok |
+| §C HP convergence | initial HP=100 both tabs; AimEvent → 12-damage hit lands on Tab B's localController.state.hp; controller.hp equals snapshot.hp (proves late-binding works) |
+| §D Weapon state | initial DualPistol/Semi; Tab A sends WeaponSwitch → both snapshots reflect fireMode=1; Tab A's getLocalWeaponState converges to 1 |
+| §E Snapshot timing | frames advance at 8-100 Hz; newer frame arrives in <250ms |
+| §F RTT + transport | RTT finite + <500ms; connected=true |
+| §G Field sanity (NEW per Codex review) | playerId/HP/ammo/yaw/pitch/velocity/weaponId/fireMode all finite + in-range |
+
+All 24/24 PASS on Hetzner with bundle `index-CbRUFl9j.js`. The smoke is now the canonical regression gate for any change that touches wire-up, gameSession, snapshot decoder, or remote visual tracking.
+
+**Codex cross-vendor review** flagged two timing nits (15s→25s waitForFunction, 80Hz→100Hz frame-rate upper bound) and one major coverage gap (§G field sanity). All three addressed in `1cd36d4`.
+
+**6-tab stress test** (separate inline script): all 6 tabs see all 6 player IDs in the snapshot stream within 5s.
+
+**Commits on `main`**:
+- `9a72e6c fix(wire-up): late-bound snapshot poll + WASM MIME + fe-sync matrix smoke`
+- `1cd36d4 test(fe-sync): add §G field-sanity block + relax timing tolerances (Codex review)`
+
+**Memory anchors**: §specialists-web-hetzner-prod-wireup-2026-09-04 (updated with PR #131 lessons).
+
+**Next session task**: real Mac 2-tab playtest for user-facing confirmation, or pick one of the recommended next directions.
+
 ---
 
 ## 2026-09-05 — PR #130 (snapshot decoder + Predictor + Interpolator migration)
