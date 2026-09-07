@@ -104,6 +104,14 @@ export interface CharacterControllerOptions {
    * happened to be when the local tab loaded).
    */
   respawnPosition?: Vector3;
+  /**
+   * PR #139 follow-up — initial yaw (radians; 0 = +Z forward). When
+   * provided, the controller is constructed facing this direction.
+   * Used at multiplayer spawn so player 1 (x=-8) and player 2 (x=-4)
+   * face each other immediately on tab load — no need to mouse-look
+   * around to find the other rig. Defaults to 0.
+   */
+  startYawRadians?: number;
 }
 
 /** Default gravity direction used by `checkSupport` (must match world gravity). */
@@ -147,7 +155,16 @@ export function createCharacterController(
   havok.dynamicFriction = BASE_DYNAMIC_FRICTION;
   havok.up = new Vector3(0, 1, 0);
 
-  return new CharacterController(havok, options.visualRoot, startPosition, options.respawnPosition);
+  const controller = new CharacterController(havok, options.visualRoot, startPosition, options.respawnPosition);
+  // PR #139 follow-up — apply initial yaw so spawn-time multiplayer
+  // players face each other immediately. setYaw() both sets the
+  // internal yawRadians AND builds the Y-axis Quaternion that the
+  // chase camera reads, so the camera also spawns facing the
+  // chosen direction.
+  if (options.startYawRadians !== undefined) {
+    controller.setYaw(options.startYawRadians);
+  }
+  return controller;
 }
 
 /** Public wrapper — owns the Havok controller + stunt state machine. */
@@ -337,6 +354,11 @@ export class CharacterController {
   public setYaw(radians: number): void {
     this.yawRadians = radians;
     Quaternion.RotationAxisToRef(this.up, radians, this.state.rotation);
+  }
+
+  /** Read the current yaw (radians; 0 = +Z forward). */
+  public getYaw(): number {
+    return this.yawRadians;
   }
 
   /**

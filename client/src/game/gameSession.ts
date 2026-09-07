@@ -407,6 +407,23 @@ export function createGameSession(
     CAPSULE.height / 2,
     0,
   );
+  // PR #139 follow-up — spawn yaw so the player faces the center of
+  // the arena (x=0) on first frame. Without this, every player
+  // spawns facing +Z and has to mouse-look around to find the
+  // other tab. The 5-slot X-axis spawn layout (x=-8/-4/0/+4/+8)
+  // means:
+  //   - Players 1, 2 (left of center) → face +X (yaw = +π/2)
+  //   - Player 3 (center) → face +Z (yaw = 0)
+  //   - Players 4, 5 (right of center) → face -X (yaw = -π/2)
+  // Formula: yaw = -sign(localSpawnOffsetX) * π/2 (with sign(0) → 0).
+  // The chase camera reads the character's yaw, so this also rotates
+  // the camera's initial direction.
+  const localSpawnYaw =
+    localSpawnOffsetX > 0
+      ? -Math.PI / 2
+      : localSpawnOffsetX < 0
+      ? Math.PI / 2
+      : 0;
   // The remote rig never needs a unique spawn (it's driven by the
   // interpolator from the first snapshot — `tick()` returns the
   // server-authoritative positions). Keep the visual-only spawn
@@ -418,6 +435,7 @@ export function createGameSession(
   const localController: CharacterController = createCharacterController(scene, {
     startPosition: localSpawn,
     visualRoot: localModel.root,
+    startYawRadians: localSpawnYaw,
   });
   const applyLocalPose = attachPoseUpdater(localModel, localController);
 

@@ -146,8 +146,20 @@ const TWO_PI = 2 * Math.PI;
 export function createChaseCamera(
   scene: Scene,
   character: CharacterController,
-  canvas?: HTMLCanvasElement,
+  options?: { canvas?: HTMLCanvasElement; initialYawRadians?: number },
 ): ChaseCameraHandle {
+  const canvas = options?.canvas;
+  // PR #139 follow-up — initial yaw for the chase camera. Defaults
+  // to 0. When the character controller is created with a non-zero
+  // `startYawRadians` (PR #139 multiplayer-spawn fix), the chase
+  // camera must initialize to match, otherwise the camera's
+  // yawRadians accumulator stays at 0 and the first frame's
+  // encodeInput emits `yaw=0`, which the next frame's
+  // decodeInput → controller.setYaw(0) reapplies — clobbering the
+  // spawn yaw within a single tick. With both initializers in
+  // sync, the first frame's yawRadians round-trips cleanly and
+  // the spawn yaw survives.
+  const initialYawRadians = options?.initialYawRadians ?? 0;
   const camera = new UniversalCamera(
     "chase",
     new Vector3(0, 1.5, -2.8),
@@ -188,7 +200,7 @@ export function createChaseCamera(
   // PR 11.1 state: local yaw accumulator. Mirrors character.yawRadians
   // (set via the controller's `setYaw` in scene.ts) so the camera can
   // render with the same orientation as the character on each frame.
-  let yawRadians = 0;
+  let yawRadians = initialYawRadians;
   // PR 11.3 state: local pitch accumulator ([-π/2, +π/2]). Applied
   // to camera.rotation.x (negated) in the locked render branches. CLAMPS
   // (not wraps) because pitch has hard physical limits — a wrap would
