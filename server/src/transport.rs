@@ -1383,7 +1383,7 @@ pub(super) async fn handle_binary(
                 // player's actual reported position.
                 room_guard.physics.add_player(
                     pu.player_id,
-                    Position { x: pu.position_x, y: pu.position_y },
+                    Position { x: pu.position_x, y: pu.position_y, z: 0.0 },
                 );
                 // PR 11.7.D2.1 / FIX — snap the kinematic body to the
                 // client's reported translation on every PositionUpdate.
@@ -1397,12 +1397,12 @@ pub(super) async fn handle_binary(
                 // stale first-PositionUpdate position forever).
                 room_guard.physics.set_position(
                     pu.player_id,
-                    Position { x: pu.position_x, y: pu.position_y },
+                    Position { x: pu.position_x, y: pu.position_y, z: 0.0 },
                 );
                 room_guard.record_position(
                     pu.player_id,
                     pu.server_frame,
-                    Position { x: pu.position_x, y: pu.position_y },
+                    Position { x: pu.position_x, y: pu.position_y, z: 0.0 },
                 );
             }
             debug!(
@@ -2067,12 +2067,12 @@ mod tests {
             room_guard.record_position(
                 7,
                 10,
-                specialists_server::Position { x: 0.0, y: 0.0 },
+                specialists_server::Position { x: 0.0, y: 0.0, z: 0.0 },
             );
             room_guard.record_position(
                 9,
                 10,
-                specialists_server::Position { x: 5.0, y: 0.0 },
+                specialists_server::Position { x: 5.0, y: 0.0, z: 0.0 },
             );
             // Advance the room's server frame so the AimEvent's
             // `req.frame = 10` is within MAX_LOOKAHEAD_FRAMES (16).

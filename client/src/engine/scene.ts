@@ -1263,6 +1263,11 @@ export async function createScene(
               playerId: localPlayerId,
               positionX: postPos.x,
               positionY: postPos.z,
+              // PR #156 — vertical Y. The local predictor's
+              // havokStep constructs a PlayerState for the client's
+              // own prediction mirror. The wire now carries
+              // positionZ; mirror Havok's y axis into it.
+              positionZ: postPos.y,
               velocityX: postVel.x,
               velocityY: postVel.z,
               yaw: 0, // PR 11.7.B wire doesn't carry yaw/pitch

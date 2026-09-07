@@ -206,6 +206,10 @@ export class Predictor {
       playerId: localPlayerId,
       positionX: 0,
       positionY: 0,
+      // PR #156 — vertical Y. The local predictor's mirror state
+      // starts at 0 (no movement yet); the first server snapshot
+      // overwrites this with the authoritative Rapier y axis.
+      positionZ: 0,
       velocityX: 0,
       velocityY: 0,
       yaw: 0,

@@ -19,19 +19,24 @@
 // for the hitscan-mid-air edge case this fixes.
 
 use std::collections::VecDeque;
-
-/// 2D position. z is constant on the flat demo map (per §3.5)
-/// and re-derived server-side from the player's recorded height
-/// when lag comp needs it. Carrying x + y keeps the wire type 14
-/// bytes; an x + y + z type would be 18 bytes (see §3.5 note).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// 2D XZ position used by the snapshot interpolator's lag-comp
+/// hit-test. PR 11.7.D kept the wire at 14 bytes (x + y) for the
+/// horizontal plane; PR #156 added `z` for the vertical axis,
+/// bumping the wire to 18 bytes (x + y + z). Used by
+/// `snapshot.rs::encode_player_state` + `damage_relay.rs` lag-comp.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
+    /// PR #156 — vertical Y (Rapier body translation's y axis).
+    /// Babylon's Y axis = Rapier's Y axis (both ground-up). The
+    /// server's physics simulation tracks 3D position internally;
+    /// the snapshot previously dropped z when exporting to the wire.
+    pub z: f32,
 }
 
 impl Position {
-    pub const ZERO: Position = Position { x: 0.0, y: 0.0 };
+    pub const ZERO: Position = Position { x: 0.0, y: 0.0, z: 0.0 };
 }
 
 /// Per-player ring buffer. Capacity is `retention_frames` (~64
@@ -181,10 +186,10 @@ mod tests {
     #[test]
     fn snapshot_at_exact_match() {
         let mut h = PositionHistory::new(4);
-        h.record(10, Position { x: 1.0, y: 2.0 });
-        h.record(20, Position { x: 3.0, y: 4.0 });
-        assert_eq!(h.snapshot_at(10), Some(Position { x: 1.0, y: 2.0 }));
-        assert_eq!(h.snapshot_at(20), Some(Position { x: 3.0, y: 4.0 }));
+        h.record(10, Position { x: 1.0, y: 2.0, z: 0.0 });
+        h.record(20, Position { x: 3.0, y: 4.0, z: 0.0 });
+        assert_eq!(h.snapshot_at(10), Some(Position { x: 1.0, y: 2.0, z: 0.0 }));
+        assert_eq!(h.snapshot_at(20), Some(Position { x: 3.0, y: 4.0, z: 0.0 }));
     }
 
     /// PR 11.6.C — target frame is between two recorded frames;
@@ -194,18 +199,18 @@ mod tests {
     #[test]
     fn snapshot_at_nearest_when_between() {
         let mut h = PositionHistory::new(8);
-        h.record(10, Position { x: 1.0, y: 1.0 });
-        h.record(20, Position { x: 2.0, y: 2.0 });
-        h.record(30, Position { x: 3.0, y: 3.0 });
+        h.record(10, Position { x: 1.0, y: 1.0, z: 0.0 });
+        h.record(20, Position { x: 2.0, y: 2.0, z: 0.0 });
+        h.record(30, Position { x: 3.0, y: 3.0, z: 0.0 });
         // Target 25: equidistant from 20 (5 below) and 30 (5
         // above). Prefer the one <= target (frame 20).
-        assert_eq!(h.snapshot_at(25), Some(Position { x: 2.0, y: 2.0 }));
+        assert_eq!(h.snapshot_at(25), Some(Position { x: 2.0, y: 2.0, z: 0.0 }));
         // Target 21: closest is 20 (1 below) over 30 (9 above).
-        assert_eq!(h.snapshot_at(21), Some(Position { x: 2.0, y: 2.0 }));
+        assert_eq!(h.snapshot_at(21), Some(Position { x: 2.0, y: 2.0, z: 0.0 }));
         // Target 29: closest is 30 (1 above) over 20 (9 below).
-        assert_eq!(h.snapshot_at(29), Some(Position { x: 3.0, y: 3.0 }));
+        assert_eq!(h.snapshot_at(29), Some(Position { x: 3.0, y: 3.0, z: 0.0 }));
         // Target 19: closest is 20 (1 above) over 10 (9 below).
-        assert_eq!(h.snapshot_at(19), Some(Position { x: 2.0, y: 2.0 }));
+        assert_eq!(h.snapshot_at(19), Some(Position { x: 2.0, y: 2.0, z: 0.0 }));
     }
 
     /// PR 11.6.C — empty buffer returns None for any target. The
@@ -223,22 +228,22 @@ mod tests {
     #[test]
     fn record_then_snapshot_returns_inserted_position() {
         let mut h = PositionHistory::new(4);
-        h.record(0, Position { x: 0.0, y: 0.0 });
-        h.record(1, Position { x: 1.0, y: 1.0 });
-        assert_eq!(h.snapshot_at(0), Some(Position { x: 0.0, y: 0.0 }));
-        assert_eq!(h.snapshot_at(1), Some(Position { x: 1.0, y: 1.0 }));
+        h.record(0, Position { x: 0.0, y: 0.0, z: 0.0 });
+        h.record(1, Position { x: 1.0, y: 1.0, z: 0.0 });
+        assert_eq!(h.snapshot_at(0), Some(Position { x: 0.0, y: 0.0, z: 0.0 }));
+        assert_eq!(h.snapshot_at(1), Some(Position { x: 1.0, y: 1.0, z: 0.0 }));
         // Future frame still within ±8 tolerance → closest is
         // frame 1.
-        assert_eq!(h.snapshot_at(9), Some(Position { x: 1.0, y: 1.0 }));
+        assert_eq!(h.snapshot_at(9), Some(Position { x: 1.0, y: 1.0, z: 0.0 }));
     }
 
     #[test]
     fn retention_caps_buffer_size() {
         let mut h = PositionHistory::new(2);
-        h.record(0, Position { x: 0.0, y: 0.0 });
-        h.record(1, Position { x: 1.0, y: 1.0 });
-        h.record(2, Position { x: 2.0, y: 2.0 });
-        h.record(3, Position { x: 3.0, y: 3.0 });
+        h.record(0, Position { x: 0.0, y: 0.0, z: 0.0 });
+        h.record(1, Position { x: 1.0, y: 1.0, z: 0.0 });
+        h.record(2, Position { x: 2.0, y: 2.0, z: 0.0 });
+        h.record(3, Position { x: 3.0, y: 3.0, z: 0.0 });
         assert_eq!(h.len(), 2);
         // PR 11.7.B / §3.14: after retention, frames 2 + 3
         // remain. A query for frame 0 returns the closest
@@ -247,9 +252,9 @@ mod tests {
         // "largest <=" returned None for frame 0 because no
         // frame was <= 0 in the buffer. The NEW snap-to-nearest
         // doesn't return None for normal lag-comp windows.
-        assert_eq!(h.snapshot_at(0), Some(Position { x: 2.0, y: 2.0 }));
-        assert_eq!(h.snapshot_at(2), Some(Position { x: 2.0, y: 2.0 }));
-        assert_eq!(h.snapshot_at(3), Some(Position { x: 3.0, y: 3.0 }));
+        assert_eq!(h.snapshot_at(0), Some(Position { x: 2.0, y: 2.0, z: 0.0 }));
+        assert_eq!(h.snapshot_at(2), Some(Position { x: 2.0, y: 2.0, z: 0.0 }));
+        assert_eq!(h.snapshot_at(3), Some(Position { x: 3.0, y: 3.0, z: 0.0 }));
     }
 
     /// PR 11.7.B / §3.14 — snap-to-nearest behavior.
@@ -261,20 +266,20 @@ mod tests {
     #[test]
     fn snapshot_at_snap_to_nearest_basic() {
         let mut h = PositionHistory::new(8);
-        h.record(5, Position { x: 5.0, y: 5.0 });
-        h.record(10, Position { x: 10.0, y: 10.0 });
-        h.record(15, Position { x: 15.0, y: 15.0 });
+        h.record(5, Position { x: 5.0, y: 5.0, z: 0.0 });
+        h.record(10, Position { x: 10.0, y: 10.0, z: 0.0 });
+        h.record(15, Position { x: 15.0, y: 15.0, z: 0.0 });
         // Target = 12: closest is 10 (2 below) over 15 (3
         // above) — frame 10 wins. (Both within ±8.)
-        assert_eq!(h.snapshot_at(12), Some(Position { x: 10.0, y: 10.0 }));
+        assert_eq!(h.snapshot_at(12), Some(Position { x: 10.0, y: 10.0, z: 0.0 }));
         // Target = 14: closest is 15 (1 above) over 10 (4
         // below) — frame 15 wins. (We pick the closest, not
         // the largest <=.)
-        assert_eq!(h.snapshot_at(14), Some(Position { x: 15.0, y: 15.0 }));
+        assert_eq!(h.snapshot_at(14), Some(Position { x: 15.0, y: 15.0, z: 0.0 }));
         // Target = 15: exact match.
-        assert_eq!(h.snapshot_at(15), Some(Position { x: 15.0, y: 15.0 }));
+        assert_eq!(h.snapshot_at(15), Some(Position { x: 15.0, y: 15.0, z: 0.0 }));
         // Target = 5: exact match (backward direction).
-        assert_eq!(h.snapshot_at(5), Some(Position { x: 5.0, y: 5.0 }));
+        assert_eq!(h.snapshot_at(5), Some(Position { x: 5.0, y: 5.0, z: 0.0 }));
     }
 
     // -- PR 11.7.B / §3.14 new tests ----------------------------
@@ -285,20 +290,20 @@ mod tests {
     #[test]
     fn snapshot_at_snap_to_nearest_within_tolerance() {
         let mut h = PositionHistory::new(16);
-        h.record(0, Position { x: 0.0, y: 0.0 });
-        h.record(2, Position { x: 2.0, y: 2.0 });
-        h.record(4, Position { x: 4.0, y: 4.0 });
-        h.record(6, Position { x: 6.0, y: 6.0 });
-        h.record(8, Position { x: 8.0, y: 8.0 });
+        h.record(0, Position { x: 0.0, y: 0.0, z: 0.0 });
+        h.record(2, Position { x: 2.0, y: 2.0, z: 0.0 });
+        h.record(4, Position { x: 4.0, y: 4.0, z: 0.0 });
+        h.record(6, Position { x: 6.0, y: 6.0, z: 0.0 });
+        h.record(8, Position { x: 8.0, y: 8.0, z: 0.0 });
         // Target 5: closest is frame 4 (1 below) over frame 6 (1
         // above). Prefer frame <= target (frame 4).
-        assert_eq!(h.snapshot_at(5), Some(Position { x: 4.0, y: 4.0 }));
+        assert_eq!(h.snapshot_at(5), Some(Position { x: 4.0, y: 4.0, z: 0.0 }));
         // Target 7: closest is frame 6 (1 below) over frame 8 (1
         // above). Prefer frame 6.
-        assert_eq!(h.snapshot_at(7), Some(Position { x: 6.0, y: 6.0 }));
+        assert_eq!(h.snapshot_at(7), Some(Position { x: 6.0, y: 6.0, z: 0.0 }));
         // Target 3: closest is frame 2 (1 below) over frame 4 (1
         // above). Prefer frame 2.
-        assert_eq!(h.snapshot_at(3), Some(Position { x: 2.0, y: 2.0 }));
+        assert_eq!(h.snapshot_at(3), Some(Position { x: 2.0, y: 2.0, z: 0.0 }));
     }
 
     /// PR 11.7.B / §3.14 — outside ±8 tolerance: the snapshot
@@ -307,14 +312,14 @@ mod tests {
     #[test]
     fn snapshot_at_fallback_to_closest_outside_tolerance() {
         let mut h = PositionHistory::new(8);
-        h.record(100, Position { x: 100.0, y: 100.0 });
-        h.record(105, Position { x: 105.0, y: 105.0 });
-        h.record(110, Position { x: 110.0, y: 110.0 });
+        h.record(100, Position { x: 100.0, y: 100.0, z: 0.0 });
+        h.record(105, Position { x: 105.0, y: 105.0, z: 0.0 });
+        h.record(110, Position { x: 110.0, y: 110.0, z: 0.0 });
         // Target 200: 90 frames beyond frame 110 (the closest).
         // Outside ±8 tolerance → fallback to closest available.
-        assert_eq!(h.snapshot_at(200), Some(Position { x: 110.0, y: 110.0 }));
+        assert_eq!(h.snapshot_at(200), Some(Position { x: 110.0, y: 110.0, z: 0.0 }));
         // Target 50: 50 frames before frame 100 (the closest).
-        assert_eq!(h.snapshot_at(50), Some(Position { x: 100.0, y: 100.0 }));
+        assert_eq!(h.snapshot_at(50), Some(Position { x: 100.0, y: 100.0, z: 0.0 }));
     }
 
     /// PR 11.7.B / §3.14 — `should_store_frame` predicate.

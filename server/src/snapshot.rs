@@ -181,6 +181,13 @@ impl SnapshotGenerator {
                 player_id: *player_id,
                 position_x: pos.x,
                 position_y: pos.y,
+                // PR #156 — vertical Y. `pos.z` is Rapier's y axis
+                // (set in `physics.rs::position()` to `t.y`). The
+                // client interprets this as Babylon's Y axis
+                // (ground-up) and applies it to the remote rig's
+                // vertical position so jumps / crates broadcast
+                // their elevation across tabs.
+                position_z: pos.z,
                 velocity_x: vel[0],
                 velocity_y: vel[1],
                 yaw,
@@ -278,7 +285,7 @@ mod tests {
             // Seed the physics world with a body at origin so the
             // snapshot's position/velocity lookups return
             // sensible values.
-            room.physics.add_player(*id, Position { x: 0.0, y: 0.0 });
+            room.physics.add_player(*id, Position { x: 0.0, y: 0.0, z: 0.0 });
         }
         room
     }
@@ -414,7 +421,7 @@ mod tests {
         let mut outs = Vec::new();
         for id in ids {
             room.add_player(*id);
-            room.physics.add_player(*id, Position { x: 0.0, y: 0.0 });
+            room.physics.add_player(*id, Position { x: 0.0, y: 0.0, z: 0.0 });
             let co = crate::connection_outbound::ConnectionOutbound::with_capacity(cap);
             room.register_connection(*id, co.clone());
             outs.push(co);

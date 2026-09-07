@@ -657,7 +657,12 @@ impl PhysicsWorld {
         let handle = self.body_handles.get(&id)?;
         let body = self.bodies.get(*handle)?;
         let t = body.translation();
-        Some(Position { x: t.x, y: t.z })
+        // PR #156 — 3D position. Pre-#156 this returned `Position { x,
+        // y, z: 0.0 }` (z was hardcoded to ground level). Now z
+        // reflects the Rapier body's actual vertical translation so
+        // jumps + crates broadcast their elevation through the
+        // snapshot.
+        Some(Position { x: t.x, y: t.z, z: t.y })
     }
 
     /// PR 11.7.D2.1 — snap a kinematic player body to a client-
@@ -801,7 +806,7 @@ mod tests {
     #[test]
     fn add_player_creates_capsule_at_start_pos() {
         let mut w = PhysicsWorld::new();
-        w.add_player(1, Position { x: 2.0, y: 3.0 });
+        w.add_player(1, Position { x: 2.0, y: 3.0, z: 0.0 });
         assert_eq!(w.n_players(), 1);
         // Position is XZ-only: the capsule's body translation is
         // (start.x, capsule_half_height + radius, start.y) — we
@@ -815,7 +820,7 @@ mod tests {
     fn add_player_is_idempotent() {
         let mut w = PhysicsWorld::new();
         w.add_player(1, Position::ZERO);
-        w.add_player(1, Position { x: 99.0, y: 99.0 });
+        w.add_player(1, Position { x: 99.0, y: 99.0, z: 0.0 });
         assert_eq!(w.n_players(), 1);
         // The second call is a no-op so position stays at (0, 0).
         let p = w.position(1).unwrap();

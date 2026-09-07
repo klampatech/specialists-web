@@ -30,6 +30,9 @@ function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
         playerId: 1,
         positionX: 1.25,
         positionY: -3.5,
+
+        positionZ: 0.0, // PR #156
+
         velocityX: 0.1,
         velocityY: 0.2,
         yaw: 0.785,
@@ -44,6 +47,9 @@ function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
         playerId: 2,
         positionX: -2.0,
         positionY: 5.5,
+
+        positionZ: 0.0, // PR #156
+
         velocityX: -0.3,
         velocityY: 0.0,
         yaw: -1.5,
@@ -69,6 +75,8 @@ describe("encodeSnapshot / decodeSnapshot round-trip (PR 11.7.D)", () => {
           playerId: 1,
           positionX: 1.5,
           positionY: -3.5,
+          // PR #156 — vertical Y (Rapier's y axis = Babylon's Y axis)
+          positionZ: 0.5, // 0.5 is exact in f32
           velocityX: 0.125,
           velocityY: 0.25,
           yaw: 0.5, // 0.5 is exact in f32
@@ -83,6 +91,7 @@ describe("encodeSnapshot / decodeSnapshot round-trip (PR 11.7.D)", () => {
           playerId: 2,
           positionX: -2.0,
           positionY: 5.5,
+          positionZ: 1.75, // mid-jump elevation
           velocityX: -0.125, // exact in f32
           velocityY: 0.0,
           yaw: -1.0, // exact in f32
@@ -120,6 +129,9 @@ describe("encodeSnapshot / decodeSnapshot round-trip (PR 11.7.D)", () => {
           playerId: i + 1,
           positionX: i * 0.5,
           positionY: i,
+
+          positionZ: 0.0, // PR #156
+
           velocityX: 0,
           velocityY: 0,
           yaw: 0,
@@ -165,9 +177,10 @@ describe("encodeSnapshot / decodeSnapshot round-trip (PR 11.7.D)", () => {
           playerId: 7,
           positionX: 1.5, // exact in f32
           positionY: -2.25, // exact in f32
+          positionZ: 0.875, // exact in f32
           velocityX: 0.0,
           velocityY: 0.0,
-          yaw: Math.PI / 4, // 0.7853981... approximates; just check it's reproducible
+          yaw: Math.PI / 4, // 0.7853981... approximates;just check it's reproducible
           pitch: -0.1,
           hp: 42,
           ammo: 7,
