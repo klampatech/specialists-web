@@ -81,6 +81,25 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ---
 
+## 2026-09-07 — PR #146 (hide ghost remote rig when no peer connected)
+
+**Scope**: Kyle's screenshot showed the cyan ghost rig half-sunken into the floor when he tested solo (no second tab).
+
+**Root cause**: `client/src/game/remotePlayer.ts:createRemotePlayer()` creates the remote rig at the Havok default (0, 1, 0) when no peer is connected — and the rig was visible from spawn. With Y=1 + capsule geometry centered at that height, the bottom half of the rig was below the floor plane (Y=0).
+
+**Fix**:
+- `createRemotePlayer`: rig root starts `setEnabled(false)`.
+- `wireServerTransport.ts onSnapshot`: when the first peer player is resolved from the snapshot stream (the auto-fill branch from PR #139), flip the rig's `setEnabled(true)`.
+
+**Verified live on Hetzner**:
+- Solo tab: `remoteRootEnabled: false`, only the red local character visible.
+- 2-tab smoke: both tabs report `remoteRootEnabled: true`, both characters visible side-by-side, both standing properly with shadows.
+- HUD ammo `▮▮▮▮▮▮▮▮▮▮ /10` (matches server PLAYER_MAX_AMMO=10 from PR #142).
+
+**Why "this still isn't playing like it's working"** — Kyle was testing single-tab. Solo = no peer = no other player to shoot. The "ghost rig" he saw was the visual placeholder for a peer that wasn't there. With #146, the ghost only appears when a real peer connects. The smoke + my Playwright tests confirm 2-tab multiplayer works (both characters visible, shots land, ammo sync'd, HP decrements via snapshot).
+
+**Memory anchor**: §specialists-web-2026-09-07 (updated).
+
 ## 2026-09-07 — PRs #142 + #143 (PLAYER_MAX_AMMO=10 + crate repositioning)
 
 **Scope**: Close two remaining UX bugs from Kyle's 2026-09-07 live playtest after PR #141 (spawn yaw).
