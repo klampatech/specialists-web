@@ -393,12 +393,16 @@ export async function createScene(
   // Multiplayer path: the GameSession owns BOTH rigs + both controllers +
   // the LockstepRuntime; the render loop just calls `gameSession.tick()`.
   // PR 11.6.D FIX 2: pass localPlayerId + peerPlayerId from
-  // window flags (set by the smoke init script). Defaults to 1
-  // and 2 for the legacy 2-player demo.
+  // window flags (set by the smoke init script). localPlayerId
+  // defaults to 1 for the legacy 2-player demo; peerPlayerId
+  // defaults to UNDEFINED (PR #139) — the snapshot stream
+  // auto-fills from the first non-self player id. Pre-#139
+  // defaulted `?? 2` which caused the symmetric self-peer bug
+  // (both tabs defaulted peer=2; Tab B's "remote" was Tab B).
   const initLocalPlayerId =
     (window as unknown as { __localPlayerId?: number }).__localPlayerId ?? 1;
   const initPeerPlayerId =
-    (window as unknown as { __peerPlayerId?: number }).__peerPlayerId ?? 2;
+    (window as unknown as { __peerPlayerId?: number }).__peerPlayerId;
   // PR 11.7.D2 / §3.10 — createGameSession no longer takes a
   // transport arg (no peer wire to plug in). The gameSession owns a
   // LockstepState stub for HUD compat. The remote visual is driven

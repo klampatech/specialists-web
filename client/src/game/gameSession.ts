@@ -229,10 +229,14 @@ export interface GameSession {
   readonly localPlayerId: number;
   /**
    * PR 11.6.D FIX 2 — the peer's player ID. Used as `targetPlayerId`
-   * on outbound DamageRequests. Defaults to 2. The smoke drives this
+   * on outgoing DamageRequests. May be undefined if the snapshot
+   * stream hasn't yet seen another player — the snapshot-stream
+   * auto-fill (PR #139) will populate this. The smoke drives this
    * via `window.__peerPlayerId`.
    */
-  readonly peerPlayerId: number;
+  readonly peerPlayerId: number | undefined;
+  /** PR #139 — late-bind the peer id (snapshot auto-fill). */
+  setPeerPlayerId(id: number): void;
   /** All combat events ever generated this session (HUD reads `length`). */
   getCombatEvents(): CombatEvent[];
   /** Drain the combat events since the last call; the tracer render uses
@@ -482,10 +486,14 @@ export function createGameSession(
    *  `tools/damage-server-hp-convergence-smoke.mjs`). */
   const localPlayerId: number = opts.localPlayerId ?? 1;
   /** PR 11.6.D FIX 2 — the peer's player ID. Used as `targetPlayerId`
-   *  on outgoing DamageRequests. Defaults to 2 (the demo's 2-player
-   *  layout). The smoke drives this via `window.__peerPlayerId` so
-   *  Tab A targets player 2 and Tab B targets player 1. */
-  const peerPlayerId: number = opts.peerPlayerId ?? 2;
+   *  on outgoing DamageRequests. Defaults to UNDEFINED (was `?? 2`
+   *  pre-#139). When undefined, the snapshot stream auto-fills
+   *  peerPlayerId from the first non-self playerId in the first
+   *  snapshot — prevents the symmetric self-peer bug where Tab B's
+   *  "remote" was Tab B itself (both tabs defaulted peerPlayerId=2).
+   *  The smoke drives this via `window.__peerPlayerId` so Tab A
+   *  targets player 2 and Tab B targets player 1. */
+  let peerPlayerId: number | undefined = opts.peerPlayerId;
   /** PR 11.6.D — monotonic eventId counter for outbound DamageRequests.
    *  The server rejects stale eventIds (PR 11.6.D §3.4.1 gate 6).
    *  Start at 1 (0 is a sentinel — never used on the wire). */
@@ -1030,10 +1038,18 @@ export function createGameSession(
     submitLocalInput,
     // PR 11.6.D FIX 2: expose the local + peer player ids on the
     // returned handle. The smoke uses these to assert the right tab
-    // is sending fire events to the right target. Both are
-    // immutable for the session's lifetime.
+    // is sending fire events to the right target. `peerPlayerId` is
+    // a getter so the snapshot-stream auto-fill (PR #139) is
+    // visible to callers without re-passing the value. The smoke
+    // drives `peerPlayerId` via `window.__peerPlayerId` so Tab A
+    // targets player 2 and Tab B targets player 1.
     localPlayerId,
-    peerPlayerId,
+    get peerPlayerId(): number | undefined {
+      return peerPlayerId;
+    },
+    setPeerPlayerId: (id: number) => {
+      peerPlayerId = id;
+    },
     // PR 11.6.D: late-bind server-auth transport. Defaults to the
     // constructor option (may be `null` for P2P smokes).
     setServerTransport: (t) => {

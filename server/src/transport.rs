@@ -73,7 +73,7 @@ use tracing::{debug, error, info, warn};
 use wtransport::{Endpoint, ServerConfig};
 
 use specialists_server::cert::DEFAULT_SANS;
-use specialists_server::constants::DEVBX_ROOM_ID;
+use specialists_server::constants::{DEVBX_ROOM_ID, MAX_PLAYERS_PER_ROOM};
 use specialists_server::position_history::Position;
 use specialists_server::protocol::{
     decode_aim_event, decode_inputs_server, decode_melee_event, decode_ping,
@@ -692,6 +692,24 @@ where
     let placeholder_id;
     {
         let mut room_guard = room_arc.write().await;
+        // PR #139 — enforce MAX_PLAYERS_PER_ROOM at WS accept.
+        // The matchmaker's `max_players` is a contract; the server
+        // must honor it. Without this gate, ghost connections from
+        // prior smoke runs accumulate in `room.connections` (the
+        // room.connections entry isn't always cleared on WS close),
+        // and new tabs joining see the ghosts in their snapshot.
+        if room_guard.connections.len() >= MAX_PLAYERS_PER_ROOM as usize {
+            warn!(
+                "rejecting WS open: room full (existing={}, max={})",
+                room_guard.connections.len(),
+                MAX_PLAYERS_PER_ROOM
+            );
+            // Drop the outbound channel so the WebSocket handshake
+            // completes then the socket closes.
+            drop(room_guard);
+            outbound.close();
+            return Ok(());
+        }
         placeholder_id = room_guard.allocate_next_player_id();
         room_guard.register_connection(placeholder_id, outbound.clone());
     }
