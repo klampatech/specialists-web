@@ -481,8 +481,15 @@ export async function createScene(
   }
 
   // ---- Chase camera --------------------------------------------------------
-  // Follows the LOCAL controller regardless of mode.
-  const chase: ChaseCameraHandle = createChaseCamera(scene, character, canvas);
+  // PR #139 follow-up — initial yaw passed to the chase camera so
+  // its yawRadians accumulator matches the character's spawn yaw.
+  // Without this, the chase camera emits yaw=0 in the first frame's
+  // wire packet, which the next frame's decodeInput → setYaw(0)
+  // reapplies, clobbering the spawn yaw within one tick.
+  const chase: ChaseCameraHandle = createChaseCamera(scene, character, {
+    canvas,
+    initialYawRadians: character?.getYaw?.() ?? 0,
+  });
 
   // ---- Spectator camera (PR 11.4, dev-only) -------------------------------
   // Lazy-allocated UniversalCamera. Instantiated UNCONDITIONALLY in DEV
