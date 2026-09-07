@@ -204,6 +204,36 @@ impl SnapshotGenerator {
         // order is randomized by Rust's default hasher).
         player_states.sort_by_key(|p| p.player_id);
 
+        // PR #158 — snapshot broadcast summary. Logs the per-player
+        // state at info-level once per snapshot broadcast (20Hz per
+        // room) so Kyle can `journalctl -u specialists-server -f |
+        // grep SNAPSHOT` to correlate FE HUD readings with BE
+        // authoritative state during playtests. Disabled by default
+        // (info); flip on via `RUST_LOG=snapshot_summary=info`.
+        if tracing::enabled!(target: "snapshot_summary", tracing::Level::INFO) {
+            let summary = player_states
+                .iter()
+                .map(|p| {
+                    format!(
+                        "p{}:hp{}:ammo{}:yaw{:.2}:z{:.2}",
+                        p.player_id,
+                        p.hp,
+                        p.ammo,
+                        p.yaw,
+                        p.position_z
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!(
+                target: "snapshot_summary",
+                room_id = %room.id,
+                server_frame = room.next_server_frame.saturating_sub(1),
+                "SNAPSHOT {}",
+                summary
+            );
+        }
+
         Snapshot {
             server_frame: room.next_server_frame.saturating_sub(1),
             next_server_frame: room.next_server_frame,

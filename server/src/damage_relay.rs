@@ -401,6 +401,24 @@ pub fn validate_and_relay_aim(
         .copied()
         .filter(|id| *id != req_source)
         .collect();
+    // PR #158 — accepted-aim telemetry. Fires once per AimEvent
+    // that survives all gates (even if no targets in range).
+    // Useful for diagnosing "shots landed but no hit" — confirms
+    // the fire-rate cooldown gate passed and ammo was consumed.
+    tracing::info!(
+        target: "damage_relay",
+        source = req_source,
+        event_id = req.event_id,
+        req_frame = req.frame,
+        ammo_after = room.players.get(&req_source).map(|p| p.ammo).unwrap_or(0),
+        targets = target_ids.len(),
+        "AIM_ACCEPTED source={} ev={} frame={} ammo_after={} targets={}",
+        req_source,
+        req.event_id,
+        req.frame,
+        room.players.get(&req_source).map(|p| p.ammo).unwrap_or(0),
+        target_ids.len(),
+    );
     for target_id in target_ids {
         // Re-fetch the target's position history (immutable borrow).
         let target_history = match room.position_history.get(&target_id) {
@@ -465,7 +483,24 @@ pub fn validate_and_relay_aim(
            .get_mut(&target_id)
            .expect("target_id from keys() invariant violated");
        target_player.hp = target_player.hp.saturating_sub(amount);
-    }
+       // PR #158 — hit telemetry for diagnostic correlation.
+       // Always on at info-level (target: "damage_relay") so
+       // `journalctl -u specialists-server -f | grep HIT` shows
+       // every server-validated hit with HP before/after. Cheap:
+       // one log line per hit, at 20Hz snapshot rate max.
+       tracing::info!(
+           target: "damage_relay",
+           source = req_source,
+           target = target_id,
+           amount,
+           hp_after = target_player.hp,
+           "HIT source={} target={} dmg={} hp_after={}",
+           req_source,
+           target_id,
+           amount,
+           target_player.hp,
+       );
+       }
     // Side effects on every accepted event (gate 4 passes):
     // decrement source ammo + stamp last_fire_at + saturating
     // eventId stamp. The fire rate is consumed EVEN ON MISS
