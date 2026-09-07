@@ -81,6 +81,41 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ---
 
+## 2026-09-07 — PR #139 (peerPlayerId auto-fill + MAX_PLAYERS enforcement) — live Kyle playtest fix
+
+**Scope**: Close the post-#134 'Tab B sees itself' multiplayer bug that surfaced in Kyle's live 2-tab playtest on Hetzner. Tab A (localId=1) correctly saw Tab B's rig; Tab B (localId=2) saw only its own rig (no remote player visible). HP didn't decrement, ammo sync was inconsistent.
+
+**Root cause (Kyle playtest, 2026-09-07 09:30)**:
+- `gameSession.ts:488` defaulted `peerPlayerId ?? 2`. The lobby never emitted `?peerId=`. Both tabs defaulted peer=2.
+- Tab A (id=1) → peer=2 → found player 2's rig ✓
+- Tab B (id=2) → peer=2 → found ITSELF (player 2) → self-rendering ✗
+- Hetzner DEVBX room had ghost connections from prior smoke runs that didn't clear. Snapshot was stale; new tabs saw ghosts in the snapshot.
+
+**Fix (3 files, 4 changes)**:
+- `client/src/game/gameSession.ts` — `peerPlayerId ?? 2` → `peerPlayerId` (no default; can be undefined). Added `setPeerPlayerId(id)` method. Changed handle's `peerPlayerId` to getter + setter (was immutable).
+- `client/src/engine/scene.ts` — `initPeerPlayerId ?? 2` → `initPeerPlayerId` (no default).
+- `client/src/engine/wireServerTransport.ts` — snapshot `onSnapshot` listener auto-fills `peerPlayerId` from the first non-self playerId in the first snapshot that contains another player.
+- `server/src/transport.rs` — gate at WS accept: `if room.connections.len() >= MAX_PLAYERS_PER_ROOM { reject + close }`.
+
+**Why wireServerTransport.ts (not scene.ts)**: the auto-fill is in the `if (effectiveMultiplayer)` block in scene.ts, which Vite tree-shakes from prod. wireServerTransport.ts is side-effect-imported and survives tree-shake. The first attempt put the auto-fill in scene.ts and the bundle was missing the call site (verified via `grep -c "setPeerPlayerId(remotePlayer\|peerPlayerId === undefined" dist/assets/index-*.js` returning 0).
+
+**Verified live on Hetzner (Playwright)**:
+- 2-tab smoke: Tab A `sessPeerId=2` → remoteRoot [-4, 1, 0] (player 2's spawn); Tab B `sessPeerId=1` → remoteRoot [-8, 1, 0] (player 1's spawn). Symmetric ✓
+- 10-shot spam from Tab A: Tab B's HP dropped 100→0 (DualPistol 8dmg × 12 hits saturates HP). All ammo decremented correctly (Tab A 6→2; snapshot 6→2 in Tab B).
+- 2-shot spam (just to see HP): Tab B HP 100→76 (= 100-24, 3 hits worth of dmg landed); ammo 6→4.
+
+**Bundle deployed**: `index-DMWKTL31.js` (built 2026-09-07 15:18 UTC). `grep -c "setPeerPlayerId(x.playerId" index-*.js` = 1 (the auto-fill call site). Server rebuilt + redeployed (binary replaced 2026-09-07 15:05 UTC, restarted clean).
+
+**Pitfalls encoded (added to skill + memory)**:
+- `peerPlayerId ?? N` default → USE `undefined` + snapshot auto-fill. Mirror of `localPlayerId ?? 1` lesson in PR #134.
+- Vite tree-shake of side-effect modules: any code that MUST run in prod (snapshot handlers, broadcast handlers, predictor hooks) lives in `wireServerTransport.ts` (side-effect-imported) NOT `scene.ts` (tree-shaken inside `if (effectiveMultiplayer)`). Detection: `grep -c "<call_site_marker>" dist/assets/index-*.js` — if 0 in prod but 1 in source, the code is in the tree-shaken block.
+- Server `max_players` is a contract: matchmaker reports it, server MUST enforce it at WS accept. Ghost connections from prior runs accumulate otherwise.
+
+**Next session carry-forwards**:
+- (a) Real Mac 2-tab multiplayer playtest from Kyle (vs current Playwright headless). The Mac Chrome CDP tunnel is up; Kyle can re-test in Vivaldi.
+- (b) The asymmetric-render issue (Tab 0 only sees its own rig because of world crate at (-5, 1.25, -2) occluding camera ray to player 2 at (-4, 1, 0)) — a UX/geometry issue, not a render bug. Solutions: move the crate, widen the camera FOV, spawn players further apart, or have the camera face the remote rig by default.
+- (c) Phantom `claimed_player_id=0` collision (UNRESOLVED) — instrument `dbSendPositionUpdateThrottled` to log `localPlayerId` per send to confirm the StrictMode double-mount theory.
+
 ## 2026-09-05 — PR #128 + #129-followup (matchmaker public-host + gameSession tree-shake)
 
 **Scope**: Hetzner prod bring-up completion. The 2026-09-04 deploy session had two latent bugs in the production bundle: (1) the matchmaker returned URLs containing the requester's egress IP rather than the server's, breaking direct matchmaker consumers and forcing a `serve-static.mjs` URL-rewrite workaround; (2) the new gameSession creation path (`window.__gameSession = gameSession`) was tree-shaken from the prod bundle because it sat inside scene.ts's `if (import.meta.env.DEV)` block. Kyle's playtest (msg `1545827883321135125`, room `1mm4mqI1`) exposed bug #2: wire-up connected but `snapshot: null` and no rig — HUD was reading hardcoded fallback values. Two PRs shipped in this session.
