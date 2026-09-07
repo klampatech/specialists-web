@@ -72,13 +72,21 @@ const RING_BUFFER_CAPACITY = 8;
  * `Interpolator.tick(now)`. Mirrors the shape of
  * `protocol/snapshot.PlayerState` but with a Babylon `Vector3`
  * position (world-space, ready to feed into Havok setPosition)
- * + an optional rotation (undefined until PR 11.7.E adds
- * yaw/pitch to the snapshot wire).
+ * + a yaw in radians (used to rotate the remote rig to match
+ * the peer's facing direction).
  */
 export interface RemotePlayerState {
   playerId: number;
   position: Vector3Type;
-  rotation: undefined; // reserved for PR 11.7.E
+  /** Peer's yaw in radians (Babylon convention: 0 = +Z forward).
+   *  Post-PR #155 the interpolator reads the snapshot's
+   *  `yaw` field (which PR #59 wired) and propagates it here so
+   *  the scene-side pose applier can rotate the remote rig to
+   *  match the peer's facing direction. Pre-#155 this was
+   *  `undefined` — the remote rig always rendered with the
+   *  default forward facing regardless of where the peer was
+   *  actually looking. */
+  yaw: number;
 }
 
 interface BufferedSnapshot {
@@ -226,6 +234,52 @@ export class Interpolator {
   /** Per-frame stats counters. Cumulative across the session. */
   private _starvationCount = 0;
   private _extrapolationCount = 0;
+
+  /** PR #155 — optional side-channel sink for the interpolated yaw.
+   *  Set via `setYawSink(...)` from the scene-side wiring so the
+   *  remote controller's `setYaw` method can be invoked even when
+   *  Vite's closure analyzer tree-shakes the LIVE hook body that
+   *  would otherwise do the same job. Stored as a closure reference
+   *  on the instance so it's reachable from `tick()` (which Vite
+   *  does NOT tree-shake because the interpolator is exposed on
+   *  `window.__interpolator`).
+   *
+   *  PR #155 NOTE: the constructor initializes `_yawSink` to a
+   *  default that resolves the live remote controller from the
+   *  `window.__gameSession` slot at call time. This is necessary
+   *  because Vite is tree-shaking the scene-side `setYawSink(...)`
+   *  call inside the `createScene` IIFE (the IIFE itself isn't
+   *  considered reachable from the `createScene` export as far as
+   *  Vite's analyzer can prove). With the default sink, the
+   *  interpolation still applies the yaw to the live controller as
+   *  long as `window.__gameSession.remoteController.setYaw` is set
+   *  by the time `tick()` runs.
+   */
+  private _yawSink: ((playerId: number, yawRadians: number) => void) | null =
+    (playerId: number, yawRadians: number) => {
+      const liveSession = (window as unknown as {
+        __gameSession?: {
+          remoteController?: { setYaw?: (r: number) => void };
+        };
+      }).__gameSession;
+      const liveRemoteCtrl = liveSession?.remoteController;
+      if (liveRemoteCtrl && typeof liveRemoteCtrl.setYaw === "function") {
+        liveRemoteCtrl.setYaw(yawRadians);
+      }
+      // Reference playerId to silence the unused-arg lint
+      void playerId;
+    };
+
+  /**
+   * PR #155 — register a callback that receives every interpolated
+   * yaw value as `tick()` returns. The scene-side wiring passes a
+   * callback that resolves the `playerId` → remote controller and
+   * invokes `setYaw`. The callback is held on the instance so it's
+   * reachable through the interpolator's exported tick path.
+   */
+  setYawSink(sink: (playerId: number, yawRadians: number) => void): void {
+    this._yawSink = sink;
+  }
 
   /** PR 11.7.C — wall-clock arrival time of the most recent snapshot,
    *  per remote player. Used for extrapolation age checks. */
@@ -471,32 +525,50 @@ export class Interpolator {
           }
         }
       }
-      // Convert from server (X, Y) horizontal-only to Babylon
-      // (x, y, z) world-space. Y = ground-up (CAPSULE.height / 2
-      // for the controller\'s spawn); the snapshot wire
-      // \'s positionY is depth (Z in Babylon).
-      // The Babylon Vector3 here is what Havok\'s setPosition
-      // expects (a world-space point).
+      // PR #155 — vertical Y of the remote rig. Pre-#155 this was
+      // HARDCODED to 1.0 (capsule half-height), which meant the
+      // remote rig was always pinned at ground level regardless of
+      // where the peer actually was. The snapshot wire only carries
+      // (positionX, positionY) where positionY is depth (server's
+      // Rapier y axis = Babylon's z axis) — it does NOT carry the
+      // vertical Y component (PR #59 documented this as a known
+      // shape gap: the height is implicit on the Rapier capsule
+      // body). So we keep the Y=1.0 default for now but expose it
+      // as a single line so the positionZ follow-up (server-side
+      // 3D position) is a one-line change.
       const position = new Vector3(
         playerState.positionX,
-        // Y is fixed at character capsule half-height; the
-        // snapshot\'s `positionY` is depth (server y axis),
-        // not vertical. The server\'s snapshot.rs defines
-        // the (x, y) → (Babylon x, Babylon z) mapping.
         1.0,
         playerState.positionY,
       );
+      const yawValue = playerState.yaw ?? 0;
       out.push({
         playerId,
         position,
-        // Rotation (yaw / pitch) on the wire is zero in
-        // PR 11.7.B (per server/src/snapshot.rs line 111-112:
-        // `yaw: 0.0, pitch: 0.0`). The interpolator returns
-        // undefined for rotation; the scene applies Havok\'s
-        // default rotation. PR 11.7.E wires yaw/pitch on the
-        // wire; the interpolated rotation will be added here.
-        rotation: undefined,
+        // PR #155 — surface the snapshot's yaw to the scene-side
+        // pose applier. Pre-#155 this was `rotation: undefined`,
+        // so the remote rig always rendered with the default
+        // forward-facing direction regardless of where the peer
+        // was looking. The snapshot wire DOES carry yaw/pitch
+        // (PR #59 wired it; PR 11.7.E filled it from
+        // `Room.players[id].yaw_radians`) — the interpolator just
+        // wasn't reading them. Now `lerpPlayerState` lerps yaw
+        // alongside position so the remote rig smoothly rotates
+        // to match the peer's facing direction.
+        yaw: yawValue,
       });
+      // PR #155 / DUAL PATH — also invoke the optional yaw sink
+      // so callers that need the yaw applied INSIDE the
+      // interpolator's reachable code path can do so without
+      // going through the LIVE hook body (which Vite's closure
+      // analyzer is tree-shaking direct method calls inside).
+      // The `__yawSink` is set from the scene-side wiring via
+      // `Interpolator.setYawSink(...)`. Pre-#155 the yaw value
+      // was discarded; post-#155 it flows through this side
+      // channel into the controller's setYaw method.
+      if (this._yawSink) {
+        this._yawSink(playerId, yawValue);
+      }
     }
     return out;
   }

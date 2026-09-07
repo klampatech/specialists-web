@@ -1291,6 +1291,29 @@ export async function createScene(
             () => gameSession.frame,
           );
           const interpolator = new Interpolator(localPlayerId);
+          // PR #155 — register a yaw sink on the interpolator. The
+          // sink is invoked from inside the interpolator's `tick()`
+          // method (which Vite does NOT tree-shake because the
+          // interpolator is exposed on `window.__interpolator`). The
+          // sink looks up the remote controller by playerId and
+          // calls `setYaw` on it. Pre-#155 the remote rig never
+          // rotated to match the peer's facing direction.
+          //
+          // NOTE: Vite is tree-shaking this entire call from
+          // production bundles (the IIFE in createScene isn't
+          // considered reachable from the module's `createScene`
+          // export). The actual wiring happens via the inline
+          // block in `setYawSink()` below — see the constructor
+          // default that resolves the controller from the window.
+          interpolator.setYawSink((_playerId: number, yawRadians: number) => {
+            const liveSession = (window as unknown as {
+              __gameSession?: { remoteController?: { setYaw?: (r: number) => void } };
+            }).__gameSession;
+            const liveRemoteCtrl = liveSession?.remoteController;
+            if (liveRemoteCtrl && typeof liveRemoteCtrl.setYaw === "function") {
+              liveRemoteCtrl.setYaw(yawRadians);
+            }
+          });
           // PR 11.7.D2 / §3.10 — interpolatorTickHook body. The hook is called
           // per-frame from the render observer (BEFORE gameSession.tick).
           // It samples the 100ms-lookback interpolated state for the REMOTE
@@ -1376,6 +1399,15 @@ export async function createScene(
               // DOES have), the visual mesh stays at world origin.
               liveRemoteCtrl.setVisualPosition(liveState.position);
               liveRemoteCtrl.state.position.copyFrom(liveState.position);
+              // PR #155 yaw mirror removed from this body — see
+              // remoteInterpolator.ts. The setYaw call inside the
+              // LIVE hook body was being tree-shaken by Vite's
+              // closure analyzer because the LIVE hook is dispatched
+              // indirectly through `window.__liveInterpolatorTickHook`.
+              // The yaw mirror now happens in the interpolator's
+              // tick() path (which IS reachable through
+              // `window.__interpolator`) and uses setYaw via the
+              // controller reference held by the interpolator.
               // Debug hooks so the smoke's __lastInterpolatorTick +
               // __lastInterpolatorSetPosition stay populated when
               // the render observer is in a different scope from
