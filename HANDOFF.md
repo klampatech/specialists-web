@@ -98,6 +98,49 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 **Memory anchor**: §specialists-web-2026-09-07 (updated).
 
+## 2026-09-07 — PR #152 (Debug HUD playerId + peerPlayerId resolution)
+
+**Scope**: Fix Debug HUD display bugs revealed by Kyle's playtest screenshot.
+
+**Two bugs**:
+1. **Snapshot players shows `?:hp100, ?:hp100`** — DebugHud read `p.id` from the snapshot's PlayerState, but the snapshot field is `playerId` per `protocol/snapshot.ts::PlayerState`. Pre-#152, always showed `?`.
+2. **`localId / peerId: 1 / ?`** — wireServerTransport's onSnapshot auto-fill (PR #139) populates `liveSession.peerPlayerId`, but never mirrors to `window.__peerPlayerId`. The lobby doesn't emit `&peerId=` in the URL, so PeerOverlay never wrote the window flag.
+
+**Fix**:
+1. Read `p.playerId` instead of `p.id` in DebugHud (`client/src/ui/DebugHud.tsx:324`).
+2. Mirror peer id to `window.__peerPlayerId` in wireServerTransport's auto-fill block.
+
+**Verified live on Hetzner**: bundle `index-C9ZnVCBX.js` contains both fixes.
+
+**Diagnosed but NOT fixed (deferred to follow-up PR)**:
+
+### Y-axis (vertical position) not in snapshot wire format
+
+Kyle observed: "no vertical was visible between tabs" — when one player jumps, the other tab sees the remote rig stay at Y=1 (ground level) instead of tracking the jump. Same applies to standing on crates (the remote rig appears inside the crate on the other tab).
+
+**Root cause** (`server/src/physics.rs:656` + `server/src/position_history.rs:25-26`):
+- The server's `Position` struct is `{x: f32, y: f32}` — no Z field.
+- `physics.position()` returns `Position { x: t.x, y: t.z }` — XZ plane only.
+- The comment in `physics.rs:653-655` says "2D XZ position for a player".
+- The protocol's PlayerState wire layout (`protocol/snapshot.ts:88-101`) carries `positionX` and `positionY` (which is depth = Babylon's Z).
+- Vertical Y is tracked by Rapier physics (`body.translation()` returns 3D), but the server-side export drops it.
+
+**Fix would require**:
+1. Bump `PLAYER_STATE_BODY_SIZE` 31 → 35 (add 4 bytes for `positionZ`).
+2. Add `position_z: f32` to `Position` struct in `server/src/position_history.rs`.
+3. Update `physics.position()` to `Position { x: t.x, y: t.z, z: t.y }` (Babylon's Y = physics' Y).
+4. Update Rust `PlayerState` encoder/decoder + TS encoder/decoder.
+5. Update `damage_relay.rs` lag-comp hit-test to use the 3D position.
+6. Update `remoteInterpolator.ts` to read the new field.
+
+**Status**: Not started. Documented for next session. PR #152 lays the groundwork (Debug HUD can now actually show playerId resolution, so we'll be able to confirm the Y fix when shipped).
+
+### Server frame desync (client frames far ahead of server)
+
+Both tabs in Kyle's screenshot show client frame ~6464/9739 while server frame is 4907 on both. Clients are ~1500-4800 frames ahead of the server. This could be a clock-drift issue (client uses `performance.now()` for its frame counter, server has its own tick counter, and the gap indicates the client is stepping ahead faster than the server can keep up). Not investigated. Could explain laggy input response Kyle observed.
+
+**Memory anchor**: §specialists-web-2026-09-07 (updated).
+
 ## 2026-09-07 — PRs #142 + #143 (PLAYER_MAX_AMMO=10 + crate repositioning)
 
 **Scope**: Close two remaining UX bugs from Kyle's 2026-09-07 live playtest after PR #141 (spawn yaw).
