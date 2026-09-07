@@ -396,7 +396,7 @@ pub const MELEE_EVENT_WIRE_SIZE: usize = MELEE_EVENT_BODY_SIZE + 1;
 /// `COMBAT.melee.damage = 25`). Per-weapon melee multipliers (e.g.
 /// katana 50, knife 15) are deferred to a future weapons arc PR; PR
 /// #114 keeps the surface tight with one fixed value, mirroring the
-/// single-`PLAYER_MAX_AMMO = 6` approach from PR #78.
+/// single-`PLAYER_MAX_AMMO = 10` approach from PR #142 (was 6 in PR #78).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MeleeEvent {
     pub source_player_id: u16,

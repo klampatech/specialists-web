@@ -184,11 +184,11 @@ describe("protocol PR #108 — rate-limit + headshot constants", () => {
     expect(HEADSHOT_MULTIPLIER).toBe(3);
   });
 
-  it("PLAYER_MAX_AMMO = 6 (DualPistol magazine size)", () => {
+  it("PLAYER_MAX_AMMO = 10 (DualPistol magazine size, PR #142)", () => {
     // Mirror of `server/src/constants.rs::PLAYER_MAX_AMMO`. The
     // HUD's reload-progress bar uses this for the
     // fill-when-full computation. Drift = HUD reload bar
     // vanishes before the server confirms the reload.
-    expect(PLAYER_MAX_AMMO).toBe(6);
+    expect(PLAYER_MAX_AMMO).toBe(10);
   });
 });
