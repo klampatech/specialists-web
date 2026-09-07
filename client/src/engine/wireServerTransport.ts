@@ -474,6 +474,27 @@ void (async () => {
         const remotePlayer = snap.players.find((p) => p.playerId !== liveSession.localPlayerId);
         if (remotePlayer) {
           liveSession.setPeerPlayerId(remotePlayer.playerId);
+          // PR #146 — reveal the remote rig mesh the moment we
+          // confirm a peer is connected. Pre-#146 the rig was
+          // visible from spawn (half-sunken ghost at the Havok
+          // default position when no peer was present). Now
+          // hidden by default + revealed on first peer detection.
+          // Mirrors the lobby's expected UX: solo = no ghost
+          // rig; multi = rig appears when peer connects.
+          const w = window as unknown as {
+            __remoteRigVisible?: boolean;
+          };
+          if (w.__remoteRigVisible !== true) {
+            const remoteModel = (
+              liveSession as unknown as {
+                remoteModel?: { root?: { setEnabled?: (b: boolean) => void } };
+              }
+            ).remoteModel;
+            if (remoteModel?.root?.setEnabled) {
+              remoteModel.root.setEnabled(true);
+              w.__remoteRigVisible = true;
+            }
+          }
         }
       }
       // HP edge detection — must run BEFORE the interpolator so the
