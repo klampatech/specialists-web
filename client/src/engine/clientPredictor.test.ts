@@ -61,6 +61,8 @@ function makePlayer(playerId: number, x: number, y: number = 0): PlayerState {
     playerId,
     positionX: x,
     positionY: y,
+    // PR #156 — vertical Y. Tests default to ground level.
+    positionZ: 0,
     velocityX: 0,
     velocityY: 0,
     yaw: 0,

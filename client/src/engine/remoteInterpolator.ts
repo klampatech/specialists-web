@@ -209,6 +209,10 @@ function lerpPlayerState(
     playerId: newer.playerId,
     positionX: lerp(older.positionX, newer.positionX),
     positionY: lerp(older.positionY, newer.positionY),
+    // PR #156 — vertical Y. Pre-#156 the wire didn't carry this so
+    // the lerp didn't either; the remote rig never moved vertically
+    // even when the peer jumped. Now lerp linearly.
+    positionZ: lerp(older.positionZ ?? 1.0, newer.positionZ ?? 1.0),
     velocityX: lerp(older.velocityX, newer.velocityX),
     velocityY: lerp(older.velocityY, newer.velocityY),
     yaw: older.yaw + dyaw * t,
@@ -530,20 +534,23 @@ export class Interpolator {
           }
         }
       }
-      // PR #155 — vertical Y of the remote rig. Pre-#155 this was
-      // HARDCODED to 1.0 (capsule half-height), which meant the
-      // remote rig was always pinned at ground level regardless of
-      // where the peer actually was. The snapshot wire only carries
-      // (positionX, positionY) where positionY is depth (server's
-      // Rapier y axis = Babylon's z axis) — it does NOT carry the
-      // vertical Y component (PR #59 documented this as a known
-      // shape gap: the height is implicit on the Rapier capsule
-      // body). So we keep the Y=1.0 default for now but expose it
-      // as a single line so the positionZ follow-up (server-side
-      // 3D position) is a one-line change.
+      // PR #156 — vertical Y of the remote rig. Pre-#155 this was
+      // HARDCODED to 1.0 (capsule half-height). Pre-#156 this was
+      // still hardcoded because the wire didn't carry vertical Y.
+      // PR #156 added `positionZ` to the snapshot's PlayerState
+      // (bumped PLAYER_STATE_BODY_SIZE 31 → 35) and now the remote
+      // rig's vertical position tracks the peer's actual elevation.
+      // Jumps + standing on crates now broadcast across tabs.
       const position = new Vector3(
         playerState.positionX,
-        1.0,
+        // Babylon's Y axis = Rapier's y axis. The server's physics
+        // simulation tracks vertical Y; the snapshot now exports it
+        // as `positionZ`. Fall back to 1.0 (capsule half-height) if
+        // a pre-#156 client sends a 31-byte payload (which decodes
+        // with positionZ=0 — but the server wouldn't accept that
+        // payload anyway because the wire-size check at the decoder
+        // rejects 31-byte payloads).
+        playerState.positionZ ?? 1.0,
         playerState.positionY,
       );
       const yawValue = playerState.yaw ?? 0;

@@ -427,6 +427,9 @@ void (async () => {
         playerId: liveLocalPlayerId,
         positionX: postPos.x,
         positionY: postPos.z,
+        // PR #156 — vertical Y. Babylon's Y axis = Havok's y axis.
+        // Pre-#156 the wire only carried the XZ horizontal plane.
+        positionZ: postPos.y,
         velocityX: postVel.x,
         velocityY: postVel.z,
         yaw: 0, // PR 11.7.B wire doesn't carry yaw/pitch

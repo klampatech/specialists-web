@@ -465,7 +465,7 @@ mod tests {
     fn add_player_is_idempotent() {
         let mut room = Room::new("DEVBX");
         room.add_player(1);
-        room.record_position(1, 5, Position { x: 1.0, y: 2.0 });
+        room.record_position(1, 5, Position { x: 1.0, y: 2.0, z: 0.0 });
         room.push_input(1, 0, [1u8; 12]);
         // Re-add shouldn't wipe state.
         room.add_player(1);

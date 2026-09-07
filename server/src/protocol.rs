@@ -267,7 +267,7 @@ pub fn decode_weapon_switch(buf: &[u8]) -> Option<WeaponSwitch> {
         fire_mode_index: b.get_u8(),
     })
 }
-pub const PLAYER_STATE_WIRE_SIZE: usize = 31;
+pub const PLAYER_STATE_WIRE_SIZE: usize = 35;
 
 // -- AimEvent (PR AimEvent, replaces DamageRequest) -----------------------
 
@@ -723,6 +723,16 @@ pub struct PlayerState {
     pub player_id: PlayerIdT,
     pub position_x: f32,
     pub position_y: f32,
+    /// PR #156 — vertical Y (Babylon's Y axis = Rapier's Y axis).
+    /// The wire previously carried only the XZ horizontal plane
+    /// (2D XZ position per `physics.rs::position()`) — the server's
+    /// physics simulation tracked vertical Y but the snapshot
+    /// dropped it. Kyle's playtest observed the remote rig staying
+    /// at ground level when the peer jumped / stood on a crate.
+    /// Adding `position_z` makes the wire a true 3D state. Decoded
+    /// by `protocol/snapshot.ts::decodeSnapshot` as a new field at
+    /// offset 18 (after velocityY), 4 bytes (f32 BE).
+    pub position_z: f32,
     pub velocity_x: f32,
     pub velocity_y: f32,
     pub yaw: f32,
@@ -788,10 +798,15 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         snap.players.len(),
     );
     buf.put_u8(snap.players.len() as u8);
-   for p in &snap.players {
-       buf.put_u16(p.player_id);
+    for p in &snap.players {
+        buf.put_u16(p.player_id);
         buf.put_f32(p.position_x);
         buf.put_f32(p.position_y);
+        // PR #156 — vertical Y (Rapier body translation's y axis).
+        // Pre-#156 the wire carried only (x, y) where y was Rapier's
+        // z. Now (x, y, z) → (Rapier_x, Rapier_z, Rapier_y) where the
+        // last is the vertical height above ground.
+        buf.put_f32(p.position_z);
         buf.put_f32(p.velocity_x);
         buf.put_f32(p.velocity_y);
         buf.put_f32(p.yaw);
@@ -849,6 +864,8 @@ pub fn decode_snapshot(buf: &[u8]) -> Option<Snapshot> {
             player_id: b.get_u16(),
             position_x: b.get_f32(),
             position_y: b.get_f32(),
+            // PR #156 — vertical Y. See encoder comment.
+            position_z: b.get_f32(),
             velocity_x: b.get_f32(),
             velocity_y: b.get_f32(),
             yaw: b.get_f32(),
@@ -1144,7 +1161,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_per_player_size_is_29() {
+    fn snapshot_per_player_size_is_35() {
+        // PR #156 — bumped from 31 to 35 bytes per player (added
+        // positionZ f32 BE at offset 10..13).
         let snap = Snapshot {
             server_frame: 1,
             next_server_frame: 2,
@@ -1152,6 +1171,7 @@ mod tests {
                 player_id: 7,
                 position_x: 1.0,
                 position_y: 2.0,
+                position_z: 0.5, // PR #156 — vertical Y
                 velocity_x: 0.5,
                 velocity_y: -0.5,
                 yaw: 0.0,
@@ -1161,24 +1181,51 @@ mod tests {
                 is_firing: 1,
                 weapon_id: 0,
                 current_fire_mode: 0,
-                }
-],
+            }],
         };
         let bytes = encode_snapshot(&snap);
         assert_eq!(bytes.len(), SNAPSHOT_WIRE_SIZE_MIN + PLAYER_STATE_WIRE_SIZE);
-        assert_eq!(bytes.len(), 9 + 31);
-        assert_eq!(bytes.len(), 40);
+        assert_eq!(bytes.len(), 9 + 35);
+        assert_eq!(bytes.len(), 44);
     }
 
     #[test]
-    fn snapshot_at_24_players_is_706_bytes() {
-        // PR 11.7.B plan §3.5: 24p * 29 = 696 + 9 header = 705... wait,
-        // the brief says 706. Let me recompute: 4 (server_frame) + 4
-        // (next_server_frame) + 1 (player_count) = 9 bytes header;
-        // 24 * 29 = 696 bytes players; total = 705 bytes. The plan
-        // reference uses a different per-player size (22 bytes per
-        // player, 8-byte header); the brief locks the 29-byte size.
-        // This test pins the brief math: 9 + 24*29 = 705.
+    fn snapshot_position_z_round_trips() {
+        // PR #156 — vertical Y survives encode → decode round-trip.
+        let snap = Snapshot {
+            server_frame: 1,
+            next_server_frame: 2,
+            players: vec![PlayerState {
+                player_id: 7,
+                position_x: 1.0,
+                position_y: 2.0,
+                position_z: 1.85, // mid-jump elevation
+                velocity_x: 0.5,
+                velocity_y: -0.5,
+                yaw: 0.0,
+                pitch: 0.0,
+                hp: 88,
+                ammo: 6,
+                is_firing: 1,
+                weapon_id: 0,
+                current_fire_mode: 0,
+            }],
+        };
+        let bytes = encode_snapshot(&snap);
+        let decoded = decode_snapshot(&bytes).expect("decode");
+        assert_eq!(decoded.players.len(), 1);
+        assert!(
+            (decoded.players[0].position_z - 1.85).abs() < 1e-6,
+            "position_z round-trip drift: got {}",
+            decoded.players[0].position_z,
+        );
+    }
+
+    #[test]
+    fn snapshot_at_24_players_is_849_bytes() {
+        // PR #156 — bumped from 31 to 35 bytes per player (added
+        // positionZ f32 BE). 9 header + 24*35 players = 849 bytes
+        // (was 753 pre-#156; was 705 pre-PR-#107).
         let snap = Snapshot {
             server_frame: 0,
             next_server_frame: 0,
@@ -1187,6 +1234,7 @@ mod tests {
                     player_id: id,
                     position_x: 0.0,
                     position_y: 0.0,
+                    position_z: 0.0,
                     velocity_x: 0.0,
                     velocity_y: 0.0,
                     yaw: 0.0,
@@ -1196,18 +1244,17 @@ mod tests {
                     is_firing: 0,
                     weapon_id: 0,
                     current_fire_mode: 0,
-                    }
-)
+                })
                 .collect(),
         };
         let bytes = encode_snapshot(&snap);
         assert_eq!(
             bytes.len(),
-            753,
-            "24p snapshot is 9 header + 24*31 players = 753 bytes (PR #107 +1 byte per player for current_fire_mode)"
+            849,
+            "24p snapshot is 9 header + 24*35 players = 849 bytes (PR #156 +4 bytes per player for positionZ)"
         );
         // And the on-the-wire size is one more (the discriminator).
-        assert_eq!(bytes.len() + 1, 754);
+        assert_eq!(bytes.len() + 1, 850);
     }
 
     #[test]
@@ -1217,10 +1264,12 @@ mod tests {
             next_server_frame: 0xfeedface,
             players: vec![
                 PlayerState {
-                    player_id: 1,
-                    position_x: 1.5,
-                    position_y: -2.25,
-                    velocity_x: 0.1,
+                player_id: 1,
+                position_x: 1.5,
+                position_y: -2.25,
+                // PR #156 — vertical Y (default 0.0 in tests)
+                position_z: 0.0,
+                velocity_x: 0.1,
                     velocity_y: 0.2,
                     yaw: 1.57,
                     pitch: -0.5,
@@ -1232,10 +1281,12 @@ mod tests {
                     }
 ,
                 PlayerState {
-                    player_id: 2,
-                    position_x: -3.0,
-                    position_y: 4.5,
-                    velocity_x: -0.7,
+                player_id: 2,
+                position_x: -3.0,
+                position_y: 4.5,
+                // PR #156 — vertical Y (default 0.0 in tests)
+                position_z: 0.0,
+                velocity_x: -0.7,
                     velocity_y: 0.0,
                     yaw: 0.0,
                     pitch: 0.5,
@@ -1262,6 +1313,8 @@ mod tests {
                 player_id: 7,
                 position_x: 0.0,
                 position_y: 0.0,
+                // PR #156 — vertical Y (default 0.0 in tests)
+                position_z: 0.0,
                 velocity_x: 0.0,
                 velocity_y: 0.0,
                 yaw: 0.0,
