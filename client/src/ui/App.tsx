@@ -336,7 +336,19 @@ export function App() {
             frame: session.frame,
             repeatedFrames: session.repeatedFrameCount,
             hasRemote: session.runtime.hasRemote,
-            hits: session.getCombatEvents().length,
+            // PR #148 — `hits` counter now reports ONLY confirmed hits
+            // on the peer (fire_hit + melee_hit), not every tracer
+            // render (fire_miss). Pre-#148, `hits = combatEvents.length`
+            // counted both fire_hit AND fire_miss, so shooting the
+            // world (a crate, the sky, the ground) incremented `hits`.
+            // Kyle flagged this as 'shooting anything still counts as
+            // a hit — should only count when you shoot another player
+            // model'. The fix: filter by `kind` so the HUD reports
+            // the actual gameplay-meaningful event count.
+            hits:
+              session.getCombatEvents().filter(
+                (e) => e.kind === "fire_hit" || e.kind === "melee_hit",
+              ).length,
             bulletTime: inputState?.bulletTimeHeld ?? false,
             localHp: health.local.hp,
             remoteHp: health.remote.hp,
