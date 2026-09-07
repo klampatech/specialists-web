@@ -4796,3 +4796,4 @@ Deviations from the original HANDOFF.md plan for this session:
 - **Blockers are surfaced, not buried.** Anything stuck >1 session = top of the Open Questions section in `docs/SPEC.md`.
 - **Playtest status is mandatory at every session end.** See `docs/SPEC.md` → Operating Principles. If nothing was playable, say so.
 - **Don't rewrite history.** The kickoff entry below records the old vault-as-source-of-truth model. It was correct at the time; new model is `docs/SPEC.md` canonical + vault mirror (see the PM tooling-baseline session entry above for the flip).
+
