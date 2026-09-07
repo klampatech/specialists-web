@@ -85,6 +85,7 @@ import {
   nextReloadEventId as dbNextReloadEventId,
 } from "../net/damageBus";
 import type { AimEvent, MeleeEvent } from "../../../protocol/damage";
+import { encodeAimEvent } from "../../../protocol/damage";
 import type { ServerTransport } from "../net/serverTransport";
 import { WEAPONS_TABLE, FireMode } from "../../../protocol/constants";
 
@@ -741,6 +742,17 @@ export function createGameSession(
       const cooldownOk =
         now - lastFireMsLocal >= COMBAT.dualPistol.fireCooldownMs;
       const ammoOk = ammoCountLocal > 0;
+      // PR #158 — debug counter exposed on window. Counts every
+      // rising-edge fire attempt regardless of whether the
+      // AimEvent was sent. Useful for diagnosing "I clicked but
+      // nothing fired".
+      if (typeof window !== "undefined") {
+        (window as unknown as { __debugFireAttempts?: number }).__debugFireAttempts =
+          ((window as unknown as { __debugFireAttempts?: number }).__debugFireAttempts ?? 0) + 1;
+        if (!cooldownOk) (window as unknown as { __debugFireBlockedCooldown?: number }).__debugFireBlockedCooldown = ((window as unknown as { __debugFireBlockedCooldown?: number }).__debugFireBlockedCooldown ?? 0) + 1;
+        if (!ammoOk) (window as unknown as { __debugFireBlockedAmmo?: number }).__debugFireBlockedAmmo = ((window as unknown as { __debugFireBlockedAmmo?: number }).__debugFireBlockedAmmo ?? 0) + 1;
+        if (!serverTransport) (window as unknown as { __debugFireBlockedNoTransport?: number }).__debugFireBlockedNoTransport = ((window as unknown as { __debugFireBlockedNoTransport?: number }).__debugFireBlockedNoTransport ?? 0) + 1;
+      }
       if (cooldownOk && ammoOk && serverTransport) {
         // PR 65 — use the snapshot's `serverFrame` (most recent
         // authoritative server frame) plus the per-tick offset
@@ -779,6 +791,15 @@ export function createGameSession(
         };
         lastSnapshotFrameSeen = snapFrame;
         dbSendAimEvent(serverTransport, req);
+        // PR #158 — debug counter exposed on window. Counts every
+        // successful AimEvent send (after cooldown/ammo/noTransport
+        // gates pass).
+        if (typeof window !== "undefined") {
+          (window as unknown as { __debugAimSent?: number }).__debugAimSent =
+            ((window as unknown as { __debugAimSent?: number }).__debugAimSent ?? 0) + 1;
+          (window as unknown as { __debugLastAimHex?: string }).__debugLastAimHex =
+            Array.from(encodeAimEvent(req)).slice(0, 5).map(b => b.toString(16).padStart(2, '0')).join(' ');
+        }
         // Stamp the local fire timestamp + decrement local ammo
         // (snapshot stream carries the authoritative ammo on the
         // next 20Hz tick; this is for immediate HUD feedback).
@@ -1085,26 +1106,56 @@ export function createGameSession(
       lastRenderedIdx = combatEvents.length;
       return drain;
     },
-    getHealthSnapshot: (): HealthSnapshot => ({
-      local: {
-        hp: localController.state.hp,
-        // Convert the absolute respawning-until timestamp to a remaining
-        // countdown for the HUD. Clamped at 0 — past-deadline renders 0
-        // (teleport fires this frame). `lastNowMs` was captured inside
-        // the last `tick()`; same value the tick uses to fire the teleport.
-        respawningMs:
-          localController.state.respawningUntilMs > 0
-            ? Math.max(0, localController.state.respawningUntilMs - lastNowMs)
-            : 0,
-      },
-      remote: {
-        hp: remoteController.state.hp,
-        respawningMs:
-          remoteController.state.respawningUntilMs > 0
-            ? Math.max(0, remoteController.state.respawningUntilMs - lastNowMs)
-            : 0,
-      },
-    }),
+    getHealthSnapshot: (): HealthSnapshot => {
+      // PR #158 — read the REMOTE HP from the server-authoritative
+      // snapshot, not from `remoteController.state.hp`. Pre-#158
+      // the HUD's "HP them" value came from the remote controller's
+      // `state.hp` field, which was initialized to 100 and never
+      // updated (the remote controller is positioned by the
+      // interpolator but its HP field has no setter wired to the
+      // snapshot). So the HUD's "HP them" stayed at 100 forever
+      // unless the local controller's hitscan damaged the remote —
+      // which only happens in the local tab's perspective. Kyle's
+      // playtest observed "HP them doesn't drop when I shoot them"
+      // because the HUD was reading a stale field.
+      //
+      // Resolution: query `__latestSnap()` for the peer's HP. If
+      // the snapshot is missing or the peer hasn't been promoted
+      // yet, fall back to 100 (initial) so the HUD doesn't render
+      // NaN.
+      const snap = typeof window !== "undefined"
+        ? (window as unknown as {
+            __latestSnap?: () => {
+              players: Array<{ playerId: number; hp?: number }>;
+            } | null;
+          }).__latestSnap?.() ?? null
+        : null;
+      const peerSnapPlayer =
+        snap && peerPlayerId !== undefined
+          ? snap.players.find((p) => p.playerId === peerPlayerId)
+          : null;
+      return {
+        local: {
+          hp: localController.state.hp,
+          // Convert the absolute respawning-until timestamp to a remaining
+          // countdown for the HUD. Clamped at 0 — past-deadline renders 0
+          // (teleport fires this frame). `lastNowMs` was captured inside
+          // the last `tick()`; same value the tick uses to fire the teleport.
+          respawningMs:
+            localController.state.respawningUntilMs > 0
+              ? Math.max(0, localController.state.respawningUntilMs - lastNowMs)
+              : 0,
+        },
+        remote: {
+          // PR #158 — server-authoritative HP from the snapshot.
+          hp: peerSnapPlayer?.hp ?? 100,
+          respawningMs:
+            remoteController.state.respawningUntilMs > 0
+              ? Math.max(0, remoteController.state.respawningUntilMs - lastNowMs)
+              : 0,
+        },
+      };
+    },
     /**
      * PR 11.4: scene.ts calls this on F2 toggle. Skips both
      * `controller.update()` calls + combat semantics while active.
