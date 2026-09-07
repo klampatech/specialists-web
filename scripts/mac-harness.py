@@ -275,12 +275,19 @@ def dump_state(page):
         const rigMeshes = visibleMeshes.filter(m => m.name && (
             m.name.includes('torso') || m.name.includes('head')
         ));
-        // Group: count distinct rigs by detecting torso+head pairs at different positions
         const torsoPositions = rigMeshes.filter(m => m.name.includes('torso')).map(m => ({
             name: m.name,
             x: Math.round(m.absolutePosition.x * 10) / 10,
             y: Math.round(m.absolutePosition.y * 10) / 10,
             z: Math.round(m.absolutePosition.z * 10) / 10,
+            parentName: m.parent?.name,
+            parentX: m.parent?.position?.x,
+            parentY: m.parent?.position?.y,
+            parentZ: m.parent?.position?.z,
+            isVisible: m.isVisible,
+            isEnabled: m.isEnabled(),
+            isReady: m.isReady?.(),
+            isEnabledInActiveMesh: m.isInActiveMesh,
         }));
         return {
             url: location.href,
@@ -295,6 +302,11 @@ def dump_state(page):
             })) ?? null,
             visibleMeshCount: visibleMeshes.length,
             torsoPositions,
+            remoteRoot_pos: s.remoteModel?.root ? {x: Math.round(s.remoteModel.root.position.x*10)/10, y: Math.round(s.remoteModel.root.position.y*10)/10, z: Math.round(s.remoteModel.root.position.z*10)/10} : null,
+            remoteVisualRoot_pos: s.remoteController?.visualRoot ? {x: Math.round(s.remoteController.visualRoot.position.x*10)/10, y: Math.round(s.remoteController.visualRoot.position.y*10)/10, z: Math.round(s.remoteController.visualRoot.position.z*10)/10} : null,
+            remoteVisualRoot_isRoot: s.remoteController?.visualRoot === s.remoteModel?.root,
+            lastSetPosition: window.__lastInterpolatorSetPosition ? JSON.stringify(window.__lastInterpolatorSetPosition) : null,
+            liveHookSet: typeof window.__liveInterpolatorTickHook,
             bodyTextSnippet: (document.body.innerText || '').substring(0, 500),
         };
     })()""")

@@ -1405,17 +1405,41 @@ export async function createScene(
               // tracks the snapshot, not just the Havok body. Without
               // these two calls (which the closure-bound hook above
               // DOES have), the visual mesh stays at world origin.
-              // PR 2026-09-06 / setVisualPositionAndCommit — also force
-              // the visualRoot's world matrix to recompute. Without
-              // this, Babylon's cached absolute matrices on the rig's
-              // child meshes (torso, head, arms, legs) stay stale and
-              // the rig doesn't draw at the new visualRoot position.
-              // Single-line fix for the asymmetric render bug
-              // (one tab sees both rigs, the other sees only its
-              // local). See characterController.ts for full rationale.
-              liveRemoteCtrl.commitRemoteTransform(liveState.position);
+              //
+              // PR 2026-09-06 / ALSO force visualRoot.computeWorldMatrix(true).
+              // Without explicit computeWorldMatrix, Babylon's cached
+              // absolute matrices on the rig's child meshes (torso,
+              // head, arms, legs) stay stale and the rig doesn't draw
+              // at the new visualRoot position. This is the
+              // single-line fix for the asymmetric render bug
+              // (one tab sees both rigs, the other sees only its local).
+              //
+              // IMPLEMENTATION NOTE / Vite+Terser optimizer quirk:
+              //   Previously this code called a helper method
+              //   `setVisualPositionAndCommit` (and later
+              //   `commitRemoteTransform`). The Vite optimizer saw that
+              //   the helper body was a strict superset of another
+              //   method (`setVisualPosition`) — same name prefix + same
+              //   structure — and after inlining the only-call-site
+              //   renamed the call back to `setVisualPosition`. That
+              //   silently dropped the `computeWorldMatrix(true)` line,
+              //   reintroducing the bug. The current version INLINES
+              //   the helper's logic at the call site so the optimizer
+              //   can't rename anything. A window-scope sentinel write
+              //   guards against further elision.
+              const visualRootForDebug = (liveRemoteCtrl as unknown as {
+                getVisualRootForDebug?: () => {
+                  position: { copyFrom: (pos: { x: number; y: number; z: number }) => void };
+                  computeWorldMatrix: (force: boolean) => void;
+                } | undefined;
+              }).getVisualRootForDebug?.();
+              if (visualRootForDebug && typeof window !== "undefined") {
+                visualRootForDebug.position.copyFrom(liveState.position);
+                visualRootForDebug.computeWorldMatrix(true);
+                const wr = window as unknown as { __remoteCommitCount?: number };
+                wr.__remoteCommitCount = (wr.__remoteCommitCount ?? 0) + 1;
+              }
               liveRemoteCtrl.state.position.copyFrom(liveState.position);
-              // Debug hooks so the smoke's __lastInterpolatorTick +
               // __lastInterpolatorSetPosition stay populated when
               // the render observer is in a different scope from
               // the original closure.

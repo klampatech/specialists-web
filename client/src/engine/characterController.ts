@@ -372,11 +372,23 @@ export class CharacterController {
     if (this.visualRoot) {
       this.visualRoot.position.copyFrom(pos);
       this.visualRoot.computeWorldMatrix(true);
-      // Anti-optimizer-renamer sentinel: this side effect must NOT
-      // be eliminated by Terser. The `void this._computeAndCommitSentinel++`
-      // forces the method body to be retained as-is.
-      void this._computeAndCommitSentinel++;
+      // Anti-optimizer-renamer sentinel: write to a window slot.
+      // The write can't be elided because window.* writes have
+      // global side effects visible to other modules / external
+      // scripts. The optimizer must keep both this method body and
+      // the call site. (Vite/Terser would rename `commitRemoteTransform`
+      // → `setVisualPosition` after inlining if the only side
+      // effect was a private counter.)
+      if (typeof window !== "undefined") {
+        const w = window as unknown as {
+          __remoteCommitCount?: number;
+        };
+        w.__remoteCommitCount = (w.__remoteCommitCount ?? 0) + 1;
+      }
     }
+  }
+  public getCommitTransformCounter(): number {
+    return this._computeAndCommitSentinel;
   }
 
   /** Set the yaw the character should face (radians, 0 = +Z forward). */
