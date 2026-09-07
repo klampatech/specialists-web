@@ -136,9 +136,7 @@ async function main() {
 
 async function mainImpl() {
   log(`Going against ${STATIC_URL}`);
-  log(`SMOKE_NO_BOOT=${SMOKE_NO_BOOT}, SMOKE_NO_BUILD=${SMOKE_NO_BUILD}`);
-
-  // PR #135 — build the prod bundle if not skipping. Same shape as
+  log(`SMOKE_NO_BOOT=${SMOKE_NO_BOOT}, SMOKE_NO_BUILD=${SMOKE_NO_BUILD}`);  // PR #135 — build the prod bundle if not skipping. Same shape as
   // prod-bundle-smoke.mjs: VITE_MATCHMAKER_ORIGIN must point at the
   // matchmaker HTTP endpoint so the lobby's POST /rooms hits the right
   // origin (and the lobby's wss_url derivation picks the TLS variant
@@ -290,7 +288,19 @@ async function mainImpl() {
   }
 
   // Wait for navigation to ?server=<wss_url>
+  // PR 2026-09-07 — the post-#134 lobby UX shows a room-code overlay
+  // with a "Continue" button. Click Continue to navigate to the
+  // game URL with `?server=<wss_url>&localId=1`.
   try {
+    // First, wait for the room-code overlay (if present)
+    try {
+      await pageA.waitForSelector('[data-testid="lobby-room-code"]', { timeout: 5000 });
+      log("Tab A: room-code overlay appeared, clicking Continue…");
+      await pageA.click('[data-testid="lobby-continue"]', { timeout: 4000 });
+    } catch {
+      // No overlay — older lobby UX direct-navigates
+      log("Tab A: no room-code overlay (legacy UX) — waiting for direct nav");
+    }
     await pageA.waitForFunction(
       (prevUrl) => {
         const u = new URL(window.location.href);
