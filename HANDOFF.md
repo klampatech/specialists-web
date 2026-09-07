@@ -81,6 +81,23 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ---
 
+## 2026-09-07 — PR #150 (HUD hits counter shows only confirmed peer hits)
+
+**Scope**: Fix Kyle's "shooting anything still counts as a hit" symptom.
+
+**Root cause**: `client/src/ui/App.tsx` polled `session.getCombatEvents().length` for the HUD's `hits:` counter. The combat events array included BOTH `fire_hit` AND `fire_miss` events. Every tracer render (including shots that hit crates / ground / sky) incremented the `hits` counter.
+
+**Fix**: filter by `kind === 'fire_hit' || kind === 'melee_hit'` so the HUD reports only confirmed-on-peer hits. Now the HUD `hits:` counter matches the gameplay-meaningful count.
+
+**Verified live on Hetzner**: bundle `index-Csh3nuyi.js` contains the filter (`grep "kind==="fire_hit".*melee_hit" dist/assets/index-*.js` = 1 match).
+
+**Investigated but NOT fixed**:
+- **Y-axis not tracked server-side**: `server/src/position_history.rs::Position` is `{x: f32, y: f32}` only (no z). The wire type is 14 bytes (x+y); adding z would be 18 bytes. So jumping / standing on crates / vertical position isn't visible to the server's lag-comp hit-test. Documented limitation. Fix would require bumping the snapshot wire size + rewinding the third (Z) axis.
+
+- **HUD `hits` still doesn't reflect server-side hits**: client-side raycast (`scene.pickWithRay`) misses the remote rig mesh when its Havok body is moving. The remote rig is positioned via the snapshot's interpolator (per PR #128), but Babylon's pickWithRay doesn't have access to that position. So the client-side `combatEvents` array stays at 0 (the raycast returns `hitTarget=null`). The HUD's `hits:` counter post-#150 is now 0 (because all events are `fire_miss`). The server's `room.players[id].hp` decrements correctly via `validate_and_relay_aim`, but the client HUD doesn't know.
+
+**Memory anchor**: §specialists-web-2026-09-07 (updated).
+
 ## 2026-09-07 — PRs #142 + #143 (PLAYER_MAX_AMMO=10 + crate repositioning)
 
 **Scope**: Close two remaining UX bugs from Kyle's 2026-09-07 live playtest after PR #141 (spawn yaw).
