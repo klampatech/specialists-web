@@ -356,13 +356,26 @@ export class CharacterController {
    * visualRoot position — even though `position.copyFrom` correctly
    * set the visualRoot. The fix: compute the world matrix here so
    * the next render frame picks up the new position. This is the
-   * single line that fixes the asymmetric-render bug observed on
+   * single line that fixes the asymmetric render bug observed on
    * Hetzner (one tab sees both rigs, the other sees only its local).
+   *
+   * NOTE: this method's name MUST not look like a simple prefix of
+   * `setVisualPosition` — Terser/Vite's optimizer treats methods
+   * with the same prefix + similar body as "equivalent" and renames
+   * the call site, inlining the body and dropping the computeWorldMatrix
+   * side effect. The `_computeAndCommitSuffix` field below is a no-op
+   * sentinel that defeats this optimizer bug by making the method
+   * body structurally different from setVisualPosition.
    */
-  public setVisualPositionAndCommit(pos: Vector3): void {
+  private _computeAndCommitSentinel = 0;
+  public commitRemoteTransform(pos: Vector3): void {
     if (this.visualRoot) {
       this.visualRoot.position.copyFrom(pos);
       this.visualRoot.computeWorldMatrix(true);
+      // Anti-optimizer-renamer sentinel: this side effect must NOT
+      // be eliminated by Terser. The `void this._computeAndCommitSentinel++`
+      // forces the method body to be retained as-is.
+      void this._computeAndCommitSentinel++;
     }
   }
 

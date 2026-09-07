@@ -1413,7 +1413,7 @@ export async function createScene(
               // Single-line fix for the asymmetric render bug
               // (one tab sees both rigs, the other sees only its
               // local). See characterController.ts for full rationale.
-              liveRemoteCtrl.setVisualPositionAndCommit(liveState.position);
+              liveRemoteCtrl.commitRemoteTransform(liveState.position);
               liveRemoteCtrl.state.position.copyFrom(liveState.position);
               // Debug hooks so the smoke's __lastInterpolatorTick +
               // __lastInterpolatorSetPosition stay populated when
@@ -1441,6 +1441,25 @@ export async function createScene(
               if (!Array.isArray(w.__renderTrace)) w.__renderTrace = [];
               const trace = w.__renderTrace;
               if (trace.length >= 120) trace.shift();
+              // PR 2026-09-06 / debug trace — capture per-frame
+              // rendering state for the remote rig. Helps diagnose
+              // the asymmetric render bug (Tab 1 sees cyan rig, Tab 0
+              // doesn't) by surfacing the actual Babylon mesh state
+              // at the moment the liveHook fires. Ring buffer of 120
+              // frames (~2s at 60fps). Diagnostic only — does not
+              // affect production behavior.
+              //
+              // Anti-tree-shake: Terser/Rollup deletes this block as
+              // dead code if the trace buffer isn't read elsewhere.
+              // The harness reads it via window.__renderTrace, which
+              // is the same string the minifier would rename. To
+              // force the trace code to survive, we expose a getter
+              // that the harness can call directly (callable methods
+              // are NOT renameable). The getter MUST touch the trace
+              // array to be a "use", which prevents tree-shaking.
+              (window as unknown as {
+                __getRenderTrace?: () => unknown[];
+              }).__getRenderTrace = (): unknown[] => w.__renderTrace || [];
               const visualRoot = (liveRemoteCtrl as unknown as {
                 getVisualRootForDebug?: () => unknown;
               }).getVisualRootForDebug?.();
