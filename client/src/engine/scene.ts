@@ -362,10 +362,19 @@ export async function createScene(
   // state-machine effect), but the boxes still serve as visible reference
   // geometry and they exercise the static-collision path of the Havok
   // controller.
+  //
+  // PR #139-followup — the previous (-5, 1.25, -2) crate literally
+  // occluded player 1's chase camera ray to player 2 at spawn.
+  // Player 1 (x=-8) → camera at (-8, 1.5, -2.8) looking at chest
+  // (-8, 0.9, 0). Player 2 (x=-4) is at +X from the camera. The
+  // (-5, 1.25, -2) crate's bounding box swept across that ray.
+  // Moved to (-7, 1.25, -7) — still visible reference geometry in
+  // the player's peripheral, but no longer between player 1's
+  // camera and player 2 at spawn.
   const cratePositions: Array<{ pos: Vector3; size: [number, number, number] }> = [
     { pos: new Vector3(4, 1, 0), size: [2, 2, 2] },
     { pos: new Vector3(-3, 0.5, 3), size: [1, 1, 1] },
-    { pos: new Vector3(-5, 1.25, -2), size: [2.5, 2.5, 2.5] },
+    { pos: new Vector3(-7, 1.25, -7), size: [2.5, 2.5, 2.5] },
   ];
   for (const crate of cratePositions) {
     const [w, h, d] = crate.size;

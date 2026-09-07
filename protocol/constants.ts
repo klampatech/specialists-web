@@ -282,8 +282,9 @@ export function weaponDef(id: WeaponId): WeaponDef {
 }
 
 /** PR 11.7.E — maximum ammo per magazine. Mirrors
- *  `server/src/constants.rs::PLAYER_MAX_AMMO`. The client's
+ *  `server/src/constants.rs::PLAYER_MAX_AMMO = 10` (DualPistol's
+ *  magazine_size in `WEAPONS_TABLE`). The client's
  *  `BulletHud` uses this for the reload-progress UI's
  *  fill-when-full computation; the snapshot's `ammo` byte carries
  *  the live value. */
-export const PLAYER_MAX_AMMO = 6;
+export const PLAYER_MAX_AMMO = 10;

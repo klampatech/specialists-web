@@ -56,7 +56,12 @@ export const MOVEMENT = {
 // scripts). If `server/src/constants.rs::PLAYER_MAX_AMMO` ever
 // changed, every one of those sites would silently break. The
 // constant is now imported wherever the literal was.
-export const PLAYER_MAX_AMMO: number = 6;
+// PR #142 — aligned to server's `PLAYER_MAX_AMMO=10` (DualPistol's
+// magazine_size in `protocol/constants.ts::WEAPONS_TABLE`). Pre-#142
+// this was hardcoded to 6, causing the HUD ammo bar to show
+// `▮▮▯▯▯▯▯▯▯▯ /10` after 2 shots fired (server actually had 6/6
+// = full magazine, but the HUD thought there were 4 ammo left).
+export const PLAYER_MAX_AMMO: number = 10;
 
 /** Stunt tunables (animation-state only — no physics deformation). */
 export const STUNTS = {
