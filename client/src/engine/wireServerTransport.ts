@@ -552,7 +552,31 @@ void (async () => {
         // position onto the visualRoot TransformNode AND state.position
         // so the rig visually tracks the snapshot, not just the Havok
         // body.
-        liveRemote.setVisualPosition(liveState.position);
+        //
+        // PR 2026-09-06 / inline commit — ALSO force the visualRoot to
+        // recompute its world matrix. Without the explicit
+        // computeWorldMatrix(true), Babylon's cached absolute matrices
+        // on the rig's child meshes (torso, head, arms, legs) stay
+        // stale after a position.copyFrom on the parent TransformNode,
+        // and the rig doesn't draw at the new visualRoot position. This
+        // is the asymmetric-render-bug fix (one tab sees both rigs, the
+        // other sees only its local). Inline + window-scope sentinel
+        // defeats Vite/Terser's optimizer rename heuristic that had
+        // silently dropped this call when it was a helper method.
+        const visualRootForDebug = (
+          liveRemote as unknown as {
+            getVisualRootForDebug?: () => {
+              position: { copyFrom: (pos: { x: number; y: number; z: number }) => void };
+              computeWorldMatrix: (force: boolean) => void;
+            } | undefined;
+          }
+        ).getVisualRootForDebug?.();
+        if (visualRootForDebug) {
+          visualRootForDebug.position.copyFrom(liveState.position);
+          visualRootForDebug.computeWorldMatrix(true);
+          const wr = window as unknown as { __remoteCommitCount?: number };
+          wr.__remoteCommitCount = (wr.__remoteCommitCount ?? 0) + 1;
+        }
         liveRemote.state.position.copyFrom(liveState.position);
         // Debug hooks so the smoke's __lastInterpolatorTick +
         // __lastInterpolatorSetPosition stay populated when the
