@@ -74,6 +74,20 @@ export function Lobby() {
   // clicking one doesn't disable the other. A user who started
   // Create can still type a code and click Join (and vice versa).
   const [creating, setCreating] = useState(false);
+  // PR 2026-09-06 / room-code-share UX — after successful Create,
+  // we surface the new room code to the user so they can share it
+  // with friends. The user clicks "Continue" (or auto-navigates
+  // after a 6s timer) to enter the game. `createdRoom` holds the
+  // matchmaker's full createRoom response; we extract the code
+  // from `ws_url` / `wss_url` path segment.
+  const [createdRoom, setCreatedRoom] = useState<
+    | { id: string; ws_url: string; wss_url?: string; serverUrl: string }
+    | null
+  >(null);
+  // True after the user clicks Continue on the room-code overlay.
+  // We don't auto-navigate because auto-nav gives the user no
+  // chance to read or share the code (PR 2026-09-06).
+  const [continuing, setContinuing] = useState(false);
   const [joining, setJoining] = useState(false);
   // Monotonic counter for in-flight getRoom() fetches. Stored
   // as a ref (not state) because we need to read the LATEST
@@ -151,44 +165,18 @@ export function Lobby() {
       // the browser's mixed-content blocker silently drops the WSS
       // handshake. (Workaround was `VITE_MATCHMAKER_ORIGIN=https://...`
       // build-time env var on Hetzner; this fix removes it.)
-      const { ws_url, wss_url } = await roomApi.createRoom(origin);
+      const { ws_url, wss_url, id } = await roomApi.createRoom(origin);
       const serverUrl =
         window.location.protocol === "https:" ? wss_url ?? ws_url : ws_url;
-      // Navigate to the same page with `?server=<serverUrl>`. PeerOverlay
-      // picks up the flag on module re-evaluation and wires the
-      // ServerTransport. (No need to reset `creating` — the page
-      // navigates away on the next tick.)
-      const target = new URL(window.location.href);
-      target.searchParams.set("server", serverUrl);
-      // PR #134 — append `&localId=<id>` so the lobby is the
-      // single source of truth for player identity. The creator
-      // is always id=1 (the first connection into a fresh room
-      // — the server's per-room `Room::next_player_id` starts at
-      // 1, server/src/session.rs). PeerOverlay reads this URL
-      // param into `window.__localPlayerId` (see
-      // client/src/ui/PeerOverlay.tsx), which wireServerTransport
-      // consumes as `claimed_player_id` on the wire. Without
-      // this, both tabs defaulted to localId=1, both spawned at
-      // the same world position, and the snapshot's playerId
-      // lookup mis-routed DamageBroadcasts (the pre-#134 lobby
-      // bug). The real-player perspective: a player clicking
-      // "Create" expects to be player 1.
-      target.searchParams.set("localId", "1");
-      // Popup-blocker / sandboxed-frame / etc. recovery (NB #3). The
-      // browser can throw on `window.location.href = ...` if it
-      // refuses the navigation. Without this try/catch, a blocked
-      // nav would leave `creating: true` forever with no error —
-      // the button would just sit greyed out. Reset state + surface
-      // a friendly message so the user can retry.
-      try {
-        window.location.href = target.toString();
-      } catch (navErr) {
+      // PR 2026-09-06 / room-code-share UX — instead of immediately
+      // navigating away, surface the room code so the user can share
+      // it. The Create button stays disabled while the overlay is
+      // up; Continue (or Enter) closes the overlay and navigates.
+      flushSync(() => {
         setStatus(null);
-        setError(
-          "Navigation blocked. Click again or allow popups for this site.",
-        );
+        setCreatedRoom({ id, ws_url, wss_url, serverUrl });
         setCreating(false);
-      }
+      });
     } catch (e) {
       setStatus(null);
       if (isMatchmakerNetworkError(e)) {
@@ -197,6 +185,27 @@ export function Lobby() {
         setError(`Failed to create room: ${(e as Error).message}`);
       }
       setCreating(false);
+    }
+  };
+
+  // PR 2026-09-06 / room-code-share UX — handler for the Continue
+  // button on the room-code overlay. Builds the URL with `?server=`
+  // + `&localId=1` (the creator is always player 1 per
+  // server/src/session.rs's per-room counter) and navigates.
+  const onContinueToRoom = () => {
+    if (!createdRoom) return;
+    setContinuing(true);
+    flushSync(() => {
+      setStatus(null);
+    });
+    const target = new URL(window.location.href);
+    target.searchParams.set("server", createdRoom.serverUrl);
+    target.searchParams.set("localId", "1");
+    try {
+      window.location.href = target.toString();
+    } catch (navErr) {
+      setContinuing(false);
+      setError("Navigation blocked. Click again or allow popups for this site.");
     }
   };
 
@@ -435,6 +444,115 @@ export function Lobby() {
     );
   };
 
+  // PR 2026-09-06 / room-code-share UX — overlay that surfaces
+  // the freshly-created room code with a Copy-to-clipboard button
+  // and a Continue-to-game button. The overlay REPLACES the
+  // Create+Join form (so the user can't double-create or join a
+  // different room while reading the code). The code is rendered
+  // as a large monospace block; the Copy button uses
+  // navigator.clipboard.writeText and falls back to a manual
+  // selection if clipboard API isn't available.
+  const renderCreatedRoomOverlay = () => {
+    if (!createdRoom) return null;
+    const onCopy = async () => {
+      try {
+        await navigator.clipboard.writeText(createdRoom.id);
+        setStatus(`Copied "${createdRoom.id}" to clipboard`);
+      } catch {
+        setStatus(`Room code: ${createdRoom.id}`);
+      }
+    };
+    return (
+      <div
+        data-testid="lobby-created-overlay"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="lobby-created-title"
+        style={{
+          position: "absolute",
+          inset: 0,
+          background: "rgba(20, 20, 28, 0.96)",
+          color: "#e6e6ea",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "1.5rem",
+          zIndex: 200,
+        }}
+      >
+        <h2
+          id="lobby-created-title"
+          style={{ fontSize: "1.2rem", margin: "0 0 0.4rem" }}
+        >
+          Room created
+        </h2>
+        <p
+          style={{
+            margin: "0 0 1rem",
+            opacity: 0.75,
+            fontSize: "0.85rem",
+            textAlign: "center",
+          }}
+        >
+          Share this code with friends. They open the same URL,
+          paste the code, and click Join.
+        </p>
+        <div
+          data-testid="lobby-room-code"
+          style={{
+            fontFamily: "monospace",
+            fontSize: "1.8rem",
+            fontWeight: "bold",
+            letterSpacing: "0.1em",
+            padding: "0.6rem 1.2rem",
+            background: "#181820",
+            border: "1px solid #3563d3",
+            borderRadius: "6px",
+            margin: "0 0 1rem",
+            userSelect: "all",
+          }}
+        >
+          {createdRoom.id}
+        </div>
+        <div style={{ display: "flex", gap: "0.6rem" }}>
+          <button
+            data-testid="lobby-copy-code"
+            onClick={onCopy}
+            style={{
+              padding: "0.6rem 1rem",
+              background: "#2c8c4d",
+              color: "#fff",
+              border: 0,
+              borderRadius: "6px",
+              cursor: "pointer",
+              fontSize: "0.95rem",
+            }}
+          >
+            Copy code
+          </button>
+          <button
+            data-testid="lobby-continue"
+            onClick={onContinueToRoom}
+            disabled={continuing}
+            autoFocus
+            style={{
+              padding: "0.6rem 1.2rem",
+              background: continuing ? "#444" : "#3563d3",
+              color: "#fff",
+              border: 0,
+              borderRadius: "6px",
+              cursor: continuing ? "default" : "pointer",
+              fontSize: "0.95rem",
+            }}
+          >
+            {continuing ? "Joining…" : "Continue →"}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   // PR 94 (lobby a11y) — focus management. Three effects:
   //
   //   1. Capture previously-focused element on mount + focus the
@@ -644,6 +762,8 @@ export function Lobby() {
       <p style={{ marginTop: "2rem", fontSize: "0.75rem", opacity: 0.5 }}>
         Matchmaker: <code>{origin}</code>
       </p>
+
+      {renderCreatedRoomOverlay()}
     </div>
   );
 }

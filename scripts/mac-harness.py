@@ -198,34 +198,47 @@ def wait_for_in_game(page, timeout_ms=30000):
 
 
 def create_room(page, label):
+    """Open the lobby, click Create room, wait for the room-code overlay,
+    extract the code, click Continue, then return the code.
+    """
     page.goto(PROD_URL, wait_until="domcontentloaded", timeout=20000)
     page.wait_for_timeout(2500)
     try:
         page.locator("[data-testid='lobby-create']").click(timeout=4000)
     except Exception as e:
         return None, f"create-click: {e}"
-    page.wait_for_timeout(3500)
-    # URL pattern: ?server=wss://host/rooms/<CODE>&localId=N
-    # The slash before <CODE> is URL-encoded as %2F in the server= value.
-    # Use urllib to decode the URL safely.
-    from urllib.parse import unquote, urlparse, parse_qs
-    parsed = urlparse(page.url)
-    qs = parse_qs(parsed.query)
-    server_param = qs.get("server", [None])[0]
-    code = None
-    if server_param:
-        # server_param is the full WSS URL — extract code from /rooms/<code>
-        m = re.search(r"/rooms/([A-Za-z0-9_-]+)", server_param)
-        if m:
-            code = m.group(1)
-    if not code:
-        # Fallback: decode URL and search for rooms/<code>
-        decoded = unquote(page.url)
-        m = re.search(r"rooms/([A-Za-z0-9_-]+)", decoded)
-        if m:
-            code = m.group(1)
-    if not code:
-        return None, f"no room code in url: {page.url}"
+    # Wait for the room-code overlay (post-2026-09-06 UX)
+    try:
+        page.wait_for_selector("[data-testid='lobby-room-code']", timeout=10000)
+    except Exception:
+        # Fallback: pre-2026-09-06 behavior — direct navigation
+        page.wait_for_timeout(3500)
+        from urllib.parse import unquote, urlparse, parse_qs
+        parsed = urlparse(page.url)
+        qs = parse_qs(parsed.query)
+        server_param = qs.get("server", [None])[0]
+        code = None
+        if server_param:
+            m = re.search(r"/rooms/([A-Za-z0-9_-]+)", server_param)
+            if m:
+                code = m.group(1)
+        if not code:
+            decoded = unquote(page.url)
+            m = re.search(r"rooms/([A-Za-z0-9_-]+)", decoded)
+            if m:
+                code = m.group(1)
+        if not code:
+            return None, f"no room code (no overlay + no url code): {page.url}"
+        return code, None
+    # Extract code from overlay
+    code = page.locator("[data-testid='lobby-room-code']").inner_text().strip()
+    # Click Continue
+    try:
+        page.locator("[data-testid='lobby-continue']").click(timeout=4000)
+    except Exception as e:
+        return code, f"continue-click: {e}"
+    # Wait for navigation away from the lobby
+    page.wait_for_timeout(3000)
     return code, None
 
 
