@@ -93,6 +93,37 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Memory anchors**: §specialists-web-hetzner-prod-wireup-2026-09-04 (updated), §evo-verification-discipline-2026-09-05 (added).
 
 **Next session task**: predictor/interpolator migration to wireServerTransport.ts (same tree-shake pattern, separate scope). Or real 2-tab Mac playtest for user-facing confirmation.
+---
+
+## 2026-09-05 — PR #130 (snapshot decoder + Predictor + Interpolator migration)
+
+**Scope**: Close the third tree-shake variant — snapshot decoder pipeline was tree-shaken from prod. Wire received snapshots but `__latestSnap()` returned `null`. Pre-fix bundle `index-Bm8ArOAY.js` had `Predictor x 0, Interpolator x 0, decodeSnapshot x 0` (all minified out).
+
+**PR #130 — snapshot decoder migration** (`b0b51ff`, MERGED):
+- **`client/src/engine/wireServerTransport.ts` (+303)** — new top-level async IIFE that polls `__gameSession` (up to 2s), then wires the snapshot decoder + Predictor + Interpolator + LIVE tick hook. Mirrors the PR #128/129 pattern. Includes Havok-step wrapper (save/restore pattern from PR 11.7.C), the respawn-snap HP-edge detector (from PR 11.7.D3.1), the local weapon state sync (from PR #108), and the LIVE observer publish. The scene.ts predictor/interpolator block at lines 1197-1513 stays INTACT for dev canary.
+- **`client/tools/prod-bundle-smoke.mjs` (+44)** — new `bundle-snapshot-decoder` assertion + extended `requiredMarkers`.
+- **`client/tools/two-tab-prod-bundle-damage-smoke.mjs` (+58)** — new `assertSnapshotsDecoded` (assertion 4): probes `__latestSnap()`, `window.__interpolator`, `__lastInterpolatorSetPosition`.
+- **`client/tools/pr130-visual-confirm.mjs` (+253, NEW)** — opens two tabs, waits 5s, asserts remote rig tracks Tab A's position.
+
+**Verification**:
+| Surface | Result |
+|---|---|
+| `npm run typecheck` | exit 0 |
+| `npx vitest run` | 118/118 PASS |
+| `npm run build` | exit 0 (bundle `index-Bxr3vwIa.js`) |
+| Bundle gate | `Predictor x 2`, `Interpolator x 6`, `__liveInterpolatorTickHook x 2`, `__predictor x 2`, `__interpolator x 3`, `snapshot decoder wired x 1` |
+| prod-bundle-smoke (Hetzner) | 7/8 PASS (1 lobby-create-join URL-nav failure is lobby flow) |
+| **two-tab-prod-bundle-damage-smoke (Hetzner)** | **4/4 PASS** |
+| **Visual (Hetzner, 2-tab screenshot)** | **2 capsules at distinct positions — snapshot-driven remote tracking working** |
+
+**Workflow patterns captured**:
+1. **Third tree-shake variant now in the canon**: DEV-gated code is the obvious one; `await import()` inside unawaited IIFEs is the second; full code blocks inside `if (effectiveMultiplayer) { ... }` IIFEs that Vite can't prove reachable is the third. Fix pattern is the same for all three.
+2. **The 2-tab damage smoke is now a 4-assertion gate**: wire-up + single-instance + damage-converges + snapshots-decoded.
+3. **scp-silent-failure pitfall (recurring)**: every Hetzner deploy needs `ls -la dist/assets/index-*.js` after the scp.
+
+**Memory anchors**: §specialists-web-hetzner-prod-wireup-2026-09-04 (updated).
+
+**Next session task**: real Mac 2-tab playtest for user-facing confirmation (option (d) above). Or smoke resilience (option (a)).
 
 ---
 
