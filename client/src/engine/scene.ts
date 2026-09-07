@@ -1405,7 +1405,15 @@ export async function createScene(
               // tracks the snapshot, not just the Havok body. Without
               // these two calls (which the closure-bound hook above
               // DOES have), the visual mesh stays at world origin.
-              liveRemoteCtrl.setVisualPosition(liveState.position);
+              // PR 2026-09-06 / setVisualPositionAndCommit — also force
+              // the visualRoot's world matrix to recompute. Without
+              // this, Babylon's cached absolute matrices on the rig's
+              // child meshes (torso, head, arms, legs) stay stale and
+              // the rig doesn't draw at the new visualRoot position.
+              // Single-line fix for the asymmetric render bug
+              // (one tab sees both rigs, the other sees only its
+              // local). See characterController.ts for full rationale.
+              liveRemoteCtrl.setVisualPositionAndCommit(liveState.position);
               liveRemoteCtrl.state.position.copyFrom(liveState.position);
               // Debug hooks so the smoke's __lastInterpolatorTick +
               // __lastInterpolatorSetPosition stay populated when

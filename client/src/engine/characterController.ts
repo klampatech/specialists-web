@@ -333,6 +333,28 @@ export class CharacterController {
     }
   }
 
+  /**
+   * PR 2026-09-06 / setVisualPositionAndCommit — same as
+   * `setVisualPosition`, but ALSO forces the visualRoot to recompute
+   * its world matrix. Babylon caches world matrices and only marks
+   * them dirty on parent changes; a `position.copyFrom()` on a parent
+   * TransformNode doesn't automatically propagate the dirty flag to
+   * child meshes' cached absolute matrices. Without the explicit
+   * `computeWorldMatrix(true)`, the rig's torso/head/arm/leg meshes
+   * keep stale absolute matrices and don't draw at the new
+   * visualRoot position — even though `position.copyFrom` correctly
+   * set the visualRoot. The fix: compute the world matrix here so
+   * the next render frame picks up the new position. This is the
+   * single line that fixes the asymmetric-render bug observed on
+   * Hetzner (one tab sees both rigs, the other sees only its local).
+   */
+  public setVisualPositionAndCommit(pos: Vector3): void {
+    if (this.visualRoot) {
+      this.visualRoot.position.copyFrom(pos);
+      this.visualRoot.computeWorldMatrix(true);
+    }
+  }
+
   /** Set the yaw the character should face (radians, 0 = +Z forward). */
   public setYaw(radians: number): void {
     this.yawRadians = radians;
