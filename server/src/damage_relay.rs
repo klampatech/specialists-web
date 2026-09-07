@@ -1060,6 +1060,7 @@ mod tests {
                 Position {
                     x: source_xy.0,
                     y: source_xy.1,
+                    z: 0.0,
                 },
             );
             room.record_position(
@@ -1068,6 +1069,7 @@ mod tests {
                 Position {
                     x: target_xy.0,
                     y: target_xy.1,
+                    z: 0.0,
                 },
             );
         }
@@ -1289,12 +1291,12 @@ mod tests {
         room.add_player(2);
         room.players.get_mut(&1).unwrap().ammo = 10;
         for frame in 0..30u32 {
-            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
-            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0, z: 0.0 });
         }
         for frame in 30..50u32 {
-            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
-            room.record_position(2, frame, Position { x: 100.0, y: 0.0 });
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
+            room.record_position(2, frame, Position { x: 100.0, y: 0.0, z: 0.0 });
         }
         // Advance the room's server frame so the AimEvent's
         // `req.frame = 40` is within MAX_LOOKAHEAD_FRAMES (16) of
@@ -1325,7 +1327,7 @@ mod tests {
         room.add_player(1);
         room.players.get_mut(&1).unwrap().ammo = 10;
         for frame in 0..5u32 {
-            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
         }
         let req = passing_aim_event();
         let initial_ammo = room.players.get(&1).unwrap().ammo;
@@ -1346,9 +1348,9 @@ mod tests {
         room.players.get_mut(&1).unwrap().ammo = 10;
         // target3 at (200,0) is well past the 50m pistol range.
         for frame in 0..5u32 {
-            room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
-            room.record_position(2, frame, Position { x: 5.0, y: 0.0 });
-            room.record_position(3, frame, Position { x: 200.0, y: 0.0 });
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0, z: 0.0 });
+            room.record_position(3, frame, Position { x: 200.0, y: 0.0, z: 0.0 });
         }
         let req = passing_aim_event();
         let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());

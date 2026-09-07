@@ -62,8 +62,8 @@ export const SNAPSHOT_BODY_SIZE = 9;
  *      receiving side fills 0 = DualPistol as a default)
  *   1  currentFireMode u8 (PR #107 — index into
  *      `WEAPONS_TABLE[weaponId].fire_modes[]`. 0 = first mode.)
- *  Math: 2 + 4 + 4 + 4 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1 = 31 bytes. */
-export const PLAYER_STATE_BODY_SIZE = 31;
+ *  Math: 2 + 4 + 4 + 4 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 4 = 35 bytes. */
+export const PLAYER_STATE_BODY_SIZE = 35;
 
 // -- Wire-size constants (disc + body — full packet) ------------
 
@@ -83,27 +83,36 @@ export function snapshotWireSize(playerCount: number): number {
  * Per-player state inside a Snapshot. Mirrors
  * `server/src/protocol.rs::PlayerState`.
  *
- * Wire layout (31 bytes — `PLAYER_STATE_BODY_SIZE`, PR #107 grew
- * from 30 to 31 to carry `currentFireMode` at offset 30):
+ * Wire layout (35 bytes — `PLAYER_STATE_BODY_SIZE`, PR #156 grew
+ * from 31 to 35 to carry `positionZ` at offset 10..13):
  *   byte 0..1   playerId (u16 BE)
  *   byte 2..5   positionX (f32 BE)
  *   byte 6..9   positionY (f32 BE)
- *   byte 10..13 velocityX (f32 BE)
- *   byte 14..17 velocityY (f32 BE)
- *   byte 18..21 yaw (f32 BE — radians)
- *   byte 22..25 pitch (f32 BE — radians)
- *   byte 26     hp (u8)
- *   byte 27     ammo (u8)
- *   byte 28     isFiring (u8 — 0 or 1)
- *   byte 29     weaponId (u8 — PR #102; 0=DualPistol, 1=Shotgun,
+ *   byte 10..13 positionZ (f32 BE — PR #156; Babylon's vertical Y,
+ *              Rapier's y axis. Pre-#156 the wire only carried the
+ *              XZ horizontal plane; jumps / standing on crates were
+ *              invisible to the peer.)
+ *   byte 14..17 velocityX (f32 BE)
+ *   byte 18..21 velocityY (f32 BE)
+ *   byte 22..25 yaw (f32 BE — radians)
+ *   byte 26..29 pitch (f32 BE — radians)
+ *   byte 30     hp (u8)
+ *   byte 31     ammo (u8)
+ *   byte 32     isFiring (u8 — 0 or 1)
+ *   byte 33     weaponId (u8 — PR #102; 0=DualPistol, 1=Shotgun,
  *              2=Sniper)
- *   byte 30     currentFireMode (u8 — PR #107; index into
+ *   byte 34     currentFireMode (u8 — PR #107; index into
  *              `WEAPONS_TABLE[weaponId].fire_modes[]`. 0 = first mode.)
  */
 export interface PlayerState {
   playerId: number;
   positionX: number;
   positionY: number;
+  /** PR #156 — vertical Y (Rapier's y axis = Babylon's Y axis).
+   *  Pre-#156 this field didn't exist on the wire; the snapshot
+   *  decoder fell back to 0 for the remote rig's vertical position,
+   *  so jumps were invisible to peers. Now read at byte offset 10. */
+  positionZ: number;
   velocityX: number;
   velocityY: number;
   /** Radians — 0..2π on the client. */
@@ -207,8 +216,8 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
     u32BE(snap.nextServerFrame),
     new Uint8Array([snap.players.length & 0xff]),
   ]);
-  // Per-player payload: 31 bytes each (was 30 pre-PR-#107; the
-  // `currentFireMode` byte at offset 30 is the PR #107 addition).
+  // Per-player payload: 35 bytes each (was 31 pre-PR-#156; the
+  // `positionZ` f32 at offset 10..13 is the PR #156 addition).
   // concatBytes builds the total incrementally so the size
   // assertion below catches drift.
   const playerBytes = snap.players.map((p) =>
@@ -216,6 +225,9 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
       u16BE(p.playerId),
       f32BE(p.positionX),
       f32BE(p.positionY),
+      // PR #156 — vertical Y (Rapier's y axis = Babylon's Y axis).
+      // Pre-#156 the wire only carried the XZ horizontal plane.
+      f32BE(p.positionZ),
       f32BE(p.velocityX),
       f32BE(p.velocityY),
       f32BE(p.yaw),
@@ -293,18 +305,22 @@ export function decodeSnapshot(buf: Uint8Array): Snapshot | null {
       playerId: dv.getUint16(off + 0, false),
       positionX: dv.getFloat32(off + 2, false),
       positionY: dv.getFloat32(off + 6, false),
-      velocityX: dv.getFloat32(off + 10, false),
-      velocityY: dv.getFloat32(off + 14, false),
-      yaw: dv.getFloat32(off + 18, false),
-      pitch: dv.getFloat32(off + 22, false),
-      hp: dv.getUint8(off + 26),
-      ammo: dv.getUint8(off + 27),
-      isFiring: dv.getUint8(off + 28),
+      // PR #156 — vertical Y. Rapier's y axis (Babylon's Y axis).
+      // Pre-#156 the decoder fell back to 0 for the remote rig's
+      // vertical position; jumps were invisible to peers.
+      positionZ: dv.getFloat32(off + 10, false),
+      velocityX: dv.getFloat32(off + 14, false),
+      velocityY: dv.getFloat32(off + 18, false),
+      yaw: dv.getFloat32(off + 22, false),
+      pitch: dv.getFloat32(off + 26, false),
+      hp: dv.getUint8(off + 30),
+      ammo: dv.getUint8(off + 31),
+      isFiring: dv.getUint8(off + 32),
       // PR #102 — weapon id (0=DualPistol, 1=Shotgun, 2=Sniper).
-      weaponId: dv.getUint8(off + 29),
+      weaponId: dv.getUint8(off + 33),
       // PR #107 — current fire-mode INDEX (into
       // `WEAPONS_TABLE[weaponId].fire_modes[]`).
-      currentFireMode: dv.getUint8(off + 30),
+      currentFireMode: dv.getUint8(off + 34),
     });
   }
   return { serverFrame, nextServerFrame, players };
