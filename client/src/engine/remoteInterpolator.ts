@@ -257,6 +257,11 @@ export class Interpolator {
    */
   private _yawSink: ((playerId: number, yawRadians: number) => void) | null =
     (playerId: number, yawRadians: number) => {
+      // PR #155 — only invoke the side-effect in browser-like
+      // environments. Vitest runs the interpolator in Node where
+      // `window` is undefined; without this guard the boundary
+      // tests crash on `ReferenceError: window is not defined`.
+      if (typeof window === "undefined") return;
       const liveSession = (window as unknown as {
         __gameSession?: {
           remoteController?: { setYaw?: (r: number) => void };
