@@ -1422,6 +1422,7 @@ export async function createScene(
               const w = window as unknown as {
                 __lastInterpolatorTick?: { ts: number; statesCount: number };
                 __lastInterpolatorSetPosition?: { x: number; z: number; ts: number; playerId: number };
+                __renderTrace?: Array<unknown>;
               };
               w.__lastInterpolatorTick = { ts: performance.now(), statesCount: liveStates.length };
               w.__lastInterpolatorSetPosition = {
@@ -1430,6 +1431,99 @@ export async function createScene(
                 ts: performance.now(),
                 playerId: liveState.playerId,
               };
+              // PR 2026-09-06 / debug trace — capture per-frame
+              // rendering state for the remote rig. Helps diagnose
+              // the asymmetric render bug (Tab 1 sees cyan rig, Tab 0
+              // doesn't) by surfacing the actual Babylon mesh state
+              // at the moment the liveHook fires. Ring buffer of 120
+              // frames (~2s at 60fps). Diagnostic only — does not
+              // affect production behavior.
+              if (!Array.isArray(w.__renderTrace)) w.__renderTrace = [];
+              const trace = w.__renderTrace;
+              if (trace.length >= 120) trace.shift();
+              const visualRoot = (liveRemoteCtrl as unknown as {
+                getVisualRootForDebug?: () => unknown;
+              }).getVisualRootForDebug?.();
+              const visualRootTN = visualRoot as
+                | {
+                    getScene?: () => unknown;
+                    position?: { x: number; y: number; z: number };
+                    absolutePosition?: { x: number; y: number; z: number };
+                  }
+                | undefined;
+              const scene = visualRootTN?.getScene?.() as
+                | {
+                    activeCamera?: {
+                      position: { x: number; y: number; z: number };
+                      target?: { x: number; y: number; z: number };
+                      fov?: number;
+                      mode?: number;
+                    };
+                    meshes?: Array<{
+                      name?: string;
+                      absolutePosition?: { x: number; y: number; z: number };
+                      isVisible?: boolean;
+                      isEnabled?: () => boolean;
+                      absoluteMatrix?: unknown;
+                    }>;
+                    getActiveMeshes?: () => { data: unknown[]; length: number };
+                  }
+                | undefined;
+              const cam = scene?.activeCamera;
+              const remoteTorso = scene?.meshes?.find?.(
+                (m: { name?: string }) => m.name === "remote_torso",
+              );
+              const activeMeshes = scene?.getActiveMeshes?.();
+              trace.push({
+                ts: performance.now(),
+                liveRemoteCtrlExists: !!liveRemoteCtrl,
+                visualRootExists: !!visualRoot,
+                visualRootPos: visualRootTN?.position
+                  ? {
+                      x: visualRootTN.position.x,
+                      y: visualRootTN.position.y,
+                      z: visualRootTN.position.z,
+                    }
+                  : null,
+                visualRootAbsPos: visualRootTN?.absolutePosition
+                  ? {
+                      x: visualRootTN.absolutePosition.x,
+                      y: visualRootTN.absolutePosition.y,
+                      z: visualRootTN.absolutePosition.z,
+                    }
+                  : null,
+                remoteTorsoExists: !!remoteTorso,
+                remoteTorsoAbs: remoteTorso?.absolutePosition
+                  ? {
+                      x: remoteTorso.absolutePosition.x,
+                      y: remoteTorso.absolutePosition.y,
+                      z: remoteTorso.absolutePosition.z,
+                    }
+                  : null,
+                remoteTorsoIsVisible: remoteTorso?.isVisible,
+                remoteTorsoEnabled: remoteTorso?.isEnabled?.(),
+                remoteTorsoHasAbsMatrix: !!remoteTorso?.absoluteMatrix,
+                remoteTorsoInActiveList: activeMeshes?.data
+                  ? activeMeshes.data.includes(remoteTorso as unknown)
+                  : null,
+                activeMeshCount: activeMeshes?.length,
+                cameraPos: cam
+                  ? {
+                      x: cam.position.x,
+                      y: cam.position.y,
+                      z: cam.position.z,
+                    }
+                  : null,
+                cameraTarget: cam?.target
+                  ? {
+                      x: cam.target.x,
+                      y: cam.target.y,
+                      z: cam.target.z,
+                    }
+                  : null,
+                cameraFov: cam?.fov,
+                cameraMode: cam?.mode,
+              });
             };
             (window as unknown as {
               __liveInterpolatorTickHook?: ((nowMs: number) => void) | null;

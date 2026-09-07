@@ -334,6 +334,17 @@ export class CharacterController {
   }
 
   /**
+   * PR 2026-09-06 / getVisualRootForDebug — public read-only access
+   * to visualRoot for diagnostics. Used by the liveHook's
+   * `__renderTrace` ring buffer in scene.ts to capture per-frame
+   * rendering state for the asymmetric-render bug investigation.
+   * Production-safe: read-only, no setter.
+   */
+  public getVisualRootForDebug(): TransformNode | undefined {
+    return this.visualRoot;
+  }
+
+  /**
    * PR 2026-09-06 / setVisualPositionAndCommit — same as
    * `setVisualPosition`, but ALSO forces the visualRoot to recompute
    * its world matrix. Babylon caches world matrices and only marks
