@@ -336,7 +336,10 @@ export function App() {
             frame: session.frame,
             repeatedFrames: session.repeatedFrameCount,
             hasRemote: session.runtime.hasRemote,
-            hits: session.getCombatEvents().length,
+            hits:
+              session.getCombatEvents().filter(
+                (e) => e.kind === "fire_hit" || e.kind === "melee_hit",
+              ).length,
             bulletTime: inputState?.bulletTimeHeld ?? false,
             localHp: health.local.hp,
             remoteHp: health.remote.hp,
