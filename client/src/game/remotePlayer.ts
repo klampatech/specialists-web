@@ -73,6 +73,16 @@ export function createRemotePlayer(
   respawnPosition?: Vector3,
 ): RemotePlayer {
   const root = new TransformNode(`${name}_root`, scene);
+  // PR #146 — start the remote rig HIDDEN. Pre-#146 the rig was
+  // visible from spawn, half-sunk into the floor at the Havok
+  // default (0, 1, 0) when no peer was connected (single-player
+  // or pre-first-snapshot). Kyle flagged this as the 'blue model
+  // half-sunken into the ground' UX bug. The rig becomes
+  // visible the moment the snapshot stream confirms a peer
+  // player exists (see wireServerTransport.ts onSnapshot handler
+  // — sets `__remoteRigVisible = true` when peerPlayerId is
+  // resolved from the first non-self snapshot entry).
+  root.setEnabled(false);
 
   // ---- Torso: capsule sized to match the Havok collision shape -----------
   const torso = MeshBuilder.CreateCapsule(
