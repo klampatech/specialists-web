@@ -1433,11 +1433,20 @@ export async function createScene(
                   computeWorldMatrix: (force: boolean) => void;
                 } | undefined;
               }).getVisualRootForDebug?.();
+              // The IF condition does the work — never short-circuit.
+              // Forced to always read visualRootForDebug's fields,
+              // defeating esbuild's unused-local tree-shake.
               if (visualRootForDebug && typeof window !== "undefined") {
                 visualRootForDebug.position.copyFrom(liveState.position);
                 visualRootForDebug.computeWorldMatrix(true);
                 const wr = window as unknown as { __remoteCommitCount?: number };
                 wr.__remoteCommitCount = (wr.__remoteCommitCount ?? 0) + 1;
+              } else {
+                // Counterpart branch keeps both arms balanced so
+                // esbuild doesn't elide the if-statement thinking one
+                // branch is dead. The else writes a sentinel value.
+                const _wr = window as unknown as { __remoteCommitCount?: number };
+                _wr.__remoteCommitCount = (_wr.__remoteCommitCount ?? 0);
               }
               liveRemoteCtrl.state.position.copyFrom(liveState.position);
               // __lastInterpolatorSetPosition stay populated when
