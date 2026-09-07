@@ -319,9 +319,19 @@ export function DebugHud({ visible }: DebugHudProps): JSX.Element | null {
         ).__latestSnap;
         const snap = typeof getLatestSnap === "function" ? getLatestSnap() : null;
         const players = snap?.players;
+        // PR #152 — read `playerId` from the snapshot's PlayerState
+        // (pre-#152 the HUD read `p.id`, which is undefined because
+        // the wire-decoded snapshot uses `playerId` per
+        // `protocol/snapshot.ts::PlayerState`). Result: snapshot
+        // players showed `?:hp100` instead of `1:hp100, 2:hp100` —
+        // the Debug HUD couldn't disambiguate which player was
+        // which during multi-tab playtests.
         const playersStr = Array.isArray(players)
           ? players
-              .map((p: { id?: number; hp?: number }) => `${p.id ?? "?"}:hp${p.hp ?? "?"}`)
+              .map(
+                (p: { playerId?: number; hp?: number }) =>
+                  `${p.playerId ?? "?"}:hp${p.hp ?? "?"}`,
+              )
               .join(", ")
           : "—";
 

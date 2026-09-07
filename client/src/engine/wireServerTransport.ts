@@ -474,6 +474,16 @@ void (async () => {
         const remotePlayer = snap.players.find((p) => p.playerId !== liveSession.localPlayerId);
         if (remotePlayer) {
           liveSession.setPeerPlayerId(remotePlayer.playerId);
+          // PR #152 — mirror the peer id to `window.__peerPlayerId`
+          // so the Debug HUD's `localId / peerId:` line resolves
+          // instead of showing `?`. Pre-#152 only PeerOverlay wrote
+          // `window.__peerPlayerId`, and the lobby doesn't emit
+          // `&peerId=` in the URL — so the auto-fill from the
+          // snapshot stream populated `liveSession.peerPlayerId` but
+          // the Debug HUD stayed stuck on `?`.
+          if (typeof window !== "undefined") {
+            (window as unknown as { __peerPlayerId?: number }).__peerPlayerId = remotePlayer.playerId;
+          }
           // PR #146 — reveal the remote rig mesh the moment we
           // confirm a peer is connected. Pre-#146 the rig was
           // visible from spawn (half-sunken ghost at the Havok
