@@ -1,21 +1,14 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// PR 2026-09-06 / debug-build — explicitly disable minify so the
-// Vite/Terser optimizer stops renaming methods that share a prefix
-// with another method (e.g. setVisualPositionAndCommit →
-// setVisualPosition). The minify step is what was dropping the
-// computeWorldMatrix(true) call in scene.ts. We will re-enable
-// minify once the asymmetric render bug is fully diagnosed and
-// fixed (the inline + sentinel pattern is fragile against the
-// current Terser version's heuristics). For now: no-minify + full
-// source maps so we can verify the actual code that gets shipped.
+// PR 2026-09-06 / reverted — re-enable minify now that the actual
+// root cause of the asymmetric render bug has been identified
+// (the liveHook in wireServerTransport.ts was the unfixed one —
+// scene.ts was a red herring). The minifier rename heuristic is
+// a real footgun but the liveHook now writes to a window-scope
+// property so elision would be observable. Keep minify on.
 export default defineConfig({
   plugins: [react()],
-  build: {
-    minify: false,
-    sourcemap: true,
-  },
   optimizeDeps: {
     exclude: ["@babylonjs/havok"],
   },
