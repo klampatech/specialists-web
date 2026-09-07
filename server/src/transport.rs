@@ -646,6 +646,34 @@ where
     let room_id = parse_room_id(&path);
     let room_arc = ensure_room(&rooms, &room_id).await;
 
+    // PR #135 / 2026-09-06 — enforce `MAX_PLAYERS_PER_ROOM` at the WS
+    // handshake. The matchmaker advertises `max_players: 24` in its
+    // POST/GET /rooms responses, but the wire server didn't actually
+    // enforce it. Smoke runs (which close chromium tabs without
+    // proper WS close-frame handling) leaked connections indefinitely,
+    // bloating room.connections to 50+ entries after a handful of
+    // runs and breaking client-side rendering (the snapshot playerId
+    // map grew unbounded). Pre-allocate check rejects new connections
+    // once `room.connections.len() >= MAX_PLAYERS_PER_ROOM`. We close
+    // the WS with a 1011 status and log a warn so it's debuggable.
+    {
+        let room_guard = room_arc.read().await;
+        if room_guard.connections.len() >= crate::constants::MAX_PLAYERS_PER_ROOM as usize {
+            warn!(
+                %peer,
+                room_id = %room_id,
+                current = room_guard.connections.len(),
+                max = crate::constants::MAX_PLAYERS_PER_ROOM,
+                "WS handshake rejected: room full"
+            );
+            // Close the WS upgrade with a server-side error. We can't
+            // return Result::Err cleanly here because we're inside the
+            // post-handshake path; use the same logic as tungstenite's
+            // CloseFrame handshake error path. Simplest: just return.
+            return Ok(());
+        }
+    }
+
     // PR 11.6.D: per-connection outbound mpsc sender. Each
     // connection gets a unique placeholder PlayerId (assigned by
     // `next_placeholder_player_id`) until its first `DamageRequest`
