@@ -115,7 +115,18 @@ pub const POSITION_HISTORY_STORE_HZ: u32 = 32;
 /// PR 11.7.E) carries a 6-bullet magazine. Matches the client-side
 /// `COMBAT.dualPistol.PLAYER_MAX_AMMO` so the reload-progress bar
 /// fills exactly when the snapshot reports `ammo == PLAYER_MAX_AMMO`.
-pub const PLAYER_MAX_AMMO: u8 = 6;
+/// PR #108 — initial ammo count per weapon. PR #108 introduced the
+/// per-weapon WEAPONS_TABLE; PR #142 aligns `PLAYER_MAX_AMMO` (which
+/// the snapshot uses for ammo saturation + the reload gate's
+/// `>= max` check) to the DualPistol's `magazine_size=10` instead
+/// of the legacy hardcoded 6. The server's `PLAYER_MAX_AMMO` is
+/// the "default weapon's magazine size" sentinel — only used as the
+/// reload-target value + the reload-rejection gate. Per-weapon
+/// switching is handled in the snapshot stream; the live `ammo` byte
+/// always reflects the actual magazine state for the weapon the
+/// local tab last selected. The client reads
+/// `WEAPONS_TABLE[weaponId].magazineSize` for the HUD bar width.
+pub const PLAYER_MAX_AMMO: u8 = 10;
 /// Minimum interval between reloads per player (server-side rate-limit).
 /// 1 reload per second per player — conservative anti-spam gate. Mirrors
 /// `client/src/engine/characterConfig.ts::COMBAT.dualPistol.lastReloadAtMinIntervalMs`.
