@@ -81,6 +81,34 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 
 ---
 
+## 2026-09-07 — PRs #142 + #143 (PLAYER_MAX_AMMO=10 + crate repositioning)
+
+**Scope**: Close two remaining UX bugs from Kyle's 2026-09-07 live playtest after PR #141 (spawn yaw).
+
+**1. PLAYER_MAX_AMMO = 6 → 10 (server + client + protocol)**
+
+Pre-#142, the server enforced `PLAYER_MAX_AMMO=6` (legacy pre-#108 days) while `protocol/constants.ts::WEAPONS_TABLE[DualPistol].magazineSize=10`. After firing 6 shots, the server's ammo gate thought the magazine was full and rejected reloads, but the HUD bar showed `▮▮▯▯▯▯▯▯▯▯ /10` — looking like there were still 4 rounds. Kyle observed this as 'ammo counts seem inconsistent or don't work'.
+
+Fix: aligned all three `PLAYER_MAX_AMMO` constants (server `server/src/constants.rs`, client `client/src/engine/characterConfig.ts`, protocol `protocol/constants.ts`) to 10 (DualPistol's `magazineSize`). Updated the protocol drift test (`weaponSwitch.test.ts`) from `expect(PLAYER_MAX_AMMO).toBe(6)` to `expect(PLAYER_MAX_AMMO).toBe(10)` (PR #143).
+
+Verified live on Hetzner: 2-tab smoke — Tab A fired 10 shots → Tab B's HP 100→0 (DualPistol 8dmg × 12 hits saturates HP). All 10 ammo ticks consumed. Reload successfully refilled to 10/10.
+
+**2. Move obstructing spawn crate (-5, 1.25, -2) → (-7, 1.25, -7)**
+
+Pre-#142, the back-left crate literally blocked player 1's chase camera ray to player 2 at spawn. Player 1 at (-8, 0, 0), camera at (-8, 1.5, -2.8) looking at chest (-8, 0.9, 0); player 2 at (-4, 1, 0). The crate's bounding box swept across that ray, occluding the remote rig.
+
+Moved to (-7, 1.25, -7) — still visible reference geometry in player's peripheral, no longer between camera + remote rig at spawn.
+
+Verified live on Hetzner: 2-tab Playwright screenshots show BOTH characters visible (red + cyan) with only the brown crate in the right side of the frame, not occluding the line-of-sight.
+
+**Investigated but NOT fixed: phantom `claimed_player_id=0` collision**
+
+Source: `server/src/transport.rs:1176` — when a connection's claimed_player_id collides with an existing player in `room.connections`, the server allocates a fallback (the next available id from the per-room counter), creating "phantom" player ids that show up in snapshots but never received a real connection. The smoke's `stress-24p-smoke.mjs` already treats this as WARN (post-#137), so not blocking CI. **Proper fix**: server should reject the second claim rather than allocating a fallback (would require distinguishing legitimate tab reloads from ghost connections — non-trivial). Carried forward.
+
+**Deployed to Hetzner** (server rebuilt + client bundle `index-C9TmSUaY.js` deployed 2026-09-07 18:00 UTC).
+
+**Memory anchors**: §specialists-web-2026-09-07-evening (new), §specialists-web-2026-09-07-morning (carried forward).
+
 ## 2026-09-07 — PR #139 (peerPlayerId auto-fill + MAX_PLAYERS enforcement) — live Kyle playtest fix
 
 **Scope**: Close the post-#134 'Tab B sees itself' multiplayer bug that surfaced in Kyle's live 2-tab playtest on Hetzner. Tab A (localId=1) correctly saw Tab B's rig; Tab B (localId=2) saw only its own rig (no remote player visible). HP didn't decrement, ammo sync was inconsistent.
