@@ -74,7 +74,11 @@ use tracing::{debug, error, info, warn};
 use wtransport::{Endpoint, ServerConfig};
 
 use specialists_server::cert::DEFAULT_SANS;
-use specialists_server::constants::{DEVBX_ROOM_ID, MAX_PLAYERS_PER_ROOM};
+use specialists_server::constants::{
+    DEVBX_ROOM_ID, MAX_PLAYERS_PER_ROOM, POSITION_UPDATE_ARENA_HALF_EXTENT_M,
+    POSITION_UPDATE_DISPLACEMENT_SLOP_M, POSITION_UPDATE_FUTURE_FRAME_TOLERANCE,
+    POSITION_UPDATE_MAX_SPEED_MPS, POSITION_UPDATE_MIN_INTERVAL_MS,
+};
 use specialists_server::position_history::Position;
 use specialists_server::protocol::{
     decode_aim_event, decode_inputs_server, decode_melee_event, decode_ping,
@@ -1686,32 +1690,158 @@ pub(super) async fn handle_binary(
             vec![]
         }
         DISCRIMINATOR_POSITION_UPDATE => {
-            // PR 11.7.B / §3.6 — PositionUpdate is DEPRECATED. The
-            // server-side `PositionHistory` is now fed by Rapier's
-            // physics tick (64Hz) — `Room.physics` writes to it
-            // inside `physics_tick_loop`. Per-player PositionUpdate
-            // packets from the client are still accepted for
-            // backward compatibility (the existing 5191 smoke
-            // depends on them for HP-convergence lag-comp math).
-            // PR 11.7.D removes this handler entirely.
-            //
-            // The deprecation is the gradual cutover plan from
-            // §3.6 — clients keep sending their old per-player
-            // PositionUpdate packets (Havok WASM still drives
-            // their pose prediction); the server logs a warn so
-            // the cutover timeline is observable in dev-box logs.
-            warn!(
-                "PositionUpdate (0x03) is deprecated, will be removed in 11.7.D;                  using client-driven position for PositionHistory"
-            );
+            // PR 11.7.D — `0x03 PositionUpdate` is a validated, rate-
+            // limited, server-clamped position-correction seam (closes
+            // the teleport-cheat vector from audit
+            // `specialists-web-audit-2026-09-07.md` §2). Gates: finite
+            // coords, arena bounds, per-player wall-clock rate-limit,
+            // client-frame monotonicity on `Player.last_position_update_frame`,
+            // wall-clock displacement budget vs `Room.physics.position`.
+            // First packet (no body / no prior accepted timestamp) is
+            // exempted so the integration smokes' seed flow still lands.
             let Some(pu) = decode_position_update(&payload[1..]) else {
                 warn!("positionUpdate: decoder rejected malformed payload");
                 return vec![];
             };
+            // Gate #1 — finite coords (NaN/inf would propagate
+            // into Rapier and panic the physics step).
+            if !pu.position_x.is_finite() || !pu.position_y.is_finite() {
+                warn!(
+                    player_id = pu.player_id,
+                    server_frame = pu.server_frame,
+                    position_x = pu.position_x,
+                    position_y = pu.position_y,
+                    "positionUpdate rejected: non-finite coordinates",
+                );
+                return vec![];
+            }
+            // Gate #2 — arena bounds (40×40 ground + overshoot).
+            let arena = POSITION_UPDATE_ARENA_HALF_EXTENT_M;
+            if pu.position_x.abs() > arena || pu.position_y.abs() > arena {
+                warn!(
+                    player_id = pu.player_id,
+                    server_frame = pu.server_frame,
+                    position_x = pu.position_x,
+                    position_y = pu.position_y,
+                    arena_half_extent_m = arena,
+                    "positionUpdate rejected: out of arena bounds",
+                );
+                return vec![];
+            }
+            // (Gate #3 — rate-limit — is implemented further down,
+            // just before the connection-promotion block, so a
+            // rate-limited packet doesn't mutate `room.players` or
+            // trigger a physics body create.)
             // Push onto the room's PositionHistory. §1.2 seam: WRITE-ONLY.
             let room_id = connection_state.lock().unwrap().room_id();
             let room_arc = ensure_room(rooms, &room_id).await;
             {
                 let mut room_guard = room_arc.write().await;
+                // Validation gate #4 - client-frame monotonicity gate.
+                // The wire field `pu.server_frame` is the CLIENT's
+                // local engine frame counter (Babylon
+                // `engine.advanced.frame`), NOT the server tick
+                // clock. The server's Rapier tick records positions
+                // using `room.next_server_frame` in the
+                // position_history ring buffer, which is on a
+                // DIFFERENT scale from the client. Comparing them
+                // directly would either reject every legitimate
+                // packet once the server clock drifts past the
+                // client's, or accept replayed packets if the
+                // client's clock ever wraps. Track the last ACCEPTED
+                // client-sent frame on Player
+                // (`last_position_update_frame`) and compare
+                // like-against-like.
+                //
+                // Idempotent retry: an EXACT-duplicate frame (same
+                // as the last accepted one) is allowed through - a
+                // common smoke pattern sends 3 identical frames
+                // back-to-back as a "primer", and WebSocket retries
+                // can also re-deliver the same frame. The downstream
+                // gates (displacement, rate-limit) still apply.: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
+                let last_client_frame: Option<u32> = room_guard
+                    .players
+                    .get(&pu.player_id)
+                    .and_then(|p| p.last_position_update_frame);
+                if let Some(prev_frame) = last_client_frame {
+                    if pu.server_frame == prev_frame {
+                        // Idempotent re-send - allow through.
+                    } else if pu.server_frame < prev_frame {
+                        // Lower than last accepted - replay or
+                        // out-of-order. Drop.
+                        warn!(
+                            player_id = pu.player_id,
+                            server_frame = pu.server_frame,
+                            last_client_frame = prev_frame,
+                            "positionUpdate rejected: stale client_frame (replay / out-of-order)",
+                        );
+                        return vec![];
+                    } else if pu.server_frame
+                        > prev_frame + POSITION_UPDATE_FUTURE_FRAME_TOLERANCE
+                    {
+                        // Higher than tolerance window - looks like
+                        // a future-frame spoof (a malicious client
+                        // trying to fast-forward its own clock to
+                        // dodge the displacement gate by claiming
+                        // "lots of time passed").
+                        warn!(
+                            player_id = pu.player_id,
+                            server_frame = pu.server_frame,
+                            last_client_frame = prev_frame,
+                            tolerance_frames = POSITION_UPDATE_FUTURE_FRAME_TOLERANCE,
+                            "positionUpdate rejected: client_frame too far in the future",
+                        );
+                        return vec![];
+                    }
+                }
+                // Validation gate #5 - displacement budget against
+                // the body's CURRENT authoritative position. Uses
+                // WALL-CLOCK elapsed time since the last ACCEPTED
+                // PositionUpdate for this player, NOT the client-
+                // frame delta. The wire's `server_frame` is the
+                // client's local engine counter and can be
+                // arbitrarily advanced by a malicious client to
+                // claim "lots of time passed" - wall-clock is the
+                // trustworthy time source for the displacement
+                // budget.
+                //
+                // First packet for a player (no body yet, or no
+                // previous accepted packet) is exempted - the seed
+                // flow used by the integration smokes sends one
+                // packet at a known position and expects it to land
+                // without a prior body or prior accepted timestamp.: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
+                if let Some(current_pos) = room_guard.physics.position(pu.player_id) {
+                    let last_receive_at = room_guard
+                        .players
+                        .get(&pu.player_id)
+                        .and_then(|p| p.last_position_update_received_at);
+                    let dt_seconds = match last_receive_at {
+                        Some(prev) => Instant::now()
+                            .saturating_duration_since(prev)
+                            .as_secs_f32()
+                            .max(0.001),
+                        None => 0.0, // exempt - first packet
+                    };
+                    let dx = pu.position_x - current_pos.x;
+                    let dy = pu.position_y - current_pos.y;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    let budget = POSITION_UPDATE_MAX_SPEED_MPS * dt_seconds
+                        + POSITION_UPDATE_DISPLACEMENT_SLOP_M;
+                    if distance > budget {
+                        warn!(
+                            player_id = pu.player_id,
+                            server_frame = pu.server_frame,
+                            current_x = current_pos.x,
+                            current_y = current_pos.y,
+                            requested_x = pu.position_x,
+                            requested_y = pu.position_y,
+                            distance_m = distance,
+                            budget_m = budget,
+                            "positionUpdate rejected: displacement exceeds server budget (teleport cheat attempt)",
+                        );
+                        return vec![];
+                    }
+                }
                 // PR 11.7.D2.1 / FIX — promote the connection from its
                 // placeholder id to the claimed `pu.player_id` on the
                 // FIRST PositionUpdate, mirroring the DamageRequest
@@ -1744,6 +1874,35 @@ pub(super) async fn handle_binary(
                 // means Gate2 anti-spoof would reject). We promote
                 // BEFORE add_player so the snapshot's player id matches
                 // the client's claim — but only if the slot is empty.
+                // Gate #3 — per-player wall-clock rate-limit. The
+                // 5ms floor is below the legitimate 32Hz cadence
+                // (~31ms) so honest traffic is never caught. Runs
+                // AFTER gates #1/#2/#4/#5 (so a rejected packet
+                // doesn't burn the budget) and BEFORE the connection
+                // promotion + `add_player` block below (so a
+                // rate-limited packet doesn't mutate `room.players`,
+                // ammo, or trigger a physics body create). First
+                // packet (no record yet) is exempted. The wall-clock
+                // stamp lands AFTER `add_player` so the first
+                // accepted packet leaves a stamp subsequent packets
+                // can read.
+                let rate_limit_now = Instant::now();
+                if let Some(player) = room_guard.players.get(&pu.player_id) {
+                    if let Some(prev) = player.last_position_update_received_at {
+                        let elapsed_ms = rate_limit_now
+                            .duration_since(prev)
+                            .as_millis() as u64;
+                        if elapsed_ms < POSITION_UPDATE_MIN_INTERVAL_MS {
+                            warn!(
+                                player_id = pu.player_id,
+                                elapsed_ms,
+                                min_interval_ms = POSITION_UPDATE_MIN_INTERVAL_MS,
+                                "positionUpdate rejected: per-player rate-limit",
+                            );
+                            return vec![];
+                        }
+                    }
+                }
                 if placeholder_player_id != pu.player_id
                     && !room_guard.connections.contains_key(&pu.player_id)
                 {
@@ -1802,6 +1961,15 @@ pub(super) async fn handle_binary(
                     if p.ammo == 0 {
                         p.ammo = specialists_server::constants::PLAYER_MAX_AMMO;
                     }
+                }
+                // Stamp rate-limit + frame on first accept. The
+                // `rate_limit_now` Instant was captured BEFORE Gate #3
+                // (above) so the stamp's wall-clock value is
+                // consistent with the rate-limit floor. Subsequent
+                // packets read this stamp in Gate #3.
+                if let Some(player) = room_guard.players.get_mut(&pu.player_id) {
+                    player.last_position_update_received_at = Some(rate_limit_now);
+                    player.last_position_update_frame = Some(pu.server_frame);
                 }
                 // PR 11.7.D2.1 / FIX — also register a physics body
                 // for this player. Pre-fix, PositionUpdate only added
@@ -2719,6 +2887,278 @@ mod tests {
             "Tab A stays at id=1, Tab B lands at id=3 (next available per-room id after the collision); actual={:?}",
             actual_ids,
         );
+    }
+
+    // PR 11.7.D — PositionUpdate validator tests (closes the
+    // teleport-cheat vector documented in
+    // `specialists-web-audit-2026-09-07.md` §2).
+
+    #[tokio::test]
+    async fn dispatch_position_update_first_packet_seeds_body_from_claim() {
+        // No prior body -> displacement gate exempted. Handler
+        // seeds the physics body and PositionHistory entry.
+        let rooms = fresh_rooms();
+        let pu = PositionUpdate {
+            server_frame: 10,
+            player_id: 7,
+            position_x: 3.5,
+            position_y: -1.25,
+        };
+        let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+        payload.extend(encode_position_update(&pu));
+
+        let reply = handle_binary(
+            &payload,
+            &rooms,
+            0,
+            ConnectionState::new(0) /* placeholder */,
+        )
+        .await;
+        assert!(reply.is_empty(), "positionUpdate must not produce a reply");
+
+        // Body was seeded at the claimed position.
+        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
+        let room_guard = room_arc.read().await;
+        let body = room_guard
+            .physics
+            .position(7)
+            .expect("body created on first packet");
+        assert_eq!(body.x, 3.5, "body X reflects the first packet's claim");
+        assert_eq!(body.y, -1.25, "body Y reflects the first packet's claim");
+        // PositionHistory received the entry.
+        let entry = room_guard
+            .position_history
+            .get(&7)
+            .expect("player 7 history")
+            .snapshot_at(10)
+            .expect("snapshot at frame 10");
+        assert_eq!(entry.x, 3.5);
+        assert_eq!(entry.y, -1.25);
+    }
+
+    #[tokio::test]
+    async fn dispatch_position_update_accepts_small_displacement() {
+        // Two packets within budget: seed at origin, move 0.10m
+        // over ~16ms — well inside MAX_SPEED * dt + slop.
+        let rooms = fresh_rooms();
+        let send = |server_frame: u32, x: f32, y: f32| {
+            let pu = PositionUpdate {
+                server_frame,
+                player_id: 7,
+                position_x: x,
+                position_y: y,
+            };
+            let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+            payload.extend(encode_position_update(&pu));
+            payload
+        };
+        // First packet — seeds the body.
+        let reply = handle_binary(
+            &send(0, 0.0, 0.0),
+            &rooms,
+            0,
+            ConnectionState::new(0) /* placeholder */,
+        )
+        .await;
+        assert!(reply.is_empty(), "first packet: no reply");
+        // Clear the 5ms wall-clock rate-limit floor.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Second packet — small move, accepted.
+        let reply = handle_binary(
+            &send(1, 0.10, 0.0),
+            &rooms,
+            0,
+            ConnectionState::new(0) /* placeholder */,
+        )
+        .await;
+        assert!(reply.is_empty(), "small displacement accepted, no reply");
+
+        // Body reflects the move; history has both frames.
+        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
+        let room_guard = room_arc.read().await;
+        let body = room_guard.physics.position(7).expect("body present");
+        assert!(
+            (body.x - 0.10).abs() < 0.001,
+            "body X reflects the small move"
+        );
+        assert_eq!(body.y, 0.0, "body Y unchanged");
+        let hist = room_guard
+            .position_history
+            .get(&7)
+            .expect("player 7 history");
+        assert!(hist.snapshot_at(0).is_some(), "frame 0 recorded");
+        assert!(hist.snapshot_at(1).is_some(), "frame 1 recorded");
+    }
+
+    #[tokio::test]
+    async fn dispatch_position_update_rejects_huge_displacement() {
+        // Targets Gate #5 (displacement) specifically — coords stay
+        // inside the ±100m arena (Gate #2 must NOT fire) but the
+        // requested move (≈70.7m) vastly exceeds the per-packet
+        // budget (≈1.1m after 20ms wall-clock). Body must NOT move.
+        let rooms = fresh_rooms();
+        let send = |server_frame: u32, x: f32, y: f32| {
+            let pu = PositionUpdate {
+                server_frame,
+                player_id: 7,
+                position_x: x,
+                position_y: y,
+            };
+            let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+            payload.extend(encode_position_update(&pu));
+            payload
+        };
+        // First packet — seeds the body at the origin.
+        let _ = handle_binary(
+            &send(0, 0.0, 0.0),
+            &rooms,
+            0,
+            ConnectionState::new(0) /* placeholder */,
+        )
+        .await;
+        // Clear the 5ms wall-clock rate-limit floor.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // 20ms wall-clock gap -> budget ≈ 30 * 0.020 + 0.5 = 1.1m.
+        // Distance from (0, 0) to (50, 50) is √5000 ≈ 70.7m.
+        let reply = handle_binary(
+            &send(1, 50.0, 50.0),
+            &rooms,
+            0,
+            ConnectionState::new(0) /* placeholder */,
+        )
+        .await;
+        assert!(
+            reply.is_empty(),
+            "teleport packet must not produce a reply"
+        );
+
+        // Body is NOT teleported — still at the seed position.
+        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
+        let room_guard = room_arc.read().await;
+        let body = room_guard.physics.position(7).expect("body present");
+        assert!(
+            body.x.abs() < 0.01 && body.y.abs() < 0.01,
+            "body must NOT be teleported; got ({}, {})",
+            body.x,
+            body.y
+        );
+        // PositionHistory was NOT mutated past frame 0.
+        // (snapshot_at(1) would still return frame 0 because the
+        // ±8-frame tolerance picks the closest entry — assert on
+        // the raw frame count instead.)
+        let hist = room_guard
+            .position_history
+            .get(&7)
+            .expect("player 7 history");
+        assert_eq!(
+            hist.len(),
+            1,
+            "PositionHistory should contain only the seed entry at frame 0; actual frames: {}",
+            hist.frames.len()
+        );
+        assert_eq!(
+            hist.frames.back().map(|(f, _)| *f),
+            Some(0),
+            "the only recorded frame must be the seed frame 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_position_update_rejects_non_finite_coordinates() {
+        // NaN/inf propagate into Rapier's vector math and panic
+        // the physics step. Gate #1 rejects before `set_position`.
+        let rooms = fresh_rooms();
+        let send = |x: f32, y: f32| {
+            let pu = PositionUpdate {
+                server_frame: 0,
+                player_id: 7,
+                position_x: x,
+                position_y: y,
+            };
+            let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+            payload.extend(encode_position_update(&pu));
+            payload
+        };
+        // NaN X.
+        let reply = handle_binary(
+            &send(f32::NAN, 0.0),
+            &rooms,
+            0,
+            ConnectionState::new(0) /* placeholder */,
+        )
+        .await;
+        assert!(reply.is_empty(), "NaN X: no reply");
+        // inf Y.
+        let reply = handle_binary(
+            &send(0.0, f32::INFINITY),
+            &rooms,
+            0,
+            ConnectionState::new(0) /* placeholder */,
+        )
+        .await;
+        assert!(reply.is_empty(), "inf Y: no reply");
+        // Negative inf X.
+        let reply = handle_binary(
+            &send(f32::NEG_INFINITY, 0.0),
+            &rooms,
+            0,
+            ConnectionState::new(0) /* placeholder */,
+        )
+        .await;
+        assert!(reply.is_empty(), "neg-inf X: no reply");
+
+        // No body should have been created — every packet was rejected.
+        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
+        let room_guard = room_arc.read().await;
+        assert!(
+            room_guard.physics.position(7).is_none(),
+            "no body created for non-finite coordinates"
+        );
+        assert!(
+            room_guard
+                .position_history
+                .get(&7)
+                .map(|h| h.is_empty())
+                .unwrap_or(true),
+            "no position history recorded for non-finite coordinates"
+        );
+    }
+
+    // PR 11.7.D / §3.6 follow-up - client-frame monotonicity gate.
+    // The wire's `server_frame` is the CLIENT's local engine
+    // counter; the gate compares against the last ACCEPTED
+    // client-sent frame on `Player.last_position_update_frame`,
+    // not the server-tick-keyed position_history ring buffer.
+    // Covers: exact-duplicate (idempotent retry), lower (replay),
+    // higher-by-tolerance+1 (future-frame spoof), and
+    // higher-within-tolerance (legitimate next frame).: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
+    #[tokio::test]
+    async fn dispatch_position_update_client_frame_monotonicity() {
+        let rooms = fresh_rooms();
+        let send = |frame: u32| {
+            let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+            payload.extend(encode_position_update(&PositionUpdate {
+                server_frame: frame,
+                player_id: 7,
+                position_x: 0.0,
+                position_y: 0.0,
+            }));
+            payload
+        };
+        // Seed body at origin + set last_client_frame = 100.
+        let _ = handle_binary(&send(100), &rooms, 0, ConnectionState::new(0)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let cases: &[(u32, &str)] = &[
+            (100, "exact-duplicate (idempotent retry)"),
+            (99, "lower (replay / out-of-order)"),
+            (100 + 8 + 1, "higher than last + tolerance (future-frame spoof)"),
+            (101, "higher within tolerance (legitimate next frame)"),
+        ];
+        for (frame, label) in cases {
+            let reply = handle_binary(&send(*frame), &rooms, 0, ConnectionState::new(0)).await;
+            assert!(reply.is_empty(), "{}: must not produce a reply", label);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
