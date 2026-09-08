@@ -464,6 +464,31 @@ pub fn validate_and_relay_aim(
         }
         let server_frame = room.next_server_frame;
         let server_seq = room.next_seq();
+        // Target HP decrement on EVERY hit (one target per
+        // DamageBroadcast -- a single shot can hit at most one
+        // target in the dual-pistol cone, but the Vec allows
+        // multi-hit if the cone is widened later).
+        // The HP decrement MUST succeed for the broadcast to be
+        // honest (server-authoritative -- clients apply
+        // optimistically and the snapshot is the only truth). If
+        // the target race-disconnected between the keys() snapshot
+        // above and this get_mut, drop the packet (worker stays
+        // alive) instead of panicking -- a panic would abort the
+        // Tokio worker and systemd would restart the unit, dropping
+        // every other connected player.
+        let Some(target_player) = room.players.get_mut(&target_id) else {
+            warn!(
+                source = req_source,
+                target = target_id,
+                amount,
+                "validate_and_relay_aim: gate 1 race -- target_id not in \
+                 room.players at HP decrement site (likely raced with \
+                 disconnect). Dropping packet.",
+            );
+            return vec![];
+        };
+        let hp_before = target_player.hp;
+        target_player.hp = target_player.hp.saturating_sub(amount);
         let bc = DamageBroadcast {
             server_frame,
             server_seq,
@@ -474,15 +499,6 @@ pub fn validate_and_relay_aim(
             origin_event_id: req.event_id,
         };
         broadcasts.push(bc);
-        // Target HP decrement on EVERY hit (one target per
-        // DamageBroadcast -- a single shot can hit at most one
-        // target in the dual-pistol cone, but the Vec allows
-        // multi-hit if the cone is widened later).
-       let target_player = room
-           .players
-           .get_mut(&target_id)
-           .expect("target_id from keys() invariant violated");
-       target_player.hp = target_player.hp.saturating_sub(amount);
        // PR #158 — hit telemetry for diagnostic correlation.
        // Always on at info-level (target: "damage_relay") so
        // `journalctl -u specialists-server -f | grep HIT` shows
@@ -493,11 +509,13 @@ pub fn validate_and_relay_aim(
            source = req_source,
            target = target_id,
            amount,
+           hp_before,
            hp_after = target_player.hp,
-           "HIT source={} target={} dmg={} hp_after={}",
+           "HIT source={} target={} dmg={} hp_before={} hp_after={}",
            req_source,
            target_id,
            amount,
+           hp_before,
            target_player.hp,
        );
        }
@@ -527,11 +545,40 @@ pub fn validate_and_relay_aim(
     // burst-fire semantics.
     let mut burst_mid_shot = false;
     {
-        let player = room
-            .players
-            .get_mut(&req_source)
-            .expect("gate 1 invariant violated - req_source not in room");
-        let fm = active_weapon_def.fire_modes[player.current_fire_mode as usize];
+        // Snapshot the player's current fire mode via an immutable
+        // borrow so we can log it if the mutable borrow below races
+        // against a disconnect. The immutable borrow is dropped
+        // before the get_mut (FireMode is Copy, so the value is
+        // owned). The first lookup also serves as a defensive guard:
+        // if the player has already vanished (raced disconnect between
+        // Gate 1 above and this site), we drop the packet without
+        // panicking -- the Tokio worker would otherwise abort and
+        // systemd would restart, losing every connected player.
+        let current_fire_mode: FireMode = match room.players.get(&req_source) {
+            Some(p) => active_weapon_def.fire_modes[p.current_fire_mode as usize],
+            None => {
+                warn!(
+                    source = req_source,
+                    is_firing = req.is_firing,
+                    "validate_and_relay_aim: gate 1 race -- req_source not in \
+                     room.players at burst state-machine site (likely raced \
+                     with disconnect). Dropping packet.",
+                );
+                return vec![];
+            }
+        };
+        let Some(player) = room.players.get_mut(&req_source) else {
+            warn!(
+                source = req_source,
+                fire_mode = ?current_fire_mode,
+                is_firing = req.is_firing,
+                "validate_and_relay_aim: gate 1 race -- req_source not in \
+                 room.players at burst state-machine site (likely raced \
+                 with disconnect). Dropping packet.",
+            );
+            return vec![];
+        };
+        let fm = current_fire_mode;
         match fm {
             FireMode::Semi => {
                 if req.is_firing == 0 {
@@ -568,10 +615,22 @@ pub fn validate_and_relay_aim(
             }
         }
     }
-    let player = room
-        .players
-        .get_mut(&req_source)
-        .expect("gate 1 invariant violated - req_source not in room");
+    // Graceful race-window fallback -- mirrors the burst
+    // state-machine site above. If req_source vanished between Gate
+    // 1 and now (raced disconnect), drop the packet (skipping the
+    // ammo decrement + last_fire_at stamp) instead of panicking
+    // the Tokio worker.
+    let Some(player) = room.players.get_mut(&req_source) else {
+        warn!(
+            source = req_source,
+            burst_mid_shot = burst_mid_shot,
+            event_id = req.event_id,
+            "validate_and_relay_aim: gate 1 race -- req_source not in \
+             room.players at ammo-decrement site (likely raced with \
+             disconnect). Dropping packet.",
+        );
+        return vec![];
+    };
     if !burst_mid_shot {
         player.ammo = player.ammo.saturating_sub(1);
     }
@@ -711,10 +770,20 @@ pub fn validate_and_relay_reload(
     // --- Gate 8: side-effects on success -------------------------------
     // Mutate ammo + stamp last_reload_at + advance last_event_id. The
     // snapshot stream carries the new ammo on its next 20Hz tick.
-    let player = room
-        .players
-        .get_mut(&req_source)
-        .expect("gate 1 invariant violated — req_source not in room.players");
+    // Graceful race-window fallback -- if req_source vanished between
+    // Gate 1 above and this site (raced disconnect), drop the packet
+    // (return None so the snapshot stays at the pre-reload ammo value)
+    // instead of panicking the Tokio worker.
+    let Some(player) = room.players.get_mut(&req_source) else {
+        warn!(
+            source = req_source,
+            event_id = req.event_id,
+            "validate_and_relay_reload: gate 1 race -- req_source not in \
+             room.players at side-effect site (likely raced with \
+             disconnect). Dropping packet.",
+        );
+        return None;
+    };
     player.ammo = PLAYER_MAX_AMMO;
     player.last_reload_at = Some(now);
     // Saturating eventId stamp — mirrors validate_and_relay's
@@ -998,16 +1067,6 @@ pub fn validate_and_relay_melee(
             MELEE_MAX_RANGE_METERS,
         ) {
             // Hit! Emit a DamageBroadcast for this target.
-            let bc = DamageBroadcast {
-                server_frame: room.next_server_frame,
-                server_seq: room.next_seq(),
-                source_player_id: req_source,
-                target_player_id: target_id,
-                source: 1, // 1 = melee (per `DAMAGE_SOURCE_MELEE`)
-                amount: MELEE_DAMAGE,
-                origin_event_id: req.event_id,
-            };
-            broadcasts.push(bc);
             // PR #114 — Target HP decrement on EVERY melee hit. Mirrors
             // the AimEvent path's `target_player.hp = target_player.hp
             // .saturating_sub(amount)` (line 459). Pre-fix: melee
@@ -1016,11 +1075,40 @@ pub fn validate_and_relay_melee(
             // value stayed at 100 — the smoke's HP-drop assertions
             // failed even when the cone hit. The DamageBroadcast is
             // now also the trigger for the HP state mutation.
-            let target_player = room
-                .players
-                .get_mut(&target_id)
-                .expect("target_id from keys() invariant violated");
+            // HP decrement MUST succeed for the broadcast to be
+            // honest (server-authoritative -- clients apply
+            // optimistically and the snapshot is the only truth). If
+            // the target race-disconnected between the keys() snapshot
+            // above and this get_mut, drop the packet (worker stays
+            // alive) instead of panicking.
+            // Snapshot the broadcast metadata BEFORE the get_mut --
+            // `room.next_server_frame` / `room.next_seq()` also
+            // borrow `room` mutably, so we need them outside the
+            // get_mut borrow's scope.
+            let server_frame = room.next_server_frame;
+            let server_seq = room.next_seq();
+            let Some(target_player) = room.players.get_mut(&target_id) else {
+                warn!(
+                    source = req_source,
+                    target = target_id,
+                    event_id = req.event_id,
+                    "validate_and_relay_melee: gate 1 race -- target_id not \
+                     in room.players at HP decrement site (likely raced \
+                     with disconnect). Dropping packet.",
+                );
+                return vec![];
+            };
             target_player.hp = target_player.hp.saturating_sub(MELEE_DAMAGE);
+            let bc = DamageBroadcast {
+                server_frame,
+                server_seq,
+                source_player_id: req_source,
+                target_player_id: target_id,
+                source: 1, // 1 = melee (per `DAMAGE_SOURCE_MELEE`)
+                amount: MELEE_DAMAGE,
+                origin_event_id: req.event_id,
+            };
+            broadcasts.push(bc);
         }
     }
     if !broadcasts.is_empty() {
@@ -1598,6 +1686,121 @@ mod tests {
         assert_eq!(
             snap_ammo, PLAYER_MAX_AMMO,
             "post-reload snapshot must report ammo=PLAYER_MAX_AMMO for the source",
+        );
+    }
+
+    // -- Issue 3: race-window graceful fallbacks ------------------------
+    //
+    // The hot-path `.expect()` calls in `validate_and_relay_*` were
+    // replaced with `let Some(player) = ... else { warn!(...); return
+    // vec![]; }` (or `return None;` for reload). The race window —
+    // between Gate 1 (`contains_key`) and the side-effect `get_mut` —
+    // cannot be triggered in a single-threaded test without
+    // injecting target_ids out of band, but the surrounding
+    // behavior is verifiable: pre-fix these tests would still pass,
+    // but the absence of a panic + the empty result pins the
+    // graceful-handling contract. (If the `.expect()` were ever
+    // reintroduced, an end-to-end multi-player fuzz test would
+    // catch it — but the unit-test suite guarantees the validator
+    // is panic-free for the obvious "player vanished" scenarios.)
+
+    /// Issue 3 — target race-disconnect before `validate_and_relay_aim`
+    /// must NOT panic and must return an empty broadcast vec.
+    /// Pre-fix: the `players.get_mut(&target_id).expect(...)` on the
+    /// HP-decrement site would have panicked if the target vanished
+    /// between Gate 1 and the side-effect site. Post-fix: the let-else
+    /// warns + returns vec![]. In a single-threaded test the race
+    /// manifests as "target already gone before validation started",
+    /// so the `target_ids` Vec is empty, the per-target loop doesn't
+    /// execute, and the function returns empty after applying the
+    /// standard ammo decrement (fire-rate consumed even on miss).
+    #[test]
+    fn aim_event_target_race_disconnect_does_not_panic() {
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        // Simulate the target vanishing between Gate 1 (passed) and
+        // the per-target loop. (In single-threaded test land this is
+        // equivalent to "target not in room at validation start";
+        // the `target_ids` Vec is built from `room.players.keys()`
+        // and is empty, so the loop is a no-op.)
+        room.players.remove(&2);
+        let req = passing_aim_event();
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert_eq!(
+            result.len(),
+            0,
+            "no hit should be recorded when target is gone",
+        );
+        // Fire-rate was consumed (gate 4 passed → burst logic ran
+        // → ammo decremented by 1, per the brief's gate-3 caveat
+        // and the existing `aim_event_miss_still_decrements_ammo`
+        // test). Pin this to confirm the race-window fallback didn't
+        // accidentally short-circuit the ammo decrement path.
+        let post_ammo = room.players.get(&1).unwrap().ammo;
+        assert_eq!(
+            post_ammo,
+            initial_ammo - 1,
+            "race-window fallback must still consume fire-rate on miss",
+        );
+    }
+
+    /// Issue 3 — target race-disconnect before `validate_and_relay_melee`
+    /// must NOT panic and must return an empty broadcast vec. Mirrors
+    /// the aim test above. Melee has no ammo gate, so the source's
+    /// ammo is unchanged.
+    #[test]
+    fn melee_event_target_race_disconnect_does_not_panic() {
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        room.players.remove(&2);
+        let req = MeleeEvent {
+            source_player_id: 1,
+            yaw_radians: std::f32::consts::FRAC_PI_2,
+            pitch_radians: 0.0,
+            frame: 4,
+            event_id: 1,
+        };
+        let result = validate_and_relay_melee(&req, 1, &mut room, 0, Instant::now());
+        assert_eq!(
+            result.len(),
+            0,
+            "no hit should be recorded when target is gone",
+        );
+        // Melee has no ammo cost — confirm the race-window fallback
+        // didn't accidentally trigger an ammo decrement.
+        let post_ammo = room.players.get(&1).unwrap().ammo;
+        assert_eq!(
+            post_ammo, initial_ammo,
+            "melee must NOT consume ammo even on race-window drop",
+        );
+    }
+
+    /// Issue 3 — source race-disconnect before
+    /// `validate_and_relay_reload` must NOT panic. Gate 1 catches the
+    /// missing source (the new fallback only fires when the source
+    /// vanishes between Gate 1 and the side-effect site at line 776;
+    /// that race window can't be triggered in single-threaded tests).
+    /// This test pins the panic-free + graceful-`None`-return contract
+    /// for the "source already gone" scenario.
+    #[test]
+    fn reload_source_race_disconnect_does_not_panic() {
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        // Drain ammo so gate 4 (ammo < max) would pass if we got
+        // that far. The race window for the new fallback is between
+        // Gate 1 and the side-effect site, so we can't actually
+        // exercise the let-else here — but this test pins the
+        // panic-free + Gate 1 reject path.
+        room.players.get_mut(&1).unwrap().ammo = 1;
+        // Simulate the source vanishing. Pre-fix: any caller that
+        // hit a stale connection-id path AND a race-disconnect would
+        // have panicked at the side-effect site. Post-fix: Gate 1
+        // rejects with `None`, the worker stays alive.
+        room.players.remove(&1);
+        let req = passing_reload_request();
+        let result = validate_and_relay_reload(&req, 1, &mut room, Instant::now());
+        assert!(
+            result.is_none(),
+            "missing source must be rejected with None (Gate 1 or race fallback)",
         );
     }
 }
