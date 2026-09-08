@@ -882,13 +882,13 @@ fn snapshot_includes_position_history() {
     // got stale alongside the seed literal and now mismatches
     // every build. Comparing against `room.physics.position(id)`
     // keeps the test robust to physics-settle drift.
-    let physics_pos = room.physics.position(player_id).expect("physics body exists");: per-player PositionUpdate validator (PR 11.7.D))
+    let physics_pos = room.physics.position(player_id).expect("physics body exists");
     assert_eq!(
         room.position_history
             .get(&player_id)
             .unwrap()
             .snapshot_at(0),
-        Some(physics_pos),: per-player PositionUpdate validator (PR 11.7.D))
+        Some(physics_pos),
         "PositionHistory at frame 0 should match the physics start position"
     );
 }

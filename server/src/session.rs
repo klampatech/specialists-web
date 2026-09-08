@@ -172,12 +172,9 @@ impl Player {
             // so the first packet always passes the rate-limit + frame
             // monotonicity gates.
             last_position_update_received_at: None,
-<<<<<<< HEAD
-=======
             // PR 11.7.D / §3.6 follow-up - frame-monotonicity gate
             // starts at None (player hasn't sent a PositionUpdate
             // yet -> first packet always passes the gate).
->>>>>>> 6a8d296 (fix(transport): per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
             last_position_update_frame: None,
             // PR #114 — first melee swing passes the rate-limit
             // gate (`None` means "has never swung").

@@ -1969,7 +1969,6 @@ pub(super) async fn handle_binary(
                 // packets read this stamp in Gate #3.
                 if let Some(player) = room_guard.players.get_mut(&pu.player_id) {
                     player.last_position_update_received_at = Some(rate_limit_now);
->>>>>>> 7639677 (fix(transport): move Gate #3 rate-limit ahead of add_player + tighten rejection tests)
                     player.last_position_update_frame = Some(pu.server_frame);
                 }
                 // PR 11.7.D2.1 / FIX — also register a physics body
@@ -3162,114 +3161,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
-    // PR 11.7.D / §3.6 follow-up - rejection-path tests for the
-    // remaining gates (arena bounds, rate limit, frame replay +
-    // spoof). The 5 tests above cover seed, displacement, finite.
-
-    #[tokio::test]
-    async fn dispatch_position_update_rejects_arena_out_of_bounds() {
-        // (200, 0) exceeds POSITION_UPDATE_ARENA_HALF_EXTENT_M (100m).
-        // Arena gate must drop it before any side effect.
-        let rooms = fresh_rooms();
-        let send = |frame: u32, x: f32, y: f32| {
-            let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
-            payload.extend(encode_position_update(&PositionUpdate {
-                server_frame: frame, player_id: 7, position_x: x, position_y: y,
-            }));
-            payload
-        };
-        let _ = handle_binary(&send(0, 0.0, 0.0), &rooms, 0, ConnectionState::new(0)).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let reply = handle_binary(&send(1, 200.0, 0.0), &rooms, 0, ConnectionState::new(0)).await;
-        assert!(reply.is_empty(), "out-of-arena: no reply");
-        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
-        let room_guard = room_arc.read().await;
-        let body = room_guard.physics.position(7).expect("body present");
-        assert!(body.x.abs() < 0.01 && body.y.abs() < 0.01,
-                "body must stay at seed origin; got ({}, {})", body.x, body.y);
-        let hist = room_guard.position_history.get(&7).expect("history");
-        assert_eq!(hist.len(), 1, "PositionHistory must contain only the seed entry");
-    }
-
-    #[tokio::test]
-    async fn dispatch_position_update_rejects_rate_limit() {
-        // Targets Gate #3 (rate-limit) specifically — the second
-        // packet moves a tiny 0.14m (well inside the ≈0.53m budget
-        // for a near-zero dt) so Gate #5 must NOT fire. The packet
-        // arrives IMMEDIATELY after the seed, so the 5ms wall-clock
-        // rate-limit floor trips.
-        let rooms = fresh_rooms();
-        let send = |frame: u32, x: f32, y: f32| {
-            let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
-            payload.extend(encode_position_update(&PositionUpdate {
-                server_frame: frame, player_id: 7, position_x: x, position_y: y,
-            }));
-            payload
-        };
-        let reply = handle_binary(&send(0, 0.0, 0.0), &rooms, 0, ConnectionState::new(0)).await;
-        assert!(reply.is_empty(), "first packet: no reply");
-        // IMMEDIATELY (no sleep) — must hit the rate-limit floor.
-        // Distance from (0, 0) to (0.1, 0.1) is ≈0.14m; budget for
-        // a near-zero dt is 30 * 0.001 + 0.5 ≈ 0.53m, so Gate #5
-        // passes and only Gate #3 (rate-limit) can reject.
-        let reply = handle_binary(&send(1, 0.1, 0.1), &rooms, 0, ConnectionState::new(0)).await;
-        assert!(reply.is_empty(), "rate-limited: no reply");
-        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
-        let room_guard = room_arc.read().await;
-        let body = room_guard.physics.position(7).expect("body present");
-        assert!(body.x.abs() < 0.01 && body.y.abs() < 0.01,
-                "body must stay at seed origin; got ({}, {})", body.x, body.y);
-    }
-
-    #[tokio::test]
-    async fn dispatch_position_update_rejects_stale_client_frame() {
-        // Frame 100 accepted, frame 99 is LOWER -> monotonicity gate
-        // rejects as replay / out-of-order.
-        let rooms = fresh_rooms();
-        let send = |frame: u32| {
-            let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
-            payload.extend(encode_position_update(&PositionUpdate {
-                server_frame: frame, player_id: 7, position_x: 0.0, position_y: 0.0,
-            }));
-            payload
-        };
-        let _ = handle_binary(&send(100), &rooms, 0, ConnectionState::new(0)).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let reply = handle_binary(&send(99), &rooms, 0, ConnectionState::new(0)).await;
-        assert!(reply.is_empty(), "stale frame: no reply");
-        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
-        let room_guard = room_arc.read().await;
-        let body = room_guard.physics.position(7).expect("body present");
-        assert!(body.x.abs() < 0.01 && body.y.abs() < 0.01,
-                "body must stay at seed origin; got ({}, {})", body.x, body.y);
-    }
-
-    #[tokio::test]
-    async fn dispatch_position_update_rejects_future_client_frame() {
-        // Frame 100 accepted; frame 100 + tolerance + 1 is BEYOND
-        // the tolerance window -> future-frame spoof rejected.
-        let rooms = fresh_rooms();
-        let send = |frame: u32| {
-            let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
-            payload.extend(encode_position_update(&PositionUpdate {
-                server_frame: frame, player_id: 7, position_x: 0.0, position_y: 0.0,
-            }));
-            payload
-        };
-        let _ = handle_binary(&send(100), &rooms, 0, ConnectionState::new(0)).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let too_far = 100 + POSITION_UPDATE_FUTURE_FRAME_TOLERANCE + 1;
-        let reply = handle_binary(&send(too_far), &rooms, 0, ConnectionState::new(0)).await;
-        assert!(reply.is_empty(), "future-spoof: no reply");
-        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
-        let room_guard = room_arc.read().await;
-        let body = room_guard.physics.position(7).expect("body present");
-        assert!(body.x.abs() < 0.01 && body.y.abs() < 0.01,
-                "body must stay at seed origin; got ({}, {})", body.x, body.y);
-    }
-
-=======: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
     #[tokio::test]
     async fn dispatch_ping_returns_pong() {
         let rooms = fresh_rooms();
