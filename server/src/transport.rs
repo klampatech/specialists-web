@@ -1728,10 +1728,10 @@ pub(super) async fn handle_binary(
                 );
                 return vec![];
             }
-            // Gate #3 — per-player wall-clock rate-limit. Deferred
-            // to after the `add_player` block below so the stamp
-            // lands on the first accepted packet. The 5ms floor is
-            // below the legitimate 32Hz cadence (~31ms).
+            // (Gate #3 — rate-limit — is implemented further down,
+            // just before the connection-promotion block, so a
+            // rate-limited packet doesn't mutate `room.players` or
+            // trigger a physics body create.)
             // Push onto the room's PositionHistory. §1.2 seam: WRITE-ONLY.
             let room_id = connection_state.lock().unwrap().room_id();
             let room_arc = ensure_room(rooms, &room_id).await;
@@ -1874,6 +1874,35 @@ pub(super) async fn handle_binary(
                 // means Gate2 anti-spoof would reject). We promote
                 // BEFORE add_player so the snapshot's player id matches
                 // the client's claim — but only if the slot is empty.
+                // Gate #3 — per-player wall-clock rate-limit. The
+                // 5ms floor is below the legitimate 32Hz cadence
+                // (~31ms) so honest traffic is never caught. Runs
+                // AFTER gates #1/#2/#4/#5 (so a rejected packet
+                // doesn't burn the budget) and BEFORE the connection
+                // promotion + `add_player` block below (so a
+                // rate-limited packet doesn't mutate `room.players`,
+                // ammo, or trigger a physics body create). First
+                // packet (no record yet) is exempted. The wall-clock
+                // stamp lands AFTER `add_player` so the first
+                // accepted packet leaves a stamp subsequent packets
+                // can read.
+                let rate_limit_now = Instant::now();
+                if let Some(player) = room_guard.players.get(&pu.player_id) {
+                    if let Some(prev) = player.last_position_update_received_at {
+                        let elapsed_ms = rate_limit_now
+                            .duration_since(prev)
+                            .as_millis() as u64;
+                        if elapsed_ms < POSITION_UPDATE_MIN_INTERVAL_MS {
+                            warn!(
+                                player_id = pu.player_id,
+                                elapsed_ms,
+                                min_interval_ms = POSITION_UPDATE_MIN_INTERVAL_MS,
+                                "positionUpdate rejected: per-player rate-limit",
+                            );
+                            return vec![];
+                        }
+                    }
+                }
                 if placeholder_player_id != pu.player_id
                     && !room_guard.connections.contains_key(&pu.player_id)
                 {
@@ -1933,38 +1962,14 @@ pub(super) async fn handle_binary(
                         p.ammo = specialists_server::constants::PLAYER_MAX_AMMO;
                     }
                 }
-                // Gate #3 (rate-limit, deferred). The 5ms wall-clock
-                // floor is below the legitimate 32Hz cadence and well
-                // above the timestamp resolution, so honest traffic is
-                // never caught. First packet (`None` stamp) passes
-                // through, then we stamp `now` so subsequent packets
-                // are rate-limited. Stamped only AFTER all earlier
-                // gates so a rejected packet does not consume the
-                // rate-limit window.
-                let rate_limit_now = Instant::now();
+                // Stamp rate-limit + frame on first accept. The
+                // `rate_limit_now` Instant was captured BEFORE Gate #3
+                // (above) so the stamp's wall-clock value is
+                // consistent with the rate-limit floor. Subsequent
+                // packets read this stamp in Gate #3.
                 if let Some(player) = room_guard.players.get_mut(&pu.player_id) {
-                    if let Some(prev) = player.last_position_update_received_at {
-                        let elapsed_ms = rate_limit_now
-                            .duration_since(prev)
-                            .as_millis() as u64;
-                        if elapsed_ms < POSITION_UPDATE_MIN_INTERVAL_MS {
-                            warn!(
-                                player_id = pu.player_id,
-                                elapsed_ms,
-                                min_interval_ms = POSITION_UPDATE_MIN_INTERVAL_MS,
-                                "positionUpdate rejected: per-player rate-limit",
-                            );
-                            return vec![];
-                        }
-                    }
                     player.last_position_update_received_at = Some(rate_limit_now);
-                    // PR 11.7.D / §3.6 follow-up - also stamp the
-                    // last accepted client-frame so the next packet's
-                    // monotonicity gate (Validation gate #4) compares
-                    // like-against-like. Stamped only AFTER the rate-
-                    // limit gate so a rejected packet does NOT consume
-                    // the rate-limit window AND does NOT advance the
-                    // frame stamp.: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
+>>>>>>> 7639677 (fix(transport): move Gate #3 rate-limit ahead of add_player + tighten rejection tests)
                     player.last_position_update_frame = Some(pu.server_frame);
                 }
                 // PR 11.7.D2.1 / FIX — also register a physics body
@@ -2988,9 +2993,10 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_position_update_rejects_huge_displacement() {
-        // Teleport-cheat signature from the audit: seed at origin,
-        // then send (9999, 9999). Body must NOT move, history must
-        // NOT mutate past frame 0.
+        // Targets Gate #5 (displacement) specifically — coords stay
+        // inside the ±100m arena (Gate #2 must NOT fire) but the
+        // requested move (≈70.7m) vastly exceeds the per-packet
+        // budget (≈1.1m after 20ms wall-clock). Body must NOT move.
         let rooms = fresh_rooms();
         let send = |server_frame: u32, x: f32, y: f32| {
             let pu = PositionUpdate {
@@ -3013,10 +3019,10 @@ mod tests {
         .await;
         // Clear the 5ms wall-clock rate-limit floor.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        // 1 frame at 64Hz gives a budget of ≈0.97m; distance is
-        // vastly larger.
+        // 20ms wall-clock gap -> budget ≈ 30 * 0.020 + 0.5 = 1.1m.
+        // Distance from (0, 0) to (50, 50) is √5000 ≈ 70.7m.
         let reply = handle_binary(
-            &send(1, 9999.0, 9999.0),
+            &send(1, 50.0, 50.0),
             &rooms,
             0,
             ConnectionState::new(0) /* placeholder */,
@@ -3188,8 +3194,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_position_update_rejects_rate_limit() {
-        // Two packets back-to-back: the 5ms wall-clock rate-limit
-        // floor must drop the second. Body must stay at seed.
+        // Targets Gate #3 (rate-limit) specifically — the second
+        // packet moves a tiny 0.14m (well inside the ≈0.53m budget
+        // for a near-zero dt) so Gate #5 must NOT fire. The packet
+        // arrives IMMEDIATELY after the seed, so the 5ms wall-clock
+        // rate-limit floor trips.
         let rooms = fresh_rooms();
         let send = |frame: u32, x: f32, y: f32| {
             let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
@@ -3201,7 +3210,10 @@ mod tests {
         let reply = handle_binary(&send(0, 0.0, 0.0), &rooms, 0, ConnectionState::new(0)).await;
         assert!(reply.is_empty(), "first packet: no reply");
         // IMMEDIATELY (no sleep) — must hit the rate-limit floor.
-        let reply = handle_binary(&send(1, 0.5, 0.5), &rooms, 0, ConnectionState::new(0)).await;
+        // Distance from (0, 0) to (0.1, 0.1) is ≈0.14m; budget for
+        // a near-zero dt is 30 * 0.001 + 0.5 ≈ 0.53m, so Gate #5
+        // passes and only Gate #3 (rate-limit) can reject.
+        let reply = handle_binary(&send(1, 0.1, 0.1), &rooms, 0, ConnectionState::new(0)).await;
         assert!(reply.is_empty(), "rate-limited: no reply");
         let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
         let room_guard = room_arc.read().await;
@@ -3257,8 +3269,7 @@ mod tests {
                 "body must stay at seed origin; got ({}, {})", body.x, body.y);
     }
 
-=======
->>>>>>> 6a8d296 (fix(transport): per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
+=======: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
     #[tokio::test]
     async fn dispatch_ping_returns_pong() {
         let rooms = fresh_rooms();
