@@ -111,6 +111,14 @@ fn snapshot_wire_format_roundtrip() {
     //   one player. See `protocol::PLAYER_STATE_WIRE_SIZE = 35`.
     let bytes = encode_snapshot(&snap);
     assert_eq!(bytes.len(), 9 + 1 * 35);
+    // PR #161 (PR #156 follow-up) — pinned wire format. Header is 9 bytes
+    // (4 serverFrame + 4 nextServerFrame + 1 playerCount); per-player is
+    // 35 bytes: 30 bytes (PR #106 player-state core) + 1 byte
+    // current_fire_mode (PR #107) + 4 bytes position_z (PR #156 vertical
+    // Y axis). Total = 9 + 1 * 35 = 44 bytes for 1 player. See
+    // `protocol::PLAYER_STATE_WIRE_SIZE = 35`.
+        let bytes = encode_snapshot(&snap);
+        assert_eq!(bytes.len(), 9 + 1 * 35);
         assert_eq!(
             bytes.len(),
             specialists_server::protocol::SNAPSHOT_WIRE_SIZE_MIN

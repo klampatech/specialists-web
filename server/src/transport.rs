@@ -401,13 +401,15 @@ pub async fn run_server(
     };
 
     // PR #161 — diagnostic-only. Spawn the per-discriminator histogram
-    // emitter once at server boot. It runs on its own task until the
-    // process exits and never participates in the `tokio::select!`
-    // below (which is for the transport listeners — a slow histogram
-    // tick should never be able to bring down a listener). The
+    // emitter once at server boot. It runs on its own task with a
+    // `watch` shutdown receiver so it can exit cleanly when any
+    // transport listener terminates (otherwise the loop would leak
+    // across repeated `run_server` invocations in tests/HMR and
+    // never participate in listener shutdown). The
     // `RUST_LOG=specialists_server::transport=debug` filter catches
     // its `DISC_HISTOGRAM` lines just like the per-frame traces.
-    tokio::spawn(disc_histogram_loop());
+    let (disc_shutdown_tx, disc_shutdown_rx) = tokio::sync::watch::channel(false);
+    let disc_handle = tokio::spawn(disc_histogram_loop(disc_shutdown_rx));
 
     // Wait for any listener to exit OR ctrl_c. tokio::select! with
     // a branch count that varies based on whether WSS is enabled.
@@ -419,7 +421,7 @@ pub async fn run_server(
     //
     // PR 11.6.E / Session 2 — see the previous (broken) OptionFuture
     // attempt in git history if you want to see what NOT to do.
-    tokio::select! {
+    let listener_result = tokio::select! {
         result = wt_handle => {
             match result {
                 Ok(Ok(())) => Ok(()),
@@ -471,7 +473,16 @@ pub async fn run_server(
                 Err(e) => Err(anyhow::anyhow!("matchmaker HTTP task panicked: {e}").context("run_server")),
             }
         }
-    }
+    };
+    // PR #161 — once any transport listener has exited, signal the
+    // diagnostic histogram loop to drain and await it. The shutdown
+    // send + join is bounded: the histogram task selects on the
+    // `watch` receiver and exits on the next select! poll, well
+    // before any 10s tick deadline, so this does NOT delay the
+    // listener-exit propagation we're returning to the caller.
+    let _ = disc_shutdown_tx.send(true);
+    let _ = disc_handle.await;
+    listener_result
 }
 
 pub(crate) async fn run_web_socket(
@@ -792,7 +803,7 @@ where
                             disc,
                             "WS dispatch -> handle_binary"
                         );
-                        DISC_COUNTS[(disc as usize) & 0x0F].fetch_add(1, Ordering::Relaxed);
+                        DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
                         let reply = handle_binary(&bytes, &rooms, placeholder_id, conn_state.clone()).await;
                         if !reply.is_empty() {
                             debug!(%peer, bytes_len = bytes.len(), reply_len = reply.len(), "WS dispatch -> reply");
@@ -1000,7 +1011,7 @@ async fn handle_webtransport_session(
                     disc,
                     "WT bi dispatch -> handle_binary"
                 );
-                DISC_COUNTS[(disc as usize) & 0x0F].fetch_add(1, Ordering::Relaxed);
+                DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
                 let reply = handle_binary(payload, &rooms, placeholder_id, conn_state.clone()).await;
                 if !reply.is_empty() {
                     send.write_all(&reply).await?;
@@ -1023,7 +1034,7 @@ async fn handle_webtransport_session(
                     disc,
                     "WT uni dispatch -> handle_binary"
                 );
-                DISC_COUNTS[(disc as usize) & 0x0F].fetch_add(1, Ordering::Relaxed);
+                DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
                 let _ = handle_binary(payload, &rooms, placeholder_id, conn_state.clone()).await;
                 // No direct reply on uni streams; broadcasts go via
                 // the outbound datagram path.
@@ -1039,7 +1050,7 @@ async fn handle_webtransport_session(
                     disc,
                     "WT datagram dispatch -> handle_binary"
                 );
-                DISC_COUNTS[(disc as usize) & 0x0F].fetch_add(1, Ordering::Relaxed);
+                DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
                 let _ = handle_binary(payload.as_ref(), &rooms, placeholder_id, conn_state.clone()).await;
                 // No direct reply; broadcasts go via the outbound
                 // datagram path.
@@ -1065,46 +1076,334 @@ async fn handle_webtransport_session(
 /// `room.read()` / `room.write()` in tight critical sections and
 /// never holds a write guard across an `.await`.
 //
-// PR #161 — diagnostic-only discriminator histogram. 16 counters
-// (0x00..=0x0F), bumped on EVERY inbound binary frame on BOTH the
-// WebSocket and WebTransport read paths. `disc_histogram_loop` emits a
-// `DISC_HISTOGRAM` log line every 10s with the per-disc delta. The
-// 0x0F-mask collapses the upper half of the discriminator space into
-// the 0x00-0x0F slots — known discriminators (0x01 DamageRequest,
-// 0x02 DamageBroadcast inbound, 0x05 Ping, 0x06 InputsServer, 0x07
-// WeaponSwitch, 0x08 ReloadRequest, 0x09 PositionUpdate, 0x0A AimEvent,
-// 0x0B MeleeEvent) all live in 0x00-0x0F, so this is lossless for
-// the actual protocol. Unknown discriminators (0xFF, etc.) collapse
-// into 0x0F — that's exactly the "wrong discriminator" diagnostic
-// case the histogram is meant to surface.
-static DISC_COUNTS: [AtomicU64; 16] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+// PR #161 — diagnostic-only discriminator histogram. 256 counters
+// (0x00..=0xFF, one slot per `u8` discriminator value), bumped on
+// EVERY inbound binary frame on BOTH the WebSocket and WebTransport
+// read paths. `disc_histogram_loop` emits a `DISC_HISTOGRAM` log line
+// every 10s with the per-disc delta. Using a full 256-slot table
+// (vs. the prior 16-slot table with `& 0x0F` mask) preserves the
+// upper discriminator space — important because the diagnostic is
+// specifically trying to detect frames that arrive with a wrong or
+// spoofed discriminator (e.g. 0x20, 0xFF). Collapsing those into
+// 0x00..0x0F would defeat the transport-layer visibility this PR
+// exists to provide. Known discriminators all live in 0x00..0x0F
+// (0x01 DamageRequest, 0x02 DamageBroadcast inbound, 0x05 Ping,
+// 0x06 InputsServer, 0x07 WeaponSwitch, 0x08 ReloadRequest,
+// 0x09 PositionUpdate, 0x0A AimEvent, 0x0B MeleeEvent) so the
+// lower slots remain the diagnostic hot path; upper slots are
+// intentionally preserved losslessly so spoofed/unknown
+// discriminators are observable.
+static DISC_COUNTS: [AtomicU64; 256] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
 ];
 
 // PR #161 — diagnostic-only. Emits a per-disc delta every 10s.
-// Spawned once from `run_server` and runs until the process exits.
-// Gated behind the same `specialists_server::transport=debug` filter
-// as the per-frame traces — no new RUST_LOG knob required.
-async fn disc_histogram_loop() {
+// Spawned once from `run_server` and exits cleanly when the
+// `shutdown` receiver flips (or its sender is dropped, which closes
+// the channel). Without this, the loop would leak across repeated
+// `run_server` invocations and never participate in listener
+// shutdown. Gated behind the same
+// `specialists_server::transport=debug` filter as the per-frame
+// traces — no new RUST_LOG knob required.
+//
+// **First-window semantics**: the initial `prev` snapshot is all
+// zeros, so the FIRST emission compares each slot's cumulative
+// count (since server boot) against zero and emits a delta equal
+// to the cumulative total. Subsequent windows emit deltas against
+// the previous window's snapshot — i.e. the per-10s rate, not the
+// cumulative total. This is intentional: the first 10s window is a
+// bootstrap window (gives operators a one-shot snapshot of total
+// traffic since boot) and subsequent windows give per-10s rates.
+async fn disc_histogram_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
     use std::time::Duration;
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     // Skip the immediate first tick (tokio intervals always tick at t=0).
     interval.tick().await;
-    let mut prev: [u64; 16] = [0; 16];
+    let mut prev: [u64; 256] = [0; 256];
     loop {
-        interval.tick().await;
-        let mut cur: [u64; 16] = [0; 16];
-        for (i, slot) in DISC_COUNTS.iter().enumerate() {
-            cur[i] = slot.load(Ordering::Relaxed);
-            let delta = cur[i].saturating_sub(prev[i]);
-            if delta > 0 {
-                debug!("DISC_HISTOGRAM disc=0x{:02X} count={}", i, delta);
+        tokio::select! {
+            // Bias the select toward the interval so a mid-tick
+            // shutdown doesn't preempt an emission we owe the
+            // operator — the interval wins ties via the
+            // `.biased` directive on the shutdown branch below.
+            biased;
+            _ = interval.tick() => {
+                let mut cur: [u64; 256] = [0; 256];
+                for (i, slot) in DISC_COUNTS.iter().enumerate() {
+                    cur[i] = slot.load(Ordering::Relaxed);
+                    let delta = cur[i].saturating_sub(prev[i]);
+                    if delta > 0 {
+                        debug!("DISC_HISTOGRAM disc=0x{:02X} count={}", i, delta);
+                    }
+                }
+                prev = cur;
+            }
+            _ = shutdown.changed() => {
+                // Shutdown signal received. Drop the receiver and
+                // exit — `DISC_COUNTS` is a process-static so the
+                // counters persist if `run_server` is re-entered
+                // (tests / HMR); a fresh `run_server` call spawns
+                // a fresh `prev = [0; 256]` snapshot, so the new
+                // loop's first emission is again a cumulative-vs-
+                // zero delta for that fresh boot window.
+                break;
             }
         }
-        prev = cur;
     }
 }
 
