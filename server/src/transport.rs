@@ -803,7 +803,10 @@ where
                             disc,
                             "WS dispatch -> handle_binary"
                         );
-                        DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
+                        if !bytes.is_empty() {
+                            let disc = bytes[0];
+                            DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
+                        }
                         let reply = handle_binary(&bytes, &rooms, placeholder_id, conn_state.clone()).await;
                         if !reply.is_empty() {
                             debug!(%peer, bytes_len = bytes.len(), reply_len = reply.len(), "WS dispatch -> reply");
@@ -1011,7 +1014,10 @@ async fn handle_webtransport_session(
                     disc,
                     "WT bi dispatch -> handle_binary"
                 );
-                DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
+                if !payload.is_empty() {
+                    let disc = payload[0];
+                    DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
+                }
                 let reply = handle_binary(payload, &rooms, placeholder_id, conn_state.clone()).await;
                 if !reply.is_empty() {
                     send.write_all(&reply).await?;
@@ -1034,7 +1040,10 @@ async fn handle_webtransport_session(
                     disc,
                     "WT uni dispatch -> handle_binary"
                 );
-                DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
+                if !payload.is_empty() {
+                    let disc = payload[0];
+                    DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
+                }
                 let _ = handle_binary(payload, &rooms, placeholder_id, conn_state.clone()).await;
                 // No direct reply on uni streams; broadcasts go via
                 // the outbound datagram path.
@@ -1050,7 +1059,10 @@ async fn handle_webtransport_session(
                     disc,
                     "WT datagram dispatch -> handle_binary"
                 );
-                DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
+                if !payload.is_empty() {
+                    let disc = payload[0];
+                    DISC_COUNTS[disc as usize].fetch_add(1, Ordering::Relaxed);
+                }
                 let _ = handle_binary(payload.as_ref(), &rooms, placeholder_id, conn_state.clone()).await;
                 // No direct reply; broadcasts go via the outbound
                 // datagram path.
@@ -1087,11 +1099,22 @@ async fn handle_webtransport_session(
 // spoofed discriminator (e.g. 0x20, 0xFF). Collapsing those into
 // 0x00..0x0F would defeat the transport-layer visibility this PR
 // exists to provide. Known discriminators all live in 0x00..0x0F
-// (0x01 DamageRequest, 0x02 DamageBroadcast inbound, 0x05 Ping,
-// 0x06 InputsServer, 0x07 WeaponSwitch, 0x08 ReloadRequest,
-// 0x09 PositionUpdate, 0x0A AimEvent, 0x0B MeleeEvent) so the
-// lower slots remain the diagnostic hot path; upper slots are
-// intentionally preserved losslessly so spoofed/unknown
+// (per `protocol::DISCRIMINATOR_*`):
+//   0x00 INPUTS            (legacy lockstep, PR 11.6.B §1.2)
+//   0x01 DAMAGE_REQUEST    (deprecated by PR #59; warn + drop)
+//   0x02 DAMAGE_BROADCAST  (server->client only; inbound = spoof)
+//   0x03 POSITION_UPDATE
+//   0x04 PING
+//   0x05 PONG              (server->client only)
+//   0x06 INPUTS_SERVER
+//   0x07 SNAPSHOT          (server->client only)
+//   0x08 STATE_ACK
+//   0x09 RELOAD_REQUEST
+//   0x0A AIM_EVENT
+//   0x0B MELEE_EVENT
+//   0x0C WEAPON_SWITCH
+// so the lower slots remain the diagnostic hot path; upper slots
+// are intentionally preserved losslessly so spoofed/unknown
 // discriminators are observable.
 static DISC_COUNTS: [AtomicU64; 256] = [
         AtomicU64::new(0),
