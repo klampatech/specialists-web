@@ -258,11 +258,12 @@ function runStage({ label, scriptRelPath, ports, pngA, pngB }) {
     // smoke flow bypasses the lobby — but a future change that routes
     // through Lobby.tsx won't silently point at the wrong host.
     VITE_MATCHMAKER_ORIGIN: `http://127.0.0.1:${ports.HTTP_PORT}`,
-    // NODE_OPTIONS preload: disable default-agent keep-alive in the
-    // child so its `lsof -ti:PROD_BUNDLE_PORT` cleanup does not
-    // SIGKILL the smoke itself. See the NO_KEEPALIVE_PRELOAD
-    // declaration above for the full explanation.
-    NODE_OPTIONS: `--require=${NO_KEEPALIVE_PRELOAD}`,
+    // Preserve any caller-supplied NODE_OPTIONS (e.g.
+    // --enable-source-maps) while still forcing the preload so the
+    // canonical smoke's keep-alive socket can't race against its
+    // own killProcs(). See NO_KEEPALIVE_PRELOAD above for the full
+    // explanation.
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${NO_KEEPALIVE_PRELOAD}`].filter(Boolean).join(" "),
   };
 
   log(`Spawning ${label} (node ${scriptRelPath}) on ports ${JSON.stringify(ports)}...`);
@@ -416,7 +417,7 @@ async function main() {
 // Ctrl+C would only kill the orchestrator and orphan the canary +
 // static servers.
 let activeChild = null;
-process.on("SIGINT", () => {
+function shutdownActiveStage() {
   if (activeChild && activeChild.pid) {
     try { process.kill(-activeChild.pid, "SIGTERM"); } catch {}
     setTimeout(() => {
@@ -426,7 +427,9 @@ process.on("SIGINT", () => {
   } else {
     process.exit(130);
   }
-});
+}
+process.on("SIGINT", () => shutdownActiveStage());
+process.on("SIGTERM", () => shutdownActiveStage());
 
 main().catch((e) => {
   console.error(`[smoke] FATAL: ${e.stack ?? e.message ?? e}`);
