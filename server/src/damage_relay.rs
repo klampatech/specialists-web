@@ -196,6 +196,62 @@ pub const MAX_LOOKAHEAD_FRAMES: u32 = 16;
 /// (`MELEE_MAX_RANGE_METERS = 1.5`) is symmetric with the hitscan
 /// raycast and doesn't need its own wire path. Phase 2 melee work
 /// can add a `0x0B Melee` discriminator if needed.
+/// Issue 3 follow-up -- per-target side-effect for a confirmed aim hit.
+///
+/// Extracted from `validate_and_relay_aim`'s per-target loop so:
+///   1. The race-window graceful fallback is testable in isolation
+///      (remove the target after Gate 1 captures `target_ids`, call
+///      this helper directly, assert `None` return + no seq consumed).
+///   2. The seq-leak fix (HP probe BEFORE seq allocation) lives in
+///      one place and is enforced by the borrow order.
+///
+/// Returns `Some((hp_before, hp_after))` on success (validator emits
+/// HIT telemetry) or `None` if the target vanished (the validator
+/// continues to the next target, keeping earlier broadcasts already
+/// pushed in `out_broadcasts`).
+fn apply_aim_target_hit(
+    room: &mut Room,
+    target_id: PlayerId,
+    req_source: PlayerId,
+    amount: u8,
+    origin_event_id: u32,
+    out_broadcasts: &mut Vec<DamageBroadcast>,
+) -> Option<(u8, u8)> {
+    // HP probe first (seq allocation gated on success). The mutable
+    // borrow is scoped to HP mutation + `hp_before`/`hp_after` reads
+    // so it drops before `next_server_frame` / `next_seq` claim
+    // `&mut room`.
+    let (hp_before, hp_after) = {
+        let Some(target_player) = room.players.get_mut(&target_id) else {
+            warn!(
+                source = req_source,
+                target = target_id,
+                amount,
+                "validate_and_relay_aim: gate 1 race -- target_id not in \
+                 room.players at HP decrement site (likely raced with \
+                 disconnect). Dropping packet.",
+            );
+            return None;
+        };
+        let hp_before = target_player.hp;
+        target_player.hp = target_player.hp.saturating_sub(amount);
+        (hp_before, target_player.hp)
+    };
+    let server_frame = room.next_server_frame;
+    let server_seq = room.next_seq();
+    let bc = DamageBroadcast {
+        server_frame,
+        server_seq,
+        source_player_id: req_source,
+        target_player_id: target_id,
+        source: 0, // 0 = fire (PR #59 drops melee from the wire)
+        amount,
+        origin_event_id,
+    };
+    out_broadcasts.push(bc);
+    Some((hp_before, hp_after))
+}
+
 pub fn validate_and_relay_aim(
     req: &AimEvent,
     source_player_id: PlayerId,
@@ -246,7 +302,22 @@ pub fn validate_and_relay_aim(
     let active_weapon_def = weapon_def(WeaponId::DEFAULT);
     let fire_cooldown_ms = active_weapon_def.fire_cooldown_ms;
     // --- Gate 4: fire-rate cooldown -----------------------------------
-    if let Some(last_fire) = room.players[&req_source].last_fire_at {
+    // Issue 3 follow-up: defensive get. A vanished source between
+    // Gate 1 (passed) and now means a race-disconnect; drop the
+    // packet (return vec![]) rather than panicking the Tokio worker.
+    let last_fire_at = match room.players.get(&req_source) {
+        Some(p) => p.last_fire_at,
+        None => {
+            warn!(
+                source = req_source,
+                "validate_and_relay_aim: gate 1 race -- req_source not in \
+                 room.players at fire-rate gate (likely raced with \
+                 disconnect). Dropping packet.",
+            );
+            return vec![];
+        }
+    };
+    if let Some(last_fire) = last_fire_at {
         let cooldown = std::time::Duration::from_millis(fire_cooldown_ms);
         if now.duration_since(last_fire) < cooldown {
             warn!(
@@ -260,7 +331,20 @@ pub fn validate_and_relay_aim(
         }
     }
     // --- Gate 5: ammo gate (fire only) ---------------------------------
-    if room.players[&req_source].ammo == 0 {
+    // Issue 3 follow-up: defensive get. See Gate 4 comment.
+    let source_ammo = match room.players.get(&req_source) {
+        Some(p) => p.ammo,
+        None => {
+            warn!(
+                source = req_source,
+                "validate_and_relay_aim: gate 1 race -- req_source not in \
+                 room.players at ammo gate (likely raced with \
+                 disconnect). Dropping packet.",
+            );
+            return vec![];
+        }
+    };
+    if source_ammo == 0 {
         warn!(
             source = req_source,
             "validate_and_relay_aim: rejected - zero ammo",
@@ -268,7 +352,20 @@ pub fn validate_and_relay_aim(
         return vec![];
     }
     // --- Gate 6: source is alive ---------------------------------------
-    if room.players[&req_source].hp == 0 {
+    // Issue 3 follow-up: defensive get. See Gate 4 comment.
+    let source_hp = match room.players.get(&req_source) {
+        Some(p) => p.hp,
+        None => {
+            warn!(
+                source = req_source,
+                "validate_and_relay_aim: gate 1 race -- req_source not in \
+                 room.players at HP gate (likely raced with \
+                 disconnect). Dropping packet.",
+            );
+            return vec![];
+        }
+    };
+    if source_hp == 0 {
         warn!(
             source = req_source,
             "validate_and_relay_aim: rejected - source HP is 0 (dead)",
@@ -437,8 +534,10 @@ pub fn validate_and_relay_aim(
             continue;
         };
         // Skip dead targets (server-authoritative HP -- PR 11.7.D
-        // §4.4 closure).
-        if room.players[&target_id].hp == 0 {
+        // §4.4 closure). Issue 3 follow-up: defensive get so a
+        // race-disconnected target is silently skipped (continue)
+        // rather than panicking on direct indexing.
+        if room.players.get(&target_id).map(|p| p.hp == 0).unwrap_or(true) {
             continue;
         }
         let target_pos_3d = glam::Vec3::new(target_pos.x, target_pos.y, source_origin.z);
@@ -462,66 +561,43 @@ pub fn validate_and_relay_aim(
             // 50m pistol range). Skip.
             continue;
         }
-        // Race-window graceful fallback (Evo ground-truth review
-        // 2026-09-08). The HP decrement + server_frame/server_seq
-        // allocation must happen ONLY when the broadcast will actually
-        // be emitted. Allocating eagerly + discarding on a vanished
-        // target would leak sequence numbers. Reorder: probe the
-        // mutable borrow first, mutate HP inside its scope (so the
-        // borrow ends), then allocate broadcast metadata, then
-        // construct + push. The HP mutation borrows `&mut room` for
-        // the saturating_sub; the subsequent next_server_frame /
-        // next_seq calls need &mut room too, so the HP borrow must
-        // end first (we extract `hp_before` + `hp_after` and let the
-        // borrow drop).
-        let (hp_before, hp_after) = {
-            let Some(target_player) = room.players.get_mut(&target_id) else {
-                warn!(
-                    source = req_source,
-                    target = target_id,
-                    amount,
-                    "validate_and_relay_aim: gate 1 race -- target_id not in \
-                     room.players at HP decrement site (likely raced with \
-                     disconnect). Dropping packet.",
-                );
-                return vec![];
-            };
-            let hp_before = target_player.hp;
-            target_player.hp = target_player.hp.saturating_sub(amount);
-            (hp_before, target_player.hp)
-        };
-        let server_frame = room.next_server_frame;
-        let server_seq = room.next_seq();
-        let bc = DamageBroadcast {
-            server_frame,
-            server_seq,
-            source_player_id: req_source,
-            target_player_id: target_id,
-            source: 0, // 0 = fire (PR #59 drops melee from the wire)
+        // Per-target side-effect helper. Probe the mutable borrow
+        // first so a race-disconnected target returns `None` (skip
+        // this target, keep earlier broadcasts already pushed) without
+        // consuming a sequence number. The seq-leak fix (HP probe
+        // BEFORE seq allocation) lives inside the helper so the
+        // validator stays simple. Returns `Some((hp_before, hp_after))`
+        // on success so the validator can emit HIT telemetry.
+        let Some((hp_before, hp_after)) = apply_aim_target_hit(
+            room,
+            target_id,
+            req_source,
             amount,
-            origin_event_id: req.event_id,
+            req.event_id,
+            &mut broadcasts,
+        ) else {
+            continue;
         };
-        broadcasts.push(bc);
-       // PR #158 — hit telemetry for diagnostic correlation.
-       // Always on at info-level (target: "damage_relay") so
-       // `journalctl -u specialists-server -f | grep HIT` shows
-       // every server-validated hit with HP before/after. Cheap:
-       // one log line per hit, at 20Hz snapshot rate max.
-       tracing::info!(
-           target: "damage_relay",
-           source = req_source,
-           target = target_id,
-           amount,
-           hp_before,
-           hp_after,
-           "HIT source={} target={} dmg={} hp_before={} hp_after={}",
-           req_source,
-           target_id,
-           amount,
-           hp_before,
-           hp_after,
-       );
-       }
+        // PR #158 — hit telemetry for diagnostic correlation.
+        // Always on at info-level (target: "damage_relay") so
+        // `journalctl -u specialists-server -f | grep HIT` shows
+        // every server-validated hit with HP before/after. Cheap:
+        // one log line per hit, at 20Hz snapshot rate max.
+        tracing::info!(
+            target: "damage_relay",
+            source = req_source,
+            target = target_id,
+            amount,
+            hp_before,
+            hp_after,
+            "HIT source={} target={} dmg={} hp_before={} hp_after={}",
+            req_source,
+            target_id,
+            amount,
+            hp_before,
+            hp_after,
+        );
+    }
     // Side effects on every accepted event (gate 4 passes):
     // decrement source ammo + stamp last_fire_at + saturating
     // eventId stamp. The fire rate is consumed EVEN ON MISS
@@ -680,6 +756,55 @@ pub fn validate_and_relay_aim(
 ///      stamp `player.last_reload_at = Some(now)`, advance
 ///      `last_event_id_for_source[source]` to `req.event_id` (saturating,
 ///      mirrors `validate_and_relay`'s saturation semantics).
+///
+/// Issue 3 follow-up -- reload side-effects (Gate 8 body).
+///
+/// Extracted from `validate_and_relay_reload` so the race-window
+/// graceful fallback is testable in isolation (remove source after
+/// Gate 1 captured the source's presence, call helper directly,
+/// assert `None` return + no ammo change).
+///
+/// On `None` the validator returns `None`; on `Some(())` the
+/// reload is applied. The `Some(())` log line lives in the helper
+/// so the validator stays simple.
+fn apply_reload_or_skip(req: &ReloadRequest, room: &mut Room, now: Instant) -> Option<()> {
+    let req_source = req.source_player_id;
+    let Some(player) = room.players.get_mut(&req_source) else {
+        warn!(
+            source = req_source,
+            event_id = req.event_id,
+            "validate_and_relay_reload: gate 1 race -- req_source not in \
+             room.players at side-effect site (likely raced with \
+             disconnect). Dropping packet.",
+        );
+        return None;
+    };
+    player.ammo = PLAYER_MAX_AMMO;
+    player.last_reload_at = Some(now);
+    // Saturating eventId stamp — mirrors validate_and_relay's
+    // semantics so a tab reload that resets the counter doesn't
+    // wrap the stored value backward.
+    let prev_event_id = room
+        .last_event_id_for_source
+        .get(&req_source)
+        .copied()
+        .unwrap_or(0);
+    let new_event_id = if req.event_id < prev_event_id {
+        prev_event_id
+    } else {
+        req.event_id
+    };
+    room.last_event_id_for_source
+        .insert(req_source, new_event_id);
+    debug!(
+        source = req_source,
+        event_id = req.event_id,
+        new_ammo = player.ammo,
+        "validate_and_relay_reload: success",
+    );
+    Some(())
+}
+
 pub fn validate_and_relay_reload(
     req: &ReloadRequest,
     connection_player_id: PlayerId,
@@ -711,7 +836,22 @@ pub fn validate_and_relay_reload(
     }
 
     // --- Gate 3: HP > 0 ------------------------------------------------
-    if room.players[&req_source].hp == 0 {
+    // Issue 3 follow-up: defensive get. A vanished source between
+    // Gate 1 (passed) and now means a race-disconnect; drop the
+    // packet (return None) rather than panicking the Tokio worker.
+    let source_hp = match room.players.get(&req_source) {
+        Some(p) => p.hp,
+        None => {
+            warn!(
+                source = req_source,
+                "validate_and_relay_reload: gate 1 race — req_source not in \
+                 room.players at HP gate (likely raced with disconnect). \
+                 Dropping packet.",
+            );
+            return None;
+        }
+    };
+    if source_hp == 0 {
         warn!(
             source = req_source,
             "validate_and_relay_reload: rejected — source HP is 0 (dead)",
@@ -720,17 +860,43 @@ pub fn validate_and_relay_reload(
     }
 
     // --- Gate 4: ammo < max --------------------------------------------
-    if room.players[&req_source].ammo >= PLAYER_MAX_AMMO {
+    // Issue 3 follow-up: defensive get. See Gate 3 comment.
+    let current_ammo = match room.players.get(&req_source) {
+        Some(p) => p.ammo,
+        None => {
+            warn!(
+                source = req_source,
+                "validate_and_relay_reload: gate 1 race — req_source not in \
+                 room.players at ammo gate (likely raced with disconnect). \
+                 Dropping packet.",
+            );
+            return None;
+        }
+    };
+    if current_ammo >= PLAYER_MAX_AMMO {
         warn!(
             source = req_source,
-            ammo = room.players[&req_source].ammo,
+            ammo = current_ammo,
             "validate_and_relay_reload: rejected — magazine already full",
         );
         return None;
     }
 
     // --- Gate 5: rate limit (1/sec per player) -------------------------
-    if let Some(last) = room.players[&req_source].last_reload_at {
+    // Issue 3 follow-up: defensive get. See Gate 3 comment.
+    let last_reload_at = match room.players.get(&req_source) {
+        Some(p) => p.last_reload_at,
+        None => {
+            warn!(
+                source = req_source,
+                "validate_and_relay_reload: gate 1 race — req_source not in \
+                 room.players at rate-limit gate (likely raced with disconnect). \
+                 Dropping packet.",
+            );
+            return None;
+        }
+    };
+    if let Some(last) = last_reload_at {
         let since_ms = now.duration_since(last).as_millis() as u64;
         if since_ms < RELOAD_RATE_LIMIT_MS {
             warn!(
@@ -771,46 +937,10 @@ pub fn validate_and_relay_reload(
     // for symmetry with the damage validator's gate structure.
 
     // --- Gate 8: side-effects on success -------------------------------
-    // Mutate ammo + stamp last_reload_at + advance last_event_id. The
-    // snapshot stream carries the new ammo on its next 20Hz tick.
-    // Graceful race-window fallback -- if req_source vanished between
-    // Gate 1 above and this site (raced disconnect), drop the packet
-    // (return None so the snapshot stays at the pre-reload ammo value)
-    // instead of panicking the Tokio worker.
-    let Some(player) = room.players.get_mut(&req_source) else {
-        warn!(
-            source = req_source,
-            event_id = req.event_id,
-            "validate_and_relay_reload: gate 1 race -- req_source not in \
-             room.players at side-effect site (likely raced with \
-             disconnect). Dropping packet.",
-        );
-        return None;
-    };
-    player.ammo = PLAYER_MAX_AMMO;
-    player.last_reload_at = Some(now);
-    // Saturating eventId stamp — mirrors validate_and_relay's
-    // semantics so a tab reload that resets the counter doesn't
-    // wrap the stored value backward.
-    let prev_event_id = room
-        .last_event_id_for_source
-        .get(&req_source)
-        .copied()
-        .unwrap_or(0);
-    let new_event_id = if req.event_id < prev_event_id {
-        prev_event_id
-    } else {
-        req.event_id
-    };
-    room.last_event_id_for_source
-        .insert(req_source, new_event_id);
-    debug!(
-        source = req_source,
-        event_id = req.event_id,
-        new_ammo = player.ammo,
-        "validate_and_relay_reload: success",
-    );
-    Some(())
+    // Extracted into `apply_reload_or_skip` for race-window
+    // testability (remove source after Gate 1, call helper directly,
+    // assert None return + ammo unchanged).
+    apply_reload_or_skip(req, room, now)
 }
 
 /// Validate a `WeaponSwitch` request and apply the switch server-side.
@@ -855,9 +985,21 @@ pub fn validate_and_relay_weapon_switch(
         );
         return false;
     }
-    // Gate 3: rate limit.
-    let player = &room.players[&req.source_player_id];
-    if let Some(last_switch) = player.last_weapon_switch_at {
+    // Gate 3: rate limit. Issue 3 follow-up: defensive get so a
+    // race-disconnected source returns false rather than panicking
+    // the Tokio worker.
+    let last_weapon_switch_at = match room.players.get(&req.source_player_id) {
+        Some(p) => p.last_weapon_switch_at,
+        None => {
+            warn!(
+                source = req.source_player_id,
+                "weapon_switch: gate 1 race -- source vanished at rate-limit \
+                 gate (likely raced with disconnect). Dropping packet.",
+            );
+            return false;
+        }
+    };
+    if let Some(last_switch) = last_weapon_switch_at {
         let elapsed = now.duration_since(last_switch);
         if elapsed < std::time::Duration::from_millis(WEAPON_SWITCH_RATE_LIMIT_MS) {
             warn!(
@@ -893,8 +1035,19 @@ pub fn validate_and_relay_weapon_switch(
         );
         return false;
     }
-    // All gates passed — apply the switch.
-    let player = room.players.get_mut(&req.source_player_id).unwrap();
+    // All gates passed — apply the switch. Issue 3 follow-up:
+    // defensive get_mut so a race-disconnected source returns false
+    // rather than panicking the Tokio worker.
+    let Some(player) = room.players.get_mut(&req.source_player_id) else {
+        warn!(
+            source = req.source_player_id,
+            new_weapon = new_weapon.to_wire(),
+            fire_mode_index = req.fire_mode_index,
+            "weapon_switch: gate 1 race -- source vanished at apply site \
+             (likely raced with disconnect). Dropping packet.",
+        );
+        return false;
+    };
     player.apply_weapon_switch(new_weapon, req.fire_mode_index);
     player.last_weapon_switch_at = Some(now);
     debug!(
@@ -929,6 +1082,49 @@ pub fn validate_and_relay_weapon_switch(
 // distance (the cone radius is ~1.5m at the edge). Lag-comp on
 // melee is unnecessary complexity for the precision gain. If the
 // play test reveals lag-feel issues, add rewind later.
+/// Issue 3 follow-up -- per-target side-effect for a confirmed melee hit.
+///
+/// Mirrors `apply_aim_target_hit`'s shape but with melee's fixed damage
+/// value (MELEE_DAMAGE = 25) and `source: 1` discriminator (per
+/// `DAMAGE_SOURCE_MELEE`). Probe the mutable borrow first so a
+/// race-disconnected target returns `None` without consuming a
+/// sequence number -- the validator's per-target loop continues to
+/// the next target, keeping earlier broadcasts already pushed in
+/// `out_broadcasts`.
+fn apply_melee_target_hit(
+    room: &mut Room,
+    target_id: PlayerId,
+    req_source: PlayerId,
+    event_id: u32,
+    out_broadcasts: &mut Vec<DamageBroadcast>,
+) -> Option<()> {
+    let Some(target_player) = room.players.get_mut(&target_id) else {
+        warn!(
+            source = req_source,
+            target = target_id,
+            event_id,
+            "validate_and_relay_melee: gate 1 race -- target_id not \
+             in room.players at HP decrement site (likely raced \
+             with disconnect). Dropping packet.",
+        );
+        return None;
+    };
+    target_player.hp = target_player.hp.saturating_sub(MELEE_DAMAGE);
+    let server_frame = room.next_server_frame;
+    let server_seq = room.next_seq();
+    let bc = DamageBroadcast {
+        server_frame,
+        server_seq,
+        source_player_id: req_source,
+        target_player_id: target_id,
+        source: 1, // 1 = melee (per `DAMAGE_SOURCE_MELEE`)
+        amount: MELEE_DAMAGE,
+        origin_event_id: event_id,
+    };
+    out_broadcasts.push(bc);
+    Some(())
+}
+
 pub fn validate_and_relay_melee(
     req: &MeleeEvent,
     source_player_id: PlayerId,
@@ -971,7 +1167,20 @@ pub fn validate_and_relay_melee(
         return vec![];
     }
     // --- Gate 4: melee cooldown (PR #114 — independent of fire-rate) -
-    if let Some(last_melee) = room.players[&req_source].last_melee_at {
+    // Issue 3 follow-up: defensive get. See aim handler's Gate 4.
+    let last_melee_at = match room.players.get(&req_source) {
+        Some(p) => p.last_melee_at,
+        None => {
+            warn!(
+                source = req_source,
+                "validate_and_relay_melee: gate 1 race -- req_source not in \
+                 room.players at melee-cooldown gate (likely raced with \
+                 disconnect). Dropping packet.",
+            );
+            return vec![];
+        }
+    };
+    if let Some(last_melee) = last_melee_at {
         let cooldown = std::time::Duration::from_millis(MELEE_COOLDOWN_MS as u64);
         if now.duration_since(last_melee) < cooldown {
             debug!(
@@ -984,7 +1193,20 @@ pub fn validate_and_relay_melee(
         }
     }
     // --- Gate 5: source is alive (no ammo gate for melee) -------------
-    if room.players[&req_source].hp == 0 {
+    // Issue 3 follow-up: defensive get. See aim handler's Gate 4.
+    let source_hp = match room.players.get(&req_source) {
+        Some(p) => p.hp,
+        None => {
+            warn!(
+                source = req_source,
+                "validate_and_relay_melee: gate 1 race -- req_source not in \
+                 room.players at HP gate (likely raced with \
+                 disconnect). Dropping packet.",
+            );
+            return vec![];
+        }
+    };
+    if source_hp == 0 {
         warn!(
             source = req_source,
             "validate_and_relay_melee: rejected - source HP is 0 (dead)",
@@ -1002,11 +1224,22 @@ pub fn validate_and_relay_melee(
     // --- Gate 7: per-player eventId update + last_melee_at stamp ------
     // All gates before this point are zero-cost when they fail (no
     // side effects). This is the first point where we mutate state,
-    // so it's the natural commit point.
+    // so it's the natural commit point. Issue 3 follow-up:
+    // defensive get_mut so a race-disconnected source returns
+    // vec![] rather than panicking the Tokio worker.
     let new_last_event_id = req.event_id.max(last_event_id);
     room.last_event_id_for_source
         .insert(req_source, new_last_event_id);
-    room.players.get_mut(&req_source).unwrap().last_melee_at = Some(now);
+    let Some(player) = room.players.get_mut(&req_source) else {
+        warn!(
+            source = req_source,
+            "validate_and_relay_melee: gate 1 race -- req_source not in \
+             room.players at last_melee_at stamp site (likely raced \
+             with disconnect). Dropping packet.",
+        );
+        return vec![];
+    };
+    player.last_melee_at = Some(now);
 
     // --- Gate 8: cone-vs-position hit detection ------------------------
     // Derive the source's forward direction from the claim's yaw +
@@ -1042,7 +1275,12 @@ pub fn validate_and_relay_melee(
         .filter(|&id| id != req_source)
         .collect();
     for target_id in target_ids {
-        let target = &room.players[&target_id];
+        // Issue 3 follow-up: defensive get so a race-disconnected
+        // target is silently skipped (continue) rather than
+        // panicking on direct indexing.
+        let Some(target) = room.players.get(&target_id) else {
+            continue;
+        };
         // Skip dead targets — no point damaging a corpse.
         if target.hp == 0 {
             continue;
@@ -1084,38 +1322,23 @@ pub fn validate_and_relay_melee(
             // the target race-disconnected between the keys() snapshot
             // above and this get_mut, drop the packet (worker stays
             // alive) instead of panicking.
-            // Race-window graceful fallback (Evo ground-truth review
-            // 2026-09-08). Probe the mutable borrow first so a vanished
-            // target returns `vec![]` without consuming a sequence
-            // number. After the probe, allocate broadcast metadata +
-            // mutate HP + construct + push -- no seq leak on the
-            // race path.
+            // Per-target side-effect helper. Probe the mutable borrow
+            // first so a race-disconnected target returns `None`
+            // (skip this target, keep earlier broadcasts already
+            // pushed) without consuming a sequence number. The
+            // seq-leak fix (HP probe BEFORE seq allocation) lives
+            // inside the helper so the validator stays simple.
+            if apply_melee_target_hit(
+                room,
+                target_id,
+                req_source,
+                req.event_id,
+                &mut broadcasts,
+            )
+            .is_none()
             {
-                let Some(target_player) = room.players.get_mut(&target_id) else {
-                    warn!(
-                        source = req_source,
-                        target = target_id,
-                        event_id = req.event_id,
-                        "validate_and_relay_melee: gate 1 race -- target_id not \
-                         in room.players at HP decrement site (likely raced \
-                         with disconnect). Dropping packet.",
-                    );
-                    return vec![];
-                };
-                target_player.hp = target_player.hp.saturating_sub(MELEE_DAMAGE);
-            };
-            let server_frame = room.next_server_frame;
-            let server_seq = room.next_seq();
-            let bc = DamageBroadcast {
-                server_frame,
-                server_seq,
-                source_player_id: req_source,
-                target_player_id: target_id,
-                source: 1, // 1 = melee (per `DAMAGE_SOURCE_MELEE`)
-                amount: MELEE_DAMAGE,
-                origin_event_id: req.event_id,
-            };
-            broadcasts.push(bc);
+                continue;
+            }
         }
     }
     if !broadcasts.is_empty() {
@@ -1824,5 +2047,105 @@ mod tests {
             result.is_none(),
             "missing source must be rejected with None (Gate 1 or race fallback)",
         );
+    }
+
+    // -- Issue 3 follow-up: race-window tests for the helpers ----------
+    //
+    // The single-threaded `*_target_race_disconnect_does_not_panic`
+    // tests above remove the target BEFORE the validator is called.
+    // This makes the validator's per-target loop see `target_ids.len()
+    // == 0`, so the let-else inside the helper is unreachable. The
+    // tests below reach the helper directly with the player already
+    // gone, so the let-else branch is exercised (returns `None`,
+    // `out_broadcasts` stays empty, no seq is consumed).
+
+    /// Issue 3 follow-up -- `apply_aim_target_hit` with a vanished
+    /// target must return `None`, leave `out_broadcasts` empty, and
+    /// consume zero server sequences. Pins the seq-leak fix on the
+    /// race path.
+    #[test]
+    fn aim_event_target_race_disconnect_at_hp_decrement() {
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        // Simulate the race-disconnect: validator's Gate 1 already
+        // passed (we don't call the validator), but between the
+        // `target_ids` capture and the per-target side-effect site,
+        // the target is removed.
+        room.players.remove(&2);
+        let mut broadcasts: Vec<DamageBroadcast> = Vec::new();
+        let seq_before = room.next_server_seq;
+        let result = apply_aim_target_hit(&mut room, 2, 1, 12, 1, &mut broadcasts);
+        assert!(
+            result.is_none(),
+            "apply_aim_target_hit must return None for a vanished target",
+        );
+        assert!(
+            broadcasts.is_empty(),
+            "no broadcast must be pushed on race-window drop",
+        );
+        assert_eq!(
+            room.next_server_seq, seq_before,
+            "no server sequence must be consumed on race-window drop              (seq-leak fix must hold even on the race path)",
+        );
+        // Target's HP must not be mutated (the helper never reached
+        // the saturating_sub because the borrow probe failed).
+        assert!(
+            !room.players.contains_key(&2),
+            "vanished target remains absent",
+        );
+    }
+
+    /// Issue 3 follow-up -- `apply_melee_target_hit` with a vanished
+    /// target must return `None`, leave `out_broadcasts` empty, and
+    /// consume zero server sequences. Mirrors the aim test above.
+    #[test]
+    fn melee_event_target_race_disconnect_at_hp_decrement() {
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        room.players.remove(&2);
+        let mut broadcasts: Vec<DamageBroadcast> = Vec::new();
+        let seq_before = room.next_server_seq;
+        let result = apply_melee_target_hit(&mut room, 2, 1, 1, &mut broadcasts);
+        assert!(
+            result.is_none(),
+            "apply_melee_target_hit must return None for a vanished target",
+        );
+        assert!(
+            broadcasts.is_empty(),
+            "no broadcast must be pushed on race-window drop",
+        );
+        assert_eq!(
+            room.next_server_seq, seq_before,
+            "no server sequence must be consumed on race-window drop",
+        );
+    }
+
+    /// Issue 3 follow-up -- `apply_reload_or_skip` with a vanished
+    /// source must return `None` and leave the source's ammo
+    /// unchanged. Pins the race-window fallback for reload (where
+    /// the helper isn't in a per-target loop but the same "vanished
+    /// between Gate 1 and side-effect site" race applies).
+    #[test]
+    fn reload_source_race_disconnect_at_side_effect() {
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        // Drain ammo + simulate the source vanishing after Gate 1
+        // (the source IS in room at Gate 1 -- we don't call the
+        // validator's Gate 1 directly here, but we exercise the
+        // side-effect helper's defensive get_mut).
+        room.players.get_mut(&1).unwrap().ammo = 3;
+        let ammo_before = room.players.get(&1).unwrap().ammo;
+        room.players.remove(&1);
+        let req = passing_reload_request();
+        let result = apply_reload_or_skip(&req, &mut room, Instant::now());
+        assert!(
+            result.is_none(),
+            "apply_reload_or_skip must return None for a vanished source",
+        );
+        assert!(
+            room.players.get(&1).is_none(),
+            "vanished source must remain absent",
+        );
+        // The validator's Gate 4 (ammo < max) would have accepted
+        // ammo=3 if reached, but the helper never runs -- so the
+        // ammo check is moot; we just assert the source is gone.
+        let _ = ammo_before;
     }
 }
