@@ -462,33 +462,36 @@ pub fn validate_and_relay_aim(
             // 50m pistol range). Skip.
             continue;
         }
+        // Race-window graceful fallback (Evo ground-truth review
+        // 2026-09-08). The HP decrement + server_frame/server_seq
+        // allocation must happen ONLY when the broadcast will actually
+        // be emitted. Allocating eagerly + discarding on a vanished
+        // target would leak sequence numbers. Reorder: probe the
+        // mutable borrow first, mutate HP inside its scope (so the
+        // borrow ends), then allocate broadcast metadata, then
+        // construct + push. The HP mutation borrows `&mut room` for
+        // the saturating_sub; the subsequent next_server_frame /
+        // next_seq calls need &mut room too, so the HP borrow must
+        // end first (we extract `hp_before` + `hp_after` and let the
+        // borrow drop).
+        let (hp_before, hp_after) = {
+            let Some(target_player) = room.players.get_mut(&target_id) else {
+                warn!(
+                    source = req_source,
+                    target = target_id,
+                    amount,
+                    "validate_and_relay_aim: gate 1 race -- target_id not in \
+                     room.players at HP decrement site (likely raced with \
+                     disconnect). Dropping packet.",
+                );
+                return vec![];
+            };
+            let hp_before = target_player.hp;
+            target_player.hp = target_player.hp.saturating_sub(amount);
+            (hp_before, target_player.hp)
+        };
         let server_frame = room.next_server_frame;
         let server_seq = room.next_seq();
-        // Target HP decrement on EVERY hit (one target per
-        // DamageBroadcast -- a single shot can hit at most one
-        // target in the dual-pistol cone, but the Vec allows
-        // multi-hit if the cone is widened later).
-        // The HP decrement MUST succeed for the broadcast to be
-        // honest (server-authoritative -- clients apply
-        // optimistically and the snapshot is the only truth). If
-        // the target race-disconnected between the keys() snapshot
-        // above and this get_mut, drop the packet (worker stays
-        // alive) instead of panicking -- a panic would abort the
-        // Tokio worker and systemd would restart the unit, dropping
-        // every other connected player.
-        let Some(target_player) = room.players.get_mut(&target_id) else {
-            warn!(
-                source = req_source,
-                target = target_id,
-                amount,
-                "validate_and_relay_aim: gate 1 race -- target_id not in \
-                 room.players at HP decrement site (likely raced with \
-                 disconnect). Dropping packet.",
-            );
-            return vec![];
-        };
-        let hp_before = target_player.hp;
-        target_player.hp = target_player.hp.saturating_sub(amount);
         let bc = DamageBroadcast {
             server_frame,
             server_seq,
@@ -510,13 +513,13 @@ pub fn validate_and_relay_aim(
            target = target_id,
            amount,
            hp_before,
-           hp_after = target_player.hp,
+           hp_after,
            "HIT source={} target={} dmg={} hp_before={} hp_after={}",
            req_source,
            target_id,
            amount,
            hp_before,
-           target_player.hp,
+           hp_after,
        );
        }
     // Side effects on every accepted event (gate 4 passes):
@@ -1081,24 +1084,29 @@ pub fn validate_and_relay_melee(
             // the target race-disconnected between the keys() snapshot
             // above and this get_mut, drop the packet (worker stays
             // alive) instead of panicking.
-            // Snapshot the broadcast metadata BEFORE the get_mut --
-            // `room.next_server_frame` / `room.next_seq()` also
-            // borrow `room` mutably, so we need them outside the
-            // get_mut borrow's scope.
+            // Race-window graceful fallback (Evo ground-truth review
+            // 2026-09-08). Probe the mutable borrow first so a vanished
+            // target returns `vec![]` without consuming a sequence
+            // number. After the probe, allocate broadcast metadata +
+            // mutate HP + construct + push -- no seq leak on the
+            // race path.
+            let hp_after = {
+                let Some(target_player) = room.players.get_mut(&target_id) else {
+                    warn!(
+                        source = req_source,
+                        target = target_id,
+                        event_id = req.event_id,
+                        "validate_and_relay_melee: gate 1 race -- target_id not \
+                         in room.players at HP decrement site (likely raced \
+                         with disconnect). Dropping packet.",
+                    );
+                    return vec![];
+                };
+                target_player.hp = target_player.hp.saturating_sub(MELEE_DAMAGE);
+                target_player.hp
+            };
             let server_frame = room.next_server_frame;
             let server_seq = room.next_seq();
-            let Some(target_player) = room.players.get_mut(&target_id) else {
-                warn!(
-                    source = req_source,
-                    target = target_id,
-                    event_id = req.event_id,
-                    "validate_and_relay_melee: gate 1 race -- target_id not \
-                     in room.players at HP decrement site (likely raced \
-                     with disconnect). Dropping packet.",
-                );
-                return vec![];
-            };
-            target_player.hp = target_player.hp.saturating_sub(MELEE_DAMAGE);
             let bc = DamageBroadcast {
                 server_frame,
                 server_seq,
@@ -1703,6 +1711,21 @@ mod tests {
     // reintroduced, an end-to-end multi-player fuzz test would
     // catch it — but the unit-test suite guarantees the validator
     // is panic-free for the obvious "player vanished" scenarios.)
+
+    #[test]
+    fn aim_event_hit_consumes_exactly_one_broadcast_sequence() {
+        let mut room = setup_room((0.0, 0.0), (5.0, 0.0));
+        let req = passing_aim_event();
+        let seq_before = room.next_server_seq;
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        let seq_after = room.next_server_seq;
+        assert_eq!(result.len(), 1, "normal hit must still emit one broadcast");
+        assert_eq!(
+            seq_after,
+            seq_before + 1,
+            "one broadcast must consume exactly one server sequence"
+        );
+    }
 
     /// Issue 3 — target race-disconnect before `validate_and_relay_aim`
     /// must NOT panic and must return an empty broadcast vec.
