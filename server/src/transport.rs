@@ -57,6 +57,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 // PR #134 — removed unused AtomicU16 + Ordering imports (the global
 // `PLACEHOLDER_COUNTER` was removed in favor of per-room
 // `Room::next_player_id`).
@@ -398,6 +399,15 @@ pub async fn run_server(
             }
         }))
     };
+
+    // PR #161 — diagnostic-only. Spawn the per-discriminator histogram
+    // emitter once at server boot. It runs on its own task until the
+    // process exits and never participates in the `tokio::select!`
+    // below (which is for the transport listeners — a slow histogram
+    // tick should never be able to bring down a listener). The
+    // `RUST_LOG=specialists_server::transport=debug` filter catches
+    // its `DISC_HISTOGRAM` lines just like the per-frame traces.
+    tokio::spawn(disc_histogram_loop());
 
     // Wait for any listener to exit OR ctrl_c. tokio::select! with
     // a branch count that varies based on whether WSS is enabled.
@@ -757,6 +767,32 @@ where
                 };
                 match msg {
                     Message::Binary(bytes) => {
+                        // PR #161 — diagnostic: log every inbound binary
+                        // frame BEFORE dispatch, including the
+                        // discriminator byte. The existing per-path
+                        // logs (`WS dispatch -> reply` / `WS dispatch
+                        // -> no reply`) only fire AFTER `handle_binary`
+                        // returns, so a frame that the dispatcher
+                        // silently rejects (or one that tungstenite
+                        // coalesces/drops before reaching us) was
+                        // invisible to operators. This trace fires
+                        // unconditionally on every binary frame the
+                        // server actually sees, paired with the
+                        // `WT {bi,uni,datagram} dispatch` traces
+                        // below. With the same wrap on both paths,
+                        // we can finally disambiguate whether 20-byte
+                        // AimEvent frames are being dropped at the
+                        // transport layer (this log never fires for
+                        // them) vs rejected by the dispatcher (this
+                        // log fires, but `reply.is_empty()` is true).
+                        let disc = bytes.first().copied().unwrap_or(0);
+                        debug!(
+                            %peer,
+                            bytes_len = bytes.len(),
+                            disc,
+                            "WS dispatch -> handle_binary"
+                        );
+                        DISC_COUNTS[(disc as usize) & 0x0F].fetch_add(1, Ordering::Relaxed);
                         let reply = handle_binary(&bytes, &rooms, placeholder_id, conn_state.clone()).await;
                         if !reply.is_empty() {
                             debug!(%peer, bytes_len = bytes.len(), reply_len = reply.len(), "WS dispatch -> reply");
@@ -951,6 +987,20 @@ async fn handle_webtransport_session(
                     None => continue,
                 };
                 let payload = &buf[..n];
+                // PR #161 — diagnostic: log every inbound binary frame
+                // BEFORE dispatch, including the discriminator byte.
+                // Closes the gap where frames rejected by the dispatcher's
+                // `vec![]` return (or coalesced/dropped at the transport
+                // layer) were invisible to operators. Pairs with the WS
+                // dispatch trace in `handle_websocket_connection`.
+                let disc = payload.first().copied().unwrap_or(0);
+                debug!(
+                    %authority,
+                    bytes_len = payload.len(),
+                    disc,
+                    "WT bi dispatch -> handle_binary"
+                );
+                DISC_COUNTS[(disc as usize) & 0x0F].fetch_add(1, Ordering::Relaxed);
                 let reply = handle_binary(payload, &rooms, placeholder_id, conn_state.clone()).await;
                 if !reply.is_empty() {
                     send.write_all(&reply).await?;
@@ -965,6 +1015,15 @@ async fn handle_webtransport_session(
                     None => continue,
                 };
                 let payload = &buf[..n];
+                // PR #161 — diagnostic: see `bi` branch above.
+                let disc = payload.first().copied().unwrap_or(0);
+                debug!(
+                    %authority,
+                    bytes_len = payload.len(),
+                    disc,
+                    "WT uni dispatch -> handle_binary"
+                );
+                DISC_COUNTS[(disc as usize) & 0x0F].fetch_add(1, Ordering::Relaxed);
                 let _ = handle_binary(payload, &rooms, placeholder_id, conn_state.clone()).await;
                 // No direct reply on uni streams; broadcasts go via
                 // the outbound datagram path.
@@ -972,6 +1031,15 @@ async fn handle_webtransport_session(
             datagram = connection.receive_datagram() => {
                 let dgram = datagram?;
                 let payload = dgram.payload();
+                // PR #161 — diagnostic: see `bi` branch above.
+                let disc = payload.first().copied().unwrap_or(0);
+                debug!(
+                    %authority,
+                    bytes_len = payload.len(),
+                    disc,
+                    "WT datagram dispatch -> handle_binary"
+                );
+                DISC_COUNTS[(disc as usize) & 0x0F].fetch_add(1, Ordering::Relaxed);
                 let _ = handle_binary(payload.as_ref(), &rooms, placeholder_id, conn_state.clone()).await;
                 // No direct reply; broadcasts go via the outbound
                 // datagram path.
@@ -996,6 +1064,50 @@ async fn handle_webtransport_session(
 /// the await point. In practice, the dispatcher does its
 /// `room.read()` / `room.write()` in tight critical sections and
 /// never holds a write guard across an `.await`.
+//
+// PR #161 — diagnostic-only discriminator histogram. 16 counters
+// (0x00..=0x0F), bumped on EVERY inbound binary frame on BOTH the
+// WebSocket and WebTransport read paths. `disc_histogram_loop` emits a
+// `DISC_HISTOGRAM` log line every 10s with the per-disc delta. The
+// 0x0F-mask collapses the upper half of the discriminator space into
+// the 0x00-0x0F slots — known discriminators (0x01 DamageRequest,
+// 0x02 DamageBroadcast inbound, 0x05 Ping, 0x06 InputsServer, 0x07
+// WeaponSwitch, 0x08 ReloadRequest, 0x09 PositionUpdate, 0x0A AimEvent,
+// 0x0B MeleeEvent) all live in 0x00-0x0F, so this is lossless for
+// the actual protocol. Unknown discriminators (0xFF, etc.) collapse
+// into 0x0F — that's exactly the "wrong discriminator" diagnostic
+// case the histogram is meant to surface.
+static DISC_COUNTS: [AtomicU64; 16] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+// PR #161 — diagnostic-only. Emits a per-disc delta every 10s.
+// Spawned once from `run_server` and runs until the process exits.
+// Gated behind the same `specialists_server::transport=debug` filter
+// as the per-frame traces — no new RUST_LOG knob required.
+async fn disc_histogram_loop() {
+    use std::time::Duration;
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    // Skip the immediate first tick (tokio intervals always tick at t=0).
+    interval.tick().await;
+    let mut prev: [u64; 16] = [0; 16];
+    loop {
+        interval.tick().await;
+        let mut cur: [u64; 16] = [0; 16];
+        for (i, slot) in DISC_COUNTS.iter().enumerate() {
+            cur[i] = slot.load(Ordering::Relaxed);
+            let delta = cur[i].saturating_sub(prev[i]);
+            if delta > 0 {
+                debug!("DISC_HISTOGRAM disc=0x{:02X} count={}", i, delta);
+            }
+        }
+        prev = cur;
+    }
+}
+
 pub(super) async fn handle_binary(
     payload: &[u8],
     rooms: &RoomRegistry,

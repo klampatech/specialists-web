@@ -15,6 +15,21 @@ User=kyle
 WorkingDirectory=/home/kyle/Development/specialists-web
 Environment=CARGO_PROFILE=release
 Environment=CERT_SOURCE=letsencrypt
+# PR #161 — diagnostic logging. The Hetzner-deployed copy of this unit
+# already has this line wired in manually (HANDOFF §"Server-side
+# diagnostic logging added"), but the in-repo source-of-truth file did
+# not. Lifting it into the repo so future deploys don't drift back to
+# the silent default — every PR that adds a new `debug!` trace at
+# debug-level (e.g. PR #158's `AIM_ACCEPTED`, PR #161's per-frame
+# discriminator histogram) becomes immediately visible in production
+# without requiring a separate manual edit on the box.
+#
+# Default level is `info` so production logs stay compact; the two
+# per-target `=debug` filters expose the diagnostic-only traces from
+# `damage_relay` and `specialists_server::transport` (which are
+# observability-only and fire on every event — see PR #161's
+# `bytes_len` + discriminator trace on both WS and WT recv paths).
+Environment=RUST_LOG=info,damage_relay=debug,specialists_server::transport=debug
 
 # ExecStartPre: gate on Tailscale Funnel being available on this host.
 # We refuse to boot the server if Funnel isn't configured — that way
