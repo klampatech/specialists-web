@@ -9,7 +9,8 @@
     "typecheck": "tsc -b --noEmit",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "smoke": "node tools/smoke-orchestrator.mjs"
   },
   "dependencies": {
     "@babylonjs/core": "^9.20.0",
