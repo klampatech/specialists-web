@@ -101,12 +101,12 @@ async fn integration_full_round_trip_aim_event_to_broadcast() {
             room_guard.record_position(
                 7,
                 frame,
-                specialists_server::Position { x: 0.0, y: 0.0 },
+                specialists_server::Position { x: 0.0, y: 0.0, z: 0.0 },
             );
             room_guard.record_position(
                 9,
                 frame,
-                specialists_server::Position { x: 5.0, y: 0.0 },
+                specialists_server::Position { x: 5.0, y: 0.0, z: 0.0 },
             );
         }
     }
@@ -196,8 +196,8 @@ async fn integration_lag_comp_rewinds_target_position_aim_event() {
         // an in-range frame.
         for frame in 0..8u32 {
             let xy = if frame < 4 { (5.0, 0.0) } else { (40.0, 0.0) };
-            room_guard.record_position(7, frame, specialists_server::Position { x: 0.0, y: 0.0 });
-            room_guard.record_position(9, frame, specialists_server::Position { x: xy.0, y: xy.1 });
+            room_guard.record_position(7, frame, specialists_server::Position { x: 0.0, y: 0.0, z: 0.0 });
+            room_guard.record_position(9, frame, specialists_server::Position { x: xy.0, y: xy.1, z: 0.0 });
         }
     }
 
@@ -272,8 +272,8 @@ async fn integration_two_tab_convergence_aim_event() {
         room_guard.add_player(9);
         room_guard.players.get_mut(&7).unwrap().ammo = 10;
         for frame in 0..3u32 {
-            room_guard.record_position(7, frame, specialists_server::Position { x: 0.0, y: 0.0 });
-            room_guard.record_position(9, frame, specialists_server::Position { x: 5.0, y: 0.0 });
+            room_guard.record_position(7, frame, specialists_server::Position { x: 0.0, y: 0.0, z: 0.0 });
+            room_guard.record_position(9, frame, specialists_server::Position { x: 5.0, y: 0.0, z: 0.0 });
         }
     }
 

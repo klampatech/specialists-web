@@ -29,7 +29,7 @@ fn empty_room() -> Room {
         // Seed the physics world with a body at origin so the
         // snapshot's position/velocity lookups return
         // sensible values (not Position::ZERO defaults).
-        room.physics.add_player(id, Position { x: 0.0, y: 0.0 });
+        room.physics.add_player(id, Position { x: 0.0, y: 0.0, z: 0.0 });
     }
     room
 }
@@ -103,11 +103,14 @@ fn snapshot_wire_format_roundtrip() {
     //   (playerCount) + 29 (player payload) = 38 bytes.
     // The on-the-wire size (disc + body) is 39 bytes — see
     // `SNAPSHOT_WIRE_SIZE_MIN + 1 * PLAYER_STATE_WIRE_SIZE`
-    // PR 11.7.B / PR #107 — pinned wire format. Header is 9 bytes;
-    // per-player is 30 bytes (PR #106) + 1 byte for current_fire_mode
-    // (PR #107). Total = 9 + 1 * 31 = 40 for 1 player.
-        let bytes = encode_snapshot(&snap);
-        assert_eq!(bytes.len(), 9 + 1 * 31);
+    //   PR #156 — pinned wire format (vertical-Y axis, +4-byte
+    //   position_z). Header is 9 bytes (serverFrame+nextServerFrame
+    //   +playerCount); per-player is 35 bytes: PR #106's 30-byte
+    //   player-state core + 1 byte current_fire_mode (PR #107) +
+    //   4 bytes position_z (PR #156). Total = 9 + 1 * 35 = 44 for
+    //   one player. See `protocol::PLAYER_STATE_WIRE_SIZE = 35`.
+    let bytes = encode_snapshot(&snap);
+    assert_eq!(bytes.len(), 9 + 1 * 35);
         assert_eq!(
             bytes.len(),
             specialists_server::protocol::SNAPSHOT_WIRE_SIZE_MIN
@@ -340,7 +343,7 @@ fn snapshot_is_deterministic_across_runs() {
         for id in [1u16, 2, 3, 4, 5] {
             room.add_player(id);
             room.physics
-                .add_player(id, Position { x: id as f32, y: id as f32 });
+                .add_player(id, Position { x: id as f32, y: id as f32, z: 0.0 });
             let co = specialists_server::connection_outbound::ConnectionOutbound::with_capacity(8);
             room.register_connection(id, co);
         }

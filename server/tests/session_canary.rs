@@ -114,7 +114,7 @@ async fn position_history_trims_to_capacity() {
         room.record_position(
             1,
             frame,
-            specialists_server::Position { x: frame as f32, y: 0.0 },
+            specialists_server::Position { x: frame as f32, y: 0.0, z: 0.0 },
         );
     }
     let hist = &room.position_history[&1];
@@ -257,13 +257,13 @@ async fn seed_room_for_validator(
         room_guard.record_position(
             source_id,
             frame,
-            specialists_server::Position { x: source_xy.0, y: source_xy.1 },
+            specialists_server::Position { x: source_xy.0, y: source_xy.1, z: 0.0 },
         );
         if let (Some(t), Some(txy)) = (target_id, target_xy) {
             room_guard.record_position(
                 t,
                 frame,
-                specialists_server::Position { x: txy.0, y: txy.1 },
+                specialists_server::Position { x: txy.0, y: txy.1, z: 0.0 },
             );
         }
     }
@@ -457,7 +457,7 @@ fn coyote_time_grants_jump_within_window() {
     let player_id = 1;
     room.add_player(player_id);
     room.physics
-        .add_player(player_id, Position { x: 0.0, y: 0.0 });
+        .add_player(player_id, Position { x: 0.0, y: 0.0, z: 0.0 });
 
     // Step 1..=10: settle to grounded=true. No input.
     let mut inputs: std::collections::BTreeMap<u16, [u8; 12]> =
@@ -538,7 +538,7 @@ fn coyote_time_grant_fires_mid_air_via_persistent_map() {
     let player_id = 1;
     room.add_player(player_id);
     room.physics
-        .add_player(player_id, Position { x: 0.0, y: 0.0 });
+        .add_player(player_id, Position { x: 0.0, y: 0.0, z: 0.0 });
 
     // Step 1..=5: settle to grounded=true.
     let mut inputs: std::collections::BTreeMap<u16, [u8; 12]> =
@@ -617,7 +617,7 @@ fn drain_inputs_populates_physics_step() {
     let player_id = 1;
     room.add_player(player_id);
     room.physics
-        .add_player(player_id, Position { x: 0.0, y: 0.0 });
+        .add_player(player_id, Position { x: 0.0, y: 0.0, z: 0.0 });
 
     // Seed an input packet: frame=0, MOVE_RIGHT bit set.
     let mut input_bytes = [0u8; 12];
@@ -699,7 +699,7 @@ fn coyote_time_deny_after_window() {
     let player_id = 1;
     room.add_player(player_id);
     room.physics
-        .add_player(player_id, Position { x: 0.0, y: 0.0 });
+        .add_player(player_id, Position { x: 0.0, y: 0.0, z: 0.0 });
 
     let mut inputs: std::collections::BTreeMap<u16, [u8; 12]> =
         std::collections::BTreeMap::new();
@@ -804,8 +804,8 @@ fn hitscan_rewinds_through_rapier_history_mid_air() {
     room.add_player(2);
     room.players.get_mut(&1).unwrap().ammo = 10;
     for frame in 95..=101u32 {
-        room.record_position(1, frame, Position { x: 0.0, y: 0.0 });
-        room.record_position(2, frame, Position { x: 0.0, y: 0.0 });
+        room.record_position(1, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
+        room.record_position(2, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
     }
     // Advance next_server_frame so req.frame=100 is within the
     // MAX_LOOKAHEAD_FRAMES (16) window.
@@ -844,7 +844,7 @@ fn snapshot_includes_position_history() {
     let player_id = 7;
     room.add_player(player_id);
     room.physics
-        .add_player(player_id, Position { x: 1.5, y: -2.5 });
+        .add_player(player_id, Position { x: 1.5, y: -2.5, z: 0.0 });
     let tx = specialists_server::connection_outbound::ConnectionOutbound::with_capacity(8);
     room.register_connection(player_id, tx);
 
@@ -874,13 +874,21 @@ fn snapshot_includes_position_history() {
     assert_eq!(p.position_y, -2.5);
 
     // Also verify the PositionHistory recorded the position at
-    // frame 0 (the just-stepped authoritative frame).
+    // frame 0. The capsule settles onto the ground during the
+    // physics step (z ≈ 0.647 after PR #156's vertical-Y ground
+    // raise), so we compare against the post-step physics state
+    // rather than the seed literal. Pre-PR-#156 this was z=0.0
+    // because the ground was at the y-axis origin; that assertion
+    // got stale alongside the seed literal and now mismatches
+    // every build. Comparing against `room.physics.position(id)`
+    // keeps the test robust to physics-settle drift.
+    let physics_pos = room.physics.position(player_id).expect("physics body exists");
     assert_eq!(
         room.position_history
             .get(&player_id)
             .unwrap()
             .snapshot_at(0),
-        Some(Position { x: 1.5, y: -2.5 }),
+        Some(physics_pos),
         "PositionHistory at frame 0 should match the physics start position"
     );
 }
@@ -894,15 +902,15 @@ fn position_history_snap_to_nearest() {
 
     let mut h = PositionHistory::new(16);
     for frame in (0..=8u32).step_by(2) {
-        h.record(frame, Position { x: frame as f32, y: frame as f32 });
+        h.record(frame, Position { x: frame as f32, y: frame as f32, z: 0.0 });
     }
     // Target 5: equidistant from frame 4 (1 below) and frame 6
     // (1 above). Tie-break: prefer frame <= target (frame 4).
-    assert_eq!(h.snapshot_at(5), Some(Position { x: 4.0, y: 4.0 }));
+    assert_eq!(h.snapshot_at(5), Some(Position { x: 4.0, y: 4.0, z: 0.0 }));
     // Target 7: equidistant from frame 6 (1 below) and frame 8
     // (1 above). Prefer frame 6.
-    assert_eq!(h.snapshot_at(7), Some(Position { x: 6.0, y: 6.0 }));
+    assert_eq!(h.snapshot_at(7), Some(Position { x: 6.0, y: 6.0, z: 0.0 }));
     // Target 3: equidistant from frame 2 (1 below) and frame 4
     // (1 above). Prefer frame 2.
-    assert_eq!(h.snapshot_at(3), Some(Position { x: 2.0, y: 2.0 }));
+    assert_eq!(h.snapshot_at(3), Some(Position { x: 2.0, y: 2.0, z: 0.0 }));
 }
