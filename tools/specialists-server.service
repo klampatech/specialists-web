@@ -26,10 +26,15 @@ Environment=CERT_SOURCE=letsencrypt
 #
 # Default level is `info` so production logs stay compact; the two
 # per-target `=debug` filters expose the diagnostic-only traces from
-# `damage_relay` and `specialists_server::transport` (which are
-# observability-only and fire on every event — see PR #161's
-# `bytes_len` + discriminator trace on both WS and WT recv paths).
-Environment=RUST_LOG=info,damage_relay=debug,specialists_server::transport=debug
+# `specialists_server::damage_relay` and
+# `specialists_server::transport` (which are observability-only and
+# fire on every event — see PR #161's `bytes_len` + discriminator
+# trace on both WS and WT recv paths). Note: tracing-subscriber's
+# EnvFilter directives match the FULL `tracing::debug!` target, so
+# the bare `damage_relay=debug` shorthand does NOT match
+# `specialists_server::damage_relay` — the module-qualified path
+# is required.
+Environment=RUST_LOG=info,specialists_server::damage_relay=debug,specialists_server::transport=debug
 
 # ExecStartPre: gate on Tailscale Funnel being available on this host.
 # We refuse to boot the server if Funnel isn't configured — that way
