@@ -1090,7 +1090,7 @@ pub fn validate_and_relay_melee(
             // number. After the probe, allocate broadcast metadata +
             // mutate HP + construct + push -- no seq leak on the
             // race path.
-            let hp_after = {
+            {
                 let Some(target_player) = room.players.get_mut(&target_id) else {
                     warn!(
                         source = req_source,
@@ -1103,7 +1103,6 @@ pub fn validate_and_relay_melee(
                     return vec![];
                 };
                 target_player.hp = target_player.hp.saturating_sub(MELEE_DAMAGE);
-                target_player.hp
             };
             let server_frame = room.next_server_frame;
             let server_seq = room.next_seq();
