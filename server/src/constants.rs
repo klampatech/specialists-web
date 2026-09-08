@@ -79,19 +79,46 @@ pub const INTERPOLATION_DELAY_MS: u32 = 100;
 /// (PR 11.7.C ships the encoder).
 pub const MAX_SNAPSHOT_AGE_MS: u32 = 500;
 
-// PR 11.7.D - `DISCRIMINATOR_POSITION_UPDATE` (0x03) is a VALIDATED,
-// rate-limited, server-clamped position-correction seam. The audit at
-// `specialists-web-audit-2026-09-07.md` §2 flagged the pre-PR handler
-// as a teleport-cheat vector (any client could send `PositionUpdate
-// { x: 9999, y: 9999 }` and snap the kinematic body). Gates applied:
-// finite coordinates, arena bounds (±POSITION_UPDATE_ARENA_HALF_EXTENT_M),
-// per-player wall-clock rate-limit (POSITION_UPDATE_MIN_INTERVAL_MS),
-// client-frame monotonicity on Player.last_position_update_frame
-// (the wire's `server_frame` is the CLIENT's engine counter, not the
-// server tick clock), and a wall-clock displacement budget against
-// `Room.physics.position(player_id)`. First packet (no body / no prior
-// accepted timestamp) is exempted so the integration smokes' seed flow
-// keeps working. Wire format unchanged.
+// PR 11.7.D - `DISCRIMINATOR_POSITION_UPDATE` (0x03) is now a
+// validated, rate-limited, server-clamped position-correction seam.
+// The audit at `specialists-web-audit-2026-09-07.md` §2 flagged the
+// pre-PR handler as a teleport-cheat vector: any client could send
+// `PositionUpdate { x: 9999, y: 9999 }` and have the server snap the
+// kinematic body to that point. The new contract:
+//
+//   - **Validated**: `position_x` + `position_y` must be finite
+//     (NaN/inf are dropped with a warn). The wire is 2D - z is NOT
+//     part of the legacy packet and is reconstructed from the body's
+//     capsule height on the server side (matches §3.5).
+//   - **Rate-limited**: per-player wall-clock gate of
+//     `POSITION_UPDATE_MIN_INTERVAL_MS` so a malicious client
+//     cannot spam position updates (legitimate clients send at
+//     ~31ms cadence - 5ms floor never trips honest traffic).
+//   - **Frame-monotonicity**: the wire's `server_frame` is the
+//     CLIENT's local engine frame counter (Babylon
+//     `engine.advanced.frame`), NOT the server's tick clock. The
+//     dispatcher tracks each player's last-accepted client frame
+//     and rejects packets whose frame is older (replay) or more
+//     than `POSITION_UPDATE_FUTURE_FRAME_TOLERANCE` ahead
+//     (future-frame spoof). Exact-duplicate frames are accepted
+//     (idempotent retry / smoke primer pattern).
+//   - **Server-clamped**: per-packet displacement budget of
+//     `POSITION_UPDATE_MAX_SPEED_MPS * wall_clock_dt + slop`
+//     measured from the body's authoritative current position
+//     (`Room.physics.position(player_id)`). Wall-clock elapsed is
+//     the trustworthy time source - the wire's `server_frame`
+//     could be arbitrarily advanced by a malicious client.
+//   - **First-packet exemption**: the first PositionUpdate for a
+//     player (no body yet, or no previous accepted packet) skips
+//     the displacement gate so the seed flow used by the
+//     integration smokes keeps working.
+//   - **Arena-bounded**: coordinates are clamped to a 200×200 metre
+//     square (mirrors the 40×40 ground + a generous overshoot). Out-
+//     of-bounds packets are dropped with a warn.
+//
+// This is the §3.6 gradual cutover - clients keep sending
+// `PositionUpdate`, the server keeps accepting well-formed ones, but
+// malformed / spoofed ones no longer teleport the body.: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
 
 pub const POSITION_UPDATE_ARENA_HALF_EXTENT_M: f32 = 100.0;
 pub const POSITION_UPDATE_MAX_SPEED_MPS: f32 = 30.0;

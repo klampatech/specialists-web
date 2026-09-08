@@ -1737,14 +1737,28 @@ pub(super) async fn handle_binary(
             let room_arc = ensure_room(rooms, &room_id).await;
             {
                 let mut room_guard = room_arc.write().await;
-                // Gate #4 — client-frame monotonicity. The wire's
-                // `server_frame` is the CLIENT's local engine
-                // counter (Babylon `engine.advanced.frame`), NOT the
-                // server tick clock — they live on different scales,
-                // so we compare against the last ACCEPTED client
-                // frame on `Player.last_position_update_frame`.
-                // Exact-duplicate frame = idempotent retry = allow
-                // (smoke primer pattern + WebSocket retry safety).
+                // Validation gate #4 - client-frame monotonicity gate.
+                // The wire field `pu.server_frame` is the CLIENT's
+                // local engine frame counter (Babylon
+                // `engine.advanced.frame`), NOT the server tick
+                // clock. The server's Rapier tick records positions
+                // using `room.next_server_frame` in the
+                // position_history ring buffer, which is on a
+                // DIFFERENT scale from the client. Comparing them
+                // directly would either reject every legitimate
+                // packet once the server clock drifts past the
+                // client's, or accept replayed packets if the
+                // client's clock ever wraps. Track the last ACCEPTED
+                // client-sent frame on Player
+                // (`last_position_update_frame`) and compare
+                // like-against-like.
+                //
+                // Idempotent retry: an EXACT-duplicate frame (same
+                // as the last accepted one) is allowed through - a
+                // common smoke pattern sends 3 identical frames
+                // back-to-back as a "primer", and WebSocket retries
+                // can also re-deliver the same frame. The downstream
+                // gates (displacement, rate-limit) still apply.: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
                 let last_client_frame: Option<u32> = room_guard
                     .players
                     .get(&pu.player_id)
@@ -1780,13 +1794,22 @@ pub(super) async fn handle_binary(
                         return vec![];
                     }
                 }
-                // Gate #5 — displacement budget vs body's CURRENT
-                // authoritative position. Uses WALL-CLOCK elapsed
-                // since last ACCEPTED packet (the wire's
-                // `server_frame` is client-side and trivially
-                // spoofable). First packet (no body / no prior
-                // accepted timestamp) is exempted so the integration
-                // smokes' seed flow still lands.
+                // Validation gate #5 - displacement budget against
+                // the body's CURRENT authoritative position. Uses
+                // WALL-CLOCK elapsed time since the last ACCEPTED
+                // PositionUpdate for this player, NOT the client-
+                // frame delta. The wire's `server_frame` is the
+                // client's local engine counter and can be
+                // arbitrarily advanced by a malicious client to
+                // claim "lots of time passed" - wall-clock is the
+                // trustworthy time source for the displacement
+                // budget.
+                //
+                // First packet for a player (no body yet, or no
+                // previous accepted packet) is exempted - the seed
+                // flow used by the integration smokes sends one
+                // packet at a known position and expects it to land
+                // without a prior body or prior accepted timestamp.: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
                 if let Some(current_pos) = room_guard.physics.position(pu.player_id) {
                     let last_receive_at = room_guard
                         .players
@@ -1935,10 +1958,13 @@ pub(super) async fn handle_binary(
                         }
                     }
                     player.last_position_update_received_at = Some(rate_limit_now);
-                    // Also stamp last accepted client-frame so the
-                    // next packet's monotonicity gate (gate #4)
-                    // compares like-against-like. Stamped only after
-                    // the rate-limit gate.
+                    // PR 11.7.D / §3.6 follow-up - also stamp the
+                    // last accepted client-frame so the next packet's
+                    // monotonicity gate (Validation gate #4) compares
+                    // like-against-like. Stamped only AFTER the rate-
+                    // limit gate so a rejected packet does NOT consume
+                    // the rate-limit window AND does NOT advance the
+                    // frame stamp.: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
                     player.last_position_update_frame = Some(pu.server_frame);
                 }
                 // PR 11.7.D2.1 / FIX — also register a physics body
@@ -3093,9 +3119,14 @@ mod tests {
         );
     }
 
-    // PR 11.7.D / §3.6 follow-up - client-frame monotonicity gate
-    // (compare against last ACCEPTED client frame, not the
-    // server-tick-keyed position_history ring).
+    // PR 11.7.D / §3.6 follow-up - client-frame monotonicity gate.
+    // The wire's `server_frame` is the CLIENT's local engine
+    // counter; the gate compares against the last ACCEPTED
+    // client-sent frame on `Player.last_position_update_frame`,
+    // not the server-tick-keyed position_history ring buffer.
+    // Covers: exact-duplicate (idempotent retry), lower (replay),
+    // higher-by-tolerance+1 (future-frame spoof), and
+    // higher-within-tolerance (legitimate next frame).: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
     #[tokio::test]
     async fn dispatch_position_update_client_frame_monotonicity() {
         let rooms = fresh_rooms();
@@ -3125,6 +3156,7 @@ mod tests {
         }
     }
 
+<<<<<<< HEAD
     // PR 11.7.D / §3.6 follow-up - rejection-path tests for the
     // remaining gates (arena bounds, rate limit, frame replay +
     // spoof). The 5 tests above cover seed, displacement, finite.
@@ -3225,6 +3257,8 @@ mod tests {
                 "body must stay at seed origin; got ({}, {})", body.x, body.y);
     }
 
+=======
+>>>>>>> 6a8d296 (fix(transport): per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
     #[tokio::test]
     async fn dispatch_ping_returns_pong() {
         let rooms = fresh_rooms();

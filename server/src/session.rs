@@ -104,12 +104,18 @@ pub struct Player {
     /// validation gates pass so a rejected packet does not consume
     /// the rate-limit window. `None` means "never sent one".
     pub last_position_update_received_at: Option<Instant>,
-    /// PR 11.7.D / §3.6 follow-up - last ACCEPTED client-side engine
-    /// frame counter (Babylon `engine.advanced.frame`). The wire's
-    /// `server_frame` is the CLIENT's local counter, NOT the server's
-    /// tick clock; tracking it lets the dispatcher compare
-    /// like-against-like (exact-duplicate = idempotent retry, lower =
-    /// replay, > tolerance = future-spoof). `None` = first packet.
+    /// PR 11.7.D / §3.6 follow-up - `last_position_update_frame`.
+    /// The wire field `PositionUpdate.server_frame` is the CLIENT's
+    /// local engine frame counter (Babylon `engine.advanced.frame`),
+    /// NOT the server's tick clock. The server's Rapier tick records
+    /// positions using `room.next_server_frame`, which is on a
+    /// different scale. Mixing the two scales in the same monotonicity
+    /// gate would either let replays through or reject every
+    /// legitimate packet once the server clock drifted past the
+    /// client's. This field tracks the last ACCEPTED client-sent
+    /// frame so the dispatcher's frame-monotonicity gate compares
+    /// like-against-like. `None` means "no PositionUpdate accepted
+    /// yet" - the first packet always passes the monotonicity gate.: per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
     pub last_position_update_frame: Option<u32>,
     /// PR #114 — server-side per-player melee rate-limit timestamp.
     /// The validator (`validate_and_relay_melee`) rejects any melee
@@ -166,6 +172,12 @@ impl Player {
             // so the first packet always passes the rate-limit + frame
             // monotonicity gates.
             last_position_update_received_at: None,
+<<<<<<< HEAD
+=======
+            // PR 11.7.D / §3.6 follow-up - frame-monotonicity gate
+            // starts at None (player hasn't sent a PositionUpdate
+            // yet -> first packet always passes the gate).
+>>>>>>> 6a8d296 (fix(transport): per-player client_frame monotonicity + wall-clock displacement gate (PR 11.7.D §3.6 follow-up))
             last_position_update_frame: None,
             // PR #114 — first melee swing passes the rate-limit
             // gate (`None` means "has never swung").
