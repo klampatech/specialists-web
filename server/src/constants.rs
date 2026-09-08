@@ -79,6 +79,26 @@ pub const INTERPOLATION_DELAY_MS: u32 = 100;
 /// (PR 11.7.C ships the encoder).
 pub const MAX_SNAPSHOT_AGE_MS: u32 = 500;
 
+// PR 11.7.D - `DISCRIMINATOR_POSITION_UPDATE` (0x03) is a VALIDATED,
+// rate-limited, server-clamped position-correction seam. The audit at
+// `specialists-web-audit-2026-09-07.md` §2 flagged the pre-PR handler
+// as a teleport-cheat vector (any client could send `PositionUpdate
+// { x: 9999, y: 9999 }` and snap the kinematic body). Gates applied:
+// finite coordinates, arena bounds (±POSITION_UPDATE_ARENA_HALF_EXTENT_M),
+// per-player wall-clock rate-limit (POSITION_UPDATE_MIN_INTERVAL_MS),
+// client-frame monotonicity on Player.last_position_update_frame
+// (the wire's `server_frame` is the CLIENT's engine counter, not the
+// server tick clock), and a wall-clock displacement budget against
+// `Room.physics.position(player_id)`. First packet (no body / no prior
+// accepted timestamp) is exempted so the integration smokes' seed flow
+// keeps working. Wire format unchanged.
+
+pub const POSITION_UPDATE_ARENA_HALF_EXTENT_M: f32 = 100.0;
+pub const POSITION_UPDATE_MAX_SPEED_MPS: f32 = 30.0;
+pub const POSITION_UPDATE_DISPLACEMENT_SLOP_M: f32 = 0.5;
+pub const POSITION_UPDATE_MIN_INTERVAL_MS: u64 = 5;
+pub const POSITION_UPDATE_FUTURE_FRAME_TOLERANCE: u32 = 8;
+
 // PR 11.7.B / §3.13 — coyote-time parity constants. The server grants
 // Havok's 2-frame grace window in `physics.rs::apply_jump` so a player
 // who walks off a ledge can still press jump on the contact-loss

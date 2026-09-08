@@ -99,6 +99,18 @@ pub struct Player {
     /// this to enforce 1 switch/sec/player rate limit
     /// (`WEAPON_SWITCH_RATE_LIMIT_MS`).
     pub last_weapon_switch_at: Option<Instant>,
+    /// PR 11.7.D - per-player wall-clock stamp of the most recently
+    /// ACCEPTED `0x03 PositionUpdate`. Stamped only AFTER all earlier
+    /// validation gates pass so a rejected packet does not consume
+    /// the rate-limit window. `None` means "never sent one".
+    pub last_position_update_received_at: Option<Instant>,
+    /// PR 11.7.D / §3.6 follow-up - last ACCEPTED client-side engine
+    /// frame counter (Babylon `engine.advanced.frame`). The wire's
+    /// `server_frame` is the CLIENT's local counter, NOT the server's
+    /// tick clock; tracking it lets the dispatcher compare
+    /// like-against-like (exact-duplicate = idempotent retry, lower =
+    /// replay, > tolerance = future-spoof). `None` = first packet.
+    pub last_position_update_frame: Option<u32>,
     /// PR #114 — server-side per-player melee rate-limit timestamp.
     /// The validator (`validate_and_relay_melee`) rejects any melee
     /// request whose `last_melee_at` is within `MELEE_COOLDOWN_MS`
@@ -150,6 +162,11 @@ impl Player {
             // PR #106 — weapon-switch rate limit starts at None
             // (player hasn't switched yet → first switch always passes).
             last_weapon_switch_at: None,
+            // PR 11.7.D — both PositionUpdate stamps start at None
+            // so the first packet always passes the rate-limit + frame
+            // monotonicity gates.
+            last_position_update_received_at: None,
+            last_position_update_frame: None,
             // PR #114 — first melee swing passes the rate-limit
             // gate (`None` means "has never swung").
             last_melee_at: None,
