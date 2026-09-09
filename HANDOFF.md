@@ -5,11 +5,14 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Spec location**: the canonical spec lives at `docs/SPEC.md` in the repo. The vault entry at `~/Obsidian/mem/projects/specialists-web.md` is a one-way mirror — regenerate with `./tools/sync-spec-to-vault.sh` after merging changes. Never edit the vault copy directly.
 
 
-|>## ⚡ TL;DR for the next session (read this first)
+|>## TL;DR for the next session (read this first)
 
-**`You are here`**: post-PR-#135 (2026-09-05 late session, late evening, Kyle headed to bed). **`main` @ `39fb406` (PR #135 + follow-up fixes — MERGED 2026-09-06 ~01:00 UTC).** **`You are here` summary**: PR #135 wired two **required** CI gates (lobby-e2e + fe-sync-matrix) to enforce the real-player flow on every future PR. Branch protection enabled with 31 required checks (the 9 pre-existing CF-N1 flakes preserved as non-required per §evo-verification-discipline-2026-09-05). One CI flake-fix landed (`damage-server-hp-convergence` primer 150ms → 500ms). All 31 required checks pass on the live Hetzner main; the 9 non-required flake jobs still flake but don't block merges.
+**`You are here`**: post-PR-#135 (2026-09-05 late session, late evening, Kyle headed to bed). **`main` @ `39fb406` (PR #135 + follow-up fixes — MERGED 2026-09-06 ~01:00 UTC).** **`You are here` summary**: PR #135 wired two **required** CI gates (lobby-e2e + fe-sync-matrix) to enforce the real-player flow on every future PR. Branch protection enabled with 31 required checks (the 9 pre-existing CF-N1 flakes preserved as non-required per §evo-verification-discipline-2026-09-05). One CI flake-fix landed (`damage-server-hp-convergence` primer 150ms → 500ms). All 31 required checks pass on the live Funnel-served prod (`https://m5.tail1b3795.ts.net:14432/`); the 9 non-required flake jobs still flake but don't block merges.
 
-**The full wire-up is real-player-flow-tested end-to-end.** `https://65.108.87.1:14432/` → click Create → URL has `&localId=1` → share → friend types code → click Join → URL has `&localId=2` → both tabs see 2 capsules at distinct positions → fire → HP drops on the right controller → 2/2 visual screenshots confirmed.
+**The full wire-up is real-player-flow-tested end-to-end.** `https://m5.tail1b3795.ts.net:14432/` → click Create → URL has `&localId=1` → share → friend types code → click Join → URL has `&localId=2` → both tabs see 2 capsules at distinct positions → fire → HP drops on the right controller → 2/2 visual screenshots confirmed.
+
+> **Live prod host (as of 2026-09-08):** m5 via Tailscale Funnel at `https://m5.tail1b3795.ts.net:14432/` (static) + `:14433` (canary WebTransport). The earlier Hetzner VPS at `65.108.87.1` is **historical** — see DEPLOY.md "Hetzner (historical deploy)" appendix + session logs below for the narrative. All deploys use `tools/deploy-prod.sh` over SSH to m5.
+
 
 ### What was done in this session
 
@@ -40,12 +43,12 @@ Drop a new entry at the top of the log on every session end. Keep entries short,
 **Recommended next direction (your call)**:
 - **(a) Predictor/interpolator migration to wireServerTransport.ts** (~1-2 hours). Still tree-shaken — same `if (effectiveMultiplayer)` IIFE trap, but for the predictor/interpolator hooks at `scene.ts:1123-1609`. Mirrors the PR #128/129 pattern (extract to top-level module / side-effect import). Not blocked. Closes the remaining item from the PR #123 follow-up list.
 - **(b) Smoke resilience pass — tolerate ghost placeholder IDs (CF-N1 family)** (~30 min). The 11-smoke flake-storm family is well-documented and tolerable in CI but real. Cheapest mitigation: filter by smoke-level marker rather than retry. Acceptable to defer until CI becomes load-bearing.
-- **(c) Real multiplayer playtest from Mac against Hetzner** — open `https://65.108.87.1:14432/?server=wss%3A%2F%2F65.108.87.1%3A14435%2Frooms%2Ftest&localId=1&peerId=2` in two tabs. Verify hit registration + rig visibility + matchmaker URL pickup on a real browser. Headless 2-tab smoke already proved the chain works; this is the user-facing confirmation.
-- **(d) Domain + Let's Encrypt** (~1-2 hours). Swap the Hetzner self-signed cert for a real domain + cert. Currently `65.108.87.1:14432` throws `ERR_CERT_AUTHORITY_INVALID` in non-trusting browsers. Blocks broader shareability.
+- **(c) Real multiplayer playtest from Mac against the Funnel-served prod** — open `https://m5.tail1b3795.ts.net:14432/` in two tabs (no `?server=` query needed — client derives the wire URL from the static page origin). Verify hit registration + rig visibility + matchmaker URL pickup on a real browser. Headless 2-tab smoke already proved the chain works; this is the user-facing confirmation.
+- **(d) User-owned DNS domain** (~1-2 hours, optional). Currently the prod uses `m5.tail1b3795.ts.net`, which Tailscale Funnel provisions a Let's Encrypt cert for automatically. If you want `play.<your-domain>.com`, swap the Funnel target + update `client/src/ui/Lobby.tsx:51` `PROD_MATCHMAKER_ORIGIN`. Not blocking — current setup is shareable with friends.
 - **(e) CI auto-deploy from main** (~2-3 hours). GitHub Action + secrets management to replace the manual `scp + systemctl restart` deploy. Lower-priority until we want others to deploy.
 - **(f) New feature arc** — MMR / region select / Discord OAuth, spectator mode, replay, scoreboard, leaderboard, anti-cheat. Phase 2 candidates that were deferred pre-#98.
 
-**Deploy coordination reminder**: Hetzner has the latest bundle. Future deploys are `cd client && VITE_MATCHMAKER_ORIGIN=https://65.108.87.1:14432 npm run build && scp dist/assets/index-*.js root@65.108.87.1:/root/specialists-web/client/dist/assets/ && scp dist/index.html root@65.108.87.1:/root/specialists-web/client/dist/ && ssh root@65.108.87.1 'cd /root/specialists-web/client/dist/assets && rm -f index-*.js && systemctl restart specialists-static && sleep 2 && curl -sk https://65.108.87.1:14432/ | grep index-`.
+**Deploy coordination reminder**: m5 hosts the prod via Funnel. Future deploys are a single SSH: `ssh m5 'export PATH=/home/kyle/.cargo/bin:$PATH && cd ~/Development/specialists-web && bash tools/deploy-prod.sh'`. The script pulls `origin/main`, runs a release build, boots canary + serve-static, and rewires Funnel. Use `--no-rebuild` to skip cargo if your local `main` matches `origin/main`. See DEPLOY.md for the full procedure.
 
 ## 2026-09-07 — docs PR catch-up + smoke fixes (PRs #134, #135, #136, #137)
 

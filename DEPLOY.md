@@ -1,17 +1,149 @@
 # Deploy Strategy — specialists-web
 
+> **Live prod host (as of 2026-09-08):** `m5` exposed via Tailscale Funnel at
+> **`https://m5.tail1b3795.ts.net:14432/`** (static client) and
+> **`https://m5.tail1b3795.ts.net:14433/`** (canary WebTransport). The
+> previous Hetzner VPS at `65.108.87.1` is **historical** — see the
+> [Hetzner historical deploy](#hetzner-historical-deploy) appendix at the
+> bottom of this file. All new deploys go through the Funnel path.
+
 ## Where the game runs
 
-- **m5 (192.168.x.x, Tailscale IP `100.95.111.112`)** — dev canary. Bare background process, no systemd. Plain HTTP on the static port (`:14032`) terminated by Tailscale Funnel at `https://m5.tail1b3795.ts.net:14432`. Wire server plain WS on `:14434` over Tailscale mesh (no TLS, no Funnel — Tailscale is encrypted at the mesh layer). This is for day-to-day dev and smoke runs.
-- **Hetzner VPS `65.108.87.1` (Ubuntu 24.04+)** — staging / production. Systemd-managed. Self-signed cert on the static port (`:14432`, HTTPS) and WSS port (`:14435`). Plain WS (`:14434`) and WebTransport (`:14433`) for fallback paths.
+- **m5 (LAN dev box, Tailscale IP `100.95.111.112`)** — **live prod + dev canary.** Bare background processes (canary + serve-static), launched by `tools/deploy-prod.sh`. Plain HTTP on `:14032` (loopback) terminated by Tailscale Funnel at `https://m5.tail1b3795.ts.net:14432`. Plain WS on `:14434` over the Tailscale mesh (no TLS, no Funnel — Tailscale is encrypted at the mesh layer). WebTransport on `:14433`, also exposed via Funnel. Matchmaker HTTP on `:8084` (loopback only).
+- **CI runners (GitHub-hosted ephemeral)** — boot canary + vite on CI-locked ports (e.g. `24732`/`24733`/`24734`/`24735`/`24780` for the lobby-e2e job) to avoid collisions with each other and with on-host services. See `.github/workflows/ci.yml`.
 
-## How to deploy to Hetzner
+## How to deploy to prod (Funnel / m5)
 
-### One-time bootstrap (first deploy only)
+This is the **only** deploy procedure in active use as of 2026-09-08.
+
+### One-time m5 setup (already done, included for reference)
+
+```bash
+# On m5
+sudo apt-get install -y rsync build-essential
+# Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+# Tailscale (assumed already set up on m5)
+sudo tailscale set --accept-routes
+# Enable Funnel on :14432 (static client) + :14433 (canary WT).
+# The `--bg <target>` form binds the Funnel port to a specific loopback
+# service. tools/deploy-prod.sh re-runs the equivalent bindings on every
+# deploy, so you only need this once.
+sudo /home/kyle/go/bin/tailscale funnel --https=14432 --bg http://127.0.0.1:14032
+sudo /home/kyle/go/bin/tailscale funnel --https=14433 --bg http://127.0.0.1:14433
+# Clone the repo to ~/Development/specialists-web
+git clone https://github.com/klampatech/specialists-web.git ~/Development/specialists-web
+cd ~/Development/specialists-web && git checkout main
+```
+
+### One-command deploy
+
+```bash
+# From anywhere with SSH to m5
+ssh m5 'export PATH=/home/kyle/.cargo/bin:$PATH && cd ~/Development/specialists-web && bash tools/deploy-prod.sh'
+```
+
+The script (`tools/deploy-prod.sh`):
+
+1. Verifies local HEAD matches `origin/main` (fast-forwards if behind).
+2. Runs `cargo build --release` on the server binary (skip with `--no-rebuild`).
+3. Kills any existing canary + serve-static.
+4. Boots the canary via `tools/canary-server.sh` on `:14433` (WT) / `:14434` (WS) / `:14435` (WSS) + matchmaker HTTP on `:8084`.
+5. Builds the client (`cd client && npm run build`).
+6. rsyncs `client/dist/` to itself (same-host) and starts `tools/serve-static.mjs` on `127.0.0.1:14032`.
+7. Wires Tailscale Funnel: `:14432` → `127.0.0.1:14032` (static), `:14433` → `localhost:14433` (canary WT).
+8. Prints the public URLs and a play-test checklist.
+
+### Public URLs (the actual game)
+
+- **Static client:** `https://m5.tail1b3795.ts.net:14432/`
+- **WebTransport:** `https://m5.tail1b3795.ts.net:14433/`
+- **WSS fallback:** `https://m5.tail1b3795.ts.net:14435/`
+- **Plain WS (Tailscale mesh only):** `ws://m5.tail1b3795.ts.net:14434/`
+
+Tailscale Funnel gives us a real Let's Encrypt cert on `*.ts.net`, so browsers trust it without warnings. No port-fw, no domain-of-our-own, no self-signed cert dance.
+
+### Tear-down
+
+```bash
+# On m5
+kill "$(cat /tmp/canary-server.pid)" "$(cat /tmp/serve-static.pid)"
+# Or just re-run the deploy — it kills + restarts.
+```
+
+### Logs
+
+```bash
+# Canary logs
+tail -f /tmp/canary-deploy.log
+# serve-static logs
+tail -f /tmp/serve-static.log
+```
+
+## Smoke runs
+
+### Against the live prod (Funnel)
+
+```bash
+# Local kyle box, with m5 SSH access — runs the smoke against the live URL
+cd client/tools
+PROD_BUNDLE_HOST=m5.tail1b3795.ts.net node lobby-e2e-smoke.mjs
+```
+
+This is the **load-bearing** smoke for prod. `lobby-e2e-smoke.mjs` defaults to `https://m5.tail1b3795.ts.net:14432/` (post-PR #166) — see its top-of-file comment for env-override syntax.
+
+### Local dev canary (m5)
+
+```bash
+# On m5, run smokes against the local-loopback canary without going through Funnel
+cd /home/kyle/Development/specialists-web/client/tools
+PROD_BUNDLE_HOST=127.0.0.1 PROD_BUNDLE_PORT=14432 node lobby-e2e-smoke.mjs
+node two-tab-smoke.mjs                  # connectivity, two tabs in same room
+node damage-server-hp-convergence-smoke.mjs   # fire + HP decrement
+```
+
+These boot their own canary + vite dev server on `:5174` if not already running. They do **not** exercise the production bundle — that's what `lobby-e2e-smoke.mjs` and `fe-server-sync-matrix.mjs` are for.
+
+### CI
+
+`.github/workflows/ci.yml` runs the smoke matrix on every PR. The matrix smokes spin up canary + serve-static on **CI-locked ports** (per job, e.g. `24732`/`24733`/`24734`/`24735`/`24780` for the lobby-e2e job) to avoid collisions with each other and with on-host services; the lobby/matrix smokes use `localhost:<port>` for their prod-bundle-equivalent checks. See each job for exact port assignments.
+
+## Known gaps / follow-ups
+
+- **CI auto-deploy from main** (~2-3 hours). GitHub Action + secrets management to replace the manual `ssh m5 bash tools/deploy-prod.sh` flow. Useful once we want non-Kyle deploys.
+- **Domain + Let's Encrypt for a user-owned DNS** (~1-2 hours). Currently the Funnel host (`m5.tail1b3795.ts.net`) is the Tailscale-provisioned LE cert. If you want `play.<your-domain>.com`, swap the funnel target and adjust `client/src/ui/Lobby.tsx:51`'s `PROD_MATCHMAKER_ORIGIN`.
+- **No staging environment.** m5 hosts dev + prod on the same machine; canary + serve-static are bare processes (no systemd unit). Fine for now; risky if we add more deployers.
+
+## Rollback
+
+Each deploy is just a `git pull` + rebuild via the script above. To roll back to a specific commit:
+
+```bash
+ssh m5 'cd ~/Development/specialists-web && git fetch origin && git checkout <commit-sha> && bash tools/deploy-prod.sh'
+```
+
+This rebuilds the server binary + client bundle against the chosen SHA and restarts the canary + serve-static.
+
+---
+
+## Hetzner (historical deploy)
+
+The Hetzner VPS at `65.108.87.1` was the prod host from roughly 2026-08-24 through 2026-09-04. It is **not currently deployed** and the public IP is no longer reachable. The deploy procedure below is preserved as historical reference only. If the Hetzner host comes back online, this section can be reactivated; otherwise delete it.
+
+### Hetzner hosts / ports
+
+| Port | Protocol | What |
+|------|----------|------|
+| `:14432` | HTTPS (self-signed) | Static client |
+| `:14433` | HTTPS (WebTransport) | Canary wire server |
+| `:14434` | WS (plain) | Canary fallback wire |
+| `:14435` | WSS (TLS) | Canary fallback wire, encrypted |
+| `:8084` | HTTP (loopback) | Matchmaker (proxied via serve-static) |
+
+### One-time Hetzner bootstrap (historical)
 
 ```bash
 # As root on the Hetzner box
-set -e
 DEBIAN_FRONTEND=noninteractive apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
   build-essential git curl ca-certificates \
@@ -24,12 +156,12 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
   ufw fail2ban
 
 # Firewall
-ufw allow 22/tcp     # SSH
-ufw allow 14432/tcp  # Static client (HTTPS)
-ufw allow 14433/tcp  # WebTransport (HTTPS)
-ufw allow 14434/tcp  # WS (plain, can drop if WSS-only)
-ufw allow 14435/tcp  # WSS (TLS)
-ufw allow 8084/tcp   # Matchmaker HTTP (loopback only — but listed for completeness)
+ufw allow 22/tcp
+ufw allow 14432/tcp
+ufw allow 14433/tcp
+ufw allow 14434/tcp
+ufw allow 14435/tcp
+ufw allow 8084/tcp
 ufw --force enable
 
 # Clone + build
@@ -41,20 +173,9 @@ git checkout main
 
 # First-boot cert (self-signed, generated by canary-server on startup)
 mkdir -p server/certs
-# The canary regenerates dev.pem + dev.key on first boot if missing.
-# Subsequent boots reuse them. To force regeneration, delete the files
-# and restart — useful when SANs change (new IP, new host).
 ```
 
-### Install the systemd units
-
-The two unit files live in `tools/`:
-
-- `tools/specialists-server.service` — wire server + matchmaker (Rust binary)
-- `tools/specialists-static.service` — HTTPS static + matchmaker proxy (Node)
-
-The static unit needs a small adaptation for Hetzner (no Tailscale Funnel,
-no Funnel gate in `ExecStartPre`):
+### Hetzner systemd units (historical)
 
 ```ini
 # /etc/systemd/system/specialists-server.service
@@ -92,112 +213,23 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Then:
+### Hetzner regular deploy (historical)
 
 ```bash
-systemctl daemon-reload
-systemctl enable --now specialists-server specialists-static
-journalctl -u specialists-server -f   # watch startup
-journalctl -u specialists-static -f
-```
-
-### Regular deploy (after PRs merge)
-
-```bash
-# From m5 (or any machine with SSH access to Hetzner)
+# From any box with SSH access to Hetzner
 ssh root@65.108.87.1 'cd /root/specialists-web && git pull origin main && bash tools/deploy-prod.sh && systemctl restart specialists-server specialists-static'
 ```
 
-`tools/deploy-prod.sh` runs `cargo build --release` and copies the fresh
-binary to the systemd unit's working directory. The client bundle is
-served from `client/dist/`, which gets refreshed by either:
-- `npm run build` on m5 + `scp -r dist/ root@65.108.87.1:/root/specialists-web/client/`, or
-- a CI step that builds + deploys (not yet wired up — see below).
+### Why Hetzner was deprecated
 
-## Smoke runs
+- **Manual scp + systemctl-restart deploy** was fragile (lost history of which SHA was actually live).
+- **Self-signed cert** caused `ERR_CERT_AUTHORITY_INVALID` in non-trusting browsers; blocked sharing with friends on non-dev machines.
+- **No domain** + **no LE cert automation** + **no staging** → every push was a coin flip on whether the live prod stayed up.
+- The Funnel-based deploy on m5 keeps the same port shape (14432/14433/14434) but gets a real LE cert automatically and lives in the same repo as the dev canary (one source of truth).
 
-### Local (m5 dev canary)
+### Migration notes
 
-```bash
-cd client/tools
-node two-tab-smoke.mjs                  # connectivity, two tabs in same room
-node damage-server-hp-convergence-smoke.mjs   # fire + HP decrement
-```
-
-These boot their own canary + vite dev server on `:5174` if not already
-running. They DO NOT exercise the production bundle — see "Known gap"
-below.
-
-### Hetzner (against real prod bundle)
-
-```bash
-# Headless smoke against the Hetzner wire server
-node /tmp/hetzner-smoke.mjs 'https://65.108.87.1:14432/?server=wss%3A%2F%2F65.108.87.1%3A14435%2Frooms%2F<ROOM_ID>' stay
-```
-
-`hetzner-smoke.mjs` lives at `/tmp/` on m5, not in the repo. It's the
-quick-and-dirty verification we use to confirm a fresh deploy connects.
-
-## Known gaps / follow-ups
-
-- **No CI on PRs.** Smoke matrix is local-only. A bad PR can merge
-  without anyone noticing. Want: GitHub Actions workflow that runs
-  `cargo test`, `cargo build --release`, `npm run typecheck`,
-  `npm run build`, and `node two-tab-smoke.mjs` against the prod bundle.
-- **No smoke that runs against the production bundle.** All existing
-  smokes (`client/tools/*`) run against `vite dev`. This is exactly why
-  PR #119's bug (ServerTransport tree-shaken from prod) survived for
-  weeks. Want: a smoke that builds prod, serves it from serve-static,
-  and runs two-tab-smoke-equivalent assertions.
-- **No auto-deploy from main.** Manual SSH for now. Want: a GitHub
-  Actions step on merge-to-main that runs the same `ssh ... bash
-  tools/deploy-prod.sh && scp client/dist/ ...` flow.
-- **No domain yet.** Hetzner is on a public IP with a self-signed cert;
-  browsers show "this connection is not private" warnings. Want: real
-  domain + Let's Encrypt cert (or Cloudflare in front), so anyone with
-  a browser can join without cert warnings.
-
-## Certificate management
-
-The canary generates a self-signed cert on first boot. Subsequent boots
-reuse it (cert SANs are derived from `--sans` CLI arg + the
-machine's hostname).
-
-To regenerate (after SAN change, IP change, or key compromise):
-
-```bash
-ssh root@65.108.87.1 'rm -f /root/specialists-web/server/certs/dev.{pem,key} && systemctl restart specialists-server'
-journalctl -u specialists-server   # confirm "reusing" → actually means "regenerated, now reusing on this boot"
-```
-
-The cert is **only valid for the SANs listed at generation time**. If
-you add a new IP or hostname, regenerate.
-
-For real production with a public domain, the right path is:
-1. Point DNS to `65.108.87.1`
-2. `certbot certonly --nginx -d play.example.com` (or `--standalone`)
-3. Symlink `/etc/letsencrypt/live/play.example.com/{fullchain,privkey}.pem`
-   into the systemd unit's `--cert` / `--key` paths
-4. Drop the `--cert-source self-signed` flag — the canary picks up
-   real Let's Encrypt cert automatically
-
-## Rollback
-
-Each Hetzner deploy is a `git pull` to a specific commit. To roll back:
-
-```bash
-ssh root@65.108.87.1 'cd /root/specialists-web && git checkout <commit-sha> && systemctl restart specialists-server specialists-static'
-```
-
-If the rollback needs a fresh client bundle too:
-
-```bash
-# On m5
-git checkout <commit-sha>
-cd client && npm run build
-scp -r dist/ root@65.108.87.1:/root/specialists-web/client/
-ssh root@65.108.87.1 'systemctl restart specialists-static'
-```
-
-The cert persists across rollback (it's per-boot and reuses on subsequent
-runs), so no cert dance needed for code-only rollbacks.
+- All prod URLs are now `https://m5.tail1b3795.ts.net:{14432,14433,14435}`. The Hetzner URLs `https://65.108.87.1:{...}` no longer resolve.
+- `tools/deploy-prod.sh` already targets m5; it ran against Hetzner before but the script is host-agnostic (just calls `cargo build` + `tools/canary-server.sh` + `tools/serve-static.mjs` locally + Funnel).
+- Vite env at build time: `VITE_MATCHMAKER_ORIGIN` defaults to `https://m5.tail1b3795.ts.net:14432` (see `client/src/ui/Lobby.tsx:51`). Override with `--mode production --define` if you need a different origin.
+- CI workflows still use `localhost:14432` / `localhost:14433`; no change needed there.
