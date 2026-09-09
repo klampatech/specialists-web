@@ -1,11 +1,23 @@
 #!/usr/bin/env node
-// PR #132 — lobby E2E smoke against live Hetzner.
+// PR #132 — lobby E2E smoke. Originally written against live Hetzner
+// (https://65.108.87.1:14432/). Default now points at the current live
+// prod host (m5 via Tailscale Funnel, https://m5.tail1b3795.ts.net:14432/)
+// — see DEPLOY.md for current deploy procedure.
+//
+// To run against a different host, set PROD_BUNDLE_HOST (and the related
+// PROD_BUNDLE_SCHEME / PROD_BUNDLE_PORT / WT_PORT / WS_PORT / WSS_PORT
+// / HTTP_PORT env vars) explicitly, e.g.
+//
+//   PROD_BUNDLE_HOST=localhost PROD_BUNDLE_PORT=14432 \
+//     node client/tools/lobby-e2e-smoke.mjs
+//
+// Defaults below match the canary + serve-static ports on m5.
 //
 // Drives the REAL lobby UI in two tabs:
-//   1. Tab A opens https://65.108.87.1:14432/ (no ?server=) — sees the lobby
+//   1. Tab A opens https://m5.tail1b3795.ts.net:14432/ (no ?server=) — sees the lobby
 //   2. Tab A clicks [data-testid="lobby-create"] — navigates to ?server=<wss_url>
 //   3. Read Tab A's URL → copy the room id
-//   4. Tab B opens https://65.108.87.1:14432/ — sees the lobby
+//   4. Tab B opens https://m5.tail1b3795.ts.net:14432/ — sees the lobby
 //   5. Tab B types the room id → clicks [data-testid="lobby-join"]
 //   6. Tab B navigates to ?server=<wss_url>/rooms/<id>
 //   7. Both tabs connect via the same room — verify the snapshot
@@ -46,13 +58,13 @@ const REPO_ROOT = resolve(__dirname, "..", "..");
 // real certs so this is safe in scope.
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "0";
 
-const PROD_BUNDLE_HOST = process.env.PROD_BUNDLE_HOST ?? "65.108.87.1";
+const PROD_BUNDLE_HOST = process.env.PROD_BUNDLE_HOST ?? "m5.tail1b3795.ts.net";
 const PROD_BUNDLE_SCHEME = process.env.PROD_BUNDLE_SCHEME ?? "https";
 const PROD_BUNDLE_PORT = Number(process.env.PROD_BUNDLE_PORT ?? 14432);
 const WT_PORT = Number(process.env.WT_PORT ?? 14433);
 const WS_PORT = Number(process.env.WS_PORT ?? 14434);
 const WSS_PORT = Number(process.env.WSS_PORT ?? 14435);
-const HTTP_PORT = Number(process.env.HTTP_PORT ?? 18080);
+const HTTP_PORT = Number(process.env.HTTP_PORT ?? 8084);
 const STATIC_URL = `${PROD_BUNDLE_SCHEME}://${PROD_BUNDLE_HOST}:${PROD_BUNDLE_PORT}/`;
 const CANARY_HTTP = `http://${PROD_BUNDLE_HOST}:${HTTP_PORT}`;
 
