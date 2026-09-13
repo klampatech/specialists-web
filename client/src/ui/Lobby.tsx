@@ -42,13 +42,26 @@ import {
   roomApi,
 } from "../net/matchmakerApi";
 
+// DEV matchmaker. Local canary conventionally binds 18080 (separate
+// from the static server's port); see tools/canary-server.sh + the
+// DEPLOY docs. The lobby falls back to this when `window.location.host`
+// is loopback / localhost.
 const DEV_MATCHMAKER_ORIGIN = "http://127.0.0.1:18080";
-// Production (Tailscale Funnel) — wired by the Funnel deploy script.
-// Matches the static client's URL so the lobby's same-origin POST /rooms
-// hits the static server (which proxies to the matchmaker). The static
-// URL is `https://m5.tail1b3795.ts.net:14432/` (Funnel + port; see
-// tools/deploy-prod.sh + docs/funnel-deploy.md §"Funnel deploy topology").
-const PROD_MATCHMAKER_ORIGIN = "https://m5.tail1b3795.ts.net:14432";
+
+// PRODUCTION matchmaker. Both Tailscale-Funnel (m5) and the Hetzner
+// staging box expose the matchmaker via the SAME origin that serves
+// the static bundle (serve-static.mjs proxies /rooms* to the canary
+// at MATCHMAKER_URL). So the lobby should hit its own origin and
+// let the proxy forward — that way a single bundle works against any
+// deployment (Hetzner staging, m5/Funnel, future cloud). The original
+// implementation hardcoded the m5 URL here, which silently broke the
+// Hetzner-staging flow (the bundle fires a POST to m5.tail1... which
+// returns 502 because no matchmaker runs there).
+//
+// Override with VITE_MATCHMAKER_ORIGIN=<url> at build time to force
+// a specific origin (used by the lobby-e2e smoke).
+const PROD_MATCHMAKER_ORIGIN_FALLBACK =
+  typeof window !== "undefined" ? window.location.origin : "";
 
 /** After a successful getRoom(), the player-count indicator has
  *  one of three states: not-yet-checked (roomStatus is null), the
@@ -67,7 +80,7 @@ export function Lobby() {
     (window.location.hostname === "localhost" ||
     window.location.hostname === "127.0.0.1"
       ? DEV_MATCHMAKER_ORIGIN
-      : PROD_MATCHMAKER_ORIGIN);
+      : PROD_MATCHMAKER_ORIGIN_FALLBACK);
 
   const [joinCode, setJoinCode] = useState("");
   // Per-action busy: "creating" and "joining" are independent so
