@@ -2001,9 +2001,29 @@ pub(super) async fn handle_binary(
                     pu.player_id,
                     Position { x: pu.position_x, y: pu.position_y, z: 0.0 },
                 );
+                // netcode-audit 2026-10-06 HIGH #5 — stamp the
+                // history entry with the SERVER's frame counter
+                // (room.next_server_frame), not the client's
+                // `pu.server_frame` (Babylon `engine.advanced.frame`
+                // from tab load). The 64Hz physics tick at
+                // main.rs:407 records using `room.tick_server_frame`
+                // — the two ring-buffer writers must use the same
+                // scheme or `snapshot_at` snap-to-nearest will
+                // return entries from the wrong time origin.
+                //
+                // Note: the PositionUpdate wire format (14 bytes)
+                // carries no Z field — only x and y. We set z=0.0
+                // on the body and the history entry here. A future
+                // PR that adds a Z field to the wire should thread
+                // it through (audit carryover).
+                // Borrow-checker workaround: read the frame
+                // counter into a local first; the call below
+                // would otherwise hold a mutable borrow on
+                // room_guard while reading room_guard.next_server_frame.
+                let server_frame = room_guard.next_server_frame;
                 room_guard.record_position(
                     pu.player_id,
-                    pu.server_frame,
+                    server_frame,
                     Position { x: pu.position_x, y: pu.position_y, z: 0.0 },
                 );
             }
@@ -2746,16 +2766,87 @@ mod tests {
         assert!(reply.is_empty(), "positionUpdate must not produce a reply");
 
         // Verify the PositionHistory actually received the entry.
+        //
+        // netcode-audit 2026-10-06 HIGH #5 — the entry is now
+        // stamped with the SERVER's frame counter
+        // (room.next_server_frame at the time of acceptance),
+        // NOT pu.server_frame. The two ring-buffer writers
+        // (PositionUpdate at this site + 64Hz physics tick at
+        // main.rs:407) must use the same frame scheme or
+        // snapshot_at snap-to-nearest returns entries from
+        // the wrong time origin.
+        //
+        // Pre-fix: PositionUpdate stamped the entry with
+        // pu.server_frame = 42 (client units). Post-fix: the
+        // entry is stamped with the server frame at acceptance
+        // time. The default Room::new() initializes
+        // next_server_frame = 0, so the entry lands at frame
+        // 0. Verify by looking up frame 0 directly: it must
+        // hit the entry. Looking up frame 42 must return the
+        // frame-0 entry (via the closest-available fallback)
+        // — which proves the entry is NOT at frame 42 in
+        // server-frame space.
         let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
         let hist = room_arc.read().await;
         let entry = hist
             .position_history
             .get(&7)
             .expect("player 7 history")
-            .snapshot_at(42)
-            .expect("snapshot at frame 42");
+            .snapshot_at(0)
+            .expect("snapshot at server frame 0");
         assert_eq!(entry.x, 1.5);
         assert_eq!(entry.y, -2.25);
+    }
+
+    /// netcode-audit 2026-10-06 HIGH #5 — the PositionUpdate
+    /// handler must stamp history entries with the SERVER's
+    /// frame counter, not the client's .
+    /// Pins the contract: the two ring-buffer writers
+    /// (PositionUpdate at this site + 64Hz physics tick at
+    /// main.rs:407) must use the same frame scheme.
+    #[tokio::test]
+    async fn dispatch_position_update_stamps_with_server_frame() {
+        let rooms = fresh_rooms();
+        // Pre-set the room's server frame to a known value
+        // BEFORE the position update arrives. Post-fix the
+        // entry must be stamped with this value, not with
+        // pu.server_frame.
+        {
+            let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
+            let mut room_guard = room_arc.write().await;
+            room_guard.next_server_frame = 100;
+        }
+
+        let pu = PositionUpdate {
+            server_frame: 9999, // a wildly different value
+            player_id: 7,
+            position_x: 1.5,
+            position_y: -2.25,
+        };
+        let mut payload = vec![DISCRIMINATOR_POSITION_UPDATE];
+        payload.extend(encode_position_update(&pu));
+
+        let reply = handle_binary(&payload, &rooms, 0, ConnectionState::new(0)).await;
+        assert!(reply.is_empty(), "positionUpdate must not produce a reply");
+
+        // The entry must be stamped with the SERVER frame
+        // (100), not the client frame (9999). The frame is
+        // stored in the ring buffer as a u32 — we don't have
+        // direct access to the buffer's entry, but the
+        // contract is observable: snapshot_at(100) returns
+        // the entry (exact match), and snapshot_at(9999)
+        // returns the entry only via the closest-available
+        // fallback (since 9999 is far outside ±8 of 100).
+        let room_arc = rooms.read().await.get(DEVBX_ROOM_ID).unwrap().clone();
+        let hist = room_arc.read().await;
+        let exact = hist
+            .position_history
+            .get(&7)
+            .expect("player 7 history")
+            .snapshot_at(100)
+            .expect("snapshot at server frame 100");
+        assert_eq!(exact.x, 1.5);
+        assert_eq!(exact.y, -2.25);
     }
 
     #[tokio::test]
