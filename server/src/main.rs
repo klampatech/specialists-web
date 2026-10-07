@@ -605,6 +605,72 @@ async fn main() -> ExitCode {
         }
     });
 
+    // netcode-audit 2026-10-06 LOW #9 — periodic room GC. Sweep
+    // the rooms map every 60s and drop rooms that have been
+    // empty (no live `connections`) for more than
+    // ROOM_GC_IDLE (30 minutes). Without this, a long-lived
+    // empty room keeps ticking `next_server_frame` and
+    // eventually wraps (u32 in ~2.2y at 64Hz). The sweep is
+    // a write-lock on `rooms`; under a 24p/24-room load the
+    // walk is ~24 HashMap entries and 24 read-locks on each
+    // room Arc — cheap, runs in the background.
+    let room_gc_handle = tokio::spawn({
+        let rooms = rooms.clone();
+        async move {
+            use std::time::Duration;
+            const ROOM_GC_INTERVAL: Duration = Duration::from_secs(60);
+            const ROOM_GC_IDLE: Duration = Duration::from_secs(30 * 60);
+            let mut interval = tokio::time::interval(ROOM_GC_INTERVAL);
+            interval.set_missed_tick_behavior(
+                tokio::time::MissedTickBehavior::Skip,
+            );
+            loop {
+                interval.tick().await;
+                let now = std::time::Instant::now();
+                let to_drop: Vec<String> = {
+                    let guard = rooms.read().await;
+                    guard
+                        .iter()
+                        .filter_map(|(id, room_arc)| {
+                            // The room Arc's read-lock check is
+                            // O(1). Skip the lock entirely if the
+                            // room has live connections.
+                            if let Ok(r) = room_arc.try_read() {
+                                if let Some(since) = r.empty_since {
+                                    if now.duration_since(since) > ROOM_GC_IDLE {
+                                        return Some(id.clone());
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .collect()
+                };
+                if !to_drop.is_empty() {
+                    let mut guard = rooms.write().await;
+                    for id in to_drop {
+                        // Re-check the empty_since under the
+                        // write lock — a connection may have
+                        // arrived between our sweep read and the
+                        // GC. If so, the registration cleared
+                        // empty_since to None, and the room is
+                        // no longer eligible.
+                        let still_idle = guard
+                            .get(&id)
+                            .and_then(|arc| arc.try_read().ok())
+                            .and_then(|r| r.empty_since)
+                            .map(|since| now.duration_since(since) > ROOM_GC_IDLE)
+                            .unwrap_or(false);
+                        if still_idle {
+                            guard.remove(&id);
+                            info!(room_id = %id, "room GC: dropped idle room");
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     // Wait for Ctrl-C OR either listener to fail OR either tick
     // task to panic (they never return Ok in normal operation).
     tokio::select! {
@@ -620,6 +686,9 @@ async fn main() -> ExitCode {
         }
         _ = snapshot_gen_handle => {
             warn!("snapshot_generator_loop exited unexpectedly");
+        }
+        _ = room_gc_handle => {
+            warn!("room_gc_loop exited unexpectedly");
         }
     }
 
