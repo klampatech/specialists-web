@@ -476,11 +476,15 @@ export function createGameSession(
   let wasFiringPrev = false;
   /** Previous `input.meleePressed` value — tracks rising edges. */
    let wasMelee = false;
-   // PR 65 — track the snapshot's serverFrame when we last read it,
-   // so the AimEvent's `frame` field can be expressed relative to
-   // the server's authoritative clock (not the local runtime's
-   // counter, which drifts unboundedly).
-   let lastSnapshotFrameSeen = 0;
+   // PR 65 + netcode-audit 2026-10-06 HIGH #3 — track the LOCAL
+   // runtime's `advanced.frame` at the most recent snapshot read,
+   // so the AimEvent's `frame` field can be expressed in the same
+   // clock units as `localDelta`. Pre-fix this stored the SERVER's
+   // `snapFrame`, mixing two different clock schemes (Babylon 60Hz
+   // vs server 64Hz from different epochs); `localDelta =
+   // advanced.frame - lastSnapshotLocalFrame` produced nonsense.
+   // `-1` is the "no snapshot seen yet" sentinel.
+   let lastSnapshotLocalFrame = -1;
   // PR 11.7.D2 / §3.10 — wasRemoteFiring / wasRemoteMelee REMOVED.
   // The P2P lockstep substrate is gone; there is no longer a
   // "remote input" in the lockstep sense. The remote player's
@@ -754,28 +758,33 @@ export function createGameSession(
         if (!serverTransport) (window as unknown as { __debugFireBlockedNoTransport?: number }).__debugFireBlockedNoTransport = ((window as unknown as { __debugFireBlockedNoTransport?: number }).__debugFireBlockedNoTransport ?? 0) + 1;
       }
       if (cooldownOk && ammoOk && serverTransport) {
-        // PR 65 — use the snapshot's `serverFrame` (most recent
-        // authoritative server frame) plus the per-tick offset
-        // relative to when the snapshot arrived. Pre-fix this used
-        // `advanced.frame` (the local runtime's frame counter) which
-        // can drift FAR behind the server's clock if the canary
-        // started before this tab connected. The server's frame gate
-        // rejects AimEvents with `frame` more than
-        // `POSITION_HISTORY_RETENTION_FRAMES` (64 = ~1s @ 64Hz) behind
-        // the server's `current_frame` — the local frame counter
-        // drifts unboundedly so it routinely blows this gate after a
-        // few seconds of gameplay.
+        // PR 65 + netcode-audit 2026-10-06 HIGH #3 — use the
+        // snapshot's `serverFrame` plus a `localDelta` measured in
+        // the SAME clock units (Babylon frames). Pre-fix this stored
+        // `snapFrame` (server units) into `lastSnapshotLocalFrame`
+        // and subtracted `advanced.frame` (Babylon units) from it —
+        // mixing two unrelated clock schemes. The bug surfaced as
+        // "first fire after a long lobby load gets rejected by the
+        // server's gate" because `advanced.frame` is in the
+        // hundreds-thousands after a long tab open, and adding that
+        // to `snapFrame` blew the gate.
         const snap = (window as Window & { __latestSnap?: () => unknown }).__latestSnap?.() as { serverFrame?: number } | null;
         const snapFrame = snap?.serverFrame ?? 0;
         // The snapshot was emitted at the server's frame `snapFrame`;
-        // since then the local runtime has advanced `advanced.frame`
-        // by some delta. The server has also been ticking, so the
-        // current server frame is roughly `snapFrame + (runtimeDelta
-        // / 2)` (half of our local delta passed server-side by now).
-        // Use `snapFrame + localDelta - maxRewindBuffer` to keep the
-        // request safely within the rewind window.
-        const localDelta = advanced.frame - lastSnapshotFrameSeen;
-        const reqFrame = Math.max(snapFrame, snapFrame + localDelta - 16);
+        // since then the local runtime has advanced by `localDelta`
+        // frames. Server ticks at ~64Hz, client at ~60Hz, so the
+        // server has ticked roughly `localDelta * (64/60)` frames
+        // server-side. The lag-comp rewind window is
+        // `POSITION_HISTORY_RETENTION_FRAMES` (64), so we cap the
+        // estimate 16 frames behind the projected current server
+        // frame to keep within the window.
+        const localDelta =
+          lastSnapshotLocalFrame < 0
+            ? 0
+            : advanced.frame - lastSnapshotLocalFrame;
+        const estimatedServerFrame =
+          snapFrame + Math.round(localDelta * (64 / 60));
+        const reqFrame = Math.max(snapFrame, estimatedServerFrame - 16);
         const req: AimEvent = {
           sourcePlayerId: localPlayerId,
           yawRadians: gameInput.yawRadians ?? 0,
@@ -789,7 +798,9 @@ export function createGameSession(
           // release event is emitted below on the falling edge.
           isFiring: 1,
         };
-        lastSnapshotFrameSeen = snapFrame;
+        // Store the LOCAL frame we read at, not the server frame —
+        // so the next delta math stays in Babylon-frame units.
+        lastSnapshotLocalFrame = advanced.frame;
         dbSendAimEvent(serverTransport, req);
         // PR #158 — debug counter exposed on window. Counts every
         // successful AimEvent send (after cooldown/ammo/noTransport
@@ -876,8 +887,17 @@ export function createGameSession(
       if (serverTransport) {
         const snap = (window as Window & { __latestSnap?: () => unknown }).__latestSnap?.() as { serverFrame?: number } | null;
         const snapFrame = snap?.serverFrame ?? 0;
-        const localDelta = advanced.frame - lastSnapshotFrameSeen;
-        const reqFrame = Math.max(snapFrame, snapFrame + localDelta - 16);
+        // netcode-audit 2026-10-06 HIGH #3 — same fix as the fire
+        // press path above: localDelta is in Babylon-frame units
+        // (both terms), and we keep the request within the rewind
+        // window.
+        const localDelta =
+          lastSnapshotLocalFrame < 0
+            ? 0
+            : advanced.frame - lastSnapshotLocalFrame;
+        const estimatedServerFrame =
+          snapFrame + Math.round(localDelta * (64 / 60));
+        const reqFrame = Math.max(snapFrame, estimatedServerFrame - 16);
         const req: MeleeEvent = {
           sourcePlayerId: localPlayerId,
           yawRadians: gameInput.yawRadians ?? 0,
@@ -885,7 +905,7 @@ export function createGameSession(
           frame: reqFrame,
           eventId: dbNextMeleeEventId(),
         };
-        lastSnapshotFrameSeen = snapFrame;
+        lastSnapshotLocalFrame = advanced.frame;
         dbSendMeleeEvent(serverTransport, req);
       }
     }
@@ -911,8 +931,17 @@ export function createGameSession(
     if (wasFiringPrev && !gameInput.fireHeld && serverTransport) {
       const snap = (window as Window & { __latestSnap?: () => unknown }).__latestSnap?.() as { serverFrame?: number } | null;
       const snapFrame = snap?.serverFrame ?? 0;
-      const localDelta = advanced.frame - lastSnapshotFrameSeen;
-      const reqFrame = Math.max(snapFrame, snapFrame + localDelta - 16);
+      // netcode-audit 2026-10-06 HIGH #3 — same fix as the fire
+      // press path. localDelta in same-clock terms, request within
+      // the rewind window. Capture the release moment's local
+      // frame so subsequent fires don't mix clock schemes.
+      const localDelta =
+        lastSnapshotLocalFrame < 0
+          ? 0
+          : advanced.frame - lastSnapshotLocalFrame;
+      const estimatedServerFrame =
+        snapFrame + Math.round(localDelta * (64 / 60));
+      const reqFrame = Math.max(snapFrame, estimatedServerFrame - 16);
       dbSendAimEvent(serverTransport, {
         sourcePlayerId: localPlayerId,
         yawRadians: gameInput.yawRadians ?? 0,
@@ -921,6 +950,7 @@ export function createGameSession(
         eventId: nextAimEventIdLocal++,
         isFiring: 0,
       });
+      lastSnapshotLocalFrame = advanced.frame;
     }
     wasFiringPrev = gameInput.fireHeld;
 
@@ -1043,9 +1073,18 @@ export function createGameSession(
       // the snapshot expected.
       const snap = (window as Window & { __latestSnap?: () => unknown }).__latestSnap?.() as { serverFrame?: number } | null;
       const snapFrame = snap?.serverFrame ?? 0;
-      const localDelta = advancedFrame - lastSnapshotFrameSeen;
-      const alignedFrame = Math.max(snapFrame, snapFrame + localDelta - 16);
-      lastSnapshotFrameSeen = snapFrame;
+      // netcode-audit 2026-10-06 HIGH #3 — same fix as the fire
+      // press / release / melee paths. localDelta in same-clock
+      // terms; alignedFrame within the rewind window. Store the
+      // LOCAL frame so the next delta math is consistent.
+      const localDelta =
+        lastSnapshotLocalFrame < 0
+          ? 0
+          : advancedFrame - lastSnapshotLocalFrame;
+      const estimatedServerFrame =
+        snapFrame + Math.round(localDelta * (64 / 60));
+      const alignedFrame = Math.max(snapFrame, estimatedServerFrame - 16);
+      lastSnapshotLocalFrame = advancedFrame;
       dbSendInputsServer(serverTransport, {
         frame: alignedFrame,
         encodedInput: pending.encodedInput,
