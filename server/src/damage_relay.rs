@@ -694,10 +694,41 @@ pub fn validate_and_relay_aim(
                     player.trigger_held = true;
                     player.burst_shots_remaining = count.saturating_sub(1);
                 } else {
-                    // Mid-burst — subsequent shots don't consume ammo.
-                    burst_mid_shot = true;
-                    player.burst_shots_remaining =
-                        player.burst_shots_remaining.saturating_sub(1);
+                    // Mid-burst — subsequent shots don't consume ammo
+                    // (the burst was paid upfront on the fresh-burst
+                    // branch).
+                    //
+                    // netcode-audit 2026-10-06 HIGH #4 — gate this
+                    // branch on `burst_shots_remaining > 0`. Pre-fix
+                    // the saturating_sub let the counter reach 0
+                    // while `trigger_held` stayed true; subsequent
+                    // AimEvents with `is_firing: 1` kept firing at
+                    // the semi-cadence with NO ammo cost. Pin the
+                    // "release-and-pull to start a new burst"
+                    // contract: if the burst is exhausted but the
+                    // trigger is still held, silently drop the
+                    // AimEvent (no ammo, no shot) and wait for
+                    // `is_firing: 0` to reset.
+                    if player.burst_shots_remaining > 0 {
+                        burst_mid_shot = true;
+                        player.burst_shots_remaining -= 1;
+                    } else {
+                        // Burst exhausted but trigger still held —
+                        // silently drop the AimEvent (no ammo, no
+                        // shot). The next AimEvent will also be
+                        // dropped here until the player releases
+                        // (is_firing: 0), which resets
+                        // `trigger_held = false` via the trigger-
+                        // release branch above. Then a subsequent
+                        // pull starts a fresh burst.
+                        //
+                        // NOTE: do NOT touch `trigger_held` here —
+                        // flipping would make the next AimEvent
+                        // take the `if !player.trigger_held` branch
+                        // and start a NEW burst (the bug the prior
+                        // patch introduced; corrected here).
+                        return vec![];
+                    }
                 }
             }
             FireMode::Auto => {
@@ -2068,6 +2099,145 @@ mod tests {
         assert!(
             result.is_none(),
             "missing source must be rejected with None (Gate 1 or race fallback)",
+        );
+    }
+
+    // -- netcode-audit 2026-10-06 fix #4: post-burst unlimited shots
+    //
+    // Pre-fix: holding the trigger on Burst3 fired 3 shots (the
+    // burst) then kept firing at the semi-cadence, no ammo cost,
+    // until the player released. Holding for 5 seconds dropped
+    // ammo by 1 (the fresh-burst shot) and fired ~80 HP of damage.
+    //
+    // Post-fix: the burst's N shots are the cap while the trigger
+    // is held. The (N+1)th AimEvent is silently dropped until the
+    // player releases (is_firing: 0) and pulls again (is_firing: 1).
+
+    use specialists_server::constants::PLAYER_MAX_AMMO;
+
+    /// AimEvent in Burst3 mode with `is_firing: 1`. The test below
+    /// drives this N times and asserts the post-burst shot is
+    /// dropped.
+    fn burst_aim_event(event_id: u32) -> AimEvent {
+        AimEvent {
+            source_player_id: 1,
+            yaw_radians: std::f32::consts::FRAC_PI_2,
+            pitch_radians: 0.0,
+            frame: 4,
+            event_id,
+            is_firing: 1,
+        }
+    }
+
+    /// Pick a weapon whose fire mode index 1 is `Burst3`. DualPistol
+    /// (the default weapon) has fire_modes [Semi, Burst3] (see
+    /// `WEAPONS_TABLE` in `constants.rs:352`), making index 1 the
+    /// Burst3 slot. The fix lives at the burst-state-machine arm,
+    /// not at the weapon -- but we still need a Burst-mode weapon
+    /// to exercise the bug path.
+    fn setup_burst_room(count: u8) -> Room {
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.players.get_mut(&1).unwrap().ammo = PLAYER_MAX_AMMO;
+        for frame in 0..5u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0, z: 0.0 });
+        }
+        let _ = count; // test parameter kept for documentation; the
+        // DualPistol Burst3 slot is always at fire_modes[1].
+        room.players.get_mut(&1).unwrap().current_fire_mode = 1;
+        room
+    }
+
+    /// Holding the trigger for `N + 5` AimEvents fires exactly `N`
+    /// shots. The remaining events are silently dropped (no ammo
+    /// spent, no broadcast) until `is_firing: 0` resets the state.
+    ///
+    /// We thread a fake `Instant` that's 200ms past the previous
+    /// event's stamp so the fire-rate cooldown gate (120ms) lets
+    /// every event through. Without this, the cooldown gate (not
+ /// the burst state machine) would reject all but the first
+ /// shot and the test would falsely pass.
+    #[test]
+    fn burst_state_machine_caps_overshoot_no_ammo_drain() {
+        let mut room = setup_burst_room(3);
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let base = Instant::now();
+        let mut hits = 0;
+        for ev_id in 1..=8u32 {
+            let req = burst_aim_event(ev_id);
+            // Advance time by 200ms per event — well past the
+            // 120ms DualPistol fire-rate cooldown.
+            let now = base + std::time::Duration::from_millis(200 * ev_id as u64);
+            let result = validate_and_relay_aim(&req, 1, &mut room, 0, now);
+            hits += result.len();
+        }
+        // 3 broadcasts for the 3 burst shots; the remaining 5
+        // AimEvents were silently dropped (no broadcast).
+        assert_eq!(
+            hits, 3,
+            "Burst3 + 8 sustained-fire events must emit exactly 3 DamageBroadcasts"
+        );
+        // Ammo decremented exactly once (the fresh-burst shot). The
+        // mid-burst shots don't spend ammo (per existing burst
+        // contract), AND the post-burst drops don't spend ammo
+        // (the new contract).
+        let final_ammo = room.players.get(&1).unwrap().ammo;
+        assert_eq!(
+            final_ammo,
+            initial_ammo - 1,
+            "Burst3 + 8 sustained-fire events must cost exactly 1 ammo"
+        );
+        // burst_shots_remaining must have saturated to 0 after the
+        // 3rd shot and stayed there.
+        assert_eq!(
+            room.players.get(&1).unwrap().burst_shots_remaining,
+            0,
+            "burst counter must saturate to 0 after 3 shots"
+        );
+    }
+
+    /// After the trigger is released (is_firing: 0) and pulled
+    /// again (is_firing: 1), a fresh burst starts. Pins the
+        /// "release-and-pull to start a new burst" contract.
+    #[test]
+    fn burst_state_machine_release_then_pull_starts_new_burst() {
+        let mut room = setup_burst_room(3);
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let base = Instant::now();
+        // Drive the first 3 shots of a burst.
+        for ev_id in 1..=3u32 {
+            let req = burst_aim_event(ev_id);
+            let now = base + std::time::Duration::from_millis(200 * ev_id as u64);
+            let _ = validate_and_relay_aim(&req, 1, &mut room, 0, now);
+        }
+        let ammo_after_first_burst = room.players.get(&1).unwrap().ammo;
+        assert_eq!(ammo_after_first_burst, initial_ammo - 1);
+        // Release the trigger (is_firing: 0). The validator's
+        // burst arm returns early with the burst counter reset.
+        let release = AimEvent {
+            is_firing: 0,
+            event_id: 4,
+            ..burst_aim_event(4)
+        };
+        let now_release = base + std::time::Duration::from_millis(200 * 4);
+        let _ = validate_and_relay_aim(&release, 1, &mut room, 0, now_release);
+        // Pull again (is_firing: 1) — should start a fresh burst
+        // and cost another ammo.
+        let pull = burst_aim_event(5);
+        let now_pull = base + std::time::Duration::from_millis(200 * 5);
+        let result = validate_and_relay_aim(&pull, 1, &mut room, 0, now_pull);
+        assert_eq!(
+            result.len(),
+            1,
+            "release + pull must start a fresh burst (1 broadcast)"
+        );
+        let ammo_after_second_burst = room.players.get(&1).unwrap().ammo;
+        assert_eq!(
+            ammo_after_second_burst,
+            ammo_after_first_burst - 1,
+            "release + pull must cost another ammo"
         );
     }
 
