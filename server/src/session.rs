@@ -295,6 +295,17 @@ pub struct Room {
     /// accepts wraparound at u16::MAX (~65k connections per room)
     /// — far above the matchmaker's `MAX_PLAYERS_PER_ROOM` cap (24).
     pub next_player_id: AtomicU16,
+    /// PR #156 / netcode-audit 2026-10-06 fix #1 — opt-in flag for
+    /// vertical positional advantage in lag-comp hit detection. When
+    /// `false` (default), the lag-comp hit-test clamps both source
+    /// and target Z to 0 (the pre-#156 2D-on-y behavior). When
+    /// `true`, the hit-test uses the actual rewound Z so a player
+    /// standing on a crate or in mid-air gets vertical advantage.
+    ///
+    /// Default false preserves backward compat with rooms that don't
+    /// model vertical advantage (existing 24-player flat arenas).
+    /// Set explicitly per-room when vertical advantage is desired.
+    pub allow_vertical_hits: bool,
 }
 
 impl Room {
@@ -320,6 +331,7 @@ impl Room {
             // approach makes the id sequence predictable from the
             // matchmaker's player count alone.
             next_player_id: AtomicU16::new(1),
+            allow_vertical_hits: false,
         }
     }
 

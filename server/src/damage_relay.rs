@@ -474,7 +474,14 @@ pub fn validate_and_relay_aim(
         );
         return vec![];
     };
-    let source_origin = chest_position(glam::Vec3::new(source_pos.x, source_pos.y, 0.0));
+    // PR #156 / netcode-audit 2026-10-06 fix #1 — gate vertical
+    // advantage on Room::allow_vertical_hits. When false (default),
+    // clamp source Z to 0 (preserves the pre-#156 2D-on-y behavior
+    // for existing 24p flat arenas). When true, use the rewound Z
+    // so a player on a crate or in mid-air gets vertical advantage
+    // in the hit-test.
+    let source_z = if room.allow_vertical_hits { source_pos.z } else { 0.0 };
+    let source_origin = chest_position(glam::Vec3::new(source_pos.x, source_pos.y, source_z));
     let forward = forward_from_yaw_pitch(req.yaw_radians, req.pitch_radians);
     // Pre-allocate the result Vec for the typical hit count (0..=3
     // in the 2-tab demo; 0..=23 in a 24-player stress test).
@@ -540,7 +547,11 @@ pub fn validate_and_relay_aim(
         if room.players.get(&target_id).map(|p| p.hp == 0).unwrap_or(true) {
             continue;
         }
-        let target_pos_3d = glam::Vec3::new(target_pos.x, target_pos.y, source_origin.z);
+        // PR #156 / netcode-audit 2026-10-06 fix #1 — same gate as
+        // the source origin above. Clamp target Z to 0 when
+        // vertical advantage is disabled (default).
+        let target_z = if room.allow_vertical_hits { target_pos.z } else { 0.0 };
+        let target_pos_3d = glam::Vec3::new(target_pos.x, target_pos.y, target_z);
         let hit = dual_pistol_hit(
             source_origin,
             forward,
@@ -1253,8 +1264,15 @@ pub fn validate_and_relay_melee(
     // enough that a single-tick target offset doesn't matter). The
     // `PositionHistory::snapshot_at(frame)` API accepts `u32::MAX`
     // and returns the latest recorded position.
+    // PR #156 / netcode-audit 2026-10-06 fix #1 — gate vertical
+    // advantage on Room::allow_vertical_hits, mirroring the
+    // AimEvent path above.
+    let allow_vertical = room.allow_vertical_hits;
     let source_pos = match room.position_history[&req_source].snapshot_at(u32::MAX) {
-        Some(pos) => chest_position(glam::Vec3::new(pos.x, pos.y, 0.0)),
+        Some(pos) => {
+            let z = if allow_vertical { pos.z } else { 0.0 };
+            chest_position(glam::Vec3::new(pos.x, pos.y, z))
+        }
         None => {
             // Source hasn't sent any PositionUpdates yet. Without a
             // position we can't run the cone check. Skip — same as
@@ -1295,10 +1313,14 @@ pub fn validate_and_relay_melee(
         // +0.45 offset) — mirror the AimEvent path's z-handling
         // (target_pos.z = source_origin.z so the raycast stays on
         // the attacker's horizontal plane).
+        // PR #156 / netcode-audit 2026-10-06 fix #1 — same gate as
+        // the source origin above. Clamp target Z to 0 when
+        // vertical advantage is disabled.
+        let target_z = if allow_vertical { target_pos_2d.z } else { 0.0 };
         let target_pos = chest_position(glam::Vec3::new(
             target_pos_2d.x,
             target_pos_2d.y,
-            source_pos.z,
+            target_z,
         ));
         if melee_cone_hit(
             source_pos,
@@ -2147,5 +2169,127 @@ mod tests {
         // ammo=3 if reached, but the helper never runs -- so the
         // ammo check is moot; we just assert the source is gone.
         let _ = ammo_before;
+    }
+
+    // -- netcode-audit 2026-10-06 fix #1: vertical lag-comp -----------
+    //
+    // The lag-comp hit-test must respect Room::allow_vertical_hits.
+    // When false (pre-#156 default), the test clamps both source
+    // and target Z to 0 (2D-on-y). When true, the actual rewound Z
+    // flows through and a player on a crate / in mid-air gets
+    // vertical advantage in the hit-test.
+
+    fn setup_3d_room(
+        source: (f32, f32, f32),
+        target: (f32, f32, f32),
+    ) -> Room {
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.players.get_mut(&1).unwrap().ammo = 10;
+        for frame in 0..5u32 {
+            room.record_position(1, frame, Position {
+                x: source.0, y: source.1, z: source.2,
+            });
+            room.record_position(2, frame, Position {
+                x: target.0, y: target.1, z: target.2,
+            });
+        }
+        room
+    }
+
+    /// Default (allow_vertical_hits=false) clamps both source and
+    /// target Z to 0 (the pre-#156 2D-on-y semantics). A target on
+    /// a crate (z=1.5) gets treated as if it were on the ground
+    /// (z=0) for the hit-test, so a horizontal shot from the
+    /// ground-level shooter still hits. Pins backward-compat.
+    #[test]
+    fn aim_event_default_clamp_z_treats_crate_target_as_ground() {
+        let mut room = setup_3d_room((0.0, 0.0, 0.0), (5.0, 0.0, 1.5));
+        // allow_vertical_hits defaults to false (Room::new).
+        let req = passing_aim_event(); // yaw=PI/2, pitch=0 (horizontal).
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert_eq!(
+            result.len(),
+            1,
+            "default clamp Z=0 must let the horizontal shot hit the crate target \
+             (backward-compat: pre-#156 2D-on-y semantics treats z=1.5 as z=0)"
+        );
+    }
+
+    /// With allow_vertical_hits=true, the actual Z flows through.
+    /// A horizontal shot from the ground-level shooter at the
+    /// crate target now MISSES (1.5m vertical offset exceeds the
+    /// 0.5m target radius) -- the bug that the audit flagged. Pins
+    /// the new 3D-aware contract.
+    #[test]
+    fn aim_event_allow_vertical_hits_horizontal_shot_misses_crate_target() {
+        let mut room = setup_3d_room((0.0, 0.0, 0.0), (5.0, 0.0, 1.5));
+        room.allow_vertical_hits = true;
+        let req = passing_aim_event(); // yaw=PI/2, pitch=0 (horizontal).
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert!(
+            result.is_empty(),
+            "with allow_vertical_hits=true, a horizontal shot from z=0 at z=1.5 target must MISS \
+             (1.5m vertical offset exceeds the 0.5m target radius)"
+        );
+    }
+
+    /// With allow_vertical_hits=true AND an aimed shot at the
+    /// crate target (yaw that puts the ray in the XZ plane toward
+    /// the target), the target IS hit. Pins that vertical
+    /// advantage is achievable, not just penalty.
+    ///
+    /// Geometry: shooter at world (0,0,0), target at world
+    /// (5,0,1.5) -- forward-and-to-the-right in Babylon frame.
+    /// Yaw that points at the target = atan2(5, 1.5) ≈ 1.279 rad.
+    /// The default target radius is 0.5m, the shooter chest adds
+    /// +0.45 to y, so the closest-point distance to the sphere is
+    /// sqrt(0² + 0.45² + 0²) = 0.45m (within radius).
+    #[test]
+    fn aim_event_allow_vertical_hits_aimed_shot_hits_crate_target() {
+        let mut room = setup_3d_room((0.0, 0.0, 0.0), (5.0, 0.0, 1.5));
+        room.allow_vertical_hits = true;
+        let req = AimEvent {
+            source_player_id: 1,
+            yaw_radians: 1.279,
+            pitch_radians: 0.0,
+            frame: 4,
+            event_id: 1,
+            is_firing: 1,
+        };
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert_eq!(
+            result.len(),
+            1,
+            "with allow_vertical_hits=true AND aimed shot at the crate target, the hit must land (1 broadcast)"
+        );
+    }
+
+    /// With allow_vertical_hits=false, a horizontal shot from a
+    /// higher crate-shooter at a ground-level target STILL misses
+    /// (target Z clamped to 0). Pins the existing 2D-on-y semantics
+    /// for backward compat.
+    #[test]
+    fn aim_event_default_clamp_z_blocks_high_shooter_at_ground_target() {
+        let mut room = setup_3d_room((0.0, 0.0, 1.5), (5.0, 0.0, 0.0));
+        let req = AimEvent {
+            source_player_id: 1,
+            yaw_radians: std::f32::consts::FRAC_PI_2,
+            pitch_radians: 0.0,
+            frame: 4,
+            event_id: 1,
+            is_firing: 1,
+        };
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        // The source Z gets clamped to 0 in chest_position, and the
+        // target Z is also clamped to 0. They're both at (x, y+0.45,
+        // 0) and (5, 0.45, 0) -- horizontal shot from y=0.45 at x=0
+        // toward (5, 0.45, 0) hits the target capsule (0.5m radius).
+        assert_eq!(
+            result.len(),
+            1,
+            "horizontal shot at z=0 target from z=0 source (after clamp) must hit"
+        );
     }
 }
