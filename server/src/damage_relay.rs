@@ -474,7 +474,14 @@ pub fn validate_and_relay_aim(
         );
         return vec![];
     };
-    let source_origin = chest_position(glam::Vec3::new(source_pos.x, source_pos.y, 0.0));
+    // PR #156 / netcode-audit 2026-10-06 fix #1 — gate vertical
+    // advantage on Room::allow_vertical_hits. When false (default),
+    // clamp source Z to 0 (preserves the pre-#156 2D-on-y behavior
+    // for existing 24p flat arenas). When true, use the rewound Z
+    // so a player on a crate or in mid-air gets vertical advantage
+    // in the hit-test.
+    let source_z = if room.allow_vertical_hits { source_pos.z } else { 0.0 };
+    let source_origin = chest_position(glam::Vec3::new(source_pos.x, source_pos.y, source_z));
     let forward = forward_from_yaw_pitch(req.yaw_radians, req.pitch_radians);
     // Pre-allocate the result Vec for the typical hit count (0..=3
     // in the 2-tab demo; 0..=23 in a 24-player stress test).
@@ -540,7 +547,11 @@ pub fn validate_and_relay_aim(
         if room.players.get(&target_id).map(|p| p.hp == 0).unwrap_or(true) {
             continue;
         }
-        let target_pos_3d = glam::Vec3::new(target_pos.x, target_pos.y, source_origin.z);
+        // PR #156 / netcode-audit 2026-10-06 fix #1 — same gate as
+        // the source origin above. Clamp target Z to 0 when
+        // vertical advantage is disabled (default).
+        let target_z = if room.allow_vertical_hits { target_pos.z } else { 0.0 };
+        let target_pos_3d = glam::Vec3::new(target_pos.x, target_pos.y, target_z);
         let hit = dual_pistol_hit(
             source_origin,
             forward,
@@ -634,7 +645,31 @@ pub fn validate_and_relay_aim(
         // panicking -- the Tokio worker would otherwise abort and
         // systemd would restart, losing every connected player.
         let current_fire_mode: FireMode = match room.players.get(&req_source) {
-            Some(p) => active_weapon_def.fire_modes[p.current_fire_mode as usize],
+            Some(p) => {
+                // netcode-audit 2026-10-06 MEDIUM #7 — bounds-
+                // check the fire-mode index before indexing. Pre-fix
+                // a corrupted `current_fire_mode` (out of range due
+                // to a future weapon-table change, snapshot
+                // corruption, or replay attack) would `panic!` the
+                // Tokio worker; systemd would restart the server
+                // and every connected player would lose state.
+                // The WeaponSwitch path at damage_relay.rs:1071
+                // already handles the same condition gracefully
+                // — converge on that defensive pattern.
+                let fm_idx = p.current_fire_mode as usize;
+                if fm_idx >= active_weapon_def.fire_modes.len() {
+                    warn!(
+                        source = req_source,
+                        fire_mode_idx = p.current_fire_mode,
+                        fire_modes_len = active_weapon_def.fire_modes.len(),
+                        weapon_id = active_weapon_def.weapon_id as u8,
+                        "validate_and_relay_aim: current_fire_mode out of \
+                         range (corrupted state). Dropping packet.",
+                    );
+                    return vec![];
+                }
+                active_weapon_def.fire_modes[fm_idx]
+            }
             None => {
                 warn!(
                     source = req_source,
@@ -683,10 +718,41 @@ pub fn validate_and_relay_aim(
                     player.trigger_held = true;
                     player.burst_shots_remaining = count.saturating_sub(1);
                 } else {
-                    // Mid-burst — subsequent shots don't consume ammo.
-                    burst_mid_shot = true;
-                    player.burst_shots_remaining =
-                        player.burst_shots_remaining.saturating_sub(1);
+                    // Mid-burst — subsequent shots don't consume ammo
+                    // (the burst was paid upfront on the fresh-burst
+                    // branch).
+                    //
+                    // netcode-audit 2026-10-06 HIGH #4 — gate this
+                    // branch on `burst_shots_remaining > 0`. Pre-fix
+                    // the saturating_sub let the counter reach 0
+                    // while `trigger_held` stayed true; subsequent
+                    // AimEvents with `is_firing: 1` kept firing at
+                    // the semi-cadence with NO ammo cost. Pin the
+                    // "release-and-pull to start a new burst"
+                    // contract: if the burst is exhausted but the
+                    // trigger is still held, silently drop the
+                    // AimEvent (no ammo, no shot) and wait for
+                    // `is_firing: 0` to reset.
+                    if player.burst_shots_remaining > 0 {
+                        burst_mid_shot = true;
+                        player.burst_shots_remaining -= 1;
+                    } else {
+                        // Burst exhausted but trigger still held —
+                        // silently drop the AimEvent (no ammo, no
+                        // shot). The next AimEvent will also be
+                        // dropped here until the player releases
+                        // (is_firing: 0), which resets
+                        // `trigger_held = false` via the trigger-
+                        // release branch above. Then a subsequent
+                        // pull starts a fresh burst.
+                        //
+                        // NOTE: do NOT touch `trigger_held` here —
+                        // flipping would make the next AimEvent
+                        // take the `if !player.trigger_held` branch
+                        // and start a NEW burst (the bug the prior
+                        // patch introduced; corrected here).
+                        return vec![];
+                    }
                 }
             }
             FireMode::Auto => {
@@ -1253,8 +1319,15 @@ pub fn validate_and_relay_melee(
     // enough that a single-tick target offset doesn't matter). The
     // `PositionHistory::snapshot_at(frame)` API accepts `u32::MAX`
     // and returns the latest recorded position.
+    // PR #156 / netcode-audit 2026-10-06 fix #1 — gate vertical
+    // advantage on Room::allow_vertical_hits, mirroring the
+    // AimEvent path above.
+    let allow_vertical = room.allow_vertical_hits;
     let source_pos = match room.position_history[&req_source].snapshot_at(u32::MAX) {
-        Some(pos) => chest_position(glam::Vec3::new(pos.x, pos.y, 0.0)),
+        Some(pos) => {
+            let z = if allow_vertical { pos.z } else { 0.0 };
+            chest_position(glam::Vec3::new(pos.x, pos.y, z))
+        }
         None => {
             // Source hasn't sent any PositionUpdates yet. Without a
             // position we can't run the cone check. Skip — same as
@@ -1295,10 +1368,14 @@ pub fn validate_and_relay_melee(
         // +0.45 offset) — mirror the AimEvent path's z-handling
         // (target_pos.z = source_origin.z so the raycast stays on
         // the attacker's horizontal plane).
+        // PR #156 / netcode-audit 2026-10-06 fix #1 — same gate as
+        // the source origin above. Clamp target Z to 0 when
+        // vertical advantage is disabled.
+        let target_z = if allow_vertical { target_pos_2d.z } else { 0.0 };
         let target_pos = chest_position(glam::Vec3::new(
             target_pos_2d.x,
             target_pos_2d.y,
-            source_pos.z,
+            target_z,
         ));
         if melee_cone_hit(
             source_pos,
@@ -2049,6 +2126,204 @@ mod tests {
         );
     }
 
+    // -- netcode-audit 2026-10-06 fix #4: post-burst unlimited shots
+    //
+    // Pre-fix: holding the trigger on Burst3 fired 3 shots (the
+    // burst) then kept firing at the semi-cadence, no ammo cost,
+    // until the player released. Holding for 5 seconds dropped
+    // ammo by 1 (the fresh-burst shot) and fired ~80 HP of damage.
+    //
+    // Post-fix: the burst's N shots are the cap while the trigger
+    // is held. The (N+1)th AimEvent is silently dropped until the
+    // player releases (is_firing: 0) and pulls again (is_firing: 1).
+
+    use specialists_server::constants::PLAYER_MAX_AMMO;
+
+    /// AimEvent in Burst3 mode with `is_firing: 1`. The test below
+    /// drives this N times and asserts the post-burst shot is
+    /// dropped.
+    fn burst_aim_event(event_id: u32) -> AimEvent {
+        AimEvent {
+            source_player_id: 1,
+            yaw_radians: std::f32::consts::FRAC_PI_2,
+            pitch_radians: 0.0,
+            frame: 4,
+            event_id,
+            is_firing: 1,
+        }
+    }
+
+    /// Pick a weapon whose fire mode index 1 is `Burst3`. DualPistol
+    /// (the default weapon) has fire_modes [Semi, Burst3] (see
+    /// `WEAPONS_TABLE` in `constants.rs:352`), making index 1 the
+    /// Burst3 slot. The fix lives at the burst-state-machine arm,
+    /// not at the weapon -- but we still need a Burst-mode weapon
+    /// to exercise the bug path.
+    fn setup_burst_room(count: u8) -> Room {
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.players.get_mut(&1).unwrap().ammo = PLAYER_MAX_AMMO;
+        for frame in 0..5u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0, z: 0.0 });
+        }
+        let _ = count; // test parameter kept for documentation; the
+        // DualPistol Burst3 slot is always at fire_modes[1].
+        room.players.get_mut(&1).unwrap().current_fire_mode = 1;
+        room
+    }
+
+    /// Holding the trigger for `N + 5` AimEvents fires exactly `N`
+    /// shots. The remaining events are silently dropped (no ammo
+    /// spent, no broadcast) until `is_firing: 0` resets the state.
+    ///
+    /// We thread a fake `Instant` that's 200ms past the previous
+    /// event's stamp so the fire-rate cooldown gate (120ms) lets
+    /// every event through. Without this, the cooldown gate (not
+ /// the burst state machine) would reject all but the first
+ /// shot and the test would falsely pass.
+    #[test]
+    fn burst_state_machine_caps_overshoot_no_ammo_drain() {
+        let mut room = setup_burst_room(3);
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let base = Instant::now();
+        let mut hits = 0;
+        for ev_id in 1..=8u32 {
+            let req = burst_aim_event(ev_id);
+            // Advance time by 200ms per event — well past the
+            // 120ms DualPistol fire-rate cooldown.
+            let now = base + std::time::Duration::from_millis(200 * ev_id as u64);
+            let result = validate_and_relay_aim(&req, 1, &mut room, 0, now);
+            hits += result.len();
+        }
+        // 3 broadcasts for the 3 burst shots; the remaining 5
+        // AimEvents were silently dropped (no broadcast).
+        assert_eq!(
+            hits, 3,
+            "Burst3 + 8 sustained-fire events must emit exactly 3 DamageBroadcasts"
+        );
+        // Ammo decremented exactly once (the fresh-burst shot). The
+        // mid-burst shots don't spend ammo (per existing burst
+        // contract), AND the post-burst drops don't spend ammo
+        // (the new contract).
+        let final_ammo = room.players.get(&1).unwrap().ammo;
+        assert_eq!(
+            final_ammo,
+            initial_ammo - 1,
+            "Burst3 + 8 sustained-fire events must cost exactly 1 ammo"
+        );
+        // burst_shots_remaining must have saturated to 0 after the
+        // 3rd shot and stayed there.
+        assert_eq!(
+            room.players.get(&1).unwrap().burst_shots_remaining,
+            0,
+            "burst counter must saturate to 0 after 3 shots"
+        );
+    }
+
+    /// After the trigger is released (is_firing: 0) and pulled
+    /// again (is_firing: 1), a fresh burst starts. Pins the
+        /// "release-and-pull to start a new burst" contract.
+    #[test]
+    fn burst_state_machine_release_then_pull_starts_new_burst() {
+        let mut room = setup_burst_room(3);
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let base = Instant::now();
+        // Drive the first 3 shots of a burst.
+        for ev_id in 1..=3u32 {
+            let req = burst_aim_event(ev_id);
+            let now = base + std::time::Duration::from_millis(200 * ev_id as u64);
+            let _ = validate_and_relay_aim(&req, 1, &mut room, 0, now);
+        }
+        let ammo_after_first_burst = room.players.get(&1).unwrap().ammo;
+        assert_eq!(ammo_after_first_burst, initial_ammo - 1);
+        // Release the trigger (is_firing: 0). The validator's
+        // burst arm returns early with the burst counter reset.
+        let release = AimEvent {
+            is_firing: 0,
+            event_id: 4,
+            ..burst_aim_event(4)
+        };
+        let now_release = base + std::time::Duration::from_millis(200 * 4);
+        let _ = validate_and_relay_aim(&release, 1, &mut room, 0, now_release);
+        // Pull again (is_firing: 1) — should start a fresh burst
+        // and cost another ammo.
+        let pull = burst_aim_event(5);
+        let now_pull = base + std::time::Duration::from_millis(200 * 5);
+        let result = validate_and_relay_aim(&pull, 1, &mut room, 0, now_pull);
+        assert_eq!(
+            result.len(),
+            1,
+            "release + pull must start a fresh burst (1 broadcast)"
+        );
+        let ammo_after_second_burst = room.players.get(&1).unwrap().ammo;
+        assert_eq!(
+            ammo_after_second_burst,
+            ammo_after_first_burst - 1,
+            "release + pull must cost another ammo"
+        );
+    }
+
+    // -- netcode-audit 2026-10-06 fix #7: fire_modes[] bounds check --
+    //
+    // Pre-fix: `active_weapon_def.fire_modes[p.current_fire_mode as usize]`
+    // would `panic!` if `current_fire_mode` was out of range (e.g.,
+    // 99 on a weapon that has only 2 fire modes). Post-fix the
+    // validator drops the packet gracefully — same defensive
+    // pattern as the WeaponSwitch path at damage_relay.rs:1071.
+    // The test below drives an out-of-range index and asserts the
+    // packet is dropped (no broadcast, no panic).
+
+    /// Helper that constructs a player in DualPistol (fire_modes
+    /// = [Semi, Burst3]) and forces `current_fire_mode` to an
+    /// out-of-range index. The DualPistol table has 2 entries,
+    /// so index 5 is well past the end.
+    fn setup_corrupt_fire_mode_room() -> Room {
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.players.get_mut(&1).unwrap().ammo = PLAYER_MAX_AMMO;
+        for frame in 0..5u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0, z: 0.0 });
+        }
+        // Corrupt the player's fire-mode index to a value past
+        // the end of DualPistol's fire_modes[].
+        room.players.get_mut(&1).unwrap().current_fire_mode = 5;
+        room
+    }
+
+    /// Out-of-range `current_fire_mode` must NOT panic the Tokio
+    /// worker. Pre-fix the index `fire_modes[5]` panics on a
+    /// DualPistol (2 fire modes). Post-fix the validator
+    /// gracefully drops the packet — same shape as
+    /// `WeaponSwitch` at damage_relay.rs:1071.
+    #[test]
+    fn aim_event_corrupt_fire_mode_index_drops_packet_no_panic() {
+        let mut room = setup_corrupt_fire_mode_room();
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let req = passing_aim_event();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now())
+        }))
+        .expect("validate_and_relay_aim must NOT panic on a corrupt fire_mode_index");
+        // No broadcast was emitted — the packet was dropped
+        // before any state could change.
+        assert_eq!(
+            result.len(),
+            0,
+            "corrupt fire_mode_index must drop the AimEvent (no broadcast)"
+        );
+        // Ammo is unchanged (the packet didn't reach the
+        // burst/auto state machine).
+        assert_eq!(
+            room.players.get(&1).unwrap().ammo,
+            initial_ammo,
+            "corrupt fire_mode_index must not cost ammo"
+        );
+    }
+
     // -- Issue 3 follow-up: race-window tests for the helpers ----------
     //
     // The single-threaded `*_target_race_disconnect_does_not_panic`
@@ -2147,5 +2422,127 @@ mod tests {
         // ammo=3 if reached, but the helper never runs -- so the
         // ammo check is moot; we just assert the source is gone.
         let _ = ammo_before;
+    }
+
+    // -- netcode-audit 2026-10-06 fix #1: vertical lag-comp -----------
+    //
+    // The lag-comp hit-test must respect Room::allow_vertical_hits.
+    // When false (pre-#156 default), the test clamps both source
+    // and target Z to 0 (2D-on-y). When true, the actual rewound Z
+    // flows through and a player on a crate / in mid-air gets
+    // vertical advantage in the hit-test.
+
+    fn setup_3d_room(
+        source: (f32, f32, f32),
+        target: (f32, f32, f32),
+    ) -> Room {
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.players.get_mut(&1).unwrap().ammo = 10;
+        for frame in 0..5u32 {
+            room.record_position(1, frame, Position {
+                x: source.0, y: source.1, z: source.2,
+            });
+            room.record_position(2, frame, Position {
+                x: target.0, y: target.1, z: target.2,
+            });
+        }
+        room
+    }
+
+    /// Default (allow_vertical_hits=false) clamps both source and
+    /// target Z to 0 (the pre-#156 2D-on-y semantics). A target on
+    /// a crate (z=1.5) gets treated as if it were on the ground
+    /// (z=0) for the hit-test, so a horizontal shot from the
+    /// ground-level shooter still hits. Pins backward-compat.
+    #[test]
+    fn aim_event_default_clamp_z_treats_crate_target_as_ground() {
+        let mut room = setup_3d_room((0.0, 0.0, 0.0), (5.0, 0.0, 1.5));
+        // allow_vertical_hits defaults to false (Room::new).
+        let req = passing_aim_event(); // yaw=PI/2, pitch=0 (horizontal).
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert_eq!(
+            result.len(),
+            1,
+            "default clamp Z=0 must let the horizontal shot hit the crate target \
+             (backward-compat: pre-#156 2D-on-y semantics treats z=1.5 as z=0)"
+        );
+    }
+
+    /// With allow_vertical_hits=true, the actual Z flows through.
+    /// A horizontal shot from the ground-level shooter at the
+    /// crate target now MISSES (1.5m vertical offset exceeds the
+    /// 0.5m target radius) -- the bug that the audit flagged. Pins
+    /// the new 3D-aware contract.
+    #[test]
+    fn aim_event_allow_vertical_hits_horizontal_shot_misses_crate_target() {
+        let mut room = setup_3d_room((0.0, 0.0, 0.0), (5.0, 0.0, 1.5));
+        room.allow_vertical_hits = true;
+        let req = passing_aim_event(); // yaw=PI/2, pitch=0 (horizontal).
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert!(
+            result.is_empty(),
+            "with allow_vertical_hits=true, a horizontal shot from z=0 at z=1.5 target must MISS \
+             (1.5m vertical offset exceeds the 0.5m target radius)"
+        );
+    }
+
+    /// With allow_vertical_hits=true AND an aimed shot at the
+    /// crate target (yaw that puts the ray in the XZ plane toward
+    /// the target), the target IS hit. Pins that vertical
+    /// advantage is achievable, not just penalty.
+    ///
+    /// Geometry: shooter at world (0,0,0), target at world
+    /// (5,0,1.5) -- forward-and-to-the-right in Babylon frame.
+    /// Yaw that points at the target = atan2(5, 1.5) ≈ 1.279 rad.
+    /// The default target radius is 0.5m, the shooter chest adds
+    /// +0.45 to y, so the closest-point distance to the sphere is
+    /// sqrt(0² + 0.45² + 0²) = 0.45m (within radius).
+    #[test]
+    fn aim_event_allow_vertical_hits_aimed_shot_hits_crate_target() {
+        let mut room = setup_3d_room((0.0, 0.0, 0.0), (5.0, 0.0, 1.5));
+        room.allow_vertical_hits = true;
+        let req = AimEvent {
+            source_player_id: 1,
+            yaw_radians: 1.279,
+            pitch_radians: 0.0,
+            frame: 4,
+            event_id: 1,
+            is_firing: 1,
+        };
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        assert_eq!(
+            result.len(),
+            1,
+            "with allow_vertical_hits=true AND aimed shot at the crate target, the hit must land (1 broadcast)"
+        );
+    }
+
+    /// With allow_vertical_hits=false, a horizontal shot from a
+    /// higher crate-shooter at a ground-level target STILL misses
+    /// (target Z clamped to 0). Pins the existing 2D-on-y semantics
+    /// for backward compat.
+    #[test]
+    fn aim_event_default_clamp_z_blocks_high_shooter_at_ground_target() {
+        let mut room = setup_3d_room((0.0, 0.0, 1.5), (5.0, 0.0, 0.0));
+        let req = AimEvent {
+            source_player_id: 1,
+            yaw_radians: std::f32::consts::FRAC_PI_2,
+            pitch_radians: 0.0,
+            frame: 4,
+            event_id: 1,
+            is_firing: 1,
+        };
+        let result = validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now());
+        // The source Z gets clamped to 0 in chest_position, and the
+        // target Z is also clamped to 0. They're both at (x, y+0.45,
+        // 0) and (5, 0.45, 0) -- horizontal shot from y=0.45 at x=0
+        // toward (5, 0.45, 0) hits the target capsule (0.5m radius).
+        assert_eq!(
+            result.len(),
+            1,
+            "horizontal shot at z=0 target from z=0 source (after clamp) must hit"
+        );
     }
 }

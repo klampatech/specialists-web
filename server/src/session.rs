@@ -295,6 +295,25 @@ pub struct Room {
     /// accepts wraparound at u16::MAX (~65k connections per room)
     /// — far above the matchmaker's `MAX_PLAYERS_PER_ROOM` cap (24).
     pub next_player_id: AtomicU16,
+    /// PR #156 / netcode-audit 2026-10-06 fix #1 — opt-in flag for
+    /// vertical positional advantage in lag-comp hit detection. When
+    /// `false` (default), the lag-comp hit-test clamps both source
+    /// and target Z to 0 (the pre-#156 2D-on-y behavior). When
+    /// `true`, the hit-test uses the actual rewound Z so a player
+    /// standing on a crate or in mid-air gets vertical advantage.
+    ///
+    /// Default false preserves backward compat with rooms that don't
+    /// model vertical advantage (existing 24-player flat arenas).
+    /// Set explicitly per-room when vertical advantage is desired.
+    pub allow_vertical_hits: bool,
+    /// netcode-audit 2026-10-06 LOW #9 — `Some(now)` once the
+    /// room has no live connections; the periodic GC sweep at
+    /// `main.rs` drops the room after `ROOM_GC_IDLE` elapses. A
+    /// fresh `register_connection` clears it back to `None`.
+    /// Without this, a long-lived empty room (e.g. lobby closed
+    /// but the room record wasn't removed) keeps ticking
+    /// `next_server_frame` and eventually wraps.
+    pub empty_since: Option<std::time::Instant>,
 }
 
 impl Room {
@@ -320,6 +339,10 @@ impl Room {
             // approach makes the id sequence predictable from the
             // matchmaker's player count alone.
             next_player_id: AtomicU16::new(1),
+            // netcode-audit 2026-10-06 LOW #9 — no live
+            // connections at construction time.
+            empty_since: Some(std::time::Instant::now()),
+            allow_vertical_hits: false,
         }
     }
 
@@ -392,12 +415,26 @@ impl Room {
         sender: crate::connection_outbound::ConnectionOutbound,
     ) {
         self.connections.insert(id, sender);
+        // netcode-audit 2026-10-06 LOW #9 — a fresh connection
+        // clears the empty-since stamp so the GC doesn't drop
+        // a room that just re-populated.
+        self.empty_since = None;
     }
 
     /// PR 11.6.D: drop a connection's sender. Called by the listener
     /// loop on disconnect. Idempotent.
     pub fn unregister_connection(&mut self, id: PlayerId) {
         self.connections.remove(&id);
+        // netcode-audit 2026-10-06 LOW #9 — stamp the moment the
+        // last connection left, so the periodic GC can drop the
+        // room after `ROOM_GC_IDLE` elapses. The check is
+        // deliberately on `connections.is_empty()` — `players`
+        // is not the right gate because players are added on
+        // first aim and never removed, so an empty `players` is
+        // only reached via the unregister path.
+        if self.connections.is_empty() && self.empty_since.is_none() {
+            self.empty_since = Some(std::time::Instant::now());
+        }
     }
 
     /// PR 11.6.D: increment the global server frame counter by 1
@@ -600,5 +637,74 @@ mod tests_pr11_6d {
         let now = Instant::now();
         room.record_fire(3, now);
         assert_eq!(room.players[&3].last_fire_at, Some(now));
+    }
+
+    // -- netcode-audit 2026-10-06 fix #9: room GC empty_since ----
+    //
+    // Pins the contract:
+    //   1. A fresh Room has empty_since = Some(now) — it's
+    //      empty at construction (no live connections).
+    //   2. register_connection clears empty_since = None.
+    //   3. unregister_connection of the LAST connection sets
+    //      empty_since = Some(now) (the room is now empty).
+    //   4. unregister_connection of a non-last connection leaves
+    //      empty_since alone (other connections still live).
+    //   5. register_connection after a period of being empty
+    //      clears empty_since back to None.
+    #[test]
+    fn gc_empty_since_stamps_on_last_unregister() {
+        let mut room = Room::new("DEVBX");
+        let co_a = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        let co_b = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        room.register_connection(1, co_a);
+        room.register_connection(2, co_b);
+        assert!(
+            room.empty_since.is_none(),
+            "register_connection must clear empty_since"
+        );
+        // Drop one of two connections — room still has a live
+        // connection, empty_since stays None.
+        room.unregister_connection(1);
+        assert!(
+            room.empty_since.is_none(),
+            "removing one of two connections must NOT stamp empty_since"
+        );
+        // Drop the last connection — empty_since is stamped.
+        let before = std::time::Instant::now();
+        room.unregister_connection(2);
+        let after = std::time::Instant::now();
+        let since = room.empty_since.expect(
+            "removing the last connection must stamp empty_since",
+        );
+        assert!(
+            since >= before && since <= after,
+            "empty_since must be stamped at the moment of last unregister"
+        );
+    }
+
+    #[test]
+    fn gc_register_after_empty_clears_stamp() {
+        let mut room = Room::new("DEVBX");
+        let co = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        room.register_connection(1, co);
+        room.unregister_connection(1);
+        assert!(room.empty_since.is_some());
+        // A fresh connection arrives — the GC must not drop
+        // the room; empty_since is cleared.
+        let co2 = crate::connection_outbound::ConnectionOutbound::with_capacity(8);
+        room.register_connection(2, co2);
+        assert!(
+            room.empty_since.is_none(),
+            "register_connection must clear empty_since (re-populated room)"
+        );
+    }
+
+    #[test]
+    fn gc_fresh_room_starts_empty() {
+        let room = Room::new("DEVBX");
+        assert!(
+            room.empty_since.is_some(),
+            "a fresh Room::new is empty (no live connections);              empty_since is Some(now) so the periodic GC will drop it              after ROOM_GC_IDLE elapses"
+        );
     }
 }

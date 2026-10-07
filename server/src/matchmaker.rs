@@ -461,27 +461,138 @@ async fn read_until_header_end(
     cap: usize,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
-    let mut byte = [0u8; 1];
-    let mut last4: [u8; 4] = [0, 0, 0, 0];
+    // netcode-audit 2026-10-06 MEDIUM #8 — read in chunks, not
+    // one byte at a time. A typical 200-byte HTTP/1.1 request
+    // was 200+ awaits + 200+ syscalls (each `read(&mut [u8; 1])`
+    // yields to the executor). Under a few hundred req/s the
+    // matchmaker hot path was bottlenecked on syscalls, not
+    // parsing. The 4KB scratch buffer holds ~4 chunks worth of
+    // bytes between full reads; we still honor the caller-supplied
+    // cap.
+    let mut scratch = [0u8; 4096];
     loop {
         if buf.len() >= cap {
             // Hit the cap without seeing the end-of-headers marker.
             // Caller will respond 400.
             return Ok(());
         }
-        let n = stream.read(&mut byte).await.context("read byte")?;
+        let want = std::cmp::min(scratch.len(), cap - buf.len());
+        let n = stream
+            .read(&mut scratch[..want])
+            .await
+            .context("read chunk")?;
         if n == 0 {
             // EOF before end of headers — caller will respond 400.
             return Ok(());
         }
-        buf.push(byte[0]);
-        // Shift the 4-byte window.
-        last4[0] = last4[1];
-        last4[1] = last4[2];
-        last4[2] = last4[3];
-        last4[3] = byte[0];
-        if last4 == [b'\r', b'\n', b'\r', b'\n'] {
+        // Scan for the end-of-headers marker before copying into
+        // `buf`. If found, copy up to and including it, then
+        // return; any remainder (impossible in this protocol —
+        // we only read until \r\n\r\n) is discarded.
+        if let Some(end) = scratch[..n].windows(4).position(|w| w == b"\r\n\r\n") {
+            buf.extend_from_slice(&scratch[..end + 4]);
             return Ok(());
         }
+        // No end-of-headers marker in this chunk — copy the
+        // whole chunk and keep reading. Bail to caller if this
+        // chunk filled the cap (next read would still be > cap
+        // and we don't want to silently drop bytes).
+        if buf.len() + n > cap {
+            // Defensive: would have been caught by the cap
+            // check at the top of the next loop iteration, but
+            // writing a partial chunk here is a bug. Cap the
+            // copy and return so the caller can 400.
+            let can_take = cap - buf.len();
+            buf.extend_from_slice(&scratch[..can_take]);
+            return Ok(());
+        }
+        buf.extend_from_slice(&scratch[..n]);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    /// netcode-audit 2026-10-06 MEDIUM #8 — the chunked read path
+    /// must read end-of-headers split across two socket reads
+    /// (the byte-at-a-time path read until it found \\r\\n\\r\\n
+    /// regardless of how the bytes were chunked). Drive a
+    /// listener, send a partial header followed by the rest, and
+    /// assert the function returns the full header in `buf`.
+    #[tokio::test]
+    async fn read_until_header_end_merges_chunks_across_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Server task: accept one connection, run the chunked
+        // read, return the buffer.
+        let server = tokio::spawn(async move {
+            let (mut stream, _peer) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(512);
+            read_until_header_end(&mut stream, &mut buf, 16 * 1024)
+                .await
+                .unwrap();
+            buf
+        });
+        // Client task: connect, write the request in two pieces
+        // with a small delay so the server's first read returns
+        // only the first piece.
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // First half: the request line + one header (no \\r\\n\\r\\n yet).
+        let part1 = b"GET /rooms/DEVBX HTTP/1.1\r\nHost: x\r\n";
+        // Second half: ends with \\r\\n\\r\\n to terminate the headers.
+        let part2 = b"Content-Length: 0\r\n\r\n";
+        client.write_all(part1).await.unwrap();
+        // Yield to let the server do its first read of just
+        // `part1` (no end-of-headers marker). The byte-at-a-time
+        // path also handles this, but the chunked read must too.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(part2).await.unwrap();
+        client.shutdown().await.unwrap();
+        let buf = server.await.unwrap();
+        // The full header (up to and including \\r\\n\\r\\n) must
+        // be in `buf` — proves the chunked read merged the two
+        // socket reads correctly.
+        let text = std::str::from_utf8(&buf).expect("utf8");
+        assert!(
+            text.ends_with("\r\n\r\n"),
+            "buffer must end with CRLFCRLF (got len={}, last4={:?})",
+            buf.len(),
+            &buf[buf.len().saturating_sub(4)..]
+        );
+        assert!(text.starts_with("GET /rooms/DEVBX"));
+    }
+
+    /// EOF before the end-of-headers marker must not hang the
+    /// read — the byte-at-a-time path also returned Ok(()) on
+    /// EOF, leaving `buf` with the partial request and letting
+    /// the caller respond 400. Pin the chunked read's contract.
+    #[tokio::test]
+    async fn read_until_header_end_eof_returns_gracefully() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _peer) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(512);
+            // 5-second timeout safety: the test fails fast if
+            // the function hangs on EOF.
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                read_until_header_end(&mut stream, &mut buf, 16 * 1024),
+            )
+            .await;
+            (r, buf)
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"GET /rooms/DEVBX HTTP/1.1").await.unwrap();
+        client.shutdown().await.unwrap();
+        let (r, buf) = server.await.unwrap();
+        assert!(r.is_ok(), "read must not hang on EOF");
+        assert!(
+            !buf.ends_with(b"\r\n\r\n"),
+            "EOF before end-of-headers must leave the buffer partial"
+        );
+        assert!(buf.starts_with(b"GET /rooms/DEVBX"));
     }
 }

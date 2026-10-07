@@ -430,6 +430,21 @@ void (async () => {
         // PR #156 — vertical Y. Babylon's Y axis = Havok's y axis.
         // Pre-#156 the wire only carried the XZ horizontal plane.
         positionZ: postPos.y,
+        // netcode-audit 2026-10-06 LOW #11 — the velocity fields
+        // here are NOT sent on the wire. This `PlayerState` is
+        // the predictor's output (consumed locally by the
+        // predictor's reconciliation loop at
+        // clientPredictor.ts:356 to re-simulate the local player's
+        // position forward after a server snapshot). The wire's
+        // `velocityX/Y` is encoded by the server in
+        // `server/src/snapshot.rs:113` from
+        // `room.physics.velocity(player_id)` (the Rapier linvel),
+        // not from this local havokStep. So this PlayerState's
+        // velocity is for local drift detection only — for a
+        // stationary player it is 0, for a moving player it is
+        // the post-step Havok velocity. The remote interpolator's
+        // extrapolation in remoteInterpolator.ts:425-426 reads
+        // the WIRE velocity, not this local one.
         velocityX: postVel.x,
         velocityY: postVel.z,
         yaw: 0, // PR 11.7.B wire doesn't carry yaw/pitch

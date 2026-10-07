@@ -170,7 +170,13 @@ export function sendAimEvent(
   // cooldown). Without this trace, a missing AimEvent in the server
   // log is ambiguous: did the client never send it, or did the server
   // reject it?
-  console.info(`[PR-65-DEBUG] aimEvent->send source=${req.sourcePlayerId} yaw=${req.yawRadians} pitch=${req.pitchRadians} frame=${req.frame} eventId=${req.eventId}`);
+  if (import.meta.env.DEV) {
+    console.info(
+      `[PR-65-DEBUG] aimEvent->send source=${req.sourcePlayerId} ` +
+      `yaw=${req.yawRadians} pitch=${req.pitchRadians} ` +
+      `frame=${req.frame} eventId=${req.eventId}`,
+    );
+  }
   t.sendAimEvent(req);
   return req.eventId;
 }
@@ -323,7 +329,13 @@ export function sendMeleeEvent(
   // sendMeleeEvent at all (vs. being gated upstream by
   // meleePressed / swingDurationMs / cooldown). Same pattern as
   // sendAimEvent.
-  console.info(`[PR-114-DEBUG] meleeEvent->send source=${req.sourcePlayerId} yaw=${req.yawRadians} pitch=${req.pitchRadians} frame=${req.frame} eventId=${req.eventId}`);
+  if (import.meta.env.DEV) {
+    console.info(
+      `[PR-114-DEBUG] meleeEvent->send source=${req.sourcePlayerId} ` +
+      `yaw=${req.yawRadians} pitch=${req.pitchRadians} ` +
+      `frame=${req.frame} eventId=${req.eventId}`,
+    );
+  }
   t.sendMeleeEvent(req);
   return req.eventId;
 }

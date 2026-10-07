@@ -17,15 +17,14 @@
 //     `Notify` if the queue is empty. Returns `None` once `close()` is
 //     called and the queue drains.
 //
-// **Capacity**: 1024 (was 512 pre-D2). The brief said "DO NOT bump
-// the mpsc capacity — back-pressure is the right answer, not another
-// capacity bump." CI testing on D2.1's first run showed 512 was
-// insufficient for sustained headless load: CI's snapshot-stream
-// consumer decodes at ~12-15Hz effective rate vs the producer's
-// 20Hz. Under sustained 2-tab load, the queue fills + drop-oldest
-// fires — but the consumer's decode rate is the bottleneck, not the
-// queue capacity. Bumping to 1024 gives the consumer ~50s of
-// headroom under sustained load before drop-oldest fires. The
+// **Capacity**: 512. The brief explicitly said "DO NOT bump
+// the mpsc capacity — back-pressure is the right answer, not
+// another capacity bump." PR 11.7.D2 raised this to 1024 to
+// paper over a slow CI consumer (CI decoded at ~12-15Hz vs the
+// 20Hz producer); the deeper queue amplified the LIFO ordering
+// problem (audit fix #2) before drop-oldest kicked in. With
+// fix #2 the consumer now reads in chronological order, so
+// reverting to 512 is the right back-pressure knob. The
 // drop-oldest path stays as defense-in-depth.
 // The `tokio::sync::Mutex::lock().await` integrates directly with the
 // runtime's notify mechanism, so the lock itself signals when it's
@@ -42,11 +41,12 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, Notify};
 
-/// Per-connection outbound queue capacity. See the module-level
-/// note above for why 1024 (not the brief's "DO NOT bump" 512).
-/// Drop-oldest is the architectural answer for true saturation;
-/// capacity is the practical answer for slow consumers.
-pub const CONNECTION_OUTBOUND_CAPACITY: usize = 1024;
+/// Per-connection outbound queue capacity. Matches the brief's
+/// pre-D2 mpsc capacity of 512. Drop-oldest is the architectural
+/// answer for true saturation; capacity is the practical answer
+/// for slow consumers (and the brief says keep it at 512 — DO
+/// NOT bump the mpsc capacity).
+pub const CONNECTION_OUTBOUND_CAPACITY: usize = 512;
 
 /// PR 11.7.D3.3 — process-wide atomic counter for drop-oldest fires.
 /// Bumped every time a producer pops the front of a saturated queue.
@@ -108,7 +108,7 @@ pub fn global_rate_limited_count_inc() {
 /// back-pressure).
 ///
 /// **Consumer semantics**: `recv()` is async. Returns the most
-/// recently pushed item (LIFO from the consumer's perspective — the
+/// oldest item (FIFO from the consumer's perspective — the
 /// producer's "newest" item is the consumer's first-to-pop). When the
 /// queue is empty, the consumer awaits a Notify. Returns `None` after
 /// `close()` is called AND the queue is drained.
@@ -197,9 +197,11 @@ impl ConnectionOutbound {
         Ok(())
     }
 
-    /// Async pop. Returns the next item from the back (the most
-    /// recently pushed entry). Awaits `Notify` if the queue is
-    /// empty. Returns `None` after `close()` and the queue drains.
+    /// Async pop. Returns the next item from the front (the OLDEST
+    /// entry — FIFO). Producer pushes at back via `try_send`; this
+    /// pops at front so the consumer reads in chronological order.
+    /// Awaits `Notify` if the queue is empty. Returns `None` after
+    /// `close()` and the queue drains.
     ///
     /// **Implementation note**: we hold the queue lock across the
     /// `notify.notified().await` so that when a `try_send` notifies,
@@ -211,7 +213,21 @@ impl ConnectionOutbound {
             // Fast path: pop under the lock.
             {
                 let mut q = self.inner.queue.lock().await;
-                if let Some(b) = q.pop_back() {
+                // PR 11.7.D2 / netcode-audit 2026-10-06 fix #2:
+                // FIFO from the front (oldest-first). Producer
+                // pushes at back via try_send, consumer pops at
+                // front via recv — classic FIFO. The previous LIFO
+                // `pop_back` returned the newest item first, which
+                // broke `remoteInterpolator.findBracketing` under
+                // any saturation: the bracket logic iterates
+                // arrival-order (oldest-first) to find the pair
+                // bracketing the target render time, and got
+                // reverse-chronological data under load. The unit
+                // test below (try_send_drops_oldest_when_full,
+                // multiple_try_sends_before_recv_drain_correctly)
+                // previously asserted LIFO order; both updated to
+                // assert FIFO.
+                if let Some(b) = q.pop_front() {
                     return Some(b);
                 }
                 if self.inner.closed.load(Ordering::Relaxed) {
@@ -304,14 +320,17 @@ mod tests {
         // Push one more — should drop the oldest (vec![0]).
         assert!(q.try_send(vec![99]).await.is_ok());
         assert_eq!(q.len().await, 4);
-        // Drain and verify order: LIFO from back = vec![99, 3, 2, 1].
-        // (Consumer pops from back; producer pushed 0, 1, 2, 3, 99;
-        //  drop-oldest removed 0; queue front-to-back is [1, 2, 3, 99];
-        //  consumer pop-back yields 99, 3, 2, 1.)
-        assert_eq!(q.recv().await, Some(vec![99]));
-        assert_eq!(q.recv().await, Some(vec![3]));
-        assert_eq!(q.recv().await, Some(vec![2]));
+        // Drain and verify order: FIFO from front = vec![1, 2, 3, 99].
+        // (Producer pushed 0, 1, 2, 3, 99; drop-oldest removed 0;
+        //  queue front-to-back is [1, 2, 3, 99];
+        //  consumer pop-front yields 1, 2, 3, 99.)
+        // netcode-audit 2026-10-06 fix #2 — previously asserted LIFO,
+        // which broke the snapshot stream's chronological order under
+        // any saturation.
         assert_eq!(q.recv().await, Some(vec![1]));
+        assert_eq!(q.recv().await, Some(vec![2]));
+        assert_eq!(q.recv().await, Some(vec![3]));
+        assert_eq!(q.recv().await, Some(vec![99]));
     }
 
     #[tokio::test]
@@ -355,10 +374,46 @@ mod tests {
             }
         }
         assert_eq!(got.len(), 4);
-        // Drain order: LIFO from back.
-        assert_eq!(got[0], vec![3]);
-        assert_eq!(got[1], vec![2]);
-        assert_eq!(got[2], vec![1]);
-        assert_eq!(got[3], vec![0]);
+        // Drain order: FIFO from front. netcode-audit 2026-10-06 fix
+        // #2 — previously asserted LIFO which broke the snapshot
+        // stream's chronological order under saturation.
+        assert_eq!(got[0], vec![0]);
+        assert_eq!(got[1], vec![1]);
+        assert_eq!(got[2], vec![2]);
+        assert_eq!(got[3], vec![3]);
+    }
+
+    /// netcode-audit 2026-10-06 BLOCKER #2 — regression: under
+    /// saturation (drops firing), the consumer must still drain in
+    /// chronological order. Pre-fix (LIFO), the consumer popped
+    /// the newest item first, breaking
+    /// `remoteInterpolator.findBracketing` which assumes
+    /// arrival order = insertion order.
+    ///
+    /// Setup: capacity 3, push 5 items (0, 1, 2, 3, 4). Drop-oldest
+    /// fires twice (drops 0, 1). Surviving items: [2, 3, 4] in
+    /// that front-to-back order. FIFO drain: 2, 3, 4.
+    #[tokio::test]
+    async fn drain_under_saturation_is_chronological() {
+        let q = ConnectionOutbound::with_capacity(3);
+        for i in 0..5u8 {
+            assert!(q.try_send(vec![i]).await.is_ok());
+        }
+        assert_eq!(q.len().await, 3, "queue should be at capacity");
+        assert_eq!(
+            q.drop_count(),
+            2,
+            "two oldest items should have been dropped"
+        );
+        // FIFO order under saturation: 2, 3, 4 (oldest surviving
+        // first). Pre-fix this was [4, 3, 2] (LIFO from back),
+        // which the interpolator's findBracketing misinterpreted.
+        assert_eq!(q.recv().await, Some(vec![2]));
+        assert_eq!(q.recv().await, Some(vec![3]));
+        assert_eq!(q.recv().await, Some(vec![4]));
+        // Close the queue so the next recv returns None instead of
+        // awaiting Notify forever on an empty queue.
+        q.close();
+        assert_eq!(q.recv().await, None, "no more items after close");
     }
 }

@@ -293,7 +293,7 @@ pub async fn should_rate_limit(room: &Room, threshold_pct: u8) -> bool {
         }
         // depth * 100 > cap * pct → depth/cap > pct/100
         // Multiply-first avoids floating-point; usize overflow
-        // is impossible here (cap = 1024, depth <= 1024, pct <= 100,
+        // is impossible here (cap = 512, depth <= 512, pct <= 100,
         // so both products fit easily in u64).
         let threshold_depth = (cap as u64 * clamped as u64) / 100;
         if (depth as u64) > threshold_depth {
