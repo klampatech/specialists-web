@@ -645,7 +645,31 @@ pub fn validate_and_relay_aim(
         // panicking -- the Tokio worker would otherwise abort and
         // systemd would restart, losing every connected player.
         let current_fire_mode: FireMode = match room.players.get(&req_source) {
-            Some(p) => active_weapon_def.fire_modes[p.current_fire_mode as usize],
+            Some(p) => {
+                // netcode-audit 2026-10-06 MEDIUM #7 — bounds-
+                // check the fire-mode index before indexing. Pre-fix
+                // a corrupted `current_fire_mode` (out of range due
+                // to a future weapon-table change, snapshot
+                // corruption, or replay attack) would `panic!` the
+                // Tokio worker; systemd would restart the server
+                // and every connected player would lose state.
+                // The WeaponSwitch path at damage_relay.rs:1071
+                // already handles the same condition gracefully
+                // — converge on that defensive pattern.
+                let fm_idx = p.current_fire_mode as usize;
+                if fm_idx >= active_weapon_def.fire_modes.len() {
+                    warn!(
+                        source = req_source,
+                        fire_mode_idx = p.current_fire_mode,
+                        fire_modes_len = active_weapon_def.fire_modes.len(),
+                        weapon_id = active_weapon_def.weapon_id as u8,
+                        "validate_and_relay_aim: current_fire_mode out of \
+                         range (corrupted state). Dropping packet.",
+                    );
+                    return vec![];
+                }
+                active_weapon_def.fire_modes[fm_idx]
+            }
             None => {
                 warn!(
                     source = req_source,
@@ -2238,6 +2262,65 @@ mod tests {
             ammo_after_second_burst,
             ammo_after_first_burst - 1,
             "release + pull must cost another ammo"
+        );
+    }
+
+    // -- netcode-audit 2026-10-06 fix #7: fire_modes[] bounds check --
+    //
+    // Pre-fix: `active_weapon_def.fire_modes[p.current_fire_mode as usize]`
+    // would `panic!` if `current_fire_mode` was out of range (e.g.,
+    // 99 on a weapon that has only 2 fire modes). Post-fix the
+    // validator drops the packet gracefully — same defensive
+    // pattern as the WeaponSwitch path at damage_relay.rs:1071.
+    // The test below drives an out-of-range index and asserts the
+    // packet is dropped (no broadcast, no panic).
+
+    /// Helper that constructs a player in DualPistol (fire_modes
+    /// = [Semi, Burst3]) and forces `current_fire_mode` to an
+    /// out-of-range index. The DualPistol table has 2 entries,
+    /// so index 5 is well past the end.
+    fn setup_corrupt_fire_mode_room() -> Room {
+        let mut room = Room::new("DEVBX");
+        room.add_player(1);
+        room.add_player(2);
+        room.players.get_mut(&1).unwrap().ammo = PLAYER_MAX_AMMO;
+        for frame in 0..5u32 {
+            room.record_position(1, frame, Position { x: 0.0, y: 0.0, z: 0.0 });
+            room.record_position(2, frame, Position { x: 5.0, y: 0.0, z: 0.0 });
+        }
+        // Corrupt the player's fire-mode index to a value past
+        // the end of DualPistol's fire_modes[].
+        room.players.get_mut(&1).unwrap().current_fire_mode = 5;
+        room
+    }
+
+    /// Out-of-range `current_fire_mode` must NOT panic the Tokio
+    /// worker. Pre-fix the index `fire_modes[5]` panics on a
+    /// DualPistol (2 fire modes). Post-fix the validator
+    /// gracefully drops the packet — same shape as
+    /// `WeaponSwitch` at damage_relay.rs:1071.
+    #[test]
+    fn aim_event_corrupt_fire_mode_index_drops_packet_no_panic() {
+        let mut room = setup_corrupt_fire_mode_room();
+        let initial_ammo = room.players.get(&1).unwrap().ammo;
+        let req = passing_aim_event();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_and_relay_aim(&req, 1, &mut room, 0, Instant::now())
+        }))
+        .expect("validate_and_relay_aim must NOT panic on a corrupt fire_mode_index");
+        // No broadcast was emitted — the packet was dropped
+        // before any state could change.
+        assert_eq!(
+            result.len(),
+            0,
+            "corrupt fire_mode_index must drop the AimEvent (no broadcast)"
+        );
+        // Ammo is unchanged (the packet didn't reach the
+        // burst/auto state machine).
+        assert_eq!(
+            room.players.get(&1).unwrap().ammo,
+            initial_ammo,
+            "corrupt fire_mode_index must not cost ammo"
         );
     }
 
