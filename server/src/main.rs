@@ -456,9 +456,11 @@ async fn main() -> ExitCode {
             );
             // PR 80 — read the snapshot rate-limit threshold from
             // the env once at startup. Default 25% (= 256 entries
-            // deep against the 1024 cap). Set to 100 to disable the
-            // gate entirely; set to 0 to gate every emit (useful for
-            // stress testing). Mirrors the existing
+            // deep against the 512 cap; see
+            // connection_outbound.rs::CONNECTION_OUTBOUND_CAPACITY).
+            // Set to 100 to disable the gate entirely; set to 0 to
+            // gate every emit (useful for stress testing). Mirrors the
+            // existing
             // `CANARY_STATS_INTERVAL_MS` env var pattern.
             let rate_limit_pct: u8 = std::env::var(
                 "SNAPSHOT_RATE_LIMIT_PCT",

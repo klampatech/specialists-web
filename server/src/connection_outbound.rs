@@ -17,15 +17,14 @@
 //     `Notify` if the queue is empty. Returns `None` once `close()` is
 //     called and the queue drains.
 //
-// **Capacity**: 1024 (was 512 pre-D2). The brief said "DO NOT bump
-// the mpsc capacity — back-pressure is the right answer, not another
-// capacity bump." CI testing on D2.1's first run showed 512 was
-// insufficient for sustained headless load: CI's snapshot-stream
-// consumer decodes at ~12-15Hz effective rate vs the producer's
-// 20Hz. Under sustained 2-tab load, the queue fills + drop-oldest
-// fires — but the consumer's decode rate is the bottleneck, not the
-// queue capacity. Bumping to 1024 gives the consumer ~50s of
-// headroom under sustained load before drop-oldest fires. The
+// **Capacity**: 512. The brief explicitly said "DO NOT bump
+// the mpsc capacity — back-pressure is the right answer, not
+// another capacity bump." PR 11.7.D2 raised this to 1024 to
+// paper over a slow CI consumer (CI decoded at ~12-15Hz vs the
+// 20Hz producer); the deeper queue amplified the LIFO ordering
+// problem (audit fix #2) before drop-oldest kicked in. With
+// fix #2 the consumer now reads in chronological order, so
+// reverting to 512 is the right back-pressure knob. The
 // drop-oldest path stays as defense-in-depth.
 // The `tokio::sync::Mutex::lock().await` integrates directly with the
 // runtime's notify mechanism, so the lock itself signals when it's
@@ -42,11 +41,12 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, Notify};
 
-/// Per-connection outbound queue capacity. See the module-level
-/// note above for why 1024 (not the brief's "DO NOT bump" 512).
-/// Drop-oldest is the architectural answer for true saturation;
-/// capacity is the practical answer for slow consumers.
-pub const CONNECTION_OUTBOUND_CAPACITY: usize = 1024;
+/// Per-connection outbound queue capacity. Matches the brief's
+/// pre-D2 mpsc capacity of 512. Drop-oldest is the architectural
+/// answer for true saturation; capacity is the practical answer
+/// for slow consumers (and the brief says keep it at 512 — DO
+/// NOT bump the mpsc capacity).
+pub const CONNECTION_OUTBOUND_CAPACITY: usize = 512;
 
 /// PR 11.7.D3.3 — process-wide atomic counter for drop-oldest fires.
 /// Bumped every time a producer pops the front of a saturated queue.
